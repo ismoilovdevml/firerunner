@@ -9,6 +9,7 @@ VERSION="v1.0.0"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/firerunner"
 FLINTLOCK_CONFIG_DIR="/etc/flintlock"
+PKG_MANAGER=""
 
 # Colors
 RED='\033[0;31m'
@@ -46,6 +47,20 @@ check_root() {
     fi
 }
 
+# Detect package manager
+detect_package_manager() {
+    if command -v apt-get &>/dev/null; then
+        PKG_MANAGER="apt"
+    elif command -v dnf &>/dev/null; then
+        PKG_MANAGER="dnf"
+    elif command -v yum &>/dev/null; then
+        PKG_MANAGER="yum"
+    else
+        log_error "No supported package manager found (apt/dnf/yum)"
+        exit 1
+    fi
+}
+
 # Check OS
 check_os() {
     log_step "Checking operating system..."
@@ -57,14 +72,11 @@ check_os() {
 
     source /etc/os-release
 
-    if [[ "$ID" != "ubuntu" ]] && [[ "$ID" != "debian" ]]; then
-        log_warn "OS: $ID $VERSION_ID (tested on Ubuntu 22.04+)"
-        read -p "Continue anyway? [y/N] " -n 1 -r
-        echo
-        [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
-    else
-        log_info "OS: $ID $VERSION_ID"
-    fi
+    log_info "OS: $ID $VERSION_ID"
+
+    # Detect package manager
+    detect_package_manager
+    log_info "Package manager: $PKG_MANAGER"
 }
 
 # Check prerequisites
@@ -103,18 +115,17 @@ check_prerequisites() {
 install_dependencies() {
     log_step "Installing dependencies..."
 
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq \
-        curl \
-        wget \
-        tar \
-        git \
-        make \
-        jq \
-        openssl \
-        ca-certificates \
-        gnupg >/dev/null 2>&1
+    local packages="curl wget tar git make jq openssl ca-certificates"
+
+    if [[ "$PKG_MANAGER" == "apt" ]]; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq $packages gnupg >/dev/null 2>&1
+    elif [[ "$PKG_MANAGER" == "dnf" ]]; then
+        dnf install -y -q $packages >/dev/null 2>&1
+    elif [[ "$PKG_MANAGER" == "yum" ]]; then
+        yum install -y -q $packages >/dev/null 2>&1
+    fi
 
     log_info "Dependencies installed"
 }
