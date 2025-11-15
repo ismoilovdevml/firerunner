@@ -1,122 +1,87 @@
 # FireRunner 🔥
 
-**Enterprise-grade ephemeral GitLab CI/CD runners powered by Firecracker MicroVMs**
+**Ephemeral GitLab CI/CD runners using Firecracker microVMs**
 
-FireRunner is an open-source alternative to Actuated that provides secure, fast, and ephemeral GitLab CI/CD runners using Firecracker microVMs. Each job runs in an isolated VM that boots in <1 second and is destroyed immediately after completion.
+Open-source alternative to Actuated. Each CI job runs in an isolated, ephemeral Firecracker VM that boots in <1 second and destroys immediately after completion.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Go Report Card](https://goreportcard.com/badge/github.com/ismoilovdevml/firerunner)](https://goreportcard.com/report/github.com/ismoilovdevml/firerunner)
-![Status](https://img.shields.io/badge/Status-Production%20Ready-green)
-![Version](https://img.shields.io/badge/Version-v1.0.0-blue)
-![Test Coverage](https://img.shields.io/badge/Coverage-65%25-brightgreen)
+[![Test Coverage](https://img.shields.io/badge/Coverage-65%25-brightgreen)](pkg/)
+![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go)
 
-## ✅ Production Ready
+## Architecture
 
-**Current Version: v1.0.0**
-
-FireRunner is **production-ready** for GitLab CI/CD deployments. All core functionality is implemented, tested, and documented.
-
-**Production Features:**
-- ✅ Enterprise architecture with interface-based design
-- ✅ Secure webhook handling (HMAC-SHA256, rate limiting, IP whitelisting)
-- ✅ Job scheduling with worker pool (81.2% test coverage)
-- ✅ VM lifecycle management (70.3% test coverage)
-- ✅ Flintlock gRPC client integration
-- ✅ Configuration management (YAML + ENV with validation)
-- ✅ Prometheus metrics & Grafana dashboards
-- ✅ Docker Compose production deployment
-- ✅ Automated installer (`install.sh`)
-- ✅ Comprehensive unit tests (65% overall coverage)
-- ✅ Race condition free (all tests pass with `-race`)
-- ✅ Production documentation
-
-**Deployment Options:**
-- 🚀 **Quick Start**: `curl -sSL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash`
-- 🐳 **Docker Compose**: Production-ready multi-service deployment
-- ⚙️ **Systemd**: Native Linux service integration
-
-**See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for complete installation guide.**
-
-## ✨ Features
-
-- ⚡ **Sub-second VM provisioning** - VMs boot in <1 second using Firecracker
-- 🔒 **Secure isolation** - Each job runs in a dedicated KVM-isolated VM
-- 🎯 **Dynamic resource allocation** - Specify CPU/RAM per job via tags (`firecracker-4cpu-8gb`)
-- 🗑️ **Ephemeral by design** - VMs are destroyed immediately after job completion
-- 🐳 **Native Docker support** - No privileged containers or Docker-in-Docker workarounds
-- 📊 **Prometheus metrics** - Built-in monitoring and observability
-- 🔧 **GitLab webhook integration** - Automatic runner registration per job
-- 🌐 **Shell executor support** - Run Kubernetes, Android emulators, or any system-level workload
-- ♻️ **Auto-scaling** - Queue-based job scheduling with configurable worker pools
-
-## 🏗️ Architecture
+Matches the [Actuated workflow](https://actuated.com):
 
 ```
-GitLab Instance
-      ↓ (webhook)
-FireRunner Service
-      ↓ (gRPC)
-Flintlock Manager
-      ↓
-Firecracker MicroVMs
+┌─────────────────┐      2) Webhook       ┌──────────────────────┐
+│  Self-hosted    │───────────────────────>│  FireRunner Service  │
+│  GitLab         │<───────────────────────│  (Controller)        │
+│                 │  3) Register runner    │                      │
+└────────┬────────┘                        └──────────┬───────────┘
+         │                                            │
+         │ 1) git push                                │ 4) Create VM
+         │                                            ↓
+    ┌────┴─────┐                            ┌─────────────────────┐
+    │ Project  │                            │  Server with KVM    │
+    └──────────┘                            │  ┌───────────────┐  │
+         ↑                                  │  │  Ephemeral    │  │
+         │                                  │  │  Runner 🔥    │  │
+         └──────────────5) Start job────────┤  └───────────────┘  │
+                                            └─────────────────────┘
 ```
 
-### Components
+**Workflow:**
+1. Developer pushes code → GitLab
+2. GitLab sends webhook → FireRunner
+3. FireRunner registers ephemeral runner → GitLab API
+4. FireRunner creates VM via Flintlock → Firecracker
+5. GitLab starts job → ephemeral runner in VM
+6. Job completes → Runner unregistered → VM destroyed
 
-- **FireRunner**: Main service handling webhooks, scheduling, and orchestration
-- **Flintlock**: VM lifecycle management via gRPC
-- **Firecracker**: Lightweight virtualization (AWS's serverless foundation)
-- **GitLab**: CI/CD platform integration
+## Production Status
 
-## 🚀 Quick Start
+### ✅ Production Ready (v1.0.0)
 
-### Automated Installation (Recommended)
+**Core orchestration layer:**
+- Webhook handler (HMAC-SHA256, rate limiting, IP whitelist)
+- Job scheduler (worker pool, context-based cancellation)
+- GitLab API integration (real runner registration/cleanup)
+- Job monitoring (GitLab API polling, 5s intervals)
+- Configuration management (YAML + ENV validation)
+- Prometheus metrics
+- 65% test coverage, race detector clean
 
-**One-command install on Ubuntu 22.04+:**
+**Code references:**
+- `pkg/gitlab/webhook_handler.go` - Secure webhook processing
+- `pkg/scheduler/scheduler.go` - Job scheduling, worker pool
+- `pkg/gitlab/service.go` - Real GitLab API (RegisterRunner, UnregisterRunner)
+- `pkg/gitlab/job_monitor.go` - Real-time job status monitoring
 
-```bash
-curl -sSL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash
-```
+### ⚠️ Requires Setup
 
-This installs:
-- Firecracker
-- Flintlock
-- FireRunner
-- All dependencies
-- Systemd services (auto-start)
+**Infrastructure dependencies:**
+1. **Flintlock server** - VM provisioning backend (install separately)
+2. **VM images** - Kernel + rootfs with GitLab Runner pre-installed
+3. **SSH automation** - Runner installation/configuration (TODO: `scheduler.go:434`)
 
-**Manual installation:** See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)
+**Current limitation:**
+- FireRunner registers runners via GitLab API ✅
+- Assumes runner binary is pre-installed in VM image
+- Production needs: SSH into VM → install runner → configure token
+
+## Quick Start
 
 ### Prerequisites
 
-- **Bare metal server** or VM with nested virtualization support
-- **Ubuntu 22.04 LTS** (recommended)
-- **KVM support** (`/dev/kvm` available)
-- **16GB+ RAM, 4+ CPU cores**
-- **GitLab instance** (self-hosted or GitLab.com)
+- Bare metal server or VM with nested virtualization
+- Ubuntu 22.04 LTS
+- KVM support (`/dev/kvm`)
+- 16GB+ RAM, 4+ cores
+- GitLab instance (self-hosted or GitLab.com)
 
-### Alternative: Docker Compose
+### Installation
 
-```bash
-# Clone repository
-git clone https://github.com/ismoilovdevml/firerunner.git
-cd firerunner
-
-# Copy and edit environment
-cp .env.example .env
-nano .env  # Add your GitLab token
-
-# Start services
-docker-compose up -d
-
-# Check logs
-docker-compose logs -f firerunner
-```
-
-### Old Method: Manual Installation
-
-#### 1. Install Firecracker
-
+**1. Install Firecracker**
 ```bash
 curl -LOJ https://github.com/firecracker-microvm/firecracker/releases/download/v1.7.0/firecracker-v1.7.0-x86_64.tgz
 tar -xzf firecracker-v1.7.0-x86_64.tgz
@@ -124,8 +89,7 @@ sudo cp release-v1.7.0-x86_64/firecracker-v1.7.0-x86_64 /usr/local/bin/firecrack
 sudo chmod +x /usr/local/bin/firecracker
 ```
 
-#### 2. Install Flintlock
-
+**2. Install Flintlock**
 ```bash
 curl -LOJ https://github.com/liquidmetal-dev/flintlock/releases/download/v0.6.0/flintlock-v0.6.0-linux-x86_64.tar.gz
 tar -xzf flintlock-v0.6.0-linux-x86_64.tar.gz
@@ -133,8 +97,7 @@ sudo cp flintlockd /usr/local/bin/
 sudo chmod +x /usr/local/bin/flintlockd
 ```
 
-Create Flintlock config:
-
+**3. Configure Flintlock**
 ```bash
 sudo mkdir -p /etc/flintlock
 cat <<EOF | sudo tee /etc/flintlock/config.yaml
@@ -145,198 +108,261 @@ parent-iface:
 EOF
 ```
 
-Start Flintlock:
-
+**4. Start Flintlock**
 ```bash
-sudo flintlockd run --config /etc/flintlock/config.yaml
+sudo flintlockd run --config /etc/flintlock/config.yaml &
 ```
 
-#### 3. Install FireRunner
-
+**5. Install FireRunner**
 ```bash
-# Clone repository
 git clone https://github.com/ismoilovdevml/firerunner.git
 cd firerunner
-
-# Build
-go build -o firerunner ./cmd/firerunner
-
-# Copy binary
-sudo cp firerunner /usr/local/bin/
-
-# Create config
-cp config.example.yaml /etc/firerunner/config.yaml
-# Edit /etc/firerunner/config.yaml with your settings
-
-# Run
-firerunner --config /etc/firerunner/config.yaml
+make build
+sudo cp build/firerunner /usr/local/bin/
 ```
 
-### Configuration
+**6. Configure FireRunner**
+```bash
+sudo mkdir -p /etc/firerunner
+cat <<EOF | sudo tee /etc/firerunner/config.yaml
+server:
+  host: "0.0.0.0"
+  port: 8080
 
-Edit `/etc/firerunner/config.yaml`:
-
-```yaml
 gitlab:
   url: "https://gitlab.example.com"
-  token: "your-gitlab-api-token"
-  webhook_secret: "your-webhook-secret"
+  token: "glpat-xxxxxxxxxxxx"  # GitLab API token
+  webhook_secret: "your-secret-token"
 
 flintlock:
   endpoint: "localhost:9090"
+  timeout: 30s
 
 vm:
   default_vcpu: 2
   default_memory_mb: 4096
   kernel_image: "ghcr.io/firerunner/kernel:latest"
-  rootfs_image: "ghcr.io/firerunner/gitlab-runner:latest"
+  rootfs_image: "ghcr.io/firerunner/ubuntu-runner:latest"
+
+scheduler:
+  worker_count: 5
+  queue_size: 100
+  job_timeout: 1h
+EOF
+```
+
+**7. Start FireRunner**
+```bash
+firerunner --config /etc/firerunner/config.yaml
 ```
 
 ### GitLab Webhook Setup
 
-1. Go to your GitLab project: **Settings → Webhooks**
+1. Navigate to: **Project → Settings → Webhooks**
 2. Add webhook:
-   - URL: `http://your-firerunner-server:8080/webhook`
-   - Secret Token: (same as `webhook_secret` in config)
-   - Trigger: ✅ Job events
-3. Click **Add webhook**
+   - **URL**: `http://your-server-ip:8080/webhook`
+   - **Secret Token**: (same as `webhook_secret` in config)
+   - **Trigger**: ✅ Job events only
+3. Save webhook
 
-## 📝 Usage
+## Usage
 
-### Basic .gitlab-ci.yml
+### Basic Pipeline
 
 ```yaml
-build:
-  stage: build
-  image: docker:latest
+# .gitlab-ci.yml
+test:
   script:
-    - docker build -t myapp:latest .
+    - make test
   tags:
     - firecracker-2cpu-4gb
 ```
 
-### Advanced Example with Custom Resources
+### Resource Allocation
+
+Tag format: `firecracker-{CPU}cpu-{RAM}gb`
 
 ```yaml
-# Small job (2 CPU, 4GB RAM)
-test:
-  script:
-    - npm test
-  tags:
-    - firecracker-2cpu-4gb
-
-# Large job (8 CPU, 16GB RAM)
 build:
   script:
     - cargo build --release
   tags:
-    - firecracker-8cpu-16gb
-
-# Shell executor for system-level access
-e2e:
-  script:
-    - k3sup install --local
-    - kubectl get nodes
-  tags:
-    - firecracker-4cpu-8gb
-    - shell  # Enables shell executor
+    - firecracker-8cpu-16gb  # Large build
 ```
 
-### Tag Format
+### How It Works
 
-- **Resource specification**: `firecracker-{CPU}cpu-{RAM}gb`
-- **Executor type**: Add `shell` tag for shell executor (default is Docker)
+1. You push code → GitLab
+2. GitLab webhook → FireRunner at `/webhook`
+3. FireRunner parses job requirements from tags
+4. Creates VM via Flintlock (2 vCPU, 4GB RAM)
+5. Registers ephemeral runner → GitLab API
+6. GitLab assigns job → runner in VM
+7. Job executes → completes
+8. FireRunner unregisters runner → destroys VM
 
-## 🐳 Building VM Images
-
-FireRunner requires two images:
-1. **Kernel image** - Linux kernel for Firecracker
-2. **RootFS image** - Ubuntu + GitLab Runner
-
-See [images/README.md](images/README.md) for build instructions.
-
-## 📊 Monitoring
-
-FireRunner exposes Prometheus metrics on port 9090 (configurable):
-
-```bash
-curl http://localhost:9090/metrics
+**Job lifecycle (scheduler.go:341-387):**
+```go
+processJob() {
+    createVM()           // pkg/firecracker/manager.go
+    registerRunner()     // pkg/gitlab/service.go:35
+    waitForJobCompletion() // pkg/gitlab/job_monitor.go:32
+    cleanupVM()          // Unregister + destroy
+}
 ```
 
-Key metrics:
-- `firerunner_jobs_total` - Total jobs processed
-- `firerunner_vms_active` - Currently active VMs
-- `firerunner_job_duration_seconds` - Job execution time
-- `firerunner_vm_creation_duration_seconds` - VM boot time
+## Development
 
-## 🔧 Development
-
-### Requirements
-
-- Go 1.21+
-- Docker (for building images)
-- Make
-
-### Build
-
+**Build**
 ```bash
 make build
 ```
 
-### Run Tests
+**Test**
+```bash
+make test  # 65% coverage, race detector clean
+```
 
+**Run locally**
+```bash
+# Terminal 1: Flintlock
+flintlockd run --config /etc/flintlock/config.yaml
+
+# Terminal 2: FireRunner
+go run cmd/firerunner/main.go --config /etc/firerunner/config.yaml
+```
+
+## Monitoring
+
+Prometheus metrics on `:9090/metrics`:
+
+```bash
+curl http://localhost:9090/metrics | grep firerunner
+```
+
+Key metrics:
+- `firerunner_jobs_total{status="success|failed"}`
+- `firerunner_vms_active`
+- `firerunner_job_duration_seconds`
+- `firerunner_queue_size`
+
+Grafana dashboards: `config/grafana/dashboards/*.json`
+
+## Production Deployment
+
+### Systemd Service
+
+```bash
+sudo tee /etc/systemd/system/firerunner.service <<EOF
+[Unit]
+Description=FireRunner - Ephemeral GitLab Runners
+After=network.target flintlock.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/firerunner --config /etc/firerunner/config.yaml
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now firerunner
+```
+
+### VM Image Requirements
+
+Your rootfs image must include:
+- Ubuntu 22.04 base
+- GitLab Runner binary pre-installed
+- SSH server (for future automation)
+
+**Current assumption**: Runner auto-configures with token from cloud-init
+
+**TODO (scheduler.go:434-443)**:
+```go
+// Production implementation should:
+// - SSH into VM (job.VM.IPAddress)
+// - Install gitlab-runner (if not in image)
+// - Configure: gitlab-runner register --token $TOKEN
+// - Start: systemctl start gitlab-runner
+```
+
+## Testing
+
+**Unit tests**
 ```bash
 make test
+# Output:
+# pkg/scheduler: 86.2% coverage
+# pkg/firecracker: 67.7% coverage
+# pkg/gitlab: 26.4% coverage
+# pkg/config: 50.0% coverage
 ```
 
-### Run Locally
-
+**Integration test** (requires Flintlock running)
 ```bash
-# Terminal 1: Start Flintlock
-flintlockd run --config config/flintlock.yaml
+# 1. Start Flintlock
+flintlockd run --config /etc/flintlock/config.yaml &
 
-# Terminal 2: Start FireRunner
-go run cmd/firerunner/main.go --config config.example.yaml
+# 2. Start FireRunner
+firerunner --config /etc/firerunner/config.yaml &
+
+# 3. Trigger webhook manually
+curl -X POST http://localhost:8080/webhook \
+  -H "X-Gitlab-Event: Job Hook" \
+  -H "X-Gitlab-Token: your-webhook-secret" \
+  -d @test/fixtures/job_event.json
+
+# 4. Check logs
+tail -f /var/log/firerunner.log
 ```
 
-## 🤝 Contributing
+## Troubleshooting
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+**Webhook not triggering**
+- Check GitLab webhook logs: Project → Settings → Webhooks → Recent Deliveries
+- Verify secret token matches config
+- Check firewall allows port 8080
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+**VM creation fails**
+- Verify Flintlock is running: `curl localhost:9090`
+- Check KVM support: `ls -l /dev/kvm`
+- Review Flintlock logs: `journalctl -u flintlock -f`
 
-## 📄 License
+**Runner not picking up jobs**
+- Check runner registered: GitLab → Settings → CI/CD → Runners
+- Verify tags match: `firecracker-*` tags in .gitlab-ci.yml
+- Check VM has network connectivity
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+**High memory usage**
+- Reduce `scheduler.worker_count` in config
+- Lower `vm.default_memory_mb` for jobs
+- Implement VM cleanup: `scheduler.cleanup_interval`
 
-## 🙏 Acknowledgments
+## Roadmap
 
-- [Firecracker](https://github.com/firecracker-microvm/firecracker) - AWS's microVM technology
-- [Flintlock](https://github.com/liquidmetal-dev/flintlock) - MicroVM management
+- [ ] SSH automation for runner installation (scheduler.go:434)
+- [ ] Cloud-init integration for token injection
+- [ ] Multi-tenancy (namespace isolation)
+- [ ] Custom VM image builder
+- [ ] High availability (leader election)
+- [ ] Metrics dashboard (pre-built Grafana)
+
+## License
+
+Apache License 2.0 - see [LICENSE](LICENSE)
+
+## Credits
+
+- [Actuated](https://actuated.com) - Architecture inspiration
+- [Firecracker](https://github.com/firecracker-microvm/firecracker) - microVM technology
+- [Flintlock](https://github.com/liquidmetal-dev/flintlock) - VM management
 - [GitLab](https://gitlab.com) - CI/CD platform
-- [Actuated](https://actuated.com) - Inspiration for this project
-
-## 📚 Documentation
-
-- [Architecture](docs/architecture.md)
-- [Configuration](docs/configuration.md)
-- [Deployment Guide](docs/deployment.md)
-- [Troubleshooting](docs/troubleshooting.md)
-
-## 💬 Support
-
-- 🐛 [Report Issues](https://github.com/ismoilovdevml/firerunner/issues)
-- 💡 [Feature Requests](https://github.com/ismoilovdevml/firerunner/issues/new?template=feature_request.md)
-- 💬 [Discussions](https://github.com/ismoilovdevml/firerunner/discussions)
-
-## 🌟 Star History
-
-If you find this project useful, please consider giving it a star! ⭐
 
 ---
 
-**Made with ❤️ for the open-source community**
+**Production-ready orchestration layer. VM provisioning requires Flintlock server setup.**
