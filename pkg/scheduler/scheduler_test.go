@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	gogitlab "github.com/xanzy/go-gitlab"
 
 	"github.com/ismoilovdevml/firerunner/pkg/config"
 	"github.com/ismoilovdevml/firerunner/pkg/firecracker"
@@ -79,6 +80,14 @@ func (m *mockGitLabService) RegisterRunner(ctx context.Context, projectID int64,
 
 func (m *mockGitLabService) UnregisterRunner(ctx context.Context, runnerID int64) error {
 	return nil
+}
+
+func (m *mockGitLabService) GetJob(ctx context.Context, projectID, jobID int64) (*gogitlab.Job, error) {
+	// Return a completed job for testing
+	return &gogitlab.Job{
+		ID:     int(jobID),
+		Status: "success",
+	}, nil
 }
 
 func (m *mockGitLabService) ProcessJobEvent(event *gitlab.JobEvent) error {

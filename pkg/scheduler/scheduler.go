@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	gogitlab "github.com/xanzy/go-gitlab"
 
 	"github.com/ismoilovdevml/firerunner/pkg/config"
 	"github.com/ismoilovdevml/firerunner/pkg/firecracker"
@@ -28,6 +29,7 @@ type VMManager interface {
 type GitLabService interface {
 	RegisterRunner(ctx context.Context, projectID int64, vmIP string, tags []string) (*gitlab.RunnerRegistration, error)
 	UnregisterRunner(ctx context.Context, runnerID int64) error
+	GetJob(ctx context.Context, projectID, jobID int64) (*gogitlab.Job, error)
 	ProcessJobEvent(event *gitlab.JobEvent) error
 	ProcessPipelineEvent(event *gitlab.PipelineEvent) error
 }
@@ -61,8 +63,9 @@ type Job struct {
 	StartedAt  time.Time
 	FinishedAt time.Time
 
-	VMID string
-	VM   *firecracker.MicroVM
+	VMID     string
+	VM       *firecracker.MicroVM
+	RunnerID int64 // GitLab runner ID for cleanup
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -405,38 +408,100 @@ func (w *Worker) createVM(job *Job) (*firecracker.MicroVM, error) {
 }
 
 func (w *Worker) registerRunner(job *Job) error {
-	// TODO: Implement GitLab runner registration
-	// This would use the GitLab API to register a runner for the specific job
-	w.logger.WithField("vm_ip", job.VM.IPAddress).Info("Registering GitLab runner")
+	// Register ephemeral runner via GitLab API
+	w.logger.WithFields(logrus.Fields{
+		"job_id":     job.ID,
+		"project_id": job.ProjectID,
+		"vm_ip":      job.VM.IPAddress,
+	}).Info("Registering ephemeral GitLab runner")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	registration, err := w.scheduler.gitlabSvc.RegisterRunner(ctx, job.ProjectID, job.VM.IPAddress, job.Tags)
+	if err != nil {
+		return fmt.Errorf("failed to register runner: %w", err)
+	}
+
+	w.logger.WithFields(logrus.Fields{
+		"runner_id": registration.ID,
+		"tags":      registration.Tags,
+	}).Info("Runner registered successfully")
+
+	// Store runner info for cleanup
+	job.RunnerID = registration.ID
+	job.VMID = job.VM.ID
+
+	// TODO: Install runner binary in VM via SSH and configure it
+	// For now, we assume:
+	// 1. Runner binary is pre-installed in VM image OR
+	// 2. Runner is configured via cloud-init with registration token
+	//
+	// Production implementation should:
+	// - SSH into VM (job.VM.IPAddress)
+	// - Install gitlab-runner
+	// - Configure it with registration.Token
+	// - Start the runner service
+
 	return nil
 }
 
 func (w *Worker) waitForJobCompletion(job *Job) {
-	// TODO: Implement job completion monitoring
-	// This would poll GitLab API or use webhooks to detect job completion
+	// Monitor job completion via GitLab API
+	w.logger.WithField("job_id", job.ID).Info("Waiting for job completion")
 
-	// For now, simulate job execution
-	select {
-	case <-job.ctx.Done():
-		w.logger.WithField("job_id", job.ID).Warn("Job timeout reached")
-		job.err = fmt.Errorf("job timeout")
-	case <-time.After(30 * time.Second):
-		// Simulated job completion
-		w.logger.WithField("job_id", job.ID).Info("Job completed")
+	// Create job monitor
+	monitor := gitlab.NewJobMonitor(w.scheduler.gitlabSvc, w.logger.Logger)
+
+	// Poll job status every 5 seconds
+	pollInterval := 5 * time.Second
+
+	// Wait for job to complete with context timeout
+	completedJob, err := monitor.WaitForJobCompletion(job.ctx, job.ProjectID, job.ID, pollInterval)
+	if err != nil {
+		w.logger.WithError(err).WithField("job_id", job.ID).Error("Job monitoring failed")
+		job.err = err
+		return
+	}
+
+	// Log job completion
+	w.logger.WithFields(logrus.Fields{
+		"job_id":   job.ID,
+		"status":   completedJob.Status,
+		"duration": completedJob.Duration,
+	}).Info("Job completed")
+
+	// Check if job was successful
+	if completedJob.Status != "success" {
+		job.err = fmt.Errorf("job failed with status: %s", completedJob.Status)
 	}
 }
 
 func (w *Worker) cleanupVM(job *Job) {
+	// Step 1: Unregister GitLab runner
+	if job.RunnerID > 0 {
+		w.logger.WithField("runner_id", job.RunnerID).Info("Unregistering GitLab runner")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := w.scheduler.gitlabSvc.UnregisterRunner(ctx, job.RunnerID); err != nil {
+			w.logger.WithError(err).Error("Failed to unregister runner")
+		}
+		cancel()
+	}
+
+	// Step 2: Destroy VM
 	if job.VMID == "" {
 		return
 	}
 
-	w.logger.WithField("vm_id", job.VMID).Info("Cleaning up VM")
+	w.logger.WithField("vm_id", job.VMID).Info("Destroying ephemeral VM")
 
 	ctx, cancel := context.WithTimeout(context.Background(), w.scheduler.config.VMShutdownTimeout)
 	defer cancel()
 
 	if err := w.scheduler.vmManager.DestroyVM(ctx, job.VMID); err != nil {
-		w.logger.WithError(err).Error("Failed to cleanup VM")
+		w.logger.WithError(err).Error("Failed to destroy VM")
+	} else {
+		w.logger.WithField("vm_id", job.VMID).Info("VM destroyed successfully")
 	}
 }
