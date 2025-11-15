@@ -79,18 +79,111 @@ check_os() {
     log_info "Package manager: $PKG_MANAGER"
 }
 
+# Detect if running in a virtual machine
+detect_virtualization() {
+    local is_vm=false
+    local vm_type=""
+
+    # Check systemd-detect-virt (most reliable)
+    if command -v systemd-detect-virt &>/dev/null; then
+        local virt=$(systemd-detect-virt 2>/dev/null)
+        if [[ "$virt" != "none" ]]; then
+            is_vm=true
+            vm_type=$virt
+        fi
+    fi
+
+    # Check lscpu for hypervisor
+    if lscpu | grep -q "Hypervisor vendor"; then
+        is_vm=true
+        [[ -z "$vm_type" ]] && vm_type=$(lscpu | grep "Hypervisor vendor" | awk '{print $3}')
+    fi
+
+    # Check BIOS vendor for QEMU/VMware/VirtualBox
+    if [[ -f /sys/class/dmi/id/bios_vendor ]]; then
+        local bios=$(cat /sys/class/dmi/id/bios_vendor)
+        if echo "$bios" | grep -qiE "qemu|vmware|virtualbox|xen|microsoft"; then
+            is_vm=true
+            [[ -z "$vm_type" ]] && vm_type=$bios
+        fi
+    fi
+
+    echo "$is_vm:$vm_type"
+}
+
 # Check prerequisites
 check_prerequisites() {
     log_step "Checking prerequisites..."
+
+    # Detect if running in VM
+    local virt_info=$(detect_virtualization)
+    local is_vm=$(echo "$virt_info" | cut -d: -f1)
+    local vm_type=$(echo "$virt_info" | cut -d: -f2)
 
     # KVM support
     if [[ ! -e /dev/kvm ]]; then
         log_error "KVM not available (/dev/kvm not found)"
         echo ""
-        echo "Enable virtualization in BIOS and run:"
-        echo "  sudo modprobe kvm kvm_intel  # Intel"
-        echo "  sudo modprobe kvm kvm_amd    # AMD"
+
+        if [[ "$is_vm" == "true" ]]; then
+            cat <<EOF
+${RED}╔═══════════════════════════════════════════════════════════╗
+║                    INCOMPATIBLE ENVIRONMENT                ║
+╚═══════════════════════════════════════════════════════════╝${NC}
+
+${YELLOW}Detected:${NC} Virtual Machine ($vm_type)
+${RED}Required:${NC} Bare Metal Server
+
+${YELLOW}Why this won't work:${NC}
+  • FireRunner uses Firecracker microVMs (requires KVM)
+  • Your server is running inside a virtual machine
+  • VMs cannot run nested virtualization (no /dev/kvm)
+  • Firecracker requires direct hardware access
+
+${YELLOW}Solution:${NC}
+  You need a ${GREEN}BARE METAL${NC} server with KVM support.
+
+${YELLOW}Recommended providers:${NC}
+  • Hetzner Dedicated (AX41: €39/month)
+  • OVH Bare Metal (Rise-1: €50/month)
+  • AWS EC2 Bare Metal (i3.metal: \$300+/month)
+
+${YELLOW}Current server type:${NC}
+  ✗ VPS/Cloud instance (virtual machine)
+  ✗ Nested virtualization not available
+  ✗ No direct KVM access
+
+${YELLOW}What you need:${NC}
+  ✓ Dedicated/Bare metal server
+  ✓ Direct hardware access
+  ✓ /dev/kvm device available
+
+${YELLOW}Verification commands:${NC}
+  # On bare metal, these should work:
+  ls -l /dev/kvm                    # Should exist
+  lscpu | grep "Hypervisor vendor"  # Should NOT show anything
+
+${YELLOW}Alternative:${NC}
+  If you must use VPS, consider Docker-based GitLab runners
+  instead of Firecracker (less isolation, no sub-second boot).
+
+EOF
+        else
+            echo "Virtualization may not be enabled in BIOS."
+            echo ""
+            echo "Try loading KVM module:"
+            echo "  sudo modprobe kvm kvm_intel  # Intel"
+            echo "  sudo modprobe kvm kvm_amd    # AMD"
+            echo ""
+            echo "If that doesn't work, enable VT-x/AMD-V in BIOS."
+        fi
         exit 1
+    fi
+
+    if [[ "$is_vm" == "true" ]]; then
+        log_warn "Running in VM ($vm_type) but /dev/kvm exists (nested virtualization)"
+    else
+        log_info "Bare metal detected"
     fi
     log_info "KVM support detected"
 

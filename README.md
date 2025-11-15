@@ -16,9 +16,13 @@ Ephemeral GitLab CI/CD runners with Firecracker microVMs. Open-source alternativ
 
 ## Install
 
+**⚠️ Requires bare metal server** (VPS/Cloud VMs won't work - see [Prerequisites](#prerequisites))
+
 ```bash
 curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash
 ```
+
+The installer will detect if you're on a VM and show a detailed error message.
 
 Supports: Ubuntu 22.04+, Debian 11+, Rocky Linux 9+, RHEL 9+
 
@@ -166,10 +170,23 @@ go run cmd/firerunner/main.go --config config.yaml
 
 ## Prerequisites
 
-- Bare metal or nested virtualization
-- KVM support (`/dev/kvm`)
-- 16GB+ RAM, 4+ cores
-- GitLab instance
+**REQUIRED: Bare Metal Server**
+
+- **Hardware:** Bare metal (NOT VPS/Cloud VM)
+- **KVM:** `/dev/kvm` must exist
+- **Resources:** 16GB+ RAM, 4+ cores
+- **OS:** Ubuntu 22.04+ / Debian 11+ / Rocky 9+ / RHEL 9+
+- **GitLab:** Self-hosted or GitLab.com
+
+**Supported providers:**
+- ✅ Hetzner Dedicated (AX41: €39/mo)
+- ✅ OVH Bare Metal (Rise-1: €50/mo)
+- ✅ AWS EC2 Bare Metal (i3.metal)
+- ✅ Physical servers with KVM
+
+**NOT supported:**
+- ❌ VPS/Cloud instances (Hetzner Cloud, DigitalOcean, etc.)
+- ❌ Virtual machines without nested KVM
 
 ## Troubleshooting
 
