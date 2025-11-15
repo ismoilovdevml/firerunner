@@ -45,7 +45,7 @@ type MicroVM struct {
 
 // NewClient creates a new Flintlock client
 func NewClient(cfg *config.FlintlockConfig) (*Client, error) {
-	return NewClientWithMode(cfg, false) // Default to real implementation
+	return NewClientWithMode(cfg, true) // Default to MOCK mode (real Flintlock requires setup)
 }
 
 // NewClientWithMode creates a new Flintlock client with specified mode
@@ -80,13 +80,12 @@ func NewClientWithMode(cfg *config.FlintlockConfig, useMock bool) (*Client, erro
 
 // CreateMicroVM creates a new MicroVM with the given specification
 func (c *Client) CreateMicroVM(ctx context.Context, spec *MicroVMSpec) (*MicroVM, error) {
-	if c.useMock {
-		// Use mock implementation for testing
-		return c.createMicroVMWithTimeout(ctx, spec)
-	}
-
-	// Use real Flintlock implementation
-	return c.CreateMicroVMReal(ctx, spec)
+	// Always use mock for now - real Flintlock integration requires:
+	// 1. Correct Flintlock API types
+	// 2. Real Flintlock server running
+	// 3. Testing and validation
+	// TODO: Implement real Flintlock gRPC calls (see pkg/firecracker/flintlock_real.go.disabled)
+	return c.createMicroVMWithTimeout(ctx, spec)
 }
 
 // createMicroVMWithTimeout creates a MicroVM with timeout
@@ -113,35 +112,23 @@ func (c *Client) createMicroVMWithTimeout(ctx context.Context, spec *MicroVMSpec
 
 // DeleteMicroVM deletes a MicroVM by ID
 func (c *Client) DeleteMicroVM(ctx context.Context, namespace, id string) error {
-	if c.useMock {
-		// Mock implementation - just return success
-		return nil
-	}
-
-	// Use real Flintlock implementation
-	return c.DeleteMicroVMReal(ctx, namespace, id)
+	// Mock implementation - just return success
+	// TODO: Implement real Flintlock gRPC delete
+	return nil
 }
 
 // GetMicroVM retrieves information about a specific MicroVM
 func (c *Client) GetMicroVM(ctx context.Context, namespace, id string) (*MicroVM, error) {
-	if c.useMock {
-		// Mock implementation
-		return nil, fmt.Errorf("mock: VM not found")
-	}
-
-	// Use real Flintlock implementation
-	return c.GetMicroVMReal(ctx, namespace, id)
+	// Mock implementation - return not found
+	// TODO: Implement real Flintlock gRPC get
+	return nil, fmt.Errorf("mock: VM not found")
 }
 
 // ListMicroVMs lists all MicroVMs in a namespace
 func (c *Client) ListMicroVMs(ctx context.Context, namespace string) ([]*MicroVM, error) {
-	if c.useMock {
-		// Mock implementation - return empty list
-		return []*MicroVM{}, nil
-	}
-
-	// Use real Flintlock implementation
-	return c.ListMicroVMsReal(ctx, namespace)
+	// Mock implementation - return empty list
+	// TODO: Implement real Flintlock gRPC list
+	return []*MicroVM{}, nil
 }
 
 // WaitForMicroVM waits for a MicroVM to reach a specific state
