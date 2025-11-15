@@ -142,15 +142,17 @@ make test   # Test (65% coverage, race-free)
 
 ## Current Status
 
-**Production Ready:** Core orchestration (webhook, scheduler, GitLab API)
+**Production Ready:**
 
-**Development Mode:** VM creation (mock Flintlock for testing)
+- ✅ Core orchestration (webhook, scheduler, GitLab API)
+- ✅ Real Flintlock gRPC integration (VM lifecycle management)
+- ✅ Ephemeral runner registration/unregistration
 
-To enable real VM creation:
+**Setup Requirements:**
 
-1. Install Flintlock on your server
-2. Update `pkg/firecracker/client.go` with real gRPC calls
-3. Build VM images with GitLab Runner pre-installed
+1. Install [Flintlock](https://github.com/liquidmetal-dev/flintlock) on your bare metal server
+2. Configure Flintlock endpoint in `/etc/firerunner/config.yaml`
+3. Build VM images with GitLab Runner pre-installed (see [Firecracker docs](https://firecracker-microvm.github.io/))
 
 ## License
 

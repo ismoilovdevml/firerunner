@@ -123,17 +123,10 @@ func TestManager_CreateVM(t *testing.T) {
 	cfg := testVMConfig()
 	logger := testManagerLogger()
 
-	// Create real client in mock mode
-	realClient, err := NewClient(&config.FlintlockConfig{
-		Endpoint: "localhost:9090",
-		Timeout:  30 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
+	mockClient := &mockFlintlockClient{}
 
 	manager := &Manager{
-		client:     realClient,
+		client:     mockClient,
 		config:     cfg,
 		vms:        make(map[string]*MicroVM),
 		logger:     logger,
@@ -193,19 +186,13 @@ func TestManager_CreateVM(t *testing.T) {
 }
 
 func TestManager_DestroyVM(t *testing.T) {
-	client, err := NewClient(&config.FlintlockConfig{
-		Endpoint: "localhost:9090",
-		Timeout:  30 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
+	mockClient := &mockFlintlockClient{}
 
 	cfg := testVMConfig()
 	logger := testManagerLogger()
 
 	manager := &Manager{
-		client:     client,
+		client:     mockClient,
 		config:     cfg,
 		vms:        make(map[string]*MicroVM),
 		logger:     logger,
@@ -224,7 +211,7 @@ func TestManager_DestroyVM(t *testing.T) {
 
 	// Destroy it
 	ctx := context.Background()
-	err = manager.DestroyVM(ctx, vm.ID)
+	err := manager.DestroyVM(ctx, vm.ID)
 	if err != nil {
 		t.Fatalf("DestroyVM() failed: %v", err)
 	}
@@ -237,19 +224,13 @@ func TestManager_DestroyVM(t *testing.T) {
 }
 
 func TestManager_DestroyVM_NotFound(t *testing.T) {
-	client, err := NewClient(&config.FlintlockConfig{
-		Endpoint: "localhost:9090",
-		Timeout:  30 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
+	mockClient := &mockFlintlockClient{}
 
 	cfg := testVMConfig()
 	logger := testManagerLogger()
 
 	manager := &Manager{
-		client:     client,
+		client:     mockClient,
 		config:     cfg,
 		vms:        make(map[string]*MicroVM),
 		logger:     logger,
@@ -257,7 +238,7 @@ func TestManager_DestroyVM_NotFound(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err = manager.DestroyVM(ctx, "non-existent-vm")
+	err := manager.DestroyVM(ctx, "non-existent-vm")
 	if err == nil {
 		t.Error("DestroyVM() should fail for non-existent VM")
 	}
@@ -414,19 +395,13 @@ func TestManager_TrackUntrack(t *testing.T) {
 }
 
 func TestManager_Cleanup(t *testing.T) {
-	client, err := NewClient(&config.FlintlockConfig{
-		Endpoint: "localhost:9090",
-		Timeout:  30 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
+	mockClient := &mockFlintlockClient{}
 
 	cfg := testVMConfig()
 	logger := testManagerLogger()
 
 	manager := &Manager{
-		client:     client,
+		client:     mockClient,
 		config:     cfg,
 		vms:        make(map[string]*MicroVM),
 		logger:     logger,
@@ -458,7 +433,7 @@ func TestManager_Cleanup(t *testing.T) {
 
 	// Check results - old VM should be untracked (cleanup attempts to destroy it)
 	// Recent VM should still be tracked
-	_, err = manager.GetVM("recent-vm")
+	_, err := manager.GetVM("recent-vm")
 	if err != nil {
 		t.Error("Recent VM should NOT be cleaned up")
 	}
@@ -565,19 +540,13 @@ func contains(s, substr string) bool {
 }
 
 func TestManager_Shutdown(t *testing.T) {
-	client, err := NewClient(&config.FlintlockConfig{
-		Endpoint: "localhost:9090",
-		Timeout:  30 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
+	mockClient := &mockFlintlockClient{}
 
 	cfg := testVMConfig()
 	logger := testManagerLogger()
 
 	manager := &Manager{
-		client:     client,
+		client:     mockClient,
 		config:     cfg,
 		vms:        make(map[string]*MicroVM),
 		logger:     logger,
@@ -598,7 +567,7 @@ func TestManager_Shutdown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err = manager.Shutdown(ctx)
+	err := manager.Shutdown(ctx)
 	if err != nil {
 		t.Errorf("Shutdown() failed: %v", err)
 	}

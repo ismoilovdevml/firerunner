@@ -12,8 +12,18 @@ import (
 	"github.com/ismoilovdevml/firerunner/pkg/config"
 )
 
+type FlintlockClient interface {
+	CreateMicroVM(ctx context.Context, spec *MicroVMSpec) (*MicroVM, error)
+	DeleteMicroVM(ctx context.Context, namespace, id string) error
+	GetMicroVM(ctx context.Context, namespace, id string) (*MicroVM, error)
+	ListMicroVMs(ctx context.Context, namespace string) ([]*MicroVM, error)
+	WaitForMicroVM(ctx context.Context, namespace, id string, state string, timeout time.Duration) error
+	Close() error
+	Health(ctx context.Context) error
+}
+
 type Manager struct {
-	client       *Client
+	client       FlintlockClient
 	config       *config.VMConfig
 	vms          map[string]*MicroVM
 	mu           sync.RWMutex
