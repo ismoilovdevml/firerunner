@@ -126,48 +126,47 @@ check_prerequisites() {
         echo ""
 
         if [[ "$is_vm" == "true" ]]; then
-            cat <<EOF
-${RED}╔═══════════════════════════════════════════════════════════╗
-║                    INCOMPATIBLE ENVIRONMENT                ║
-╚═══════════════════════════════════════════════════════════╝${NC}
-
-${YELLOW}Detected:${NC} Virtual Machine ($vm_type)
-${RED}Required:${NC} Bare Metal Server
-
-${YELLOW}Why this won't work:${NC}
-  • FireRunner uses Firecracker microVMs (requires KVM)
-  • Your server is running inside a virtual machine
-  • VMs cannot run nested virtualization (no /dev/kvm)
-  • Firecracker requires direct hardware access
-
-${YELLOW}Solution:${NC}
-  You need a ${GREEN}BARE METAL${NC} server with KVM support.
-
-${YELLOW}Recommended providers:${NC}
-  • Hetzner Dedicated (AX41: €39/month)
-  • OVH Bare Metal (Rise-1: €50/month)
-  • AWS EC2 Bare Metal (i3.metal: \$300+/month)
-
-${YELLOW}Current server type:${NC}
-  ✗ VPS/Cloud instance (virtual machine)
-  ✗ Nested virtualization not available
-  ✗ No direct KVM access
-
-${YELLOW}What you need:${NC}
-  ✓ Dedicated/Bare metal server
-  ✓ Direct hardware access
-  ✓ /dev/kvm device available
-
-${YELLOW}Verification commands:${NC}
-  # On bare metal, these should work:
-  ls -l /dev/kvm                    # Should exist
-  lscpu | grep "Hypervisor vendor"  # Should NOT show anything
-
-${YELLOW}Alternative:${NC}
-  If you must use VPS, consider Docker-based GitLab runners
-  instead of Firecracker (less isolation, no sub-second boot).
-
-EOF
+            echo ""
+            echo -e "${RED}╔═══════════════════════════════════════════════════════════╗"
+            echo -e "║                    INCOMPATIBLE ENVIRONMENT                ║"
+            echo -e "╚═══════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            echo -e "${YELLOW}Detected:${NC} Virtual Machine ($vm_type)"
+            echo -e "${RED}Required:${NC} Bare Metal Server"
+            echo ""
+            echo -e "${YELLOW}Why this won't work:${NC}"
+            echo "  • FireRunner uses Firecracker microVMs (requires KVM)"
+            echo "  • Your server is running inside a virtual machine"
+            echo "  • VMs cannot run nested virtualization (no /dev/kvm)"
+            echo "  • Firecracker requires direct hardware access"
+            echo ""
+            echo -e "${YELLOW}Solution:${NC}"
+            echo -e "  You need a ${GREEN}BARE METAL${NC} server with KVM support."
+            echo ""
+            echo -e "${YELLOW}Recommended providers:${NC}"
+            echo "  • Hetzner Dedicated (AX41: €39/month)"
+            echo "  • OVH Bare Metal (Rise-1: €50/month)"
+            echo "  • AWS EC2 Bare Metal (i3.metal: \$300+/month)"
+            echo ""
+            echo -e "${YELLOW}Current server type:${NC}"
+            echo "  ✗ VPS/Cloud instance (virtual machine)"
+            echo "  ✗ Nested virtualization not available"
+            echo "  ✗ No direct KVM access"
+            echo ""
+            echo -e "${YELLOW}What you need:${NC}"
+            echo "  ✓ Dedicated/Bare metal server"
+            echo "  ✓ Direct hardware access"
+            echo "  ✓ /dev/kvm device available"
+            echo ""
+            echo -e "${YELLOW}Verification commands:${NC}"
+            echo "  # On bare metal, these should work:"
+            echo "  ls -l /dev/kvm                    # Should exist"
+            echo "  lscpu | grep \"Hypervisor vendor\"  # Should NOT show anything"
+            echo ""
+            echo -e "${YELLOW}Alternative:${NC}"
+            echo "  If you must use VPS, consider Docker-based GitLab runners"
+            echo "  instead of Firecracker (less isolation, no sub-second boot)."
+            echo ""
         else
             echo "Virtualization may not be enabled in BIOS."
             echo ""
