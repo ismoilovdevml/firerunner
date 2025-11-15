@@ -8,6 +8,21 @@ Open-source alternative to Actuated. Each CI job runs in an isolated, ephemeral 
 [![Test Coverage](https://img.shields.io/badge/Coverage-65%25-brightgreen)](pkg/)
 ![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go)
 
+## Quick Install
+
+```bash
+curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash
+```
+
+This installs:
+- Firecracker v1.7.0
+- Flintlock v0.6.0
+- FireRunner v1.0.0
+- Systemd services (auto-start)
+- Interactive configuration
+
+**Manual installation:** See [Installation](#installation) section below.
+
 ## Architecture
 
 Matches the [Actuated workflow](https://actuated.com):
