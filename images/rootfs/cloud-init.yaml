@@ -1,0 +1,39 @@
+#cloud-config
+# Cloud-init configuration for FireRunner VMs
+
+# Datasource configuration for metadata service
+datasource_list: [NoCloud]
+datasource:
+  NoCloud:
+    seedfrom: http://169.254.169.254/
+
+# Set timezone
+timezone: UTC
+
+# Package management
+package_update: false
+package_upgrade: false
+
+# System configuration
+hostname: firerunner-vm
+manage_etc_hosts: true
+
+# Network configuration
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+
+# Run commands on first boot
+runcmd:
+  - echo "FireRunner VM initialized"
+  - systemctl daemon-reload
+  - systemctl start docker
+  - /usr/local/bin/startup.sh
+
+# Power state
+power_state:
+  mode: poweroff
+  timeout: 300
+  condition: true
