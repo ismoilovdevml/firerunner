@@ -11,18 +11,11 @@ CONFIG_DIR="/etc/firerunner"
 FLINTLOCK_CONFIG_DIR="/etc/flintlock"
 PKG_MANAGER=""
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
 # Logging
-log_info() { echo -e "${GREEN}[✓]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-log_error() { echo -e "${RED}[✗]${NC} $1"; }
-log_step() { echo -e "${BLUE}[→]${NC} $1"; }
+log_info() { echo "[✓] $1"; }
+log_warn() { echo "[!] $1"; }
+log_error() { echo "[✗] $1"; }
+log_step() { echo "[→] $1"; }
 
 # Banner
 show_banner() {
@@ -126,55 +119,28 @@ check_prerequisites() {
         echo ""
 
         if [[ "$is_vm" == "true" ]]; then
-            echo ""
-            echo -e "${RED}╔═══════════════════════════════════════════════════════════╗"
-            echo -e "║                    INCOMPATIBLE ENVIRONMENT                ║"
-            echo -e "╚═══════════════════════════════════════════════════════════╝${NC}"
-            echo ""
-            echo -e "${YELLOW}Detected:${NC} Virtual Machine ($vm_type)"
-            echo -e "${RED}Required:${NC} Bare Metal Server"
-            echo ""
-            echo -e "${YELLOW}Why this won't work:${NC}"
-            echo "  • FireRunner uses Firecracker microVMs (requires KVM)"
-            echo "  • Your server is running inside a virtual machine"
-            echo "  • VMs cannot run nested virtualization (no /dev/kvm)"
-            echo "  • Firecracker requires direct hardware access"
-            echo ""
-            echo -e "${YELLOW}Solution:${NC}"
-            echo -e "  You need a ${GREEN}BARE METAL${NC} server with KVM support."
-            echo ""
-            echo -e "${YELLOW}Recommended providers:${NC}"
-            echo "  • Hetzner Dedicated (AX41: €39/month)"
-            echo "  • OVH Bare Metal (Rise-1: €50/month)"
-            echo "  • AWS EC2 Bare Metal (i3.metal: \$300+/month)"
-            echo ""
-            echo -e "${YELLOW}Current server type:${NC}"
-            echo "  ✗ VPS/Cloud instance (virtual machine)"
-            echo "  ✗ Nested virtualization not available"
-            echo "  ✗ No direct KVM access"
-            echo ""
-            echo -e "${YELLOW}What you need:${NC}"
-            echo "  ✓ Dedicated/Bare metal server"
-            echo "  ✓ Direct hardware access"
-            echo "  ✓ /dev/kvm device available"
-            echo ""
-            echo -e "${YELLOW}Verification commands:${NC}"
-            echo "  # On bare metal, these should work:"
-            echo "  ls -l /dev/kvm                    # Should exist"
-            echo "  lscpu | grep \"Hypervisor vendor\"  # Should NOT show anything"
-            echo ""
-            echo -e "${YELLOW}Alternative:${NC}"
-            echo "  If you must use VPS, consider Docker-based GitLab runners"
-            echo "  instead of Firecracker (less isolation, no sub-second boot)."
-            echo ""
+            cat << 'VMEOF'
+
+════════════════════════════════════════════════════════════
+ERROR: Running in Virtual Machine
+════════════════════════════════════════════════════════════
+
+Firecracker requires KVM hardware access (/dev/kvm).
+Your server is a VM - nested virtualization not available.
+
+SOLUTION: Use a bare metal / dedicated server.
+
+Examples: Hetzner Dedicated, OVH Bare Metal, Contabo VDS
+
+════════════════════════════════════════════════════════════
+
+VMEOF
         else
-            echo "Virtualization may not be enabled in BIOS."
+            echo "KVM module not loaded or virtualization disabled in BIOS."
             echo ""
-            echo "Try loading KVM module:"
-            echo "  sudo modprobe kvm kvm_intel  # Intel"
-            echo "  sudo modprobe kvm kvm_amd    # AMD"
+            echo "Try: sudo modprobe kvm kvm_intel  # or kvm_amd for AMD"
             echo ""
-            echo "If that doesn't work, enable VT-x/AMD-V in BIOS."
+            echo "If that fails, enable VT-x/AMD-V in BIOS settings."
         fi
         exit 1
     fi
@@ -351,9 +317,7 @@ configure_firerunner() {
     mkdir -p $CONFIG_DIR
 
     echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  Configuration"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Configuration:"
     echo ""
 
     # GitLab URL
@@ -501,50 +465,19 @@ show_completion() {
     local webhook_secret=$(cat $CONFIG_DIR/.webhook_secret 2>/dev/null)
 
     echo ""
-    echo "╔═══════════════════════════════════════════════════════════╗"
-    echo -e "║  ${GREEN}✓ Installation Complete!${NC}                              ║"
-    echo "╚═══════════════════════════════════════════════════════════╝"
+    echo "════════════════════════════════════════════════════════════"
+    echo "Installation Complete"
+    echo "════════════════════════════════════════════════════════════"
     echo ""
-    echo "Services:"
-    echo "  • Flintlock:   $(systemctl is-active flintlock)"
-    echo "  • FireRunner:  $(systemctl is-active firerunner)"
+    echo "GitLab Webhook:"
+    echo "  URL:    $webhook_url"
+    echo "  Secret: $webhook_secret"
     echo ""
-    echo "Files:"
-    echo "  • Binary:   $INSTALL_DIR/firerunner"
-    echo "  • Config:   $CONFIG_DIR/config.yaml"
-    echo "  • Logs:     journalctl -u firerunner -f"
-    echo "  • Metrics:  http://localhost:9090/metrics"
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  GitLab Webhook Setup"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    echo "1. Go to: Project → Settings → Webhooks"
-    echo ""
-    echo "2. Add webhook:"
-    echo "   URL:    $webhook_url"
-    echo "   Secret: $webhook_secret"
-    echo "   Trigger: ✓ Job events"
-    echo ""
-    echo "3. Test with .gitlab-ci.yml:"
-    echo ""
-    cat <<'YAML'
-   test:
-     script:
-       - echo "Running in ephemeral VM!"
-     tags:
-       - firecracker-2cpu-4gb
-YAML
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Add webhook: Project → Settings → Webhooks → Job events"
     echo ""
     echo "Commands:"
-    echo "  • Logs:    journalctl -u firerunner -f"
-    echo "  • Status:  systemctl status firerunner"
-    echo "  • Restart: systemctl restart firerunner"
-    echo "  • Stop:    systemctl stop firerunner"
-    echo ""
-    echo "Documentation: https://github.com/ismoilovdevml/firerunner"
+    echo "  journalctl -u firerunner -f    # Logs"
+    echo "  systemctl status firerunner    # Status"
     echo ""
 }
 
