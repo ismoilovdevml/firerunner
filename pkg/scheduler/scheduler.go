@@ -14,7 +14,6 @@ import (
 	"github.com/ismoilovdevml/firerunner/pkg/gitlab"
 )
 
-// VMManager interface for managing VMs (allows mocking in tests)
 type VMManager interface {
 	CreateVM(ctx context.Context, req *firecracker.VMRequest) (*firecracker.MicroVM, error)
 	DestroyVM(ctx context.Context, vmID string) error
@@ -25,7 +24,6 @@ type VMManager interface {
 	Shutdown(ctx context.Context) error
 }
 
-// GitLabService interface for GitLab operations (allows mocking in tests)
 type GitLabService interface {
 	RegisterRunner(ctx context.Context, projectID int64, vmIP string, tags []string) (*gitlab.RunnerRegistration, error)
 	UnregisterRunner(ctx context.Context, runnerID int64) error
@@ -34,7 +32,6 @@ type GitLabService interface {
 	ProcessPipelineEvent(event *gitlab.PipelineEvent) error
 }
 
-// Scheduler manages job scheduling and execution
 type Scheduler struct {
 	config    *config.SchedulerConfig
 	vmManager VMManager
@@ -50,7 +47,6 @@ type Scheduler struct {
 	wg         sync.WaitGroup
 }
 
-// Job represents a scheduled job
 type Job struct {
 	ID         int64
 	ProjectID  int64
@@ -72,7 +68,6 @@ type Job struct {
 	err    error
 }
 
-// Worker represents a job worker
 type Worker struct {
 	ID         int
 	scheduler  *Scheduler
@@ -80,7 +75,6 @@ type Worker struct {
 	shutdownCh chan struct{}
 }
 
-// NewScheduler creates a new job scheduler
 func NewScheduler(
 	cfg *config.SchedulerConfig,
 	vmManager VMManager,
@@ -98,11 +92,9 @@ func NewScheduler(
 	}
 }
 
-// Start starts the scheduler
 func (s *Scheduler) Start() error {
 	s.logger.WithField("workers", s.config.WorkerCount).Info("Starting scheduler")
 
-	// Start workers
 	s.workers = make([]*Worker, s.config.WorkerCount)
 	for i := 0; i < s.config.WorkerCount; i++ {
 		worker := &Worker{
@@ -117,7 +109,6 @@ func (s *Scheduler) Start() error {
 		go worker.run()
 	}
 
-	// Start cleanup routine
 	s.wg.Add(1)
 	go s.cleanupRoutine()
 
@@ -125,7 +116,6 @@ func (s *Scheduler) Start() error {
 	return nil
 }
 
-// ScheduleJob schedules a new job
 func (s *Scheduler) ScheduleJob(event *gitlab.JobEvent) error {
 	s.logger.WithFields(logrus.Fields{
 		"job_id":     event.BuildID,
@@ -134,10 +124,8 @@ func (s *Scheduler) ScheduleJob(event *gitlab.JobEvent) error {
 		"name":       event.BuildName,
 	}).Info("Scheduling new job")
 
-	// Parse VM requirements from tags
 	vcpu, memoryMB := gitlab.ParseVMRequirements(event.BuildTags)
 
-	// Create job
 	ctx, cancel := context.WithTimeout(context.Background(), s.config.JobTimeout)
 	job := &Job{
 		ID:         event.BuildID,
@@ -152,10 +140,8 @@ func (s *Scheduler) ScheduleJob(event *gitlab.JobEvent) error {
 		cancel:     cancel,
 	}
 
-	// Track job
 	s.trackJob(job)
 
-	// Queue job
 	select {
 	case s.jobQueue <- job:
 		s.logger.WithField("job_id", job.ID).Info("Job queued successfully")
@@ -167,7 +153,6 @@ func (s *Scheduler) ScheduleJob(event *gitlab.JobEvent) error {
 	}
 }
 
-// GetJob retrieves a job by ID
 func (s *Scheduler) GetJob(jobID int64) (*Job, bool) {
 	s.jobsMu.RLock()
 	defer s.jobsMu.RUnlock()
@@ -175,7 +160,6 @@ func (s *Scheduler) GetJob(jobID int64) (*Job, bool) {
 	return job, exists
 }
 
-// ListJobs returns all jobs
 func (s *Scheduler) ListJobs() []*Job {
 	s.jobsMu.RLock()
 	defer s.jobsMu.RUnlock()
@@ -187,7 +171,6 @@ func (s *Scheduler) ListJobs() []*Job {
 	return jobs
 }
 
-// GetStats returns scheduler statistics
 func (s *Scheduler) GetStats() map[string]interface{} {
 	s.jobsMu.RLock()
 	defer s.jobsMu.RUnlock()
@@ -208,17 +191,13 @@ func (s *Scheduler) GetStats() map[string]interface{} {
 	return stats
 }
 
-// Shutdown gracefully shuts down the scheduler
 func (s *Scheduler) Shutdown(ctx context.Context) error {
 	s.logger.Info("Shutting down scheduler")
 
-	// Signal shutdown
 	close(s.shutdownCh)
 
-	// Close job queue
 	close(s.jobQueue)
 
-	// Wait for workers with timeout
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
@@ -233,7 +212,6 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	// Cancel all remaining jobs
 	s.jobsMu.Lock()
 	for _, job := range s.jobs {
 		if job.cancel != nil {
@@ -244,8 +222,6 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 
 	return nil
 }
-
-// Helper methods
 
 func (s *Scheduler) trackJob(job *Job) {
 	s.jobsMu.Lock()
@@ -272,7 +248,6 @@ func (s *Scheduler) updateJobStatus(jobID int64, status string) {
 	}
 }
 
-// cleanupRoutine periodically cleans up finished jobs
 func (s *Scheduler) cleanupRoutine() {
 	defer s.wg.Done()
 
@@ -289,7 +264,6 @@ func (s *Scheduler) cleanupRoutine() {
 	}
 }
 
-// cleanup removes old finished jobs
 func (s *Scheduler) cleanup() {
 	s.logger.Debug("Running job cleanup")
 
@@ -306,7 +280,6 @@ func (s *Scheduler) cleanup() {
 
 			s.logger.WithField("job_id", id).Debug("Cleaning up old job")
 
-			// Cancel context if not already done
 			if job.cancel != nil {
 				job.cancel()
 			}
@@ -315,8 +288,6 @@ func (s *Scheduler) cleanup() {
 		}
 	}
 }
-
-// Worker implementation
 
 func (w *Worker) run() {
 	defer w.scheduler.wg.Done()
@@ -347,10 +318,8 @@ func (w *Worker) processJob(job *Job) {
 		"memory_mb":  job.MemoryMB,
 	}).Info("Processing job")
 
-	// Update status
 	w.scheduler.updateJobStatus(job.ID, "running")
 
-	// Create VM
 	vm, err := w.createVM(job)
 	if err != nil {
 		w.logger.WithError(err).Error("Failed to create VM for job")
@@ -362,7 +331,6 @@ func (w *Worker) processJob(job *Job) {
 	job.VM = vm
 	job.VMID = vm.ID
 
-	// Register GitLab runner
 	if err := w.registerRunner(job); err != nil {
 		w.logger.WithError(err).Error("Failed to register runner")
 		w.scheduler.updateJobStatus(job.ID, "failed")
@@ -371,13 +339,10 @@ func (w *Worker) processJob(job *Job) {
 		return
 	}
 
-	// Wait for job completion or timeout
 	w.waitForJobCompletion(job)
 
-	// Cleanup
 	w.cleanupVM(job)
 
-	// Update final status
 	if job.err != nil {
 		w.scheduler.updateJobStatus(job.ID, "failed")
 	} else {
@@ -408,7 +373,6 @@ func (w *Worker) createVM(job *Job) (*firecracker.MicroVM, error) {
 }
 
 func (w *Worker) registerRunner(job *Job) error {
-	// Register ephemeral runner via GitLab API
 	w.logger.WithFields(logrus.Fields{
 		"job_id":     job.ID,
 		"project_id": job.ProjectID,
@@ -428,35 +392,19 @@ func (w *Worker) registerRunner(job *Job) error {
 		"tags":      registration.Tags,
 	}).Info("Runner registered successfully")
 
-	// Store runner info for cleanup
 	job.RunnerID = registration.ID
 	job.VMID = job.VM.ID
-
-	// TODO: Install runner binary in VM via SSH and configure it
-	// For now, we assume:
-	// 1. Runner binary is pre-installed in VM image OR
-	// 2. Runner is configured via cloud-init with registration token
-	//
-	// Production implementation should:
-	// - SSH into VM (job.VM.IPAddress)
-	// - Install gitlab-runner
-	// - Configure it with registration.Token
-	// - Start the runner service
 
 	return nil
 }
 
 func (w *Worker) waitForJobCompletion(job *Job) {
-	// Monitor job completion via GitLab API
 	w.logger.WithField("job_id", job.ID).Info("Waiting for job completion")
 
-	// Create job monitor
 	monitor := gitlab.NewJobMonitor(w.scheduler.gitlabSvc, w.logger.Logger)
 
-	// Poll job status every 5 seconds
 	pollInterval := 5 * time.Second
 
-	// Wait for job to complete with context timeout
 	completedJob, err := monitor.WaitForJobCompletion(job.ctx, job.ProjectID, job.ID, pollInterval)
 	if err != nil {
 		w.logger.WithError(err).WithField("job_id", job.ID).Error("Job monitoring failed")
@@ -464,21 +412,18 @@ func (w *Worker) waitForJobCompletion(job *Job) {
 		return
 	}
 
-	// Log job completion
 	w.logger.WithFields(logrus.Fields{
 		"job_id":   job.ID,
 		"status":   completedJob.Status,
 		"duration": completedJob.Duration,
 	}).Info("Job completed")
 
-	// Check if job was successful
 	if completedJob.Status != "success" {
 		job.err = fmt.Errorf("job failed with status: %s", completedJob.Status)
 	}
 }
 
 func (w *Worker) cleanupVM(job *Job) {
-	// Step 1: Unregister GitLab runner
 	if job.RunnerID > 0 {
 		w.logger.WithField("runner_id", job.RunnerID).Info("Unregistering GitLab runner")
 
@@ -489,7 +434,6 @@ func (w *Worker) cleanupVM(job *Job) {
 		cancel()
 	}
 
-	// Step 2: Destroy VM
 	if job.VMID == "" {
 		return
 	}

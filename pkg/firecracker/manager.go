@@ -12,7 +12,6 @@ import (
 	"github.com/ismoilovdevml/firerunner/pkg/config"
 )
 
-// Manager manages the lifecycle of MicroVMs
 type Manager struct {
 	client       *Client
 	config       *config.VMConfig
@@ -24,7 +23,6 @@ type Manager struct {
 	wg           sync.WaitGroup
 }
 
-// NewManager creates a new VM manager
 func NewManager(client *Client, cfg *config.VMConfig, logger *logrus.Logger) *Manager {
 	return &Manager{
 		client:     client,
@@ -35,7 +33,6 @@ func NewManager(client *Client, cfg *config.VMConfig, logger *logrus.Logger) *Ma
 	}
 }
 
-// VMRequest represents a request to create a VM
 type VMRequest struct {
 	JobID     string
 	ProjectID string
@@ -45,7 +42,6 @@ type VMRequest struct {
 	Metadata  map[string]string
 }
 
-// CreateVM creates a new MicroVM for a GitLab job
 func (m *Manager) CreateVM(ctx context.Context, req *VMRequest) (*MicroVM, error) {
 	m.logger.WithFields(logrus.Fields{
 		"job_id":     req.JobID,
@@ -54,10 +50,8 @@ func (m *Manager) CreateVM(ctx context.Context, req *VMRequest) (*MicroVM, error
 		"memory_mb":  req.MemoryMB,
 	}).Info("Creating MicroVM for job")
 
-	// Generate unique VM ID
 	vmID := generateVMID(req.JobID)
 
-	// Prepare VM spec
 	spec := &MicroVMSpec{
 		ID:               vmID,
 		Namespace:        "firerunner",
@@ -70,7 +64,6 @@ func (m *Manager) CreateVM(ctx context.Context, req *VMRequest) (*MicroVM, error
 		Labels:           m.prepareLabels(req),
 	}
 
-	// Create VM via Flintlock
 	startTime := time.Now()
 	vm, err := m.client.CreateMicroVM(ctx, spec)
 	if err != nil {
@@ -85,23 +78,19 @@ func (m *Manager) CreateVM(ctx context.Context, req *VMRequest) (*MicroVM, error
 		"ip_address": vm.IPAddress,
 	}).Info("MicroVM created successfully")
 
-	// Track VM
 	m.trackVM(vm)
 
 	return vm, nil
 }
 
-// DestroyVM destroys a MicroVM
 func (m *Manager) DestroyVM(ctx context.Context, vmID string) error {
 	m.logger.WithField("vm_id", vmID).Info("Destroying MicroVM")
 
-	// Get VM info
 	vm := m.getVM(vmID)
 	if vm == nil {
 		return fmt.Errorf("VM %s not found", vmID)
 	}
 
-	// Delete VM via Flintlock
 	startTime := time.Now()
 	if err := m.client.DeleteMicroVM(ctx, vm.Namespace, vm.ID); err != nil {
 		m.logger.WithError(err).Error("Failed to delete MicroVM")
@@ -114,13 +103,11 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string) error {
 		"duration": duration,
 	}).Info("MicroVM destroyed successfully")
 
-	// Untrack VM
 	m.untrackVM(vmID)
 
 	return nil
 }
 
-// GetVM retrieves a VM by ID
 func (m *Manager) GetVM(vmID string) (*MicroVM, error) {
 	vm := m.getVM(vmID)
 	if vm == nil {
@@ -129,7 +116,6 @@ func (m *Manager) GetVM(vmID string) (*MicroVM, error) {
 	return vm, nil
 }
 
-// ListVMs returns all tracked VMs
 func (m *Manager) ListVMs() []*MicroVM {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -142,7 +128,6 @@ func (m *Manager) ListVMs() []*MicroVM {
 	return vms
 }
 
-// StartCleanup starts the background cleanup routine
 func (m *Manager) StartCleanup(interval time.Duration) {
 	m.wg.Add(1)
 	go func() {
@@ -163,7 +148,6 @@ func (m *Manager) StartCleanup(interval time.Duration) {
 	m.logger.WithField("interval", interval).Info("Started VM cleanup routine")
 }
 
-// StopCleanup stops the background cleanup routine
 func (m *Manager) StopCleanup() {
 	m.shutdownOnce.Do(func() {
 		close(m.shutdownCh)
@@ -172,13 +156,12 @@ func (m *Manager) StopCleanup() {
 	m.logger.Info("Stopped VM cleanup routine")
 }
 
-// cleanup removes stale VMs
 func (m *Manager) cleanup() {
 	m.logger.Debug("Running VM cleanup")
 
 	m.mu.RLock()
 	staleVMs := make([]string, 0)
-	maxAge := 2 * time.Hour // VMs older than 2 hours are considered stale
+	maxAge := 2 * time.Hour
 
 	for id, vm := range m.vms {
 		if time.Since(vm.CreatedAt) > maxAge {
@@ -200,16 +183,13 @@ func (m *Manager) cleanup() {
 	}
 }
 
-// Shutdown gracefully shuts down the manager
 func (m *Manager) Shutdown(ctx context.Context) error {
 	m.logger.Info("Shutting down VM manager")
 
-	// Signal cleanup routine to stop (use sync.Once to prevent double-close)
 	m.shutdownOnce.Do(func() {
 		close(m.shutdownCh)
 	})
 
-	// Wait for cleanup routine with timeout
 	done := make(chan struct{})
 	go func() {
 		m.wg.Wait()
@@ -224,7 +204,6 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	// Destroy all remaining VMs
 	vms := m.ListVMs()
 	m.logger.WithField("count", len(vms)).Info("Destroying remaining VMs")
 
@@ -236,8 +215,6 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 
 	return nil
 }
-
-// Helper methods
 
 func (m *Manager) trackVM(vm *MicroVM) {
 	m.mu.Lock()
@@ -260,12 +237,10 @@ func (m *Manager) getVM(vmID string) *MicroVM {
 func (m *Manager) prepareMetadata(req *VMRequest) map[string]string {
 	metadata := make(map[string]string)
 
-	// Copy user-provided metadata
 	for k, v := range req.Metadata {
 		metadata[k] = v
 	}
 
-	// Add system metadata
 	metadata["firerunner.job_id"] = req.JobID
 	metadata["firerunner.project_id"] = req.ProjectID
 	metadata["firerunner.created_at"] = time.Now().Format(time.RFC3339)
@@ -276,12 +251,10 @@ func (m *Manager) prepareMetadata(req *VMRequest) map[string]string {
 func (m *Manager) prepareLabels(req *VMRequest) map[string]string {
 	labels := make(map[string]string)
 
-	// Add standard labels
 	labels["app"] = "firerunner"
 	labels["job_id"] = req.JobID
 	labels["project_id"] = req.ProjectID
 
-	// Add custom labels from config
 	for k, v := range m.config.ExtraLabels {
 		labels[k] = v
 	}
@@ -290,11 +263,9 @@ func (m *Manager) prepareLabels(req *VMRequest) map[string]string {
 }
 
 func generateVMID(jobID string) string {
-	// Generate a unique VM ID based on job ID and UUID
 	return fmt.Sprintf("vm-%s-%s", jobID, uuid.New().String()[:8])
 }
 
-// GetVMStats returns statistics about managed VMs
 func (m *Manager) GetVMStats() map[string]interface{} {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

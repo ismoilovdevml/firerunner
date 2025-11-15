@@ -8,7 +8,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config represents the main configuration for FireRunner
 type Config struct {
 	Server    ServerConfig    `yaml:"server"`
 	GitLab    GitLabConfig    `yaml:"gitlab"`
@@ -19,7 +18,6 @@ type Config struct {
 	Logging   LoggingConfig   `yaml:"logging"`
 }
 
-// ServerConfig holds HTTP server configuration
 type ServerConfig struct {
 	Host         string        `yaml:"host" env:"SERVER_HOST" default:"0.0.0.0"`
 	Port         int           `yaml:"port" env:"SERVER_PORT" default:"8080"`
@@ -30,7 +28,6 @@ type ServerConfig struct {
 	TLSKeyPath   string        `yaml:"tls_key_path" env:"SERVER_TLS_KEY"`
 }
 
-// GitLabConfig holds GitLab integration settings
 type GitLabConfig struct {
 	URL           string        `yaml:"url" env:"GITLAB_URL"`
 	Token         string        `yaml:"token" env:"GITLAB_TOKEN"`
@@ -40,7 +37,6 @@ type GitLabConfig struct {
 	MaxConcurrent int           `yaml:"max_concurrent" default:"10"`
 }
 
-// FlintlockConfig holds Flintlock gRPC client configuration
 type FlintlockConfig struct {
 	Endpoint      string        `yaml:"endpoint" env:"FLINTLOCK_ENDPOINT" default:"localhost:9090"`
 	Timeout       time.Duration `yaml:"timeout" default:"30s"`
@@ -52,7 +48,6 @@ type FlintlockConfig struct {
 	TLSClientKey  string        `yaml:"tls_client_key" env:"FLINTLOCK_TLS_CLIENT_KEY"`
 }
 
-// VMConfig holds default VM configuration
 type VMConfig struct {
 	DefaultVCPU      int64             `yaml:"default_vcpu" default:"2"`
 	DefaultMemoryMB  int64             `yaml:"default_memory_mb" default:"4096"`
@@ -64,7 +59,6 @@ type VMConfig struct {
 	ExtraLabels      map[string]string `yaml:"extra_labels"`
 }
 
-// SchedulerConfig holds job scheduling configuration
 type SchedulerConfig struct {
 	QueueSize         int           `yaml:"queue_size" default:"1000"`
 	WorkerCount       int           `yaml:"worker_count" default:"5"`
@@ -76,7 +70,6 @@ type SchedulerConfig struct {
 	PrewarmPoolSize   int           `yaml:"prewarm_pool_size" default:"0"`
 }
 
-// MetricsConfig holds metrics and monitoring configuration
 type MetricsConfig struct {
 	Enabled     bool   `yaml:"enabled" env:"METRICS_ENABLED" default:"true"`
 	Port        int    `yaml:"port" env:"METRICS_PORT" default:"9090"`
@@ -85,18 +78,16 @@ type MetricsConfig struct {
 	PprofPort   int    `yaml:"pprof_port" default:"6060"`
 }
 
-// LoggingConfig holds logging configuration
 type LoggingConfig struct {
 	Level      string `yaml:"level" env:"LOG_LEVEL" default:"info"`
-	Format     string `yaml:"format" env:"LOG_FORMAT" default:"json"` // json or text
-	Output     string `yaml:"output" default:"stdout"`                // stdout, stderr, or file path
+	Format     string `yaml:"format" env:"LOG_FORMAT" default:"json"`
+	Output     string `yaml:"output" default:"stdout"`
 	MaxSizeMB  int    `yaml:"max_size_mb" default:"100"`
 	MaxBackups int    `yaml:"max_backups" default:"3"`
 	MaxAgeDays int    `yaml:"max_age_days" default:"28"`
 	Compress   bool   `yaml:"compress" default:"true"`
 }
 
-// Load loads configuration from a YAML file
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -108,12 +99,10 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	// Apply environment variable overrides
 	if err := cfg.applyEnvOverrides(); err != nil {
 		return nil, fmt.Errorf("failed to apply env overrides: %w", err)
 	}
 
-	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
@@ -121,9 +110,7 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// applyEnvOverrides applies environment variable overrides
 func (c *Config) applyEnvOverrides() error {
-	// GitLab overrides
 	if url := os.Getenv("GITLAB_URL"); url != "" {
 		c.GitLab.URL = url
 	}
@@ -134,12 +121,10 @@ func (c *Config) applyEnvOverrides() error {
 		c.GitLab.WebhookSecret = secret
 	}
 
-	// Flintlock overrides
 	if endpoint := os.Getenv("FLINTLOCK_ENDPOINT"); endpoint != "" {
 		c.Flintlock.Endpoint = endpoint
 	}
 
-	// Server overrides
 	if host := os.Getenv("SERVER_HOST"); host != "" {
 		c.Server.Host = host
 	}
@@ -147,7 +132,6 @@ func (c *Config) applyEnvOverrides() error {
 	return nil
 }
 
-// Validate validates the configuration
 func (c *Config) Validate() error {
 	if c.GitLab.URL == "" {
 		return fmt.Errorf("gitlab.url is required")
@@ -177,7 +161,6 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// Default returns a configuration with default values
 func Default() *Config {
 	return &Config{
 		Server: ServerConfig{

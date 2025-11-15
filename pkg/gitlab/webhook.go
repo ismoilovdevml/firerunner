@@ -14,25 +14,21 @@ import (
 )
 
 const (
-	// GitLab webhook headers
 	HeaderGitLabEvent = "X-Gitlab-Event"
 	HeaderGitLabToken = "X-Gitlab-Token"
 )
 
-// WebhookHandler handles GitLab webhook events
 type WebhookHandler struct {
 	secret    string
 	logger    *logrus.Logger
 	processor EventProcessor
 }
 
-// EventProcessor processes GitLab events
 type EventProcessor interface {
 	ProcessJobEvent(event *JobEvent) error
 	ProcessPipelineEvent(event *PipelineEvent) error
 }
 
-// NewWebhookHandler creates a new webhook handler
 func NewWebhookHandler(secret string, logger *logrus.Logger, processor EventProcessor) *WebhookHandler {
 	return &WebhookHandler{
 		secret:    secret,
@@ -41,14 +37,12 @@ func NewWebhookHandler(secret string, logger *logrus.Logger, processor EventProc
 	}
 }
 
-// ServeHTTP handles incoming webhook requests
 func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Read body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		h.logger.WithError(err).Error("Failed to read webhook body")
@@ -57,14 +51,12 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// Verify webhook signature
 	if !h.verifySignature(r, body) {
 		h.logger.Warn("Invalid webhook signature")
 		http.Error(w, "Invalid signature", http.StatusUnauthorized)
 		return
 	}
 
-	// Get event type
 	eventType := r.Header.Get(HeaderGitLabEvent)
 	if eventType == "" {
 		h.logger.Warn("Missing X-Gitlab-Event header")
@@ -74,39 +66,31 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	h.logger.WithField("event_type", eventType).Debug("Received webhook event")
 
-	// Process event based on type
 	if err := h.processEvent(eventType, body); err != nil {
 		h.logger.WithError(err).Error("Failed to process webhook event")
 		http.Error(w, "Failed to process event", http.StatusInternalServerError)
 		return
 	}
 
-	// Send success response
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"accepted"}`))
 }
 
-// verifySignature verifies the webhook signature
 func (h *WebhookHandler) verifySignature(r *http.Request, body []byte) bool {
 	if h.secret == "" {
-		// If no secret is configured, skip verification (not recommended for production)
 		return true
 	}
 
-	// GitLab sends token in X-Gitlab-Token header
 	receivedToken := r.Header.Get(HeaderGitLabToken)
 	if receivedToken == "" {
 		h.logger.Warn("Missing X-Gitlab-Token header")
 		return false
 	}
 
-	// Simple token comparison
-	// For HMAC verification, GitLab enterprise supports X-Gitlab-Signature
 	if receivedToken == h.secret {
 		return true
 	}
 
-	// Check for HMAC signature (GitLab Enterprise)
 	signature := r.Header.Get("X-Gitlab-Signature")
 	if signature != "" {
 		return h.verifyHMAC(body, signature)
@@ -115,7 +99,6 @@ func (h *WebhookHandler) verifySignature(r *http.Request, body []byte) bool {
 	return false
 }
 
-// verifyHMAC verifies HMAC-SHA256 signature
 func (h *WebhookHandler) verifyHMAC(body []byte, signature string) bool {
 	mac := hmac.New(sha256.New, []byte(h.secret))
 	mac.Write(body)
@@ -124,7 +107,6 @@ func (h *WebhookHandler) verifyHMAC(body []byte, signature string) bool {
 	return hmac.Equal([]byte(signature), []byte(expectedMAC))
 }
 
-// processEvent processes different types of GitLab events
 func (h *WebhookHandler) processEvent(eventType string, body []byte) error {
 	switch eventType {
 	case "Job Hook":
@@ -137,7 +119,6 @@ func (h *WebhookHandler) processEvent(eventType string, body []byte) error {
 	}
 }
 
-// processJobEvent processes job webhook events
 func (h *WebhookHandler) processJobEvent(body []byte) error {
 	var event JobEvent
 	if err := json.Unmarshal(body, &event); err != nil {
@@ -152,19 +133,16 @@ func (h *WebhookHandler) processJobEvent(body []byte) error {
 		"project_name": event.ProjectName,
 	}).Info("Processing job event")
 
-	// Only process pending jobs (jobs that need a runner)
 	if event.BuildStatus != "pending" && event.BuildStatus != "created" {
 		h.logger.WithField("status", event.BuildStatus).Debug("Ignoring non-pending job")
 		return nil
 	}
 
-	// Check if job has firerunner tags
 	if !h.hasFireRunnerTag(event.BuildTags) {
 		h.logger.Debug("Job does not have firerunner tags, skipping")
 		return nil
 	}
 
-	// Process the event
 	if h.processor != nil {
 		return h.processor.ProcessJobEvent(&event)
 	}
@@ -172,7 +150,6 @@ func (h *WebhookHandler) processJobEvent(body []byte) error {
 	return nil
 }
 
-// processPipelineEvent processes pipeline webhook events
 func (h *WebhookHandler) processPipelineEvent(body []byte) error {
 	var event PipelineEvent
 	if err := json.Unmarshal(body, &event); err != nil {
@@ -185,7 +162,6 @@ func (h *WebhookHandler) processPipelineEvent(body []byte) error {
 		"project_id":  event.Project.ID,
 	}).Debug("Processing pipeline event")
 
-	// Process the event
 	if h.processor != nil {
 		return h.processor.ProcessPipelineEvent(&event)
 	}
@@ -193,7 +169,6 @@ func (h *WebhookHandler) processPipelineEvent(body []byte) error {
 	return nil
 }
 
-// hasFireRunnerTag checks if the job has firerunner-related tags
 func (h *WebhookHandler) hasFireRunnerTag(tags []string) bool {
 	for _, tag := range tags {
 		tag = strings.ToLower(strings.TrimSpace(tag))
@@ -207,7 +182,6 @@ func (h *WebhookHandler) hasFireRunnerTag(tags []string) bool {
 	return false
 }
 
-// HealthCheck handles health check requests
 func (h *WebhookHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"healthy"}`))

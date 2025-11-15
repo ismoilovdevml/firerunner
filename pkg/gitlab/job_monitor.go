@@ -9,18 +9,15 @@ import (
 	"github.com/xanzy/go-gitlab"
 )
 
-// GitLabJobService interface for job operations
 type GitLabJobService interface {
 	GetJob(ctx context.Context, projectID, jobID int64) (*gitlab.Job, error)
 }
 
-// JobMonitor monitors GitLab job status
 type JobMonitor struct {
 	service GitLabJobService
 	logger  *logrus.Logger
 }
 
-// NewJobMonitor creates a new job monitor
 func NewJobMonitor(service GitLabJobService, logger *logrus.Logger) *JobMonitor {
 	return &JobMonitor{
 		service: service,
@@ -28,7 +25,6 @@ func NewJobMonitor(service GitLabJobService, logger *logrus.Logger) *JobMonitor 
 	}
 }
 
-// WaitForJobCompletion waits for a job to complete
 func (jm *JobMonitor) WaitForJobCompletion(ctx context.Context, projectID, jobID int64, pollInterval time.Duration) (*gitlab.Job, error) {
 	jm.logger.WithFields(logrus.Fields{
 		"project_id": projectID,
@@ -57,7 +53,6 @@ func (jm *JobMonitor) WaitForJobCompletion(ctx context.Context, projectID, jobID
 				"stage":  job.Stage,
 			}).Debug("Job status check")
 
-			// Check if job has completed
 			if jm.isJobComplete(job.Status) {
 				jm.logger.WithFields(logrus.Fields{
 					"job_id":   jobID,
@@ -67,7 +62,6 @@ func (jm *JobMonitor) WaitForJobCompletion(ctx context.Context, projectID, jobID
 				return job, nil
 			}
 
-			// Check for job failure
 			if jm.isJobFailed(job.Status) {
 				jm.logger.WithFields(logrus.Fields{
 					"job_id": jobID,
@@ -79,7 +73,6 @@ func (jm *JobMonitor) WaitForJobCompletion(ctx context.Context, projectID, jobID
 	}
 }
 
-// isJobComplete checks if job is in a completed state
 func (jm *JobMonitor) isJobComplete(status string) bool {
 	completedStatuses := []string{
 		"success",
@@ -96,7 +89,6 @@ func (jm *JobMonitor) isJobComplete(status string) bool {
 	return false
 }
 
-// isJobFailed checks if job failed
 func (jm *JobMonitor) isJobFailed(status string) bool {
 	failedStatuses := []string{
 		"failed",
@@ -110,7 +102,3 @@ func (jm *JobMonitor) isJobFailed(status string) bool {
 	}
 	return false
 }
-
-// Note: GetJobLogs and CancelJob are commented out for now
-// as they require direct client access which breaks the interface abstraction
-// Implement these methods in the Service struct if needed

@@ -6,7 +6,6 @@ import (
 	"time"
 )
 
-// JobEvent represents a GitLab Job Hook event
 type JobEvent struct {
 	ObjectKind         string     `json:"object_kind"`
 	Ref                string     `json:"ref"`
@@ -38,7 +37,6 @@ type JobEvent struct {
 	BuildTags          []string   `json:"tags"`
 }
 
-// PipelineEvent represents a GitLab Pipeline Hook event
 type PipelineEvent struct {
 	ObjectKind       string             `json:"object_kind"`
 	ObjectAttributes PipelineAttributes `json:"object_attributes"`
@@ -49,7 +47,6 @@ type PipelineEvent struct {
 	Builds           []Build            `json:"builds"`
 }
 
-// PipelineAttributes represents pipeline attributes
 type PipelineAttributes struct {
 	ID         int64      `json:"id"`
 	Ref        string     `json:"ref"`
@@ -65,7 +62,6 @@ type PipelineAttributes struct {
 	Variables  []Variable `json:"variables"`
 }
 
-// User represents a GitLab user
 type User struct {
 	ID        int64  `json:"id"`
 	Name      string `json:"name"`
@@ -74,7 +70,6 @@ type User struct {
 	Email     string `json:"email"`
 }
 
-// Commit represents a Git commit
 type Commit struct {
 	ID        string    `json:"id"`
 	Message   string    `json:"message"`
@@ -84,13 +79,11 @@ type Commit struct {
 	Author    Author    `json:"author"`
 }
 
-// Author represents a commit author
 type Author struct {
 	Name  string `json:"name"`
 	Email string `json:"email"`
 }
 
-// Repository represents a Git repository
 type Repository struct {
 	Name            string `json:"name"`
 	URL             string `json:"url"`
@@ -101,7 +94,6 @@ type Repository struct {
 	VisibilityLevel int    `json:"visibility_level"`
 }
 
-// Project represents a GitLab project
 type Project struct {
 	ID                int64  `json:"id"`
 	Name              string `json:"name"`
@@ -116,7 +108,6 @@ type Project struct {
 	DefaultBranch     string `json:"default_branch"`
 }
 
-// MergeRequest represents a GitLab merge request
 type MergeRequest struct {
 	ID              int64  `json:"id"`
 	IID             int64  `json:"iid"`
@@ -130,7 +121,6 @@ type MergeRequest struct {
 	URL             string `json:"url"`
 }
 
-// Build represents a pipeline build/job
 type Build struct {
 	ID            int64         `json:"id"`
 	Stage         string        `json:"stage"`
@@ -148,7 +138,6 @@ type Build struct {
 	Environment   Environment   `json:"environment"`
 }
 
-// Runner represents a GitLab runner
 type Runner struct {
 	ID          int64    `json:"id"`
 	Description string   `json:"description"`
@@ -157,26 +146,22 @@ type Runner struct {
 	Tags        []string `json:"tags"`
 }
 
-// ArtifactsFile represents build artifacts
 type ArtifactsFile struct {
 	Filename string `json:"filename"`
 	Size     int64  `json:"size"`
 }
 
-// Environment represents a deployment environment
 type Environment struct {
 	Name           string `json:"name"`
 	Action         string `json:"action"`
 	DeploymentTier string `json:"deployment_tier"`
 }
 
-// Variable represents a CI/CD variable
 type Variable struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
 }
 
-// RunnerRegistration represents a GitLab runner registration
 type RunnerRegistration struct {
 	ID          int64    `json:"id"`
 	Token       string   `json:"token"`
@@ -188,14 +173,11 @@ type RunnerRegistration struct {
 	Locked      bool     `json:"locked"`
 }
 
-// ParseVMRequirements extracts VM requirements from job tags
 func ParseVMRequirements(tags []string) (vcpu int64, memoryMB int64) {
-	// Default values
 	vcpu = 2
 	memoryMB = 4096
 
 	for _, tag := range tags {
-		// Format: actuated-4cpu-8gb or firecracker-2cpu-4gb
 		if strings.Contains(tag, "cpu") && strings.Contains(tag, "gb") {
 			parts := strings.Split(tag, "-")
 			for i, part := range parts {
@@ -216,7 +198,6 @@ func ParseVMRequirements(tags []string) (vcpu int64, memoryMB int64) {
 	return vcpu, memoryMB
 }
 
-// Helper function to parse integer from string
 func parseInt(s string) (int64, error) {
 	var result int64
 	_, err := fmt.Sscanf(s, "%d", &result)
