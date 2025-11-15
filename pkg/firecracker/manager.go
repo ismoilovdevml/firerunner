@@ -14,13 +14,14 @@ import (
 
 // Manager manages the lifecycle of MicroVMs
 type Manager struct {
-	client     *Client
-	config     *config.VMConfig
-	vms        map[string]*MicroVM
-	mu         sync.RWMutex
-	logger     *logrus.Logger
-	shutdownCh chan struct{}
-	wg         sync.WaitGroup
+	client       *Client
+	config       *config.VMConfig
+	vms          map[string]*MicroVM
+	mu           sync.RWMutex
+	logger       *logrus.Logger
+	shutdownCh   chan struct{}
+	shutdownOnce sync.Once
+	wg           sync.WaitGroup
 }
 
 // NewManager creates a new VM manager
@@ -162,6 +163,15 @@ func (m *Manager) StartCleanup(interval time.Duration) {
 	m.logger.WithField("interval", interval).Info("Started VM cleanup routine")
 }
 
+// StopCleanup stops the background cleanup routine
+func (m *Manager) StopCleanup() {
+	m.shutdownOnce.Do(func() {
+		close(m.shutdownCh)
+	})
+	m.wg.Wait()
+	m.logger.Info("Stopped VM cleanup routine")
+}
+
 // cleanup removes stale VMs
 func (m *Manager) cleanup() {
 	m.logger.Debug("Running VM cleanup")
@@ -194,8 +204,10 @@ func (m *Manager) cleanup() {
 func (m *Manager) Shutdown(ctx context.Context) error {
 	m.logger.Info("Shutting down VM manager")
 
-	// Signal cleanup routine to stop
-	close(m.shutdownCh)
+	// Signal cleanup routine to stop (use sync.Once to prevent double-close)
+	m.shutdownOnce.Do(func() {
+		close(m.shutdownCh)
+	})
 
 	// Wait for cleanup routine with timeout
 	done := make(chan struct{})

@@ -13,11 +13,30 @@ import (
 	"github.com/ismoilovdevml/firerunner/pkg/gitlab"
 )
 
+// VMManager interface for managing VMs (allows mocking in tests)
+type VMManager interface {
+	CreateVM(ctx context.Context, req *firecracker.VMRequest) (*firecracker.MicroVM, error)
+	DestroyVM(ctx context.Context, vmID string) error
+	GetVM(vmID string) (*firecracker.MicroVM, error)
+	ListVMs() []*firecracker.MicroVM
+	StartCleanup(interval time.Duration)
+	StopCleanup()
+	Shutdown(ctx context.Context) error
+}
+
+// GitLabService interface for GitLab operations (allows mocking in tests)
+type GitLabService interface {
+	RegisterRunner(ctx context.Context, projectID int64, vmIP string, tags []string) (*gitlab.RunnerRegistration, error)
+	UnregisterRunner(ctx context.Context, runnerID int64) error
+	ProcessJobEvent(event *gitlab.JobEvent) error
+	ProcessPipelineEvent(event *gitlab.PipelineEvent) error
+}
+
 // Scheduler manages job scheduling and execution
 type Scheduler struct {
 	config    *config.SchedulerConfig
-	vmManager *firecracker.Manager
-	gitlabSvc *gitlab.Service
+	vmManager VMManager
+	gitlabSvc GitLabService
 	logger    *logrus.Logger
 
 	jobQueue chan *Job
@@ -61,8 +80,8 @@ type Worker struct {
 // NewScheduler creates a new job scheduler
 func NewScheduler(
 	cfg *config.SchedulerConfig,
-	vmManager *firecracker.Manager,
-	gitlabSvc *gitlab.Service,
+	vmManager VMManager,
+	gitlabSvc GitLabService,
 	logger *logrus.Logger,
 ) *Scheduler {
 	return &Scheduler{
