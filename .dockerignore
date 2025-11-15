@@ -1,8 +1,0 @@
-.git
-.github
-build
-coverage.out
-*.md
-.gitignore
-.dockerignore
-docker-compose.yml
