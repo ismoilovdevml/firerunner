@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 410" width="760" height="410" role="img" aria-label="FireRunner benchmarks measured on a nested-virtualization test host">
+<style>
+.bg{fill:#fcfcfb} .h{font:600 14px system-ui,-apple-system,Segoe UI,sans-serif;fill:#0b0b0b}
+.l,.lg{font:13px system-ui,-apple-system,Segoe UI,sans-serif;fill:#52514e} .v{font:600 13px system-ui,-apple-system,Segoe UI,sans-serif;fill:#0b0b0b}
+.fr{fill:#2a78d6} .base{fill:#eb6834} .t{font:600 16px system-ui,-apple-system,Segoe UI,sans-serif;fill:#0b0b0b}
+@media (prefers-color-scheme: dark){.bg{fill:#1a1a19} .h,.v,.t{fill:#ffffff} .l,.lg{fill:#c3c2b7} .fr{fill:#3987e5} .base{fill:#d95926}}
+</style>
+<rect class="bg" width="760" height="410" rx="10"/>
+<text class="t" x="24" y="32">Measured on one 8 vCPU / 16 GB test host (nested virtualization)</text>
+<rect class="fr" x="510" y="21" width="12" height="12" rx="3"/><text class="lg" x="528" y="32">FireRunner</text>
+<rect class="base" x="612" y="21" width="12" height="12" rx="3"/><text class="lg" x="630" y="32">Existing runner</text>
+<text class="h" x="24" y="64">How long a job waits for its microVM (p50)</text>
+<text class="l" x="238" y="91" text-anchor="end">Warm pool (pre-booted VM)</text>
+<rect class="fr" x="250" y="78" width="6.3" height="16" rx="4"/>
+<text class="v" x="264.3" y="91">250 ms</text>
+<text class="l" x="238" y="117" text-anchor="end">Cold boot</text>
+<rect class="fr" x="250" y="104" width="420.0" height="16" rx="4"/>
+<text class="v" x="678.0" y="117">16.7 s</text>
+<text class="h" x="24" y="156">Real .NET 8 service: dotnet test, 44 tests, same commit</text>
+<text class="l" x="238" y="183" text-anchor="end">FireRunner, warm pool</text>
+<rect class="fr" x="250" y="170" width="111.5" height="16" rx="4"/>
+<text class="v" x="369.5" y="183">27.7 s</text>
+<text class="l" x="238" y="209" text-anchor="end">GitLab docker executor</text>
+<rect class="base" x="250" y="196" width="125.2" height="16" rx="4"/>
+<text class="v" x="383.2" y="209">31.1 s</text>
+<text class="l" x="238" y="235" text-anchor="end">FireRunner, cold (image pulled)</text>
+<rect class="fr" x="250" y="222" width="420.0" height="16" rx="4"/>
+<text class="v" x="678.0" y="235">104.3 s</text>
+<text class="h" x="24" y="274">Demo pipeline, 6 jobs, 4 in parallel</text>
+<text class="l" x="238" y="301" text-anchor="end">FireRunner, no pool</text>
+<rect class="fr" x="250" y="288" width="420.0" height="16" rx="4"/>
+<text class="v" x="678.0" y="301">60 s</text>
+<text class="l" x="238" y="327" text-anchor="end">FireRunner, pool = 2</text>
+<rect class="fr" x="250" y="314" width="266.0" height="16" rx="4"/>
+<text class="v" x="524.0" y="327">38 s</text>
+<text class="l" x="238" y="353" text-anchor="end">FireRunner, pool = 4</text>
+<rect class="fr" x="250" y="340" width="133.0" height="16" rx="4"/>
+<text class="v" x="391.0" y="353">19 s</text>
+</svg>
