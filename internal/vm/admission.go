@@ -14,9 +14,13 @@ import (
 // overheadPct is Firecracker's per-VM memory overhead on top of the guest RAM.
 const overheadPct = 5
 
+// memTotalMB is a variable only so tests can pin host memory; production
+// never reassigns it.
+var memTotalMB = host.MemTotalMB
+
 // Capacity is the host memory microVMs may commit: MemTotal minus the reserve.
 func Capacity(cfg config.Config) (int, error) {
-	total, err := host.MemTotalMB()
+	total, err := memTotalMB()
 	if err != nil {
 		return 0, err
 	}

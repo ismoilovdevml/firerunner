@@ -45,7 +45,13 @@ func Dial(cfg config.Flintlock) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connecting to flintlock at %s: %w", cfg.Endpoint, err)
 	}
-	return &Client{conn: conn, api: mvmv1.NewMicroVMClient(conn), namespace: cfg.Namespace}, nil
+	return newClient(conn, cfg.Namespace), nil
+}
+
+// newClient wraps an established connection; split from Dial so tests can
+// hand in an in-memory (bufconn) connection.
+func newClient(conn *grpc.ClientConn, namespace string) *Client {
+	return &Client{conn: conn, api: mvmv1.NewMicroVMClient(conn), namespace: namespace}
 }
 
 func (c *Client) Close() error { return c.conn.Close() }
