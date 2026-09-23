@@ -59,3 +59,14 @@ func TestTransientListError(t *testing.T) {
 		t.Fatal("IsTransient misclassifies")
 	}
 }
+
+func TestRoleOf(t *testing.T) {
+	for id, want := range map[string][2]string{
+		"pool-ab12cd": {"pool", ""}, "job-74196": {"job", "job-74196"}, "run-1a2b3c": {"run", ""},
+		"smoke1": {"", ""}, "mvm-1": {"", ""},
+	} {
+		if r, j := RoleOf(id); r != want[0] || j != want[1] {
+			t.Errorf("RoleOf(%q) = %q,%q want %v", id, r, j, want)
+		}
+	}
+}

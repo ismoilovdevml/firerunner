@@ -28,11 +28,28 @@ import (
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
-// Label keys on every microVM FireRunner creates.
+// Label keys on every microVM FireRunner creates. flintlockd v0.15 does not
+// persist labels, so ownership is decided from the id prefix (RoleOf) instead.
 const (
 	LabelRole = "firerunner/role" // pool | job | run
 	LabelJob  = "firerunner/job"
 )
+
+// RoleOf derives the role from the microVM id FireRunner assigned:
+// pool-<rand>, job-<CI_JOB_ID> or run-<rand>. Other ids are not ours.
+func RoleOf(id string) (role, job string) {
+	prefix, _, ok := strings.Cut(id, "-")
+	if !ok {
+		return "", ""
+	}
+	switch prefix {
+	case "pool", "run":
+		return prefix, ""
+	case "job":
+		return "job", id
+	}
+	return "", ""
+}
 
 type pooled struct {
 	inst   *vm.Instance
@@ -382,7 +399,7 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 
 	states := map[string]float64{}
 	for _, v := range vms {
-		uid, labels := v.GetSpec().GetUid(), v.GetSpec().GetLabels()
+		uid := v.GetSpec().GetUid()
 		state := v.GetStatus().GetState().String()
 		states[state]++
 		d.mu.Lock()
@@ -393,7 +410,8 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 		}
 		d.mu.Unlock()
 
-		reason := decide(vmFacts{State: state, Role: labels[LabelRole], Job: labels[LabelJob], Owned: owned[uid],
+		role, job := RoleOf(v.GetSpec().GetId())
+		reason := decide(vmFacts{State: state, Role: role, Job: job, Owned: owned[uid],
 			Age: time.Since(first), Startup: startup, Booting: booting}, cfg)
 		if reason != "" {
 			d.metrics.orphansDeleted.WithLabelValues(reason).Inc()

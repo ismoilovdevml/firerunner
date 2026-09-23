@@ -398,7 +398,7 @@ func cmdVM(cfg config.Config, args []string) error {
 		}
 		sort.Slice(vms, func(i, j int) bool { return vms[i].GetSpec().GetId() < vms[j].GetSpec().GetId() })
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tUID\tSTATE\tVCPU\tMEMORY\tIP\tPROJECT")
+		fmt.Fprintln(w, "ID\tUID\tROLE\tSTATE\tVCPU\tMEMORY\tIP")
 		for _, v := range vms {
 			s := v.GetSpec()
 			var mac string
@@ -406,9 +406,9 @@ func cmdVM(cfg config.Config, args []string) error {
 				mac = ifs[len(ifs)-1].GetGuestMac()
 			}
 			ip, _ := vm.LeaseIP(cfg.Network.LeasesFile, mac)
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d MB\t%s\t%s\n", s.GetId(), s.GetUid(),
-				strings.ToLower(v.GetStatus().GetState().String()), s.GetVcpu(), s.GetMemoryInMb(),
-				dash(ip), dash(strings.ReplaceAll(s.GetLabels()["firerunner/project"], ".", "/")))
+			role, _ := daemon.RoleOf(s.GetId())
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d MB\t%s\n", s.GetId(), s.GetUid(), dash(role),
+				strings.ToLower(v.GetStatus().GetState().String()), s.GetVcpu(), s.GetMemoryInMb(), dash(ip))
 		}
 		return w.Flush()
 	case "rm", "delete":
