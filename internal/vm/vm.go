@@ -85,6 +85,12 @@ users:
 bootcmd:
   - ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 `, id, sshPubKey)
+	if cfg.VM.RegistryMirror != "" {
+		userData += fmt.Sprintf(`write_files:
+  - path: /etc/docker/daemon.json
+    content: '{"registry-mirrors": ["%s"]}'
+`, cfg.VM.RegistryMirror)
+	}
 	metaData := fmt.Sprintf("instance_id: %s/%s\nlocal_hostname: %s\nplatform: liquid_metal\n", cfg.Flintlock.Namespace, id, id)
 
 	kernelFile := "boot/vmlinux"
@@ -166,7 +172,12 @@ func SSH(cfg config.Config, ip string, args ...string) *exec.Cmd {
 func RunScript(cfg config.Config, ip string, script io.Reader, stdout, stderr io.Writer) (int, error) {
 	cmd := SSH(cfg, ip, "/bin/bash")
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = script, stdout, stderr
-	err := cmd.Run()
+	return ExitCode(cmd.Run())
+}
+
+// ExitCode turns the error of exec.Cmd.Run into an exit code; err is only
+// returned when the command could not run at all.
+func ExitCode(err error) (int, error) {
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		return exitErr.ExitCode(), nil

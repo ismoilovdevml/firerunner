@@ -33,6 +33,9 @@ RUN printf 'L+ /etc/resolv.conf - - - - /run/systemd/resolve/stub-resolv.conf\n'
     # Docker starts on first use (socket activation) so it does not slow down boot.
     && systemctl disable docker.service containerd.service \
     && systemctl enable docker.socket \
+    # The guest kernel has legacy iptables NAT built in; nf_tables is only a module.
+    && update-alternatives --set iptables /usr/sbin/iptables-legacy \
+    && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy \
     && systemctl enable ssh \
     && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config \
     && rm -f /etc/ssh/ssh_host_*_key* \

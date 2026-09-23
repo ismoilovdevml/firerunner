@@ -3,14 +3,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -22,9 +26,11 @@ import (
 	"github.com/liquidmetal-dev/flintlock/api/types"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
+	"github.com/ismoilovdevml/firerunner/internal/daemon"
 	"github.com/ismoilovdevml/firerunner/internal/executor"
 	"github.com/ismoilovdevml/firerunner/internal/flintlock"
 	"github.com/ismoilovdevml/firerunner/internal/host"
+	"github.com/ismoilovdevml/firerunner/internal/upgrade"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
@@ -52,8 +58,14 @@ Usage:
   firerunner vm logs <id|uid> [-n 100]
 
   firerunner run [--keep] -- <command...>   boot a microVM, run a command, delete it
+  firerunner pool [refresh]                 show pre-booted microVMs; refresh replaces them
+                                            (after a new rootfs image under the same tag)
+
+  firerunner daemon                         pool + reconcile + metrics (systemd: firerunner.service)
   firerunner executor prepare|run|cleanup   called by gitlab-runner (custom executor)
-  firerunner version
+  firerunner upgrade [--version edge|latest|vX.Y.Z] [--check]
+                                            replace this binary with a release (default: edge)
+  firerunner version | -v | --version
 `
 
 func main() {
@@ -79,7 +91,7 @@ func dispatch(args []string) error {
 	}
 	cmd, rest := args[0], args[1:]
 	switch cmd {
-	case "version", "--version":
+	case "version", "--version", "-v":
 		fmt.Println("firerunner", version)
 		return nil
 	case "help", "-h", "--help":
@@ -87,6 +99,8 @@ func dispatch(args []string) error {
 		return nil
 	case "config":
 		return cmdConfig(rest)
+	case "upgrade":
+		return cmdUpgrade(rest)
 	}
 
 	cfg, err := config.Load(config.Path())
@@ -106,6 +120,25 @@ func dispatch(args []string) error {
 		return cmdRun(cfg, rest)
 	case "executor":
 		return cmdExecutor(cfg, rest)
+	case "daemon":
+		return cmdDaemon()
+	case "pool":
+		dc := daemon.NewClient(cfg.Daemon.Socket)
+		if len(rest) > 0 && rest[0] == "refresh" {
+			if err := dc.Refresh(); err != nil {
+				return fmt.Errorf("daemon not reachable (systemctl status firerunner): %w", err)
+			}
+			fmt.Println("idle pool VMs are being replaced")
+			return nil
+		}
+		raw, err := dc.Pool()
+		if err != nil {
+			return fmt.Errorf("daemon not reachable (systemctl status firerunner): %w", err)
+		}
+		var out bytes.Buffer
+		_ = json.Indent(&out, raw, "", "  ")
+		fmt.Println(out.String())
+		return nil
 	}
 	return fmt.Errorf("unknown command %q\n\n%s", cmd, usage)
 }
@@ -451,7 +484,7 @@ func cmdRun(cfg config.Config, args []string) error {
 	id := "run-" + hex.EncodeToString(suffix)
 	start := time.Now()
 	fmt.Fprintf(os.Stderr, "booting %s (%d vCPU, %d MB)...\n", id, cfg.VM.VCPU, cfg.VM.MemoryMB)
-	inst, err := vm.Boot(ctx, cfg, fl, id, map[string]string{"firerunner/run": id})
+	inst, err := vm.Boot(ctx, cfg, fl, id, map[string]string{daemon.LabelRole: "run"})
 	if err != nil {
 		return err
 	}
@@ -499,6 +532,52 @@ func cmdExecutor(cfg config.Config, args []string) error {
 		return executor.Cleanup(cfg)
 	}
 	return fmt.Errorf("unknown executor stage %q", args[0])
+}
+
+// ---------------------------------------------------------------------------
+// upgrade
+
+func cmdUpgrade(args []string) error {
+	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
+	tag := fs.String("version", "edge", "release to install: edge (main), latest (newest stable) or a tag like v1.2.0")
+	check := fs.Bool("check", false, "only show which version would be installed")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	res, err := upgrade.Run(context.Background(), *tag, version, *check)
+	if err != nil {
+		return err
+	}
+	switch {
+	case !res.Changed:
+		fmt.Printf("firerunner %s is already the %s release\n", res.From, *tag)
+	case *check:
+		fmt.Printf("firerunner %s -> %s available (run: firerunner upgrade --version %s)\n", res.From, res.To, *tag)
+	default:
+		fmt.Printf("firerunner upgraded %s -> %s\n", res.From, res.To)
+		if host.ServiceActive("firerunner") {
+			if err := exec.Command("systemctl", "restart", "firerunner").Run(); err != nil {
+				return fmt.Errorf("restarting firerunner.service: %w", err)
+			}
+			fmt.Println("firerunner.service restarted")
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// daemon
+
+func cmdDaemon() error {
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	daemon.Version = version
+	d, err := daemon.New(config.Path(), log)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return d.Run(ctx)
 }
 
 // ---------------------------------------------------------------------------

@@ -21,7 +21,23 @@ const DefaultPath = "/etc/firerunner/config.yaml"
 type Config struct {
 	Flintlock Flintlock `yaml:"flintlock"`
 	VM        VM        `yaml:"vm"`
+	Pool      Pool      `yaml:"pool"`
+	Daemon    Daemon    `yaml:"daemon"`
 	Network   Network   `yaml:"network"`
+}
+
+// Pool keeps pre-booted microVMs so a job starts without waiting for a boot.
+// A pool VM is used by exactly one job and then deleted, like a cold one.
+type Pool struct {
+	Size    int           `yaml:"size"`
+	MaxIdle time.Duration `yaml:"max_idle"`
+}
+
+type Daemon struct {
+	MetricsListen     string        `yaml:"metrics_listen"`
+	Socket            string        `yaml:"socket"`
+	ReconcileInterval time.Duration `yaml:"reconcile_interval"`
+	JobMaxAge         time.Duration `yaml:"job_max_age"`
 }
 
 type Flintlock struct {
@@ -37,6 +53,10 @@ type VM struct {
 	KernelCmdline map[string]string `yaml:"kernel_cmdline"`
 	RootFSImage   string            `yaml:"rootfs_image"`
 	BootTimeout   time.Duration     `yaml:"boot_timeout"`
+	// RegistryMirror is written to the guest's Docker daemon.json (empty = none).
+	RegistryMirror string `yaml:"registry_mirror"`
+	// HostReserveMB is memory kept free on the host; microVMs wait for it.
+	HostReserveMB int `yaml:"host_reserve_mb"`
 }
 
 type Network struct {
@@ -59,6 +79,14 @@ func Default() Config {
 			KernelCmdline: map[string]string{"acpi": "off"},
 			RootFSImage:   "ghcr.io/ismoilovdevml/firerunner-rootfs:latest",
 			BootTimeout:   3 * time.Minute,
+			HostReserveMB: 1024,
+		},
+		Pool: Pool{Size: 2, MaxIdle: 30 * time.Minute},
+		Daemon: Daemon{
+			MetricsListen:     ":9477",
+			Socket:            "/run/firerunner/daemon.sock",
+			ReconcileInterval: time.Minute,
+			JobMaxAge:         3 * time.Hour,
 		},
 		Network: Network{
 			LeasesFile: "/var/lib/misc/firerunner-dnsmasq.leases",
@@ -120,6 +148,24 @@ func (c Config) Validate() error {
 	}
 	if c.VM.BootTimeout < 10*time.Second {
 		errs = append(errs, "vm.boot_timeout must be at least 10s")
+	}
+	if c.VM.HostReserveMB < 0 {
+		errs = append(errs, "vm.host_reserve_mb must not be negative")
+	}
+	if c.Pool.Size < 0 || c.Pool.Size > 32 {
+		errs = append(errs, "pool.size must be between 0 and 32")
+	}
+	if c.Pool.MaxIdle < time.Minute {
+		errs = append(errs, "pool.max_idle must be at least 1m")
+	}
+	if c.Daemon.Socket == "" {
+		errs = append(errs, "daemon.socket is required")
+	}
+	if c.Daemon.ReconcileInterval < 10*time.Second {
+		errs = append(errs, "daemon.reconcile_interval must be at least 10s")
+	}
+	if c.Daemon.JobMaxAge < 10*time.Minute {
+		errs = append(errs, "daemon.job_max_age must be at least 10m")
 	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))

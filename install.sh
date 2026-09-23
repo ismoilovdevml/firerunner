@@ -19,6 +19,9 @@
 #   FLINTLOCK_VERSION       (default: 0.15.2)
 #
 #   FR_VERSION              firerunner release to install (default: edge = latest main)
+#   FR_POOL_SIZE            pre-booted microVMs kept ready (default: 2)
+#   FR_METRICS_ALLOW        source CIDR allowed to scrape :9477/metrics (default: none, localhost only)
+#   REGISTRY_VERSION        Docker Hub pull-through mirror for microVMs (default: 3.1.1)
 #   GITLAB_RUNNER_VERSION   (default: 19.0.1)
 #
 # Register a GitLab runner right away (optional, can be done later with
@@ -35,6 +38,7 @@ set -euo pipefail
 CONTAINERD_VERSION="${CONTAINERD_VERSION:-1.7.35}"
 FIRECRACKER_VERSION="${FIRECRACKER_VERSION:-1.17.0}"
 FLINTLOCK_VERSION="${FLINTLOCK_VERSION:-0.15.2}"
+REGISTRY_VERSION="${REGISTRY_VERSION:-3.1.1}"
 GITLAB_RUNNER_VERSION="${GITLAB_RUNNER_VERSION:-19.0.1}"
 FR_VERSION="${FR_VERSION:-edge}"
 FR_BINARY="${FR_BINARY:-}"            # local firerunner binary instead of a release (development)
@@ -46,6 +50,8 @@ FR_SUBNET="${FR_SUBNET:-10.200.0}"
 FR_GITLAB_URL="${FR_GITLAB_URL:-}"
 FR_RUNNER_TOKEN="${FR_RUNNER_TOKEN:-}"
 FR_RUNNER_CONCURRENT="${FR_RUNNER_CONCURRENT:-4}"
+FR_POOL_SIZE="${FR_POOL_SIZE:-2}"
+FR_METRICS_ALLOW="${FR_METRICS_ALLOW:-}"
 FR_REPO=ismoilovdevml/firerunner
 
 BIN_DIR=/usr/local/bin
@@ -292,6 +298,7 @@ table ip firerunner {
     # microVMs may only use DHCP and DNS on the host
     iifname "${FR_BRIDGE}" udp dport { 53, 67 } accept
     iifname "${FR_BRIDGE}" tcp dport 53 accept
+    iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport 5000 accept
     iifname "${FR_BRIDGE}" ct state established,related accept
     iifname "${FR_BRIDGE}" drop
   }
@@ -426,6 +433,66 @@ EOF
 # firerunner CLI + GitLab Runner
 # --------------------------------------------------------------------------
 
+install_registry_mirror() {
+    local have=""
+    [[ -x $BIN_DIR/registry ]] && have=$($BIN_DIR/registry --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [[ "$have" != "v${REGISTRY_VERSION}" ]]; then
+        log "installing Docker Hub mirror (distribution v${REGISTRY_VERSION})"
+        local base="https://github.com/distribution/distribution/releases/download/v${REGISTRY_VERSION}"
+        local tgz="registry_${REGISTRY_VERSION}_linux_amd64.tar.gz"
+        fetch "$base/$tgz" "$TMP_DIR/$tgz"
+        fetch "$base/$tgz.sha256" "$TMP_DIR/$tgz.sha256"
+        verify "$TMP_DIR/$tgz" "$(awk '{print $1}' "$TMP_DIR/$tgz.sha256")"
+        tar -xzf "$TMP_DIR/$tgz" -C "$TMP_DIR" registry
+        install -m 0755 "$TMP_DIR/registry" "$BIN_DIR/registry"
+    fi
+    mkdir -p /var/lib/firerunner/registry
+    cat >"$CONF_DIR/registry.yml" <<EOF
+version: 0.1
+log:
+  level: warn
+storage:
+  filesystem:
+    rootdirectory: /var/lib/firerunner/registry
+  delete:
+    enabled: true
+http:
+  addr: ${FR_SUBNET}.1:5000
+proxy:
+  remoteurl: https://registry-1.docker.io
+  ttl: 168h
+EOF
+    cat >/etc/systemd/system/firerunner-registry.service <<EOF
+[Unit]
+Description=FireRunner Docker Hub pull-through mirror for microVMs
+Requires=firerunner-net.service
+After=firerunner-net.service
+
+[Service]
+ExecStart=${BIN_DIR}/registry serve ${CONF_DIR}/registry.yml
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/firerunner/registry
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+open_metrics_port() {
+    [[ -n $FR_METRICS_ALLOW ]] || return 0
+    log "allowing ${FR_METRICS_ALLOW} to scrape :9477/metrics"
+    if systemctl is-active -q firewalld 2>/dev/null; then
+        firewall-cmd -q --permanent --add-rich-rule="rule family=ipv4 source address=${FR_METRICS_ALLOW} port port=9477 protocol=tcp accept"
+        firewall-cmd -q --reload
+    elif command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow from "${FR_METRICS_ALLOW}" to any port 9477 proto tcp >/dev/null
+    fi
+}
+
 install_firerunner() {
     if [[ -n $FR_BINARY ]]; then
         log "installing firerunner from $FR_BINARY"
@@ -446,7 +513,37 @@ install_firerunner() {
     [[ -f $CONF_DIR/executor/id_ed25519 ]] ||
         ssh-keygen -q -t ed25519 -N "" -C firerunner-executor -f "$CONF_DIR/executor/id_ed25519"
     # Write the default config once so it is visible and editable.
-    [[ -f $CONF_DIR/config.yaml ]] || $BIN_DIR/firerunner config set vm.vcpu 2 >/dev/null
+    if [[ ! -f $CONF_DIR/config.yaml ]]; then
+        $BIN_DIR/firerunner config set pool.size "$FR_POOL_SIZE" >/dev/null
+        $BIN_DIR/firerunner config set vm.registry_mirror "http://${FR_SUBNET}.1:5000" >/dev/null
+    fi
+
+    cat >/etc/systemd/system/firerunner.service <<EOF
+[Unit]
+Description=FireRunner daemon (microVM pool, reconcile, metrics)
+Requires=flintlockd.service
+After=flintlockd.service
+
+[Service]
+ExecStart=${BIN_DIR}/firerunner daemon
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+RuntimeDirectory=firerunner
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/run/firerunner -/run/lock -/run/lvm
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
     local have=""
     [[ -x $BIN_DIR/gitlab-runner ]] && have=$($BIN_DIR/gitlab-runner --version 2>/dev/null | awk '/^Version:/ {print $2}')
@@ -482,7 +579,7 @@ register_runner() {
 start_services() {
     systemctl daemon-reload
     local svc
-    for svc in containerd-flintlock firerunner-net firerunner-dnsmasq flintlockd; do
+    for svc in containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry flintlockd; do
         systemctl enable -q "$svc"
         systemctl restart "$svc"
     done
@@ -491,7 +588,7 @@ start_services() {
 verify_install() {
     log "verifying"
     local ok=1 svc
-    for svc in containerd-flintlock firerunner-net firerunner-dnsmasq flintlockd; do
+    for svc in containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry flintlockd firerunner; do
         if systemctl is-active -q "$svc"; then
             log "  $svc: active"
         else
@@ -536,12 +633,12 @@ uninstall() {
         $BIN_DIR/gitlab-runner uninstall --service gitlab-runner >/dev/null 2>&1 || true
         rm -f "$BIN_DIR/gitlab-runner"
     fi
-    for svc in flintlockd firerunner-dnsmasq firerunner-net containerd-flintlock; do
+    for svc in firerunner flintlockd firerunner-registry firerunner-dnsmasq firerunner-net containerd-flintlock; do
         systemctl disable --now -q "$svc" 2>/dev/null || true
         rm -f "/etc/systemd/system/$svc.service"
     done
     systemctl daemon-reload
-    rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner"
+    rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry"
     rm -rf "$LIB_DIR"
     log "done. To also drop data: vgremove $VG && rm -rf $CONTAINERD_ROOT /var/lib/flintlock $CONF_DIR"
 }
@@ -560,8 +657,13 @@ main() {
     install_firecracker
     setup_network
     install_flintlock
+    install_registry_mirror
     start_services
     install_firerunner
+    systemctl daemon-reload
+    systemctl enable -q firerunner
+    systemctl restart firerunner
+    open_metrics_port
     verify_install
     register_runner
 }
