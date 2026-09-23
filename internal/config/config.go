@@ -31,6 +31,9 @@ type Config struct {
 type Pool struct {
 	Size    int           `yaml:"size"`
 	MaxIdle time.Duration `yaml:"max_idle"`
+	// PreloadImages are pulled into each pool VM's Docker before it is handed
+	// out, so jobs using these images skip the pull. Each VM still serves one job.
+	PreloadImages []string `yaml:"preload_images"`
 }
 
 type Daemon struct {

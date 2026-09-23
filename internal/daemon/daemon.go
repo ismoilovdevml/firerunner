@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -138,7 +139,8 @@ func (d *Daemon) listenSocket() (net.Listener, error) {
 
 // fingerprint changes whenever a setting that affects how a VM is booted changes.
 func fingerprint(c config.Config) string {
-	return fmt.Sprintf("%d/%d/%s/%s/%v/%s", c.VM.VCPU, c.VM.MemoryMB, c.VM.KernelImage, c.VM.RootFSImage, c.VM.KernelCmdline, c.VM.RegistryMirror)
+	return fmt.Sprintf("%d/%d/%s/%s/%v/%s/%v", c.VM.VCPU, c.VM.MemoryMB, c.VM.KernelImage, c.VM.RootFSImage,
+		c.VM.KernelCmdline, c.VM.RegistryMirror, c.Pool.PreloadImages)
 }
 
 // Claim hands a ready pool VM to a job. It returns nil when the pool is empty.
@@ -201,10 +203,44 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config) {
 		return
 	}
 	d.metrics.bootSeconds.WithLabelValues("pool").Observe(time.Since(start).Seconds())
+	if len(cfg.Pool.PreloadImages) > 0 {
+		// Pull outside the lock: it can take a while and jobs may claim other VMs meanwhile.
+		d.mu.Unlock()
+		pullStart := time.Now()
+		err := preload(ctx, cfg, inst.IP)
+		d.mu.Lock()
+		if err != nil {
+			d.metrics.bootFailures.WithLabelValues("preload").Inc()
+			d.log.Error("image preload failed, VM kept without it", "id", id, "err", err)
+		} else {
+			d.metrics.preloadSeconds.Observe(time.Since(pullStart).Seconds())
+		}
+	}
 	d.ready = append(d.ready, &pooled{inst: inst, bornAt: time.Now(), specID: fingerprint(cfg)})
 	d.metrics.poolReady.Set(float64(len(d.ready)))
 	d.log.Info("pool VM ready", "id", id, "ip", inst.IP, "boot", time.Since(start).Round(100*time.Millisecond).String())
 }
+
+// preload pulls pool.preload_images into the VM's Docker.
+func preload(ctx context.Context, cfg config.Config, ip string) error {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+	args := "set -e"
+	for _, img := range cfg.Pool.PreloadImages {
+		args += "; docker pull -q " + shellQuote(img)
+	}
+	cmd := vm.SSH(cfg, ip, args)
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 // expireIdle recycles pool VMs that sat idle too long or were booted with an old config.
 func (d *Daemon) expireIdle(ctx context.Context) {

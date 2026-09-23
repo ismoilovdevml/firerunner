@@ -17,6 +17,7 @@ type Metrics struct {
 	poolTarget, poolReady, poolBooting prometheus.Gauge
 	claims                             *prometheus.CounterVec
 	bootSeconds                        *prometheus.HistogramVec
+	preloadSeconds                     prometheus.Histogram
 	bootFailures                       *prometheus.CounterVec
 	prepareSeconds                     *prometheus.HistogramVec
 	jobs                               *prometheus.CounterVec
@@ -42,6 +43,8 @@ func NewMetrics() *Metrics {
 			Help: "Pool claims by jobs; result is hit (VM handed out) or miss (job cold-boots)."}, []string{"result"}),
 		bootSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "firerunner_vm_boot_seconds",
 			Help: "Time from create request to SSH ready.", Buckets: bootBuckets}, []string{"kind"}),
+		preloadSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{Name: "firerunner_pool_preload_seconds",
+			Help: "Time to pull pool.preload_images into a pool VM.", Buckets: []float64{5, 10, 20, 30, 60, 90, 120, 180, 300, 600}}),
 		bootFailures: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_vm_boot_failures_total",
 			Help: "microVMs that did not become ready."}, []string{"kind"}),
 		prepareSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "firerunner_job_prepare_seconds",
@@ -67,7 +70,7 @@ func NewMetrics() *Metrics {
 	info := prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_build_info", Help: "Build version.",
 		ConstLabels: prometheus.Labels{"version": Version}})
 	info.Set(1)
-	m.reg.MustRegister(m.poolTarget, m.poolReady, m.poolBooting, m.claims, m.bootSeconds, m.bootFailures,
+	m.reg.MustRegister(m.poolTarget, m.poolReady, m.poolBooting, m.claims, m.bootSeconds, m.preloadSeconds, m.bootFailures,
 		m.prepareSeconds, m.jobs, m.jobSeconds, m.microvms, m.orphansDeleted, m.admissionWaits,
 		m.flintlockUp, m.serviceUp, m.thinPool, m.memAvailable, m.runnerConcurrent, info,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
