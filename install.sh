@@ -697,6 +697,10 @@ EOF
 uninstall() {
     [[ $EUID -eq 0 ]] || die "run as root"
     log "stopping and removing services (thin pool and images are kept)"
+    # The daemon keeps its warm pool across restarts, so delete microVMs explicitly.
+    if [[ -x $BIN_DIR/firerunner ]] && systemctl is-active -q flintlockd; then
+        $BIN_DIR/firerunner vm rm --all >/dev/null 2>&1 || warn "could not delete all microVMs"
+    fi
     local svc
     if [[ -x $BIN_DIR/gitlab-runner ]]; then
         # The runner stays registered in GitLab; delete it there if it is no longer needed.

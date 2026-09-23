@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -55,6 +56,78 @@ type pooled struct {
 	inst   *vm.Instance
 	bornAt time.Time
 	specID string // config fingerprint the VM was booted with
+}
+
+// poolRecord is how the ready pool is persisted across daemon restarts.
+type poolRecord struct {
+	Instance vm.Instance `json:"instance"`
+	BornAt   time.Time   `json:"born_at"`
+	SpecID   string      `json:"spec_id"`
+}
+
+// alive reports whether an adopted pool VM still answers on its pinned key.
+var alive = func(cfg config.Config, inst *vm.Instance) bool {
+	return vm.SSH(cfg, inst, "true").Run() == nil
+}
+
+func (d *Daemon) poolFile() string {
+	return filepath.Join(filepath.Dir(d.cfg.Daemon.Socket), "pool.json")
+}
+
+// savePoolLocked persists the ready pool; the caller holds d.mu.
+func (d *Daemon) savePoolLocked() {
+	recs := make([]poolRecord, 0, len(d.ready))
+	for _, p := range d.ready {
+		recs = append(recs, poolRecord{Instance: *p.inst, BornAt: p.bornAt, SpecID: p.specID})
+	}
+	data, _ := json.Marshal(recs)
+	tmp := d.poolFile() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err == nil {
+		_ = os.Rename(tmp, d.poolFile())
+	}
+}
+
+// adoptPool takes back idle pool VMs a previous daemon run left ready, so a
+// restart or upgrade does not throw the warm pool away. Anything that does not
+// match (gone, other config, too old, not answering) is left for reconcile.
+func (d *Daemon) adoptPool(ctx context.Context) {
+	data, err := os.ReadFile(d.poolFile())
+	if err != nil {
+		return
+	}
+	var recs []poolRecord
+	if json.Unmarshal(data, &recs) != nil {
+		return
+	}
+	lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	vms, err := d.fl.List(lctx)
+	if err != nil {
+		return
+	}
+	live := map[string]bool{}
+	for _, v := range vms {
+		if v.GetStatus().GetState().String() == "CREATED" {
+			live[v.GetSpec().GetUid()] = true
+		}
+	}
+	d.mu.Lock()
+	cfg, fp := d.cfg, fingerprint(d.cfg)
+	d.mu.Unlock()
+	for _, r := range recs {
+		inst := r.Instance
+		if !live[inst.UID] || r.SpecID != fp || time.Since(r.BornAt) > cfg.Pool.MaxIdle || !alive(cfg, &inst) {
+			continue
+		}
+		d.mu.Lock()
+		d.ready = append(d.ready, &pooled{inst: &inst, bornAt: r.BornAt, specID: r.SpecID})
+		d.mu.Unlock()
+		d.log.Info("adopted pool VM from previous run", "id", inst.ID)
+	}
+	d.mu.Lock()
+	d.metrics.poolReady.Set(float64(len(d.ready)))
+	d.savePoolLocked()
+	d.mu.Unlock()
 }
 
 type Daemon struct {
@@ -104,6 +177,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go func() { errc <- metricsSrv.ListenAndServe() }()
 	d.log.Info("daemon started", "socket", d.cfg.Daemon.Socket, "metrics", d.cfg.Daemon.MetricsListen, "pool", d.cfg.Pool.Size)
 
+	d.adoptPool(ctx)
 	d.reconcile(ctx, true)
 	refill := time.NewTicker(2 * time.Second)
 	reconcile := time.NewTicker(d.cfg.Daemon.ReconcileInterval)
@@ -120,7 +194,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			defer cancel()
 			_ = api.Shutdown(shutdownCtx)
 			_ = metricsSrv.Shutdown(shutdownCtx)
-			d.drain(shutdownCtx, "shutdown")
+			// Keep idle pool VMs for the next run (adoptPool); they are recorded in pool.json.
+			d.mu.Lock()
+			d.savePoolLocked()
+			d.mu.Unlock()
 			return nil
 		case err := <-errc:
 			if !errors.Is(err, http.ErrServerClosed) {
@@ -171,6 +248,7 @@ func (d *Daemon) Claim() *vm.Instance {
 		if p.specID == fp {
 			d.claimed[p.inst.UID] = time.Now()
 			d.metrics.poolReady.Set(float64(len(d.ready)))
+			d.savePoolLocked()
 			d.metrics.claims.WithLabelValues("hit").Inc()
 			return p.inst
 		}
@@ -242,6 +320,7 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config) {
 	default:
 		d.ready = append(d.ready, &pooled{inst: inst, bornAt: time.Now(), specID: fingerprint(cfg)})
 		d.metrics.poolReady.Set(float64(len(d.ready)))
+		d.savePoolLocked()
 		d.log.Info("pool VM ready", "id", id, "ip", inst.IP, "took", time.Since(start).Round(100*time.Millisecond).String())
 	}
 }
@@ -282,6 +361,7 @@ func (d *Daemon) expireIdle(ctx context.Context) {
 	}
 	d.ready = keep
 	d.metrics.poolReady.Set(float64(len(d.ready)))
+	d.savePoolLocked()
 	d.mu.Unlock()
 	for _, p := range drop {
 		d.delete(ctx, p.inst, "expired")
@@ -292,6 +372,7 @@ func (d *Daemon) drain(ctx context.Context, reason string) {
 	d.mu.Lock()
 	drop := d.ready
 	d.ready = nil
+	d.savePoolLocked()
 	d.mu.Unlock()
 	for _, p := range drop {
 		d.delete(ctx, p.inst, reason)

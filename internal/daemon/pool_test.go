@@ -2,7 +2,10 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/ismoilovdevml/firerunner/internal/config"
+	"github.com/liquidmetal-dev/flintlock/api/types"
 	"io"
 	"log/slog"
 	"os"
@@ -136,7 +139,7 @@ func TestExpireIdle(t *testing.T) {
 	}
 }
 
-func TestRunShutdownDrainsPool(t *testing.T) {
+func TestRunShutdownKeepsAndRecordsPool(t *testing.T) {
 	d, srv := newTestDaemon(t)
 	fp := fingerprint(d.cfg)
 	d.ready = []*pooled{pooledVM("a", fp, 0), pooledVM("b", fp, 0)}
@@ -145,8 +148,6 @@ func TestRunShutdownDrainsPool(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- d.Run(ctx) }()
-
-	// Run is serving once the startup reconcile has listed microVMs.
 	deadline := time.Now().Add(5 * time.Second)
 	for srv.ListCalls() == 0 {
 		if time.Now().After(deadline) {
@@ -163,12 +164,45 @@ func TestRunShutdownDrainsPool(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}
-	got := srv.Deleted()
-	sort.Strings(got)
-	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
-		t.Fatalf("deleted on shutdown %v, want [a b]", got)
+	if got := srv.Deleted(); len(got) != 0 {
+		t.Fatalf("shutdown deleted idle pool VMs %v; they must survive a restart", got)
 	}
-	if len(d.ready) != 0 {
-		t.Fatalf("pool not empty after shutdown: %d", len(d.ready))
+	var recs []poolRecord
+	data, err := os.ReadFile(d.poolFile())
+	if err != nil || json.Unmarshal(data, &recs) != nil || len(recs) != 2 {
+		t.Fatalf("pool.json: %s %v", data, err)
+	}
+}
+
+func TestAdoptPoolAfterRestart(t *testing.T) {
+	d, srv := newTestDaemon(t)
+	fp := fingerprint(d.cfg)
+	recs := []poolRecord{
+		{Instance: vm.Instance{ID: "pool-ok", UID: "ok"}, BornAt: time.Now(), SpecID: fp},
+		{Instance: vm.Instance{ID: "pool-gone", UID: "gone"}, BornAt: time.Now(), SpecID: fp},
+		{Instance: vm.Instance{ID: "pool-stale", UID: "stale"}, BornAt: time.Now(), SpecID: "old"},
+		{Instance: vm.Instance{ID: "pool-old", UID: "old"}, BornAt: time.Now().Add(-2 * time.Hour), SpecID: fp},
+		{Instance: vm.Instance{ID: "pool-dead", UID: "dead"}, BornAt: time.Now(), SpecID: fp},
+	}
+	data, _ := json.Marshal(recs)
+	if err := os.WriteFile(d.poolFile(), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(uid string) *types.MicroVM {
+		return &types.MicroVM{Spec: &types.MicroVMSpec{Id: "pool-" + uid, Uid: &uid},
+			Status: &types.MicroVMStatus{State: types.MicroVMStatus_CREATED}}
+	}
+	srv.SetVMs(mk("ok"), mk("stale"), mk("old"), mk("dead"))
+	orig := alive
+	alive = func(_ config.Config, inst *vm.Instance) bool { return inst.UID != "dead" }
+	t.Cleanup(func() { alive = orig })
+
+	d.adoptPool(context.Background())
+	if len(d.ready) != 1 || d.ready[0].inst.UID != "ok" {
+		ids := []string{}
+		for _, p := range d.ready {
+			ids = append(ids, p.inst.UID)
+		}
+		t.Fatalf("adopted %v, want [ok]", ids)
 	}
 }
