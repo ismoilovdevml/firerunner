@@ -30,6 +30,27 @@ func SaveJobState(path string, st *JobState) error {
 	return os.Rename(tmp, path)
 }
 
+// CreateJobState writes a new state file and fails if one already exists.
+func CreateJobState(path string, st *JobState) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(path)
+		return err
+	}
+	return f.Close()
+}
+
 func LoadJobState(path string) (*JobState, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

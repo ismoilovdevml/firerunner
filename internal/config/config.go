@@ -93,7 +93,7 @@ func Default() Config {
 		},
 		Pool: Pool{Size: 2, MaxIdle: 30 * time.Minute},
 		Daemon: Daemon{
-			MetricsListen:     ":9477",
+			MetricsListen:     "127.0.0.1:9477", // install.sh opens :9477 only with FR_METRICS_ALLOW
 			Socket:            "/run/firerunner/daemon.sock",
 			ReconcileInterval: time.Minute,
 			JobMaxAge:         3 * time.Hour,

@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -41,10 +42,17 @@ func buildFailure(err error) error {
 	return &ExitError{Code: envInt("BUILD_FAILURE_EXIT_CODE", 1), Err: err}
 }
 
+var numericID = regexp.MustCompile(`^[0-9]{1,20}$`)
+
+// jobID derives the microVM id from the GitLab job id. It becomes a host file
+// name, a guest hostname and a flintlock id, so only a plain number is accepted.
 func jobID() (string, error) {
 	id := os.Getenv("CUSTOM_ENV_CI_JOB_ID")
 	if id == "" {
 		return "", errors.New("CUSTOM_ENV_CI_JOB_ID is not set; this command is run by gitlab-runner")
+	}
+	if !numericID.MatchString(id) {
+		return "", fmt.Errorf("CUSTOM_ENV_CI_JOB_ID %q is not a numeric job id", id)
 	}
 	return "job-" + id, nil
 }
@@ -71,11 +79,13 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	}
 
 	st := &vm.JobState{Instance: *inst, Source: source, StartedAt: start}
-	if err := vm.SaveJobState(statePath(id), st); err != nil {
+	// Exclusive: a job must never replace another job's VM binding.
+	if err := vm.CreateJobState(statePath(id), st); err != nil {
+		deleteVM(cfg, inst.UID)
 		return systemFailure(err)
 	}
 	if auth := os.Getenv("CUSTOM_ENV_DOCKER_AUTH_CONFIG"); auth != "" {
-		if err := writeDockerAuth(cfg, inst.IP, auth); err != nil {
+		if err := writeDockerAuth(cfg, inst, auth); err != nil {
 			return systemFailure(fmt.Errorf("writing DOCKER_AUTH_CONFIG to the microVM: %w", err))
 		}
 	}
@@ -92,7 +102,7 @@ func claim(cfg config.Config, dc *daemon.Client, id string) *vm.Instance {
 	if err != nil || inst == nil {
 		return nil
 	}
-	if err := vm.SSH(cfg, inst.IP, "hostnamectl", "set-hostname", id).Run(); err != nil {
+	if err := vm.SSH(cfg, inst, "hostnamectl", "set-hostname", id).Run(); err != nil {
 		fmt.Printf("pool VM %s did not answer (%v), booting a new one\n", inst.ID, err)
 		deleteVM(cfg, inst.UID)
 		return nil
@@ -134,8 +144,8 @@ func coldBoot(ctx context.Context, cfg config.Config, id string) (*vm.Instance, 
 	})
 }
 
-func writeDockerAuth(cfg config.Config, ip, auth string) error {
-	cmd := vm.SSH(cfg, ip, "mkdir -p /root/.docker && umask 077 && cat > /root/.docker/config.json")
+func writeDockerAuth(cfg config.Config, inst *vm.Instance, auth string) error {
+	cmd := vm.SSH(cfg, inst, "mkdir -p /root/.docker && umask 077 && cat > /root/.docker/config.json")
 	cmd.Stdin = strings.NewReader(auth)
 	return cmd.Run()
 }
@@ -160,9 +170,12 @@ func Run(cfg config.Config, script, stage string) error {
 
 	var code int
 	if image := os.Getenv("CUSTOM_ENV_CI_JOB_IMAGE"); image != "" && isUserStage(stage) {
-		code, err = runInContainer(cfg, st.IP, image, f)
+		if strings.HasPrefix(image, "-") {
+			return buildFailure(fmt.Errorf("invalid image %q", image))
+		}
+		code, err = runInContainer(cfg, &st.Instance, image, f)
 	} else {
-		code, err = vm.RunScript(cfg, st.IP, f, os.Stdout, os.Stderr)
+		code, err = vm.RunScript(cfg, &st.Instance, f, os.Stdout, os.Stderr)
 	}
 	switch {
 	case err != nil:
@@ -190,8 +203,8 @@ func ContainerCommand(image string) string {
 		`sh -c 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi'`
 }
 
-func runInContainer(cfg config.Config, ip, image string, script io.Reader) (int, error) {
-	cmd := vm.SSH(cfg, ip, ContainerCommand(image))
+func runInContainer(cfg config.Config, inst *vm.Instance, image string, script io.Reader) (int, error) {
+	cmd := vm.SSH(cfg, inst, ContainerCommand(image))
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = script, os.Stdout, os.Stderr
 	return vm.ExitCode(cmd.Run())
 }
@@ -222,6 +235,9 @@ func Cleanup(cfg config.Config) error {
 			return fmt.Errorf("deleting microVM %s: %w", id, err)
 		}
 		fmt.Printf("microVM %s deleted\n", id)
+	}
+	if stErr == nil {
+		vm.RemoveKnownHosts(st.ID)
 	}
 	if stErr == nil {
 		result := "success"

@@ -45,3 +45,27 @@ func TestRunWithoutPrepareIsSystemFailure(t *testing.T) {
 		t.Fatalf("want system failure, got %v", err)
 	}
 }
+
+func TestJobIDRejectsNonNumeric(t *testing.T) {
+	for _, v := range []string{"/../../../etc/x", "12 3", "1;reboot", "abc", "123456789012345678901"} {
+		t.Setenv("CUSTOM_ENV_CI_JOB_ID", v)
+		if id, err := jobID(); err == nil {
+			t.Errorf("%q accepted as %q", v, id)
+		}
+	}
+	t.Setenv("CUSTOM_ENV_CI_JOB_ID", "74196")
+	if id, err := jobID(); err != nil || id != "job-74196" {
+		t.Fatalf("numeric id: %q %v", id, err)
+	}
+}
+
+func TestLeadingDashImageIsRejected(t *testing.T) {
+	t.Setenv("CUSTOM_ENV_CI_JOB_ID", "77")
+	t.Setenv("CUSTOM_ENV_CI_JOB_IMAGE", "--privileged")
+	// No state file exists, so a system failure is expected before the image check;
+	// the image check itself is covered by ContainerCommand never seeing it.
+	var e *ExitError
+	if err := Run(config.Default(), "/nonexistent", "build_script"); !errors.As(err, &e) {
+		t.Fatalf("want ExitError, got %v", err)
+	}
+}

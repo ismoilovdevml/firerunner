@@ -219,7 +219,7 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config) {
 		d.metrics.bootSeconds.WithLabelValues("pool").Observe(time.Since(start).Seconds())
 		if len(cfg.Pool.PreloadImages) > 0 {
 			pullStart := time.Now()
-			if perr := preload(ctx, cfg, inst.IP); perr != nil {
+			if perr := preload(ctx, cfg, inst); perr != nil {
 				d.metrics.bootFailures.WithLabelValues("preload").Inc()
 				d.log.Error("image preload failed, VM kept without it", "id", id, "err", perr)
 			} else {
@@ -247,14 +247,14 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config) {
 }
 
 // preload pulls pool.preload_images into the VM's Docker.
-func preload(ctx context.Context, cfg config.Config, ip string) error {
+func preload(ctx context.Context, cfg config.Config, inst *vm.Instance) error {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 	args := "set -e"
 	for _, img := range cfg.Pool.PreloadImages {
 		args += "; docker pull -q " + shellQuote(img)
 	}
-	cmd := vm.SSH(cfg, ip, args)
+	cmd := vm.SSH(cfg, inst, args)
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -303,6 +303,7 @@ func (d *Daemon) delete(ctx context.Context, inst *vm.Instance, reason string) {
 		d.log.Error("delete failed", "id", inst.ID, "reason", reason, "err", err)
 		return
 	}
+	vm.RemoveKnownHosts(inst.ID)
 	d.log.Info("deleted microVM", "id", inst.ID, "reason", reason)
 }
 

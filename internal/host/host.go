@@ -113,16 +113,20 @@ func RegisterRunner(url, token, name string, concurrent int) error {
 	if err := os.MkdirAll("/var/lib/gitlab-runner", 0o755); err != nil {
 		return err
 	}
-	if err := run(RunnerBin, "register", "--non-interactive",
+	// The token goes through the environment, not argv, so local users cannot
+	// read it from /proc/<pid>/cmdline while gitlab-runner registers.
+	reg := exec.Command(RunnerBin, "register", "--non-interactive",
 		"--config", RunnerConfig,
-		"--url", url, "--token", token, "--name", name,
+		"--url", url, "--name", name,
 		"--executor", "custom",
 		"--builds-dir", "/root/builds", "--cache-dir", "/root/cache",
 		"--custom-prepare-exec", ExecutorBin, "--custom-prepare-args", "executor", "--custom-prepare-args", "prepare",
 		"--custom-run-exec", ExecutorBin, "--custom-run-args", "executor", "--custom-run-args", "run",
 		"--custom-cleanup-exec", ExecutorBin, "--custom-cleanup-args", "executor", "--custom-cleanup-args", "cleanup",
-	); err != nil {
-		return err
+	)
+	reg.Env = append(os.Environ(), "CI_SERVER_TOKEN="+token)
+	if out, err := reg.CombinedOutput(); err != nil {
+		return fmt.Errorf("gitlab-runner register: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
 	if err := SetConcurrent(concurrent); err != nil {
 		return err

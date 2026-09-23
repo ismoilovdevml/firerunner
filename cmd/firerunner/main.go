@@ -437,6 +437,7 @@ func cmdVM(cfg config.Config, args []string) error {
 				fmt.Fprintf(os.Stderr, "deleting %s: %v\n", ref, err)
 				continue
 			}
+			vm.RemoveKnownHosts(v.GetSpec().GetId())
 			fmt.Printf("deleted %s (%s)\n", v.GetSpec().GetId(), v.GetSpec().GetUid())
 		}
 		if failed > 0 {
@@ -496,7 +497,7 @@ func cmdRun(cfg config.Config, args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "%s ready at %s in %s\n", id, inst.IP, time.Since(start).Round(100*time.Millisecond))
 
-	code, runErr := vm.RunScript(cfg, inst.IP, strings.NewReader(strings.Join(command, " ")+"\n"), os.Stdout, os.Stderr)
+	code, runErr := vm.RunScript(cfg, inst, strings.NewReader(strings.Join(command, " ")+"\n"), os.Stdout, os.Stderr)
 	if *keep {
 		fmt.Fprintf(os.Stderr, "kept %s: ssh -i %s root@%s   (delete: firerunner vm rm %s)\n", id, cfg.Network.SSHKey, inst.IP, id)
 	} else {
@@ -505,6 +506,7 @@ func cmdRun(cfg config.Config, args []string) error {
 		if err := fl.Delete(dctx, inst.UID); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: deleting %s: %v\n", id, err)
 		} else {
+			vm.RemoveKnownHosts(id)
 			fmt.Fprintf(os.Stderr, "deleted %s (total %s)\n", id, time.Since(start).Round(100*time.Millisecond))
 		}
 	}

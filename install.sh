@@ -316,24 +316,37 @@ setup_network() {
 set -euo pipefail
 ip link show ${FR_BRIDGE} >/dev/null 2>&1 || ip link add ${FR_BRIDGE} type bridge
 ip addr replace ${FR_SUBNET}.1/24 dev ${FR_BRIDGE}
+# microVMs get IPv4 only; with IPv6 on the bridge they could reach host services via fe80::.
+sysctl -qw net.ipv6.conf.${FR_BRIDGE}.disable_ipv6=1 2>/dev/null || true
 ip link set ${FR_BRIDGE} up
 sysctl -qw net.ipv4.ip_forward=1
 nft -f - <<'NFT'
 table ip firerunner
 delete table ip firerunner
-table ip firerunner {
+table inet firerunner
+delete table inet firerunner
+table bridge firerunner
+delete table bridge firerunner
+table inet firerunner {
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
     ip saddr ${FR_SUBNET}.0/24 oifname != "${FR_BRIDGE}" masquerade
   }
   chain input {
     type filter hook input priority filter; policy accept;
-    # microVMs may only use DHCP and DNS on the host
+    # microVMs may only use DHCP, DNS and the registry mirror on the host (IPv4 and IPv6)
     iifname "${FR_BRIDGE}" udp dport { 53, 67 } accept
     iifname "${FR_BRIDGE}" tcp dport 53 accept
     iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport 5000 accept
     iifname "${FR_BRIDGE}" ct state established,related accept
     iifname "${FR_BRIDGE}" drop
+  }
+}
+# Jobs of different projects share the bridge: no frame may pass between two microVMs.
+table bridge firerunner {
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    iifname "fltap*" oifname "fltap*" drop
   }
 }
 NFT
@@ -342,6 +355,8 @@ EOF
     put "$LIB_DIR/net-down.sh" 0755 <<EOF
 #!/usr/bin/env bash
 nft delete table ip firerunner 2>/dev/null || true
+nft delete table inet firerunner 2>/dev/null || true
+nft delete table bridge firerunner 2>/dev/null || true
 ip link del ${FR_BRIDGE} 2>/dev/null || true
 EOF
 
@@ -433,7 +448,18 @@ install_flintlock() {
         (umask 077; head -c 32 /dev/urandom | base64 | tr -d '/+=\n' >"$CONF_DIR/flintlock.token")
     fi
     chmod 0600 "$CONF_DIR/flintlock.token"
-    printf 'FLINTLOCK_TOKEN=%s\n' "$(cat "$CONF_DIR/flintlock.token")" | put "$CONF_DIR/flintlock.env" 0600
+    rm -f "$CONF_DIR/flintlock.env"   # older installs passed the token on the command line
+    # flintlockd reads every flag from this file (viper); the token never appears in argv.
+    put /etc/opt/flintlockd/config.yaml 0600 <<EOF
+containerd-socket: ${CONTAINERD_SOCK}
+grpc-endpoint: ${FLINTLOCK_ENDPOINT}
+bridge-name: ${FR_BRIDGE}
+firecracker-bin: ${BIN_DIR}/firecracker
+basic-auth-token: $(cat "$CONF_DIR/flintlock.token")
+insecure: true
+log-format: json
+verbosity: 1
+EOF
 
     put /etc/systemd/system/flintlockd.service <<EOF
 [Unit]
@@ -442,16 +468,8 @@ Requires=containerd-flintlock.service firerunner-net.service
 After=containerd-flintlock.service firerunner-net.service
 
 [Service]
-EnvironmentFile=${CONF_DIR}/flintlock.env
-ExecStart=${BIN_DIR}/flintlockd run \\
-  --containerd-socket ${CONTAINERD_SOCK} \\
-  --grpc-endpoint ${FLINTLOCK_ENDPOINT} \\
-  --bridge-name ${FR_BRIDGE} \\
-  --firecracker-bin ${BIN_DIR}/firecracker \\
-  --basic-auth-token \${FLINTLOCK_TOKEN} \\
-  --insecure \\
-  --log-format json \\
-  --verbosity 1
+# All settings, including the API token, come from /etc/opt/flintlockd/config.yaml (0600).
+ExecStart=${BIN_DIR}/flintlockd run
 Restart=always
 RestartSec=5
 KillMode=process
@@ -491,7 +509,7 @@ storage:
   filesystem:
     rootdirectory: /var/lib/firerunner/registry
   delete:
-    enabled: true
+    enabled: false
 http:
   addr: ${FR_SUBNET}.1:5000
 proxy:
@@ -521,6 +539,11 @@ EOF
 open_metrics_port() {
     [[ -n $FR_METRICS_ALLOW ]] || return 0
     log "allowing ${FR_METRICS_ALLOW} to scrape :9477/metrics"
+    # metrics listen on 127.0.0.1 by default; open them only together with the firewall rule
+    if [[ "$($BIN_DIR/firerunner config get daemon.metrics_listen)" != ":9477" ]]; then
+        $BIN_DIR/firerunner config set daemon.metrics_listen ":9477" >/dev/null
+        systemctl restart firerunner
+    fi
     if systemctl is-active -q firewalld 2>/dev/null; then
         firewall-cmd -q --permanent --add-rich-rule="rule family=ipv4 source address=${FR_METRICS_ALLOW} port port=9477 protocol=tcp accept"
         firewall-cmd -q --reload
@@ -622,7 +645,7 @@ start_services() {
             firerunner-net)       files="$LIB_DIR/net-up.sh" ;;
             firerunner-dnsmasq)   files="$CONF_DIR/dnsmasq.conf" ;;
             firerunner-registry)  files="$CONF_DIR/registry.yml $BIN_DIR/registry" ;;
-            flintlockd)           files="$CONF_DIR/flintlock.env $BIN_DIR/flintlockd $BIN_DIR/firecracker" ;;
+            flintlockd)           files="/etc/opt/flintlockd/config.yaml $BIN_DIR/flintlockd $BIN_DIR/firecracker" ;;
         esac
         # shellcheck disable=SC2086
         if ! systemctl is-active -q "$svc" || changed "/etc/systemd/system/$svc.service" $files; then

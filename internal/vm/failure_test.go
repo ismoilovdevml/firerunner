@@ -195,3 +195,20 @@ func TestFitsFailurePaths(t *testing.T) {
 		}
 	})
 }
+
+func TestCreateJobStateIsExclusive(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "jobs", "job-1.json")
+	if err := CreateJobState(p, &JobState{Instance: Instance{IP: "10.0.0.1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateJobState(p, &JobState{Instance: Instance{IP: "10.0.0.2"}}); err == nil {
+		t.Fatal("second create must fail")
+	}
+	st, err := LoadJobState(p)
+	if err != nil || st.IP != "10.0.0.1" {
+		t.Fatalf("state replaced: %+v %v", st, err)
+	}
+	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v", fi.Mode().Perm())
+	}
+}
