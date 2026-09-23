@@ -159,6 +159,8 @@ usage, host memory, service health. A Grafana dashboard and alert rules are in
 - Memory admission: VMs are only booted when their memory is available, so a busy host
   queues jobs instead of running out of memory.
 - Everything the installer and `upgrade` download is checksum-verified.
+- Release binaries carry a signed build provenance and an SBOM:
+  `gh attestation verify firerunner-linux-amd64 --repo ismoilovdevml/firerunner`.
 
 A source-level audit with [cloudflare/security-audit-skill](https://github.com/cloudflare/security-audit-skill)
 found no confirmed vulnerability; its four open leads are fixed as described above.
