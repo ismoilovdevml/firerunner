@@ -9,7 +9,7 @@ ARG GITLAB_RUNNER_VERSION=19.4.0
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        systemd systemd-sysv udev dbus kmod \
+        systemd systemd-sysv systemd-resolved udev dbus kmod \
         cloud-init openssh-server sudo \
         iproute2 iputils-ping dnsutils ca-certificates \
         curl wget git git-lfs jq unzip zip xz-utils tar gzip make python3 \
