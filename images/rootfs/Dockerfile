@@ -36,6 +36,9 @@ RUN printf 'L+ /etc/resolv.conf - - - - /run/systemd/resolve/stub-resolv.conf\n'
     # The guest kernel has legacy iptables NAT built in; nf_tables is only a module.
     && update-alternatives --set iptables /usr/sbin/iptables-legacy \
     && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy \
+    # ...and no iptables raw table, which Docker 28 uses for direct-access filtering.
+    && mkdir -p /etc/systemd/system/docker.service.d \
+    && printf '[Service]\nEnvironment=DOCKER_INSECURE_NO_IPTABLES_RAW=1\n' >/etc/systemd/system/docker.service.d/firerunner.conf \
     && systemctl enable ssh \
     && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config \
     && rm -f /etc/ssh/ssh_host_*_key* \
