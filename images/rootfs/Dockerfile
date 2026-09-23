@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cloud-init openssh-server sudo \
         iproute2 iputils-ping dnsutils ca-certificates \
         curl wget git git-lfs jq unzip zip xz-utils tar gzip make python3 \
+        docker.io iptables \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # gitlab-runner inside the guest is used by the custom executor for artifacts and cache.
@@ -27,8 +28,11 @@ RUN printf 'L+ /etc/resolv.conf - - - - /run/systemd/resolve/stub-resolv.conf\n'
     # Flintlock serves meta-data/user-data over MMDS (ds=nocloud-net on the kernel cmdline).
     && printf 'datasource_list: [ NoCloud, None ]\n' >/etc/cloud/cloud.cfg.d/90-firerunner.cfg \
     # Jobs are short-lived: skip timers and units that only slow boot down.
-    && systemctl mask apt-daily.timer apt-daily-upgrade.timer motd-news.timer \
-        e2scrub_all.timer fstrim.timer man-db.timer systemd-networkd-wait-online.service \
+    && systemctl mask apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service \
+        motd-news.timer e2scrub_all.timer fstrim.timer man-db.timer systemd-networkd-wait-online.service \
+    # Docker starts on first use (socket activation) so it does not slow down boot.
+    && systemctl disable docker.service containerd.service \
+    && systemctl enable docker.socket \
     && systemctl enable ssh \
     && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config \
     && rm -f /etc/ssh/ssh_host_*_key* \
