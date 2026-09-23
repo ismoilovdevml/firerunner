@@ -156,8 +156,8 @@ func (d *Daemon) listenSocket() (net.Listener, error) {
 
 // fingerprint changes whenever a setting that affects how a VM is booted changes.
 func fingerprint(c config.Config) string {
-	return fmt.Sprintf("%d/%d/%s/%s/%v/%s/%v", c.VM.VCPU, c.VM.MemoryMB, c.VM.KernelImage, c.VM.RootFSImage,
-		c.VM.KernelCmdline, c.VM.RegistryMirror, c.Pool.PreloadImages)
+	return fmt.Sprintf("%d/%d/%s/%s/%v/%s/%s/%s/%v", c.VM.VCPU, c.VM.MemoryMB, c.VM.KernelImage, c.VM.RootFSImage,
+		c.VM.KernelCmdline, c.VM.RegistryMirror, c.VM.DockerBIP, c.VM.DockerAddressPool, c.Pool.PreloadImages)
 }
 
 // Claim hands a ready pool VM to a job. It returns nil when the pool is empty.

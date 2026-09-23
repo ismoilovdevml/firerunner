@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -85,12 +86,8 @@ users:
 bootcmd:
   - ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 `, id, sshPubKey)
-	if cfg.VM.RegistryMirror != "" {
-		userData += fmt.Sprintf(`write_files:
-  - path: /etc/docker/daemon.json
-    content: '{"registry-mirrors": ["%s"]}'
-`, cfg.VM.RegistryMirror)
-	}
+	daemonJSON, _ := json.Marshal(DockerDaemonConfig(cfg))
+	userData += fmt.Sprintf("write_files:\n  - path: /etc/docker/daemon.json\n    content: '%s'\n", daemonJSON)
 	metaData := fmt.Sprintf("instance_id: %s/%s\nlocal_hostname: %s\nplatform: liquid_metal\n", cfg.Flintlock.Namespace, id, id)
 
 	kernelFile := "boot/vmlinux"
@@ -126,6 +123,18 @@ bootcmd:
 			"vendor-data": base64.StdEncoding.EncodeToString([]byte("#cloud-config\n{}\n")),
 		},
 	}
+}
+
+// DockerDaemonConfig is the guest's /etc/docker/daemon.json.
+func DockerDaemonConfig(cfg config.Config) map[string]any {
+	d := map[string]any{
+		"bip":                   cfg.VM.DockerBIP,
+		"default-address-pools": []map[string]any{{"base": cfg.VM.DockerAddressPool, "size": 24}},
+	}
+	if cfg.VM.RegistryMirror != "" {
+		d["registry-mirrors"] = []string{cfg.VM.RegistryMirror}
+	}
+	return d
 }
 
 // MAC derives a stable, locally administered MAC from the microVM id,

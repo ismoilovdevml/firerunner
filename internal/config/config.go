@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -60,6 +61,10 @@ type VM struct {
 	RegistryMirror string `yaml:"registry_mirror"`
 	// HostReserveMB is memory kept free on the host; microVMs wait for it.
 	HostReserveMB int `yaml:"host_reserve_mb"`
+	// DockerBIP and DockerAddressPool keep the guest's Docker networks away from
+	// Docker's default 172.17.0.0/16, which often collides with company LANs.
+	DockerBIP         string `yaml:"docker_bip"`
+	DockerAddressPool string `yaml:"docker_address_pool"`
 }
 
 type Network struct {
@@ -79,10 +84,12 @@ func Default() Config {
 			MemoryMB:    2048,
 			KernelImage: "ghcr.io/liquidmetal-dev/flintlock-kernel:5.10.77",
 			// The 5.10 kernel cannot parse the ACPI tables of Firecracker >= 1.11.
-			KernelCmdline: map[string]string{"acpi": "off"},
-			RootFSImage:   "ghcr.io/ismoilovdevml/firerunner-rootfs:latest",
-			BootTimeout:   3 * time.Minute,
-			HostReserveMB: 1024,
+			KernelCmdline:     map[string]string{"acpi": "off"},
+			RootFSImage:       "ghcr.io/ismoilovdevml/firerunner-rootfs:latest",
+			BootTimeout:       3 * time.Minute,
+			HostReserveMB:     1024,
+			DockerBIP:         "10.201.0.1/24",
+			DockerAddressPool: "10.202.0.0/16",
 		},
 		Pool: Pool{Size: 2, MaxIdle: 30 * time.Minute},
 		Daemon: Daemon{
@@ -151,6 +158,12 @@ func (c Config) Validate() error {
 	}
 	if c.VM.BootTimeout < 10*time.Second {
 		errs = append(errs, "vm.boot_timeout must be at least 10s")
+	}
+	if _, _, err := net.ParseCIDR(c.VM.DockerBIP); err != nil {
+		errs = append(errs, "vm.docker_bip must be a CIDR like 10.201.0.1/24")
+	}
+	if _, _, err := net.ParseCIDR(c.VM.DockerAddressPool); err != nil {
+		errs = append(errs, "vm.docker_address_pool must be a CIDR like 10.202.0.0/16")
 	}
 	if c.VM.HostReserveMB < 0 {
 		errs = append(errs, "vm.host_reserve_mb must not be negative")

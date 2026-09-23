@@ -68,3 +68,18 @@ func TestSpec(t *testing.T) {
 		t.Fatal("spec aliases config map")
 	}
 }
+
+func TestDockerDaemonConfigAvoidsDefaultBridge(t *testing.T) {
+	cfg := config.Default()
+	cfg.VM.RegistryMirror = "http://10.200.0.1:5000"
+	s := Spec(cfg, "job-9", MAC("job-9"), "ssh-ed25519 AAAA k", nil)
+	ud, _ := base64.StdEncoding.DecodeString(s.GetMetadata()["user-data"])
+	for _, want := range []string{`"bip":"10.201.0.1/24"`, `"base":"10.202.0.0/16"`, `"registry-mirrors":["http://10.200.0.1:5000"]`, "/etc/docker/daemon.json"} {
+		if !strings.Contains(string(ud), want) {
+			t.Errorf("user-data lacks %s:\n%s", want, ud)
+		}
+	}
+	if strings.Contains(string(ud), "172.17.") {
+		t.Error("guest Docker must not use 172.17.0.0/16")
+	}
+}
