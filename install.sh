@@ -135,6 +135,35 @@ verify() {
     [[ "$got" == "$2" ]] || die "checksum mismatch for $(basename "$1"): got $got, want $2"
 }
 
+# Files that changed in this run; a service restarts only if one of its
+# files changed, so re-running the installer does not kill running jobs.
+CHANGED=" "
+
+# put FILE [MODE]: write stdin to FILE only when the content differs.
+put() {
+    local f=$1 mode=${2:-0644} tmp
+    tmp=$(mktemp)
+    cat >"$tmp"
+    if [[ -f $f ]] && cmp -s "$tmp" "$f"; then
+        rm -f "$tmp"
+        chmod "$mode" "$f"
+        return 0
+    fi
+    mkdir -p "$(dirname "$f")"
+    install -m "$mode" "$tmp" "$f"
+    rm -f "$tmp"
+    CHANGED+="$f "
+}
+
+# installed FILE: record that a binary was (re)installed.
+installed() { CHANGED+="$1 "; }
+
+changed() {
+    local f
+    for f in "$@"; do [[ $CHANGED == *" $f "* ]] && return 0; done
+    return 1
+}
+
 # --------------------------------------------------------------------------
 # containerd with devmapper snapshotter
 # --------------------------------------------------------------------------
@@ -150,12 +179,13 @@ install_containerd() {
         fetch "$base/$tgz.sha256sum" "$TMP_DIR/$tgz.sha256sum"
         verify "$TMP_DIR/$tgz" "$(awk '{print $1}' "$TMP_DIR/$tgz.sha256sum")"
         tar -xzf "$TMP_DIR/$tgz" -C /usr/local
+        installed "$BIN_DIR/containerd"
     else
         log "containerd v${CONTAINERD_VERSION} already installed"
     fi
 
     mkdir -p "$CONF_DIR" "$CONTAINERD_ROOT/snapshotter/devmapper"
-    cat >"$CONF_DIR/containerd.toml" <<EOF
+    put "$CONF_DIR/containerd.toml" <<EOF
 version = 2
 root = "${CONTAINERD_ROOT}"
 state = "${CONTAINERD_STATE}"
@@ -174,7 +204,7 @@ state = "${CONTAINERD_STATE}"
 EOF
 
     # Dedicated instance so it never clashes with a Docker/Kubernetes containerd.
-    cat >/etc/systemd/system/containerd-flintlock.service <<EOF
+    put /etc/systemd/system/containerd-flintlock.service <<EOF
 [Unit]
 Description=containerd for flintlock microVMs
 After=network.target local-fs.target lvm2-monitor.service
@@ -239,7 +269,7 @@ setup_thinpool() {
     fi
 
     mkdir -p /etc/lvm/profile
-    cat >/etc/lvm/profile/${THINPOOL}.profile <<'EOF'
+    put /etc/lvm/profile/${THINPOOL}.profile <<'EOF'
 activation {
   thin_pool_autoextend_threshold=80
   thin_pool_autoextend_percent=20
@@ -270,6 +300,7 @@ install_firecracker() {
     local rel="$TMP_DIR/release-v${FIRECRACKER_VERSION}-${FC_ARCH}"
     install -m 0755 "$rel/firecracker-v${FIRECRACKER_VERSION}-${FC_ARCH}" "$BIN_DIR/firecracker"
     install -m 0755 "$rel/jailer-v${FIRECRACKER_VERSION}-${FC_ARCH}" "$BIN_DIR/jailer"
+    installed "$BIN_DIR/firecracker"
 }
 
 # --------------------------------------------------------------------------
@@ -280,7 +311,7 @@ setup_network() {
     log "configuring bridge ${FR_BRIDGE} (${FR_SUBNET}.0/24) with DHCP and NAT"
     mkdir -p "$LIB_DIR" "$CONF_DIR"
 
-    cat >"$LIB_DIR/net-up.sh" <<EOF
+    put "$LIB_DIR/net-up.sh" 0755 <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 ip link show ${FR_BRIDGE} >/dev/null 2>&1 || ip link add ${FR_BRIDGE} type bridge
@@ -308,18 +339,17 @@ table ip firerunner {
 NFT
 EOF
 
-    cat >"$LIB_DIR/net-down.sh" <<EOF
+    put "$LIB_DIR/net-down.sh" 0755 <<EOF
 #!/usr/bin/env bash
 nft delete table ip firerunner 2>/dev/null || true
 ip link del ${FR_BRIDGE} 2>/dev/null || true
 EOF
-    chmod 0755 "$LIB_DIR/net-up.sh" "$LIB_DIR/net-down.sh"
 
-    cat >/etc/sysctl.d/90-firerunner.conf <<'EOF'
+    put /etc/sysctl.d/90-firerunner.conf <<'EOF'
 net.ipv4.ip_forward = 1
 EOF
 
-    cat >/etc/systemd/system/firerunner-net.service <<EOF
+    put /etc/systemd/system/firerunner-net.service <<EOF
 [Unit]
 Description=FireRunner microVM bridge and NAT
 After=network-online.target firewalld.service
@@ -335,7 +365,7 @@ ExecStop=${LIB_DIR}/net-down.sh
 WantedBy=multi-user.target
 EOF
 
-    cat >"$CONF_DIR/dnsmasq.conf" <<EOF
+    put "$CONF_DIR/dnsmasq.conf" <<EOF
 interface=${FR_BRIDGE}
 bind-interfaces
 except-interface=lo
@@ -348,7 +378,7 @@ log-dhcp
 EOF
 
     mkdir -p /var/lib/misc
-    cat >/etc/systemd/system/firerunner-dnsmasq.service <<EOF
+    put /etc/systemd/system/firerunner-dnsmasq.service <<EOF
 [Unit]
 Description=FireRunner DHCP/DNS for microVMs
 Requires=firerunner-net.service
@@ -393,6 +423,7 @@ install_flintlock() {
         fetch "$base/checksums.txt" "$TMP_DIR/checksums.txt"
         verify "$TMP_DIR/$bin" "$(awk -v f="$bin" '$2==f {print $1}' "$TMP_DIR/checksums.txt")"
         install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/flintlockd"
+        installed "$BIN_DIR/flintlockd"
     else
         log "flintlockd v${FLINTLOCK_VERSION} already installed"
     fi
@@ -402,9 +433,9 @@ install_flintlock() {
         (umask 077; head -c 32 /dev/urandom | base64 | tr -d '/+=\n' >"$CONF_DIR/flintlock.token")
     fi
     chmod 0600 "$CONF_DIR/flintlock.token"
-    (umask 077; printf 'FLINTLOCK_TOKEN=%s\n' "$(cat "$CONF_DIR/flintlock.token")" >"$CONF_DIR/flintlock.env")
+    printf 'FLINTLOCK_TOKEN=%s\n' "$(cat "$CONF_DIR/flintlock.token")" | put "$CONF_DIR/flintlock.env" 0600
 
-    cat >/etc/systemd/system/flintlockd.service <<EOF
+    put /etc/systemd/system/flintlockd.service <<EOF
 [Unit]
 Description=flintlock microVM service
 Requires=containerd-flintlock.service firerunner-net.service
@@ -449,9 +480,10 @@ install_registry_mirror() {
         verify "$TMP_DIR/$tgz" "$(awk '{print $1}' "$TMP_DIR/$tgz.sha256")"
         tar -xzf "$TMP_DIR/$tgz" -C "$TMP_DIR" registry
         install -m 0755 "$TMP_DIR/registry" "$BIN_DIR/registry"
+        installed "$BIN_DIR/registry"
     fi
     mkdir -p /var/lib/firerunner/registry
-    cat >"$CONF_DIR/registry.yml" <<EOF
+    put "$CONF_DIR/registry.yml" <<EOF
 version: 0.1
 log:
   level: warn
@@ -466,7 +498,7 @@ proxy:
   remoteurl: https://registry-1.docker.io
   ttl: 168h
 EOF
-    cat >/etc/systemd/system/firerunner-registry.service <<EOF
+    put /etc/systemd/system/firerunner-registry.service <<EOF
 [Unit]
 Description=FireRunner Docker Hub pull-through mirror for microVMs
 Requires=firerunner-net.service
@@ -500,7 +532,7 @@ open_metrics_port() {
 install_firerunner() {
     if [[ -n $FR_BINARY ]]; then
         log "installing firerunner from $FR_BINARY"
-        install -m 0755 "$FR_BINARY" "$BIN_DIR/firerunner"
+        put "$BIN_DIR/firerunner" 0755 <"$FR_BINARY"
     else
         log "installing firerunner ${FR_VERSION}"
         local base="https://github.com/${FR_REPO}/releases/download/${FR_VERSION}"
@@ -508,7 +540,7 @@ install_firerunner() {
         fetch "$base/$bin" "$TMP_DIR/$bin"
         fetch "$base/checksums.txt" "$TMP_DIR/fr.sums"
         verify "$TMP_DIR/$bin" "$(awk -v f="$bin" '$2==f {print $1}' "$TMP_DIR/fr.sums")"
-        install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/firerunner"
+        put "$BIN_DIR/firerunner" 0755 <"$TMP_DIR/$bin"
     fi
     log "  $($BIN_DIR/firerunner version)"
 
@@ -522,7 +554,7 @@ install_firerunner() {
         $BIN_DIR/firerunner config set vm.registry_mirror "http://${FR_SUBNET}.1:5000" >/dev/null
     fi
 
-    cat >/etc/systemd/system/firerunner.service <<EOF
+    put /etc/systemd/system/firerunner.service <<EOF
 [Unit]
 Description=FireRunner daemon (microVM pool, reconcile, metrics)
 Requires=flintlockd.service
@@ -582,10 +614,21 @@ register_runner() {
 
 start_services() {
     systemctl daemon-reload
-    local svc
+    local svc files
     for svc in containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry flintlockd; do
         systemctl enable -q "$svc"
-        systemctl restart "$svc"
+        case $svc in
+            containerd-flintlock) files="$CONF_DIR/containerd.toml $BIN_DIR/containerd" ;;
+            firerunner-net)       files="$LIB_DIR/net-up.sh" ;;
+            firerunner-dnsmasq)   files="$CONF_DIR/dnsmasq.conf" ;;
+            firerunner-registry)  files="$CONF_DIR/registry.yml $BIN_DIR/registry" ;;
+            flintlockd)           files="$CONF_DIR/flintlock.env $BIN_DIR/flintlockd $BIN_DIR/firecracker" ;;
+        esac
+        # shellcheck disable=SC2086
+        if ! systemctl is-active -q "$svc" || changed "/etc/systemd/system/$svc.service" $files; then
+            log "  (re)starting $svc"
+            systemctl restart "$svc"
+        fi
     done
 }
 
@@ -666,7 +709,9 @@ main() {
     install_firerunner
     systemctl daemon-reload
     systemctl enable -q firerunner
-    systemctl restart firerunner
+    if ! systemctl is-active -q firerunner || changed /etc/systemd/system/firerunner.service "$BIN_DIR/firerunner"; then
+        systemctl restart firerunner
+    fi
     open_metrics_port
     verify_install
     register_runner
