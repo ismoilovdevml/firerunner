@@ -1,507 +1,486 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+# FireRunner host installer.
+#
+# Prepares a KVM host (bare metal or a VM with nested virtualization) to run
+# Firecracker microVMs through Flintlock:
+#   containerd (devmapper thin pool) + Firecracker/jailer + flintlockd + bridge/DHCP/NAT
+#
+# Usage:
+#   curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash
+#   curl -sfL .../install.sh | sudo FR_DISK=/dev/sdb bash      # choose the thin-pool disk
+#   curl -sfL .../install.sh | sudo bash -s -- uninstall        # remove services (keeps data)
+#
+# Settings (environment variables):
+#   FR_DISK                 empty block device for the thin pool (default: auto-detect a blank disk)
+#   FR_BRIDGE               bridge for microVM taps          (default: br-fc)
+#   FR_SUBNET               /24 prefix for microVMs           (default: 10.200.0)
+#   CONTAINERD_VERSION      (default: 1.7.35)
+#   FIRECRACKER_VERSION     (default: 1.17.0)
+#   FLINTLOCK_VERSION       (default: 0.15.2)
+#
+# Safe to re-run: every step checks current state first.
 
-# FireRunner One-Click Installer
-# Usage: curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash
-# Or: wget -qO- https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash
+set -euo pipefail
 
-VERSION="v1.0.0"
-INSTALL_DIR="/usr/local/bin"
-CONFIG_DIR="/etc/firerunner"
-FLINTLOCK_CONFIG_DIR="/etc/flintlock"
-PKG_MANAGER=""
+CONTAINERD_VERSION="${CONTAINERD_VERSION:-1.7.35}"
+FIRECRACKER_VERSION="${FIRECRACKER_VERSION:-1.17.0}"
+FLINTLOCK_VERSION="${FLINTLOCK_VERSION:-0.15.2}"
 
-# Logging
-log_info() { echo "[✓] $1"; }
-log_warn() { echo "[!] $1"; }
-log_error() { echo "[✗] $1"; }
-log_step() { echo "[→] $1"; }
+FR_DISK="${FR_DISK:-}"
+FR_BRIDGE="${FR_BRIDGE:-br-fc}"
+FR_SUBNET="${FR_SUBNET:-10.200.0}"
 
-# Banner
-show_banner() {
-    cat <<'EOF'
-╔═══════════════════════════════════════════════════════════╗
-║                                                           ║
-║           🔥 FireRunner Installer v1.0.0 🔥              ║
-║                                                           ║
-║     Ephemeral GitLab CI/CD Runners with Firecracker      ║
-║                                                           ║
-╚═══════════════════════════════════════════════════════════╝
-EOF
-    echo ""
-}
+BIN_DIR=/usr/local/bin
+LIB_DIR=/usr/local/lib/firerunner
+CONF_DIR=/etc/firerunner
+VG=flintlock
+THINPOOL="${VG}-thinpool"          # device-mapper name of ${VG}/thinpool
+CONTAINERD_ROOT=/var/lib/containerd-flintlock
+CONTAINERD_STATE=/run/containerd-flintlock
+CONTAINERD_SOCK="${CONTAINERD_STATE}/containerd.sock"
+FLINTLOCK_ENDPOINT=127.0.0.1:9090
 
-# Check root
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root"
-        echo "Usage: curl -sfL https://... | sudo bash"
-        exit 1
-    fi
-}
+TMP_DIR=""
 
-# Detect package manager
-detect_package_manager() {
-    if command -v apt-get &>/dev/null; then
-        PKG_MANAGER="apt"
-    elif command -v dnf &>/dev/null; then
-        PKG_MANAGER="dnf"
-    elif command -v yum &>/dev/null; then
-        PKG_MANAGER="yum"
-    else
-        log_error "No supported package manager found (apt/dnf/yum)"
-        exit 1
-    fi
-}
+log()  { printf '[firerunner] %s\n' "$*"; }
+warn() { printf '[firerunner] WARNING: %s\n' "$*" >&2; }
+die()  { printf '[firerunner] ERROR: %s\n' "$*" >&2; exit 1; }
 
-# Check OS
-check_os() {
-    log_step "Checking operating system..."
+cleanup() { [[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"; return 0; }
+trap cleanup EXIT
 
-    if [[ ! -f /etc/os-release ]]; then
-        log_error "Cannot detect OS"
-        exit 1
-    fi
+# --------------------------------------------------------------------------
+# Preflight
+# --------------------------------------------------------------------------
 
-    source /etc/os-release
+preflight() {
+    [[ $EUID -eq 0 ]] || die "run as root (curl ... | sudo bash)"
+    command -v systemctl >/dev/null || die "systemd is required"
 
-    log_info "OS: $ID $VERSION_ID"
+    case "$(uname -m)" in
+        x86_64)  ARCH=amd64; FC_ARCH=x86_64 ;;
+        aarch64) ARCH=arm64; FC_ARCH=aarch64 ;;
+        *) die "unsupported architecture: $(uname -m)" ;;
+    esac
 
-    # Detect package manager
-    detect_package_manager
-    log_info "Package manager: $PKG_MANAGER"
-}
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case "${ID_LIKE:-} ${ID}" in
+        *debian*|*ubuntu*) PKG=apt ;;
+        *rhel*|*fedora*|*centos*|*rocky*|*almalinux*) PKG=dnf ;;
+        *) die "unsupported OS: ${PRETTY_NAME:-unknown} (need Ubuntu/Debian or RHEL-family)" ;;
+    esac
+    log "OS: ${PRETTY_NAME}, arch: ${ARCH}"
 
-# Detect if running in a virtual machine
-detect_virtualization() {
-    local is_vm=false
-    local vm_type=""
-
-    # Check systemd-detect-virt (most reliable)
-    if command -v systemd-detect-virt &>/dev/null; then
-        local virt=$(systemd-detect-virt 2>/dev/null)
-        if [[ "$virt" != "none" ]]; then
-            is_vm=true
-            vm_type=$virt
+    if [[ ! -c /dev/kvm ]]; then
+        if grep -qE 'vmx|svm' /proc/cpuinfo; then
+            modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null || true
         fi
+        [[ -c /dev/kvm ]] || die "/dev/kvm not found. On bare metal enable VT-x/AMD-V in BIOS.
+  In a VM enable nested virtualization (VMware: 'Expose hardware assisted
+  virtualization to the guest OS'; KVM: nested=1; cloud: a nested-virt instance type)."
     fi
-
-    # Check lscpu for hypervisor
-    if lscpu | grep -q "Hypervisor vendor"; then
-        is_vm=true
-        [[ -z "$vm_type" ]] && vm_type=$(lscpu | grep "Hypervisor vendor" | awk '{print $3}')
-    fi
-
-    # Check BIOS vendor for QEMU/VMware/VirtualBox
-    if [[ -f /sys/class/dmi/id/bios_vendor ]]; then
-        local bios=$(cat /sys/class/dmi/id/bios_vendor)
-        if echo "$bios" | grep -qiE "qemu|vmware|virtualbox|xen|microsoft"; then
-            is_vm=true
-            [[ -z "$vm_type" ]] && vm_type=$bios
-        fi
-    fi
-
-    echo "$is_vm:$vm_type"
-}
-
-# Check prerequisites
-check_prerequisites() {
-    log_step "Checking prerequisites..."
-
-    # Detect if running in VM
-    local virt_info=$(detect_virtualization)
-    local is_vm=$(echo "$virt_info" | cut -d: -f1)
-    local vm_type=$(echo "$virt_info" | cut -d: -f2)
-
-    # KVM support
-    if [[ ! -e /dev/kvm ]]; then
-        log_error "KVM not available (/dev/kvm not found)"
-        echo ""
-
-        if [[ "$is_vm" == "true" ]]; then
-            cat << 'VMEOF'
-
-════════════════════════════════════════════════════════════
-ERROR: Running in Virtual Machine
-════════════════════════════════════════════════════════════
-
-Firecracker requires KVM hardware access (/dev/kvm).
-Your server is a VM - nested virtualization not available.
-
-SOLUTION: Use a bare metal / dedicated server.
-
-Examples: Hetzner Dedicated, OVH Bare Metal, Contabo VDS
-
-════════════════════════════════════════════════════════════
-
-VMEOF
-        else
-            echo "KVM module not loaded or virtualization disabled in BIOS."
-            echo ""
-            echo "Try: sudo modprobe kvm kvm_intel  # or kvm_amd for AMD"
-            echo ""
-            echo "If that fails, enable VT-x/AMD-V in BIOS settings."
-        fi
-        exit 1
-    fi
-
-    if [[ "$is_vm" == "true" ]]; then
-        log_warn "Running in VM ($vm_type) but /dev/kvm exists (nested virtualization)"
-    else
-        log_info "Bare metal detected"
-    fi
-    log_info "KVM support detected"
-
-    # CPU cores
-    local cpu_cores=$(nproc)
-    if [[ $cpu_cores -lt 4 ]]; then
-        log_warn "Only $cpu_cores CPU cores (4+ recommended)"
-    else
-        log_info "CPU cores: $cpu_cores"
-    fi
-
-    # RAM
-    local ram_gb=$(free -g | awk '/^Mem:/{print $2}')
-    if [[ $ram_gb -lt 16 ]]; then
-        log_warn "Only ${ram_gb}GB RAM (16GB+ recommended)"
-    else
-        log_info "RAM: ${ram_gb}GB"
+    if systemd-detect-virt -q 2>/dev/null; then
+        log "running inside a VM ($(systemd-detect-virt)); nested virtualization detected via /dev/kvm"
     fi
 }
 
-# Install dependencies
-install_dependencies() {
-    log_step "Installing dependencies..."
-
-    local packages="curl wget tar git make jq openssl ca-certificates"
-
-    if [[ "$PKG_MANAGER" == "apt" ]]; then
+install_packages() {
+    log "installing packages"
+    if [[ $PKG == apt ]]; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq $packages gnupg >/dev/null 2>&1
-    elif [[ "$PKG_MANAGER" == "dnf" ]]; then
-        dnf install -y -q $packages >/dev/null 2>&1
-    elif [[ "$PKG_MANAGER" == "yum" ]]; then
-        yum install -y -q $packages >/dev/null 2>&1
+        apt-get install -y -qq curl tar lvm2 thin-provisioning-tools dnsmasq-base nftables iproute2 >/dev/null
+    else
+        dnf install -y -q curl tar lvm2 device-mapper-persistent-data dnsmasq nftables iproute >/dev/null
     fi
-
-    log_info "Dependencies installed"
 }
 
-# Install Firecracker
+# --------------------------------------------------------------------------
+# Downloads (always checksum-verified)
+# --------------------------------------------------------------------------
+
+# fetch URL DEST
+fetch() { curl -fsSL --retry 3 --retry-delay 2 -o "$2" "$1" || die "download failed: $1"; }
+
+# verify FILE SHA256
+verify() {
+    local got
+    got=$(sha256sum "$1" | awk '{print $1}')
+    [[ "$got" == "$2" ]] || die "checksum mismatch for $(basename "$1"): got $got, want $2"
+}
+
+# --------------------------------------------------------------------------
+# containerd with devmapper snapshotter
+# --------------------------------------------------------------------------
+
+install_containerd() {
+    local have=""
+    [[ -x $BIN_DIR/containerd ]] && have=$($BIN_DIR/containerd --version | awk '{print $3}')
+    if [[ "$have" != "v${CONTAINERD_VERSION}" ]]; then
+        log "installing containerd v${CONTAINERD_VERSION}"
+        local base="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}"
+        local tgz="containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz"
+        fetch "$base/$tgz" "$TMP_DIR/$tgz"
+        fetch "$base/$tgz.sha256sum" "$TMP_DIR/$tgz.sha256sum"
+        verify "$TMP_DIR/$tgz" "$(awk '{print $1}' "$TMP_DIR/$tgz.sha256sum")"
+        tar -xzf "$TMP_DIR/$tgz" -C /usr/local
+    else
+        log "containerd v${CONTAINERD_VERSION} already installed"
+    fi
+
+    mkdir -p "$CONF_DIR" "$CONTAINERD_ROOT/snapshotter/devmapper"
+    cat >"$CONF_DIR/containerd.toml" <<EOF
+version = 2
+root = "${CONTAINERD_ROOT}"
+state = "${CONTAINERD_STATE}"
+
+[grpc]
+  address = "${CONTAINERD_SOCK}"
+
+[metrics]
+  address = "127.0.0.1:1338"
+
+[plugins."io.containerd.snapshotter.v1.devmapper"]
+  pool_name = "${THINPOOL}"
+  root_path = "${CONTAINERD_ROOT}/snapshotter/devmapper"
+  base_image_size = "10GB"
+  discard_blocks = true
+EOF
+
+    # Dedicated instance so it never clashes with a Docker/Kubernetes containerd.
+    cat >/etc/systemd/system/containerd-flintlock.service <<EOF
+[Unit]
+Description=containerd for flintlock microVMs
+After=network.target local-fs.target lvm2-monitor.service
+
+[Service]
+ExecStartPre=-/sbin/modprobe overlay
+ExecStartPre=-/sbin/modprobe dm_thin_pool
+ExecStart=${BIN_DIR}/containerd --config ${CONF_DIR}/containerd.toml
+Type=notify
+Delegate=yes
+KillMode=process
+Restart=always
+RestartSec=5
+LimitNPROC=infinity
+LimitCORE=infinity
+LimitNOFILE=1048576
+TasksMax=infinity
+OOMScoreAdjust=-999
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# --------------------------------------------------------------------------
+# LVM thin pool
+# --------------------------------------------------------------------------
+
+# Prints the first whole disk that has no partitions, filesystem, LVM or mount.
+find_blank_disk() {
+    local name type
+    while read -r name type; do
+        [[ $type == disk ]] || continue
+        [[ $name == sr* || $name == loop* || $name == zram* ]] && continue
+        [[ $(lsblk -nro NAME "/dev/$name" | wc -l) -eq 1 ]] || continue   # has children
+        [[ -z $(blkid -p "/dev/$name" 2>/dev/null) ]] || continue           # has a signature
+        findmnt -rn -S "/dev/$name" >/dev/null && continue
+        echo "/dev/$name"
+        return 0
+    done < <(lsblk -dnro NAME,TYPE)
+    return 1
+}
+
+setup_thinpool() {
+    if lvs "$VG/thinpool" >/dev/null 2>&1; then
+        log "thin pool $VG/thinpool already exists"
+    else
+        if [[ -z $FR_DISK ]]; then
+            FR_DISK=$(find_blank_disk) || die "no blank disk found for the thin pool.
+  Attach an empty disk (e.g. 100G+) and re-run, or set FR_DISK=/dev/sdX (it will be wiped)."
+            log "using blank disk $FR_DISK for the thin pool"
+        fi
+        [[ -b $FR_DISK ]] || die "FR_DISK=$FR_DISK is not a block device"
+        findmnt -rn -S "$FR_DISK" >/dev/null && die "$FR_DISK is mounted"
+
+        log "creating LVM thin pool on $FR_DISK"
+        pvcreate -qy "$FR_DISK"
+        vgcreate -q "$VG" "$FR_DISK"
+        lvcreate -q --wipesignatures y -n thinpool "$VG" -l 95%VG
+        lvcreate -q --wipesignatures y -n thinpoolmeta "$VG" -l 1%VG
+        lvconvert -qy --zero n -c 512K --thinpool "$VG/thinpool" --poolmetadata "$VG/thinpoolmeta"
+    fi
+
+    mkdir -p /etc/lvm/profile
+    cat >/etc/lvm/profile/${THINPOOL}.profile <<'EOF'
+activation {
+  thin_pool_autoextend_threshold=80
+  thin_pool_autoextend_percent=20
+}
+EOF
+    lvchange -q --metadataprofile "$THINPOOL" "$VG/thinpool"
+    lvchange -q --monitor y "$VG/thinpool" || warn "could not enable thin pool monitoring"
+}
+
+# --------------------------------------------------------------------------
+# Firecracker + jailer
+# --------------------------------------------------------------------------
+
 install_firecracker() {
-    log_step "Installing Firecracker v1.7.0..."
-
-    if command -v firecracker &>/dev/null; then
-        log_info "Firecracker already installed ($(firecracker --version | head -n1))"
-        return 0
+    local have=""
+    [[ -x $BIN_DIR/firecracker ]] && have=$($BIN_DIR/firecracker --version 2>/dev/null | head -1 | awk '{print $2}')
+    if [[ "$have" == "v${FIRECRACKER_VERSION}" ]]; then
+        log "firecracker v${FIRECRACKER_VERSION} already installed"
+        return
     fi
-
-    cd /tmp
-    curl -sLO https://github.com/firecracker-microvm/firecracker/releases/download/v1.7.0/firecracker-v1.7.0-x86_64.tgz
-    tar -xzf firecracker-v1.7.0-x86_64.tgz
-    cp release-v1.7.0-x86_64/firecracker-v1.7.0-x86_64 $INSTALL_DIR/firecracker
-    chmod +x $INSTALL_DIR/firecracker
-    rm -rf firecracker-v1.7.0-x86_64.tgz release-v1.7.0-x86_64
-
-    log_info "Firecracker installed: $(firecracker --version | head -n1)"
+    log "installing firecracker v${FIRECRACKER_VERSION}"
+    local base="https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}"
+    local tgz="firecracker-v${FIRECRACKER_VERSION}-${FC_ARCH}.tgz"
+    fetch "$base/$tgz" "$TMP_DIR/$tgz"
+    fetch "$base/$tgz.sha256.txt" "$TMP_DIR/$tgz.sha256.txt"
+    verify "$TMP_DIR/$tgz" "$(awk '{print $1}' "$TMP_DIR/$tgz.sha256.txt")"
+    tar -xzf "$TMP_DIR/$tgz" -C "$TMP_DIR"
+    local rel="$TMP_DIR/release-v${FIRECRACKER_VERSION}-${FC_ARCH}"
+    install -m 0755 "$rel/firecracker-v${FIRECRACKER_VERSION}-${FC_ARCH}" "$BIN_DIR/firecracker"
+    install -m 0755 "$rel/jailer-v${FIRECRACKER_VERSION}-${FC_ARCH}" "$BIN_DIR/jailer"
 }
 
-# Install Flintlock
+# --------------------------------------------------------------------------
+# microVM network: bridge + DHCP/DNS + NAT
+# --------------------------------------------------------------------------
+
+setup_network() {
+    log "configuring bridge ${FR_BRIDGE} (${FR_SUBNET}.0/24) with DHCP and NAT"
+    mkdir -p "$LIB_DIR" "$CONF_DIR"
+
+    cat >"$LIB_DIR/net-up.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+ip link show ${FR_BRIDGE} >/dev/null 2>&1 || ip link add ${FR_BRIDGE} type bridge
+ip addr replace ${FR_SUBNET}.1/24 dev ${FR_BRIDGE}
+ip link set ${FR_BRIDGE} up
+sysctl -qw net.ipv4.ip_forward=1
+nft -f - <<'NFT'
+table ip firerunner
+delete table ip firerunner
+table ip firerunner {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr ${FR_SUBNET}.0/24 oifname != "${FR_BRIDGE}" masquerade
+  }
+  chain input {
+    type filter hook input priority filter; policy accept;
+    # microVMs may only use DHCP and DNS on the host
+    iifname "${FR_BRIDGE}" udp dport { 53, 67 } accept
+    iifname "${FR_BRIDGE}" tcp dport 53 accept
+    iifname "${FR_BRIDGE}" ct state established,related accept
+    iifname "${FR_BRIDGE}" drop
+  }
+}
+NFT
+EOF
+
+    cat >"$LIB_DIR/net-down.sh" <<EOF
+#!/usr/bin/env bash
+nft delete table ip firerunner 2>/dev/null || true
+ip link del ${FR_BRIDGE} 2>/dev/null || true
+EOF
+    chmod 0755 "$LIB_DIR/net-up.sh" "$LIB_DIR/net-down.sh"
+
+    cat >/etc/sysctl.d/90-firerunner.conf <<'EOF'
+net.ipv4.ip_forward = 1
+EOF
+
+    cat >/etc/systemd/system/firerunner-net.service <<EOF
+[Unit]
+Description=FireRunner microVM bridge and NAT
+After=network-online.target firewalld.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${LIB_DIR}/net-up.sh
+ExecStop=${LIB_DIR}/net-down.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat >"$CONF_DIR/dnsmasq.conf" <<EOF
+interface=${FR_BRIDGE}
+bind-interfaces
+except-interface=lo
+dhcp-range=${FR_SUBNET}.10,${FR_SUBNET}.250,255.255.255.0,12h
+dhcp-option=option:router,${FR_SUBNET}.1
+dhcp-option=option:dns-server,${FR_SUBNET}.1
+dhcp-leasefile=/var/lib/misc/firerunner-dnsmasq.leases
+no-hosts
+log-dhcp
+EOF
+
+    mkdir -p /var/lib/misc
+    cat >/etc/systemd/system/firerunner-dnsmasq.service <<EOF
+[Unit]
+Description=FireRunner DHCP/DNS for microVMs
+Requires=firerunner-net.service
+After=firerunner-net.service
+
+[Service]
+ExecStart=$(command -v dnsmasq) --keep-in-foreground --conf-file=${CONF_DIR}/dnsmasq.conf
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Host firewalls: let bridge traffic through and masquerade it out.
+    if systemctl is-active -q firewalld 2>/dev/null; then
+        log "firewalld active: adding ${FR_BRIDGE} to the trusted zone"
+        firewall-cmd -q --permanent --zone=trusted --add-interface="${FR_BRIDGE}" || true
+        firewall-cmd -q --permanent --zone="$(firewall-cmd --get-default-zone)" --add-masquerade
+        firewall-cmd -q --reload
+    fi
+    if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        log "ufw active: allowing routed traffic from ${FR_BRIDGE}"
+        ufw route allow in on "${FR_BRIDGE}" >/dev/null
+        ufw allow in on "${FR_BRIDGE}" to any port 67 proto udp >/dev/null
+        ufw allow in on "${FR_BRIDGE}" to any port 53 >/dev/null
+    fi
+}
+
+# --------------------------------------------------------------------------
+# flintlockd
+# --------------------------------------------------------------------------
+
 install_flintlock() {
-    log_step "Installing Flintlock v0.6.0..."
-
-    if command -v flintlockd &>/dev/null; then
-        log_info "Flintlock already installed"
-        return 0
+    local have=""
+    [[ -x $BIN_DIR/flintlockd ]] && have=$($BIN_DIR/flintlockd version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [[ "$have" != "${FLINTLOCK_VERSION}" ]]; then
+        log "installing flintlockd v${FLINTLOCK_VERSION}"
+        local base="https://github.com/liquidmetal-dev/flintlock/releases/download/v${FLINTLOCK_VERSION}"
+        local bin="flintlockd_${ARCH}"
+        fetch "$base/$bin" "$TMP_DIR/$bin"
+        fetch "$base/checksums.txt" "$TMP_DIR/checksums.txt"
+        verify "$TMP_DIR/$bin" "$(awk -v f="$bin" '$2==f {print $1}' "$TMP_DIR/checksums.txt")"
+        install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/flintlockd"
+    else
+        log "flintlockd v${FLINTLOCK_VERSION} already installed"
     fi
 
-    cd /tmp
-    curl -sLO https://github.com/liquidmetal-dev/flintlock/releases/download/v0.6.0/flintlock-v0.6.0-linux-x86_64.tar.gz
-    tar -xzf flintlock-v0.6.0-linux-x86_64.tar.gz
-    cp flintlockd $INSTALL_DIR/
-    chmod +x $INSTALL_DIR/flintlockd
-    rm -rf flintlock-v0.6.0-linux-x86_64.tar.gz flintlockd
+    # API token: generated once, root-only. Clients send it as a bearer token.
+    if [[ ! -s $CONF_DIR/flintlock.token ]]; then
+        (umask 077; head -c 32 /dev/urandom | base64 | tr -d '/+=\n' >"$CONF_DIR/flintlock.token")
+    fi
+    chmod 0600 "$CONF_DIR/flintlock.token"
+    (umask 077; printf 'FLINTLOCK_TOKEN=%s\n' "$(cat "$CONF_DIR/flintlock.token")" >"$CONF_DIR/flintlock.env")
 
-    log_info "Flintlock installed"
-}
-
-# Configure Flintlock
-configure_flintlock() {
-    log_step "Configuring Flintlock..."
-
-    mkdir -p $FLINTLOCK_CONFIG_DIR
-
-    # Detect network interface
-    local iface=$(ip route | grep default | awk '{print $5}' | head -n1)
-    [[ -z "$iface" ]] && iface="eth0"
-
-    cat > $FLINTLOCK_CONFIG_DIR/config.yaml <<EOF
-grpc-endpoint: 0.0.0.0:9090
-verbosity: debug
-parent-iface:
-  - name: $iface
-EOF
-
-    # Create systemd service
-    cat > /etc/systemd/system/flintlock.service <<EOF
+    cat >/etc/systemd/system/flintlockd.service <<EOF
 [Unit]
-Description=Flintlock - MicroVM Management Service
-Documentation=https://github.com/liquidmetal-dev/flintlock
-After=network.target
+Description=flintlock microVM service
+Requires=containerd-flintlock.service firerunner-net.service
+After=containerd-flintlock.service firerunner-net.service
 
 [Service]
-Type=simple
-User=root
-ExecStart=$INSTALL_DIR/flintlockd run --config $FLINTLOCK_CONFIG_DIR/config.yaml
+EnvironmentFile=${CONF_DIR}/flintlock.env
+ExecStart=${BIN_DIR}/flintlockd run \\
+  --containerd-socket ${CONTAINERD_SOCK} \\
+  --grpc-endpoint ${FLINTLOCK_ENDPOINT} \\
+  --bridge-name ${FR_BRIDGE} \\
+  --firecracker-bin ${BIN_DIR}/firecracker \\
+  --basic-auth-token \${FLINTLOCK_TOKEN} \\
+  --insecure \\
+  --log-format json \\
+  --verbosity 1
 Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
+RestartSec=5
+KillMode=process
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    log_info "Flintlock configured (interface: $iface)"
 }
 
-# Install Go
-install_go() {
-    if command -v go &>/dev/null; then
-        log_info "Go already installed: $(go version | awk '{print $3}')"
-        return 0
-    fi
+# --------------------------------------------------------------------------
+# Start and verify
+# --------------------------------------------------------------------------
 
-    log_step "Installing Go 1.21..."
-
-    cd /tmp
-    curl -sLO https://go.dev/dl/go1.21.6.linux-amd64.tar.gz
-    rm -rf /usr/local/go
-    tar -C /usr/local -xzf go1.21.6.linux-amd64.tar.gz
-    rm go1.21.6.linux-amd64.tar.gz
-
-    export PATH=$PATH:/usr/local/go/bin
-    echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
-
-    log_info "Go installed: $(go version | awk '{print $3}')"
-}
-
-# Install FireRunner
-install_firerunner() {
-    log_step "Installing FireRunner..."
-
-    cd /tmp
-    [[ -d firerunner ]] && rm -rf firerunner
-
-    git clone -q https://github.com/ismoilovdevml/firerunner.git
-    cd firerunner
-
-    export PATH=$PATH:/usr/local/go/bin
-    make build >/dev/null 2>&1
-
-    cp build/firerunner $INSTALL_DIR/
-    chmod +x $INSTALL_DIR/firerunner
-
-    log_info "FireRunner installed"
-
-    cd /tmp
-    rm -rf firerunner
-}
-
-# Interactive configuration
-configure_firerunner() {
-    log_step "Configuring FireRunner..."
-
-    mkdir -p $CONFIG_DIR
-
-    echo ""
-    echo "Configuration:"
-    echo ""
-
-    # GitLab URL
-    read -p "GitLab URL [https://gitlab.com]: " GITLAB_URL
-    GITLAB_URL=${GITLAB_URL:-https://gitlab.com}
-
-    # GitLab Token
-    while true; do
-        read -p "GitLab API Token (glpat-xxx): " GITLAB_TOKEN
-        [[ -n "$GITLAB_TOKEN" ]] && break
-        log_error "Token required!"
-    done
-
-    # Webhook secret
-    read -p "Webhook Secret [auto-generate]: " WEBHOOK_SECRET
-    if [[ -z "$WEBHOOK_SECRET" ]]; then
-        WEBHOOK_SECRET=$(openssl rand -hex 32)
-        log_info "Generated secret: $WEBHOOK_SECRET"
-    fi
-
-    # Server IP
-    local server_ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
-    log_info "Server IP: $server_ip"
-
-    # Workers
-    read -p "Worker count [5]: " WORKER_COUNT
-    WORKER_COUNT=${WORKER_COUNT:-5}
-
-    # Queue size
-    read -p "Queue size [100]: " QUEUE_SIZE
-    QUEUE_SIZE=${QUEUE_SIZE:-100}
-
-    # Create config
-    cat > $CONFIG_DIR/config.yaml <<EOF
-server:
-  host: "0.0.0.0"
-  port: 8080
-
-gitlab:
-  url: "$GITLAB_URL"
-  token: "$GITLAB_TOKEN"
-  webhook_secret: "$WEBHOOK_SECRET"
-  runner_tags:
-    - firerunner
-    - firecracker
-
-flintlock:
-  endpoint: "localhost:9090"
-  timeout: 30s
-
-vm:
-  default_vcpu: 2
-  default_memory_mb: 4096
-  kernel_image: "ghcr.io/firerunner/kernel:latest"
-  rootfs_image: "ghcr.io/firerunner/ubuntu-runner:latest"
-
-scheduler:
-  worker_count: $WORKER_COUNT
-  queue_size: $QUEUE_SIZE
-  job_timeout: 1h
-  vm_start_timeout: 5m
-  vm_shutdown_timeout: 1m
-  cleanup_interval: 5m
-
-logging:
-  level: "info"
-  format: "json"
-
-metrics:
-  enabled: true
-  port: 9090
-  path: "/metrics"
-EOF
-
-    # Save webhook info
-    echo "$WEBHOOK_SECRET" > $CONFIG_DIR/.webhook_secret
-    echo "http://$server_ip:8080/webhook" > $CONFIG_DIR/.webhook_url
-    chmod 600 $CONFIG_DIR/.webhook_secret
-
-    log_info "Config saved: $CONFIG_DIR/config.yaml"
-}
-
-# Create FireRunner service
-create_firerunner_service() {
-    log_step "Creating FireRunner service..."
-
-    cat > /etc/systemd/system/firerunner.service <<EOF
-[Unit]
-Description=FireRunner - Ephemeral GitLab CI/CD Runners
-Documentation=https://github.com/ismoilovdevml/firerunner
-After=network.target flintlock.service
-Requires=flintlock.service
-
-[Service]
-Type=simple
-User=root
-ExecStart=$INSTALL_DIR/firerunner --config $CONFIG_DIR/config.yaml
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    log_info "Service created"
-}
-
-# Start services
 start_services() {
-    log_step "Starting services..."
-
-    # Start Flintlock
-    systemctl enable flintlock >/dev/null 2>&1
-    systemctl restart flintlock
-    sleep 2
-
-    if systemctl is-active --quiet flintlock; then
-        log_info "Flintlock: active"
-    else
-        log_error "Flintlock failed to start"
-        journalctl -u flintlock -n 20 --no-pager
-        exit 1
-    fi
-
-    # Start FireRunner
-    systemctl enable firerunner >/dev/null 2>&1
-    systemctl restart firerunner
-    sleep 2
-
-    if systemctl is-active --quiet firerunner; then
-        log_info "FireRunner: active"
-    else
-        log_error "FireRunner failed to start"
-        journalctl -u firerunner -n 20 --no-pager
-        exit 1
-    fi
+    systemctl daemon-reload
+    local svc
+    for svc in containerd-flintlock firerunner-net firerunner-dnsmasq flintlockd; do
+        systemctl enable -q "$svc"
+        systemctl restart "$svc"
+    done
 }
 
-# Show completion
-show_completion() {
-    local webhook_url=$(cat $CONFIG_DIR/.webhook_url 2>/dev/null)
-    local webhook_secret=$(cat $CONFIG_DIR/.webhook_secret 2>/dev/null)
+verify_install() {
+    log "verifying"
+    local ok=1 svc
+    for svc in containerd-flintlock firerunner-net firerunner-dnsmasq flintlockd; do
+        if systemctl is-active -q "$svc"; then
+            log "  $svc: active"
+        else
+            warn "  $svc: NOT active (journalctl -u $svc)"; ok=0
+        fi
+    done
+    local _
+    for _ in $(seq 1 15); do
+        ss -ltn | grep -q " ${FLINTLOCK_ENDPOINT} " && break
+        sleep 1
+    done
+    if ss -ltn | grep -q " ${FLINTLOCK_ENDPOINT} "; then
+        log "  flintlock gRPC listening on ${FLINTLOCK_ENDPOINT}"
+    else
+        warn "  flintlock gRPC not listening on ${FLINTLOCK_ENDPOINT}"; ok=0
+    fi
+    dmsetup status "$THINPOOL" >/dev/null 2>&1 && log "  thin pool ${THINPOOL}: ok" || { warn "  thin pool ${THINPOOL} missing"; ok=0; }
+    [[ $ok -eq 1 ]] || die "installation finished with errors"
 
-    echo ""
-    echo "════════════════════════════════════════════════════════════"
-    echo "Installation Complete"
-    echo "════════════════════════════════════════════════════════════"
-    echo ""
-    echo "GitLab Webhook:"
-    echo "  URL:    $webhook_url"
-    echo "  Secret: $webhook_secret"
-    echo ""
-    echo "Add webhook: Project → Settings → Webhooks → Job events"
-    echo ""
-    echo "Commands:"
-    echo "  journalctl -u firerunner -f    # Logs"
-    echo "  systemctl status firerunner    # Status"
-    echo ""
+    cat <<EOF
+
+FireRunner host is ready.
+  flintlock API : ${FLINTLOCK_ENDPOINT} (localhost only)
+  API token     : ${CONF_DIR}/flintlock.token (root only)
+  microVM net   : ${FR_BRIDGE} ${FR_SUBNET}.0/24, DHCP + NAT
+  versions      : containerd ${CONTAINERD_VERSION}, firecracker ${FIRECRACKER_VERSION}, flintlock ${FLINTLOCK_VERSION}
+EOF
 }
 
-# Main
+uninstall() {
+    [[ $EUID -eq 0 ]] || die "run as root"
+    log "stopping and removing services (thin pool and images are kept)"
+    local svc
+    for svc in flintlockd firerunner-dnsmasq firerunner-net containerd-flintlock; do
+        systemctl disable --now -q "$svc" 2>/dev/null || true
+        rm -f "/etc/systemd/system/$svc.service"
+    done
+    systemctl daemon-reload
+    rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd"
+    rm -rf "$LIB_DIR"
+    log "done. To also drop data: vgremove $VG && rm -rf $CONTAINERD_ROOT /var/lib/flintlock $CONF_DIR"
+}
+
 main() {
-    show_banner
-    check_root
-    check_os
-    check_prerequisites
-    install_dependencies
-
+    case "${1:-install}" in
+        install) ;;
+        uninstall) uninstall; exit 0 ;;
+        *) die "usage: install.sh [install|uninstall]" ;;
+    esac
+    preflight
+    TMP_DIR=$(mktemp -d)
+    install_packages
+    install_containerd
+    setup_thinpool
     install_firecracker
+    setup_network
     install_flintlock
-    configure_flintlock
-
-    install_go
-    install_firerunner
-
-    configure_firerunner
-    create_firerunner_service
-
     start_services
-    show_completion
+    verify_install
 }
 
-# Run
 main "$@"
