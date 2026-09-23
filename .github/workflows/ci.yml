@@ -17,7 +17,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod
 
       - name: Go Format
         run: |
@@ -43,7 +43,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod
 
       - name: Go Mod Download
         run: go mod download
@@ -72,7 +72,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod
 
       - name: Build Binary
         run: make build

@@ -1,304 +1,541 @@
+// Command firerunner manages a FireRunner host: ephemeral Firecracker microVMs
+// for GitLab CI jobs, driven through flintlock.
 package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
-	"net/http"
+	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/sirupsen/logrus"
+	"github.com/liquidmetal-dev/flintlock/api/types"
 
-	"github.com/ismoilovdevml/firerunner/pkg/config"
-	"github.com/ismoilovdevml/firerunner/pkg/firecracker"
-	"github.com/ismoilovdevml/firerunner/pkg/gitlab"
-	"github.com/ismoilovdevml/firerunner/pkg/scheduler"
+	"github.com/ismoilovdevml/firerunner/internal/config"
+	"github.com/ismoilovdevml/firerunner/internal/executor"
+	"github.com/ismoilovdevml/firerunner/internal/flintlock"
+	"github.com/ismoilovdevml/firerunner/internal/host"
+	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
-var (
-	configPath = flag.String("config", "config.yaml", "Path to configuration file")
-	version    = "dev"
-	commit     = "unknown"
-	buildDate  = "unknown"
-)
+var version = "dev"
+
+const usage = `firerunner - ephemeral Firecracker microVMs for GitLab CI
+
+Usage:
+  firerunner status                         show host, microVM and runner state
+  firerunner doctor                         check everything and explain what is wrong
+
+  firerunner config show                    print the effective config
+  firerunner config keys                    list settable keys
+  firerunner config get <key>
+  firerunner config set <key> <value>       e.g. vm.vcpu 4, vm.memory_mb 4096, vm.boot_timeout 2m
+  firerunner config unset vm.kernel_cmdline.<arg>
+
+  firerunner runner register --url <gitlab-url> --token <glrt-...> [--concurrent 4] [--name NAME]
+  firerunner runner status
+  firerunner runner concurrent <n>          max parallel jobs (= microVMs)
+  firerunner runner unregister
+
+  firerunner vm list
+  firerunner vm rm <id|uid>... | --all
+  firerunner vm logs <id|uid> [-n 100]
+
+  firerunner run [--keep] -- <command...>   boot a microVM, run a command, delete it
+  firerunner executor prepare|run|cleanup   called by gitlab-runner (custom executor)
+  firerunner version
+`
 
 func main() {
-	flag.Parse()
+	err := dispatch(os.Args[1:])
+	var exitErr *executor.ExitError
+	switch {
+	case err == nil:
+	case errors.As(err, &exitErr):
+		fmt.Fprintln(os.Stderr, "firerunner:", exitErr.Err)
+		os.Exit(exitErr.Code)
+	case errors.Is(err, flag.ErrHelp):
+		os.Exit(0)
+	default:
+		fmt.Fprintln(os.Stderr, "firerunner:", err)
+		os.Exit(1)
+	}
+}
 
-	logger := setupLogger()
+func dispatch(args []string) error {
+	if len(args) == 0 {
+		fmt.Print(usage)
+		return nil
+	}
+	cmd, rest := args[0], args[1:]
+	switch cmd {
+	case "version", "--version":
+		fmt.Println("firerunner", version)
+		return nil
+	case "help", "-h", "--help":
+		fmt.Print(usage)
+		return nil
+	case "config":
+		return cmdConfig(rest)
+	}
 
-	logger.WithFields(logrus.Fields{
-		"version":    version,
-		"commit":     commit,
-		"build_date": buildDate,
-	}).Info("Starting FireRunner")
-
-	cfg, err := loadConfig(*configPath, logger)
+	cfg, err := config.Load(config.Path())
 	if err != nil {
-		logger.WithError(err).Fatal("Failed to load configuration")
+		return err
 	}
-
-	app, err := initializeApp(cfg, logger)
-	if err != nil {
-		logger.WithError(err).Fatal("Failed to initialize application")
+	switch cmd {
+	case "status":
+		return cmdStatus(cfg)
+	case "doctor":
+		return cmdDoctor(cfg)
+	case "runner":
+		return cmdRunner(rest)
+	case "vm":
+		return cmdVM(cfg, rest)
+	case "run":
+		return cmdRun(cfg, rest)
+	case "executor":
+		return cmdExecutor(cfg, rest)
 	}
-
-	if err := app.Start(); err != nil {
-		logger.WithError(err).Fatal("Failed to start application")
-	}
-
-	waitForShutdown(app, logger)
+	return fmt.Errorf("unknown command %q\n\n%s", cmd, usage)
 }
 
-type App struct {
-	config          *config.Config
-	logger          *logrus.Logger
-	flintlockClient *firecracker.Client
-	vmManager       *firecracker.Manager
-	gitlabService   *gitlab.Service
-	scheduler       *scheduler.Scheduler
-	webhookHandler  *gitlab.WebhookHandler
-	httpServer      *http.Server
-	metricsServer   *http.Server
-}
+// ---------------------------------------------------------------------------
+// config
 
-func initializeApp(cfg *config.Config, logger *logrus.Logger) (*App, error) {
-	logger.Info("Initializing application components")
-
-	flintlockClient, err := firecracker.NewClient(&cfg.Flintlock)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Flintlock client: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := flintlockClient.Health(ctx); err != nil {
-		logger.WithError(err).Warn("Flintlock health check failed (will retry)")
-	}
-	cancel()
-
-	vmManager := firecracker.NewManager(flintlockClient, &cfg.VM, logger)
-
-	gitlabService, err := gitlab.NewService(&cfg.GitLab, logger)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GitLab service: %w", err)
-	}
-
-	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-	if err := gitlabService.Health(ctx); err != nil {
-		logger.WithError(err).Warn("GitLab health check failed")
-	}
-	cancel()
-
-	sched := scheduler.NewScheduler(&cfg.Scheduler, vmManager, gitlabService, logger)
-
-	processor := &EventProcessor{
-		scheduler: sched,
-		logger:    logger,
-	}
-	webhookHandler := gitlab.NewWebhookHandler(cfg.GitLab.WebhookSecret, logger, processor)
-
-	httpServer := setupHTTPServer(cfg, webhookHandler)
-
-	var metricsServer *http.Server
-	if cfg.Metrics.Enabled {
-		metricsServer = setupMetricsServer(cfg)
-	}
-
-	return &App{
-		config:          cfg,
-		logger:          logger,
-		flintlockClient: flintlockClient,
-		vmManager:       vmManager,
-		gitlabService:   gitlabService,
-		scheduler:       sched,
-		webhookHandler:  webhookHandler,
-		httpServer:      httpServer,
-		metricsServer:   metricsServer,
-	}, nil
-}
-
-func (app *App) Start() error {
-	app.logger.Info("Starting application services")
-
-	app.vmManager.StartCleanup(app.config.Scheduler.CleanupInterval)
-
-	if err := app.scheduler.Start(); err != nil {
-		return fmt.Errorf("failed to start scheduler: %w", err)
-	}
-
-	if app.metricsServer != nil {
-		go func() {
-			app.logger.WithField("port", app.config.Metrics.Port).Info("Starting metrics server")
-			if err := app.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				app.logger.WithError(err).Error("Metrics server error")
-			}
-		}()
-	}
-
-	go func() {
-		app.logger.WithFields(logrus.Fields{
-			"host": app.config.Server.Host,
-			"port": app.config.Server.Port,
-		}).Info("Starting HTTP server")
-
-		var err error
-		if app.config.Server.TLSEnabled {
-			err = app.httpServer.ListenAndServeTLS(
-				app.config.Server.TLSCertPath,
-				app.config.Server.TLSKeyPath,
-			)
-		} else {
-			err = app.httpServer.ListenAndServe()
-		}
-
-		if err != nil && err != http.ErrServerClosed {
-			app.logger.WithError(err).Fatal("HTTP server error")
-		}
-	}()
-
-	app.logger.Info("Application started successfully")
-	return nil
-}
-
-func (app *App) Shutdown(ctx context.Context) error {
-	app.logger.Info("Shutting down application")
-
-	if app.httpServer != nil {
-		if err := app.httpServer.Shutdown(ctx); err != nil {
-			app.logger.WithError(err).Error("Failed to shutdown HTTP server")
-		}
-	}
-
-	if app.metricsServer != nil {
-		if err := app.metricsServer.Shutdown(ctx); err != nil {
-			app.logger.WithError(err).Error("Failed to shutdown metrics server")
-		}
-	}
-
-	if err := app.scheduler.Shutdown(ctx); err != nil {
-		app.logger.WithError(err).Error("Failed to shutdown scheduler")
-	}
-
-	if err := app.vmManager.Shutdown(ctx); err != nil {
-		app.logger.WithError(err).Error("Failed to shutdown VM manager")
-	}
-
-	if app.flintlockClient != nil {
-		if err := app.flintlockClient.Close(); err != nil {
-			app.logger.WithError(err).Error("Failed to close Flintlock client")
-		}
-	}
-
-	app.logger.Info("Application shutdown completed")
-	return nil
-}
-
-type EventProcessor struct {
-	scheduler *scheduler.Scheduler
-	logger    *logrus.Logger
-}
-
-func (ep *EventProcessor) ProcessJobEvent(event *gitlab.JobEvent) error {
-	return ep.scheduler.ScheduleJob(event)
-}
-
-func (ep *EventProcessor) ProcessPipelineEvent(event *gitlab.PipelineEvent) error {
-	ep.logger.WithField("pipeline_id", event.ObjectAttributes.ID).Debug("Pipeline event received")
-	return nil
-}
-
-func setupLogger() *logrus.Logger {
-	logger := logrus.New()
-
-	level := os.Getenv("LOG_LEVEL")
-	if level == "" {
-		level = "info"
-	}
-
-	logLevel, err := logrus.ParseLevel(level)
-	if err != nil {
-		logLevel = logrus.InfoLevel
-	}
-
-	logger.SetLevel(logLevel)
-
-	format := os.Getenv("LOG_FORMAT")
-	if format == "json" {
-		logger.SetFormatter(&logrus.JSONFormatter{})
-	} else {
-		logger.SetFormatter(&logrus.TextFormatter{
-			FullTimestamp: true,
-		})
-	}
-
-	return logger
-}
-
-func loadConfig(path string, logger *logrus.Logger) (*config.Config, error) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		logger.Warn("Config file not found, using defaults")
-		return config.Default(), nil
-	}
-
+func cmdConfig(args []string) error {
+	path := config.Path()
 	cfg, err := config.Load(path)
+	if err != nil && (len(args) == 0 || args[0] != "set") {
+		return err
+	}
+	sub := "show"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch {
+	case sub == "show":
+		fmt.Printf("# %s\n", path)
+		for _, k := range config.Keys(cfg) {
+			v, _ := config.Get(cfg, k)
+			fmt.Printf("%s = %s\n", k, v)
+		}
+		return nil
+	case sub == "keys":
+		fmt.Println(strings.Join(config.Keys(cfg), "\n"))
+		return nil
+	case sub == "path":
+		fmt.Println(path)
+		return nil
+	case sub == "get" && len(args) == 2:
+		v, err := config.Get(cfg, args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Println(v)
+		return nil
+	case sub == "set" && len(args) == 3:
+		next, err := config.Set(cfg, args[1], args[2])
+		if err != nil {
+			return err
+		}
+		if err := config.Save(path, next); err != nil {
+			return err
+		}
+		v, _ := config.Get(next, args[1])
+		fmt.Printf("%s = %s (applies to the next job)\n", args[1], v)
+		return nil
+	case sub == "unset" && len(args) == 2:
+		next, err := config.Unset(cfg, args[1])
+		if err != nil {
+			return err
+		}
+		return config.Save(path, next)
+	}
+	return errors.New("usage: firerunner config show|keys|path|get <key>|set <key> <value>|unset <key>")
+}
+
+// ---------------------------------------------------------------------------
+// status / doctor
+
+func cmdStatus(cfg config.Config) error {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer w.Flush()
+	fmt.Fprintf(w, "FireRunner\t%s\n", version)
+
+	kvm := "ok"
+	if err := host.KVM(); err != nil {
+		kvm = err.Error()
+	}
+	fmt.Fprintf(w, "KVM\t%s\n", kvm)
+
+	var svc []string
+	for _, s := range append(host.Services, "gitlab-runner") {
+		state := "down"
+		if host.ServiceActive(s) {
+			state = "up"
+		}
+		svc = append(svc, s+" "+state)
+	}
+	fmt.Fprintf(w, "Services\t%s\n", strings.Join(svc, ", "))
+
+	if data, meta, err := host.ThinPoolUsage(); err == nil {
+		fmt.Fprintf(w, "Thin pool\tdata %.1f%%, metadata %.1f%%\n", data, meta)
+	} else {
+		fmt.Fprintf(w, "Thin pool\t%v\n", err)
+	}
+
+	fmt.Fprintf(w, "microVM size\t%d vCPU, %d MB, boot timeout %s\n", cfg.VM.VCPU, cfg.VM.MemoryMB, cfg.VM.BootTimeout)
+	fmt.Fprintf(w, "Images\t%s\n\t%s\n", cfg.VM.RootFSImage, cfg.VM.KernelImage)
+
+	if vms, err := listVMs(cfg); err == nil {
+		states := map[string]int{}
+		for _, v := range vms {
+			states[strings.ToLower(v.GetStatus().GetState().String())]++
+		}
+		fmt.Fprintf(w, "microVMs\t%d %s\n", len(vms), formatCounts(states))
+	} else {
+		fmt.Fprintf(w, "microVMs\tflintlock unreachable: %v\n", err)
+	}
+
+	if r, err := host.ReadRunner(); err == nil {
+		fmt.Fprintf(w, "Runner\t%s -> %s (executor %s, concurrent %d)\n", r.Name, r.URL, r.Executor, r.Concurrent)
+	} else {
+		fmt.Fprintf(w, "Runner\tnot registered (firerunner runner register --url ... --token glrt-...)\n")
+	}
+	return nil
+}
+
+func cmdDoctor(cfg config.Config) error {
+	failed := 0
+	check := func(name string, err error, hint string) {
+		if err == nil {
+			fmt.Printf("  ok    %s\n", name)
+			return
+		}
+		failed++
+		fmt.Printf("  FAIL  %s: %v\n", name, err)
+		if hint != "" {
+			fmt.Printf("        -> %s\n", hint)
+		}
+	}
+
+	fmt.Println("Host")
+	check("/dev/kvm", host.KVM(), "enable VT-x/AMD-V (bare metal) or nested virtualization (VM)")
+	for _, s := range host.Services {
+		var err error
+		if !host.ServiceActive(s) {
+			err = errors.New("not running")
+		}
+		check("service "+s, err, "journalctl -u "+s+" -n 50")
+	}
+	var fwd error
+	if !host.IPForward() {
+		fwd = errors.New("net.ipv4.ip_forward=0")
+	}
+	check("IP forwarding", fwd, "systemctl restart firerunner-net")
+	data, meta, err := host.ThinPoolUsage()
+	if err == nil && (data > 80 || meta > 80) {
+		err = fmt.Errorf("data %.1f%%, metadata %.1f%%", data, meta)
+	}
+	check("thin pool below 80%", err, "remove unused images or extend the flintlock volume group")
+
+	fmt.Println("flintlock")
+	_, err = listVMs(cfg)
+	check("API "+cfg.Flintlock.Endpoint, err, "systemctl status flintlockd; token in "+cfg.Flintlock.TokenFile)
+	_, err = os.Stat(cfg.Network.SSHKey)
+	check("executor SSH key", err, "re-run install.sh")
+
+	fmt.Println("GitLab runner")
+	if _, err := host.ReadRunner(); err != nil {
+		fmt.Println("  warn  not registered yet")
+		fmt.Println("        -> firerunner runner register --url <gitlab-url> --token <glrt-...>")
+	} else {
+		var err error
+		if !host.ServiceActive("gitlab-runner") {
+			err = errors.New("not running")
+		}
+		check("service gitlab-runner", err, "journalctl -u gitlab-runner -n 50")
+	}
+
+	if failed > 0 {
+		return fmt.Errorf("%d check(s) failed", failed)
+	}
+	fmt.Println("\nAll checks passed. Smoke test: firerunner run -- uname -a")
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// runner
+
+func cmdRunner(args []string) error {
+	if len(args) == 0 {
+		args = []string{"status"}
+	}
+	switch args[0] {
+	case "register":
+		fs := flag.NewFlagSet("runner register", flag.ContinueOnError)
+		url := fs.String("url", "", "GitLab URL, e.g. https://gitlab.example.com")
+		token := fs.String("token", os.Getenv("FIRERUNNER_RUNNER_TOKEN"), "runner authentication token (glrt-...)")
+		hostname, _ := os.Hostname()
+		name := fs.String("name", "firerunner-"+hostname, "runner name shown in GitLab")
+		concurrent := fs.Int("concurrent", 4, "max parallel jobs")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *url == "" || *token == "" {
+			return errors.New("--url and --token are required (create the runner in GitLab: Settings > CI/CD > Runners > New runner)")
+		}
+		if err := host.RegisterRunner(*url, *token, *name, *concurrent); err != nil {
+			return err
+		}
+		fmt.Printf("Runner %s registered with %s (%d concurrent microVM jobs)\n", *name, *url, *concurrent)
+		return nil
+	case "status":
+		r, err := host.ReadRunner()
+		if err != nil {
+			return err
+		}
+		state := "down"
+		if host.ServiceActive("gitlab-runner") {
+			state = "up"
+		}
+		fmt.Printf("name        %s\nurl         %s\nexecutor    %s\nconcurrent  %d\nservice     %s\n", r.Name, r.URL, r.Executor, r.Concurrent, state)
+		return nil
+	case "concurrent":
+		if len(args) != 2 {
+			return errors.New("usage: firerunner runner concurrent <n>")
+		}
+		var n int
+		if _, err := fmt.Sscan(args[1], &n); err != nil {
+			return err
+		}
+		if err := host.SetConcurrent(n); err != nil {
+			return err
+		}
+		fmt.Printf("concurrent = %d (gitlab-runner reloads it automatically)\n", n)
+		return nil
+	case "unregister":
+		return host.UnregisterRunner()
+	}
+	return errors.New("usage: firerunner runner register|status|concurrent|unregister")
+}
+
+// ---------------------------------------------------------------------------
+// vm
+
+func listVMs(cfg config.Config) ([]*types.MicroVM, error) {
+	fl, err := flintlock.Dial(cfg.Flintlock)
 	if err != nil {
 		return nil, err
 	}
-
-	logger.Info("Configuration loaded successfully")
-	return cfg, nil
+	defer fl.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return fl.List(ctx)
 }
 
-func setupHTTPServer(cfg *config.Config, webhookHandler *gitlab.WebhookHandler) *http.Server {
-	mux := http.NewServeMux()
-
-	mux.Handle("/webhook", webhookHandler)
-	mux.HandleFunc("/health", webhookHandler.HealthCheck)
-	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ready"}`))
-	})
-
-	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
-
-	return &http.Server{
-		Addr:         addr,
-		Handler:      mux,
-		ReadTimeout:  cfg.Server.ReadTimeout,
-		WriteTimeout: cfg.Server.WriteTimeout,
+func cmdVM(cfg config.Config, args []string) error {
+	if len(args) == 0 {
+		args = []string{"list"}
 	}
-}
-
-func setupMetricsServer(cfg *config.Config) *http.Server {
-	mux := http.NewServeMux()
-	mux.Handle(cfg.Metrics.Path, promhttp.Handler())
-
-	addr := fmt.Sprintf(":%d", cfg.Metrics.Port)
-
-	return &http.Server{
-		Addr:    addr,
-		Handler: mux,
+	fl, err := flintlock.Dial(cfg.Flintlock)
+	if err != nil {
+		return err
 	}
-}
-
-func waitForShutdown(app *App, logger *logrus.Logger) {
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-
-	sig := <-sigCh
-	logger.WithField("signal", sig.String()).Info("Received shutdown signal")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer fl.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	if err := app.Shutdown(ctx); err != nil {
-		logger.WithError(err).Error("Shutdown failed")
-		os.Exit(1)
+	switch args[0] {
+	case "list", "ls":
+		vms, err := fl.List(ctx)
+		if err != nil {
+			return err
+		}
+		sort.Slice(vms, func(i, j int) bool { return vms[i].GetSpec().GetId() < vms[j].GetSpec().GetId() })
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "ID\tUID\tSTATE\tVCPU\tMEMORY\tIP\tPROJECT")
+		for _, v := range vms {
+			s := v.GetSpec()
+			var mac string
+			if ifs := s.GetInterfaces(); len(ifs) > 0 {
+				mac = ifs[len(ifs)-1].GetGuestMac()
+			}
+			ip, _ := vm.LeaseIP(cfg.Network.LeasesFile, mac)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d MB\t%s\t%s\n", s.GetId(), s.GetUid(),
+				strings.ToLower(v.GetStatus().GetState().String()), s.GetVcpu(), s.GetMemoryInMb(),
+				dash(ip), dash(strings.ReplaceAll(s.GetLabels()["firerunner/project"], ".", "/")))
+		}
+		return w.Flush()
+	case "rm", "delete":
+		refs := args[1:]
+		if len(refs) == 1 && refs[0] == "--all" {
+			vms, err := fl.List(ctx)
+			if err != nil {
+				return err
+			}
+			refs = nil
+			for _, v := range vms {
+				refs = append(refs, v.GetSpec().GetUid())
+			}
+		}
+		if len(refs) == 0 {
+			return errors.New("usage: firerunner vm rm <id|uid>... | --all")
+		}
+		for _, ref := range refs {
+			v, err := fl.Find(ctx, ref)
+			if err != nil {
+				return err
+			}
+			if err := fl.Delete(ctx, v.GetSpec().GetUid()); err != nil {
+				return fmt.Errorf("deleting %s: %w", ref, err)
+			}
+			fmt.Printf("deleted %s (%s)\n", v.GetSpec().GetId(), v.GetSpec().GetUid())
+		}
+		return nil
+	case "logs":
+		fs := flag.NewFlagSet("vm logs", flag.ContinueOnError)
+		lines := fs.Int("n", 100, "number of lines")
+		if len(args) < 2 {
+			return errors.New("usage: firerunner vm logs <id|uid> [-n 100]")
+		}
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		v, err := fl.Find(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		s := v.GetSpec()
+		path := filepath.Join("/var/lib/flintlock/vm", s.GetNamespace(), s.GetId(), s.GetUid(), "firecracker.stdout")
+		return tail(path, *lines, os.Stdout)
+	}
+	return errors.New("usage: firerunner vm list|rm|logs")
+}
+
+// ---------------------------------------------------------------------------
+// run: ad-hoc smoke test
+
+func cmdRun(cfg config.Config, args []string) error {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	keep := fs.Bool("keep", false, "keep the microVM after the command finishes")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	command := fs.Args()
+	if len(command) == 0 {
+		return errors.New("usage: firerunner run [--keep] -- <command...>")
 	}
 
-	logger.Info("Goodbye!")
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	fl, err := flintlock.Dial(cfg.Flintlock)
+	if err != nil {
+		return err
+	}
+	defer fl.Close()
+
+	suffix := make([]byte, 3)
+	_, _ = rand.Read(suffix)
+	id := "run-" + hex.EncodeToString(suffix)
+	start := time.Now()
+	fmt.Fprintf(os.Stderr, "booting %s (%d vCPU, %d MB)...\n", id, cfg.VM.VCPU, cfg.VM.MemoryMB)
+	inst, err := vm.Boot(ctx, cfg, fl, id, map[string]string{"firerunner/run": id})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "%s ready at %s in %s\n", id, inst.IP, time.Since(start).Round(100*time.Millisecond))
+
+	code, runErr := vm.RunScript(cfg, inst.IP, strings.NewReader(strings.Join(command, " ")+"\n"), os.Stdout, os.Stderr)
+	if *keep {
+		fmt.Fprintf(os.Stderr, "kept %s: ssh -i %s root@%s   (delete: firerunner vm rm %s)\n", id, cfg.Network.SSHKey, inst.IP, id)
+	} else {
+		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := fl.Delete(dctx, inst.UID); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: deleting %s: %v\n", id, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "deleted %s (total %s)\n", id, time.Since(start).Round(100*time.Millisecond))
+		}
+	}
+	if runErr != nil {
+		return runErr
+	}
+	if code != 0 {
+		return &executor.ExitError{Code: code, Err: fmt.Errorf("command exited with %d", code)}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// executor
+
+func cmdExecutor(cfg config.Config, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: firerunner executor prepare|run <script> <stage>|cleanup")
+	}
+	switch args[0] {
+	case "prepare":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return executor.Prepare(ctx, cfg)
+	case "run":
+		if len(args) != 3 {
+			return errors.New("usage: firerunner executor run <script> <stage>")
+		}
+		return executor.Run(cfg, args[1], args[2])
+	case "cleanup":
+		return executor.Cleanup(cfg)
+	}
+	return fmt.Errorf("unknown executor stage %q", args[0])
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+
+func formatCounts(m map[string]int) string {
+	if len(m) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%d %s", m[k], k))
+	}
+	return "(" + strings.Join(parts, ", ") + ")"
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func tail(path string, n int, w io.Writer) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	_, err = fmt.Fprintln(w, strings.Join(lines, "\n"))
+	return err
 }

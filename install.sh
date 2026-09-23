@@ -18,6 +18,16 @@
 #   FIRECRACKER_VERSION     (default: 1.17.0)
 #   FLINTLOCK_VERSION       (default: 0.15.2)
 #
+#   FR_VERSION              firerunner release to install (default: edge = latest main)
+#   GITLAB_RUNNER_VERSION   (default: 19.0.1)
+#
+# Register a GitLab runner right away (optional, can be done later with
+# `firerunner runner register`):
+#   FR_GITLAB_URL           e.g. https://gitlab.example.com
+#   FR_RUNNER_TOKEN         runner authentication token (glrt-...) from
+#                           Settings > CI/CD > Runners > New project/group/instance runner
+#   FR_RUNNER_CONCURRENT    max parallel jobs / microVMs (default: 4)
+#
 # Safe to re-run: every step checks current state first.
 
 set -euo pipefail
@@ -25,10 +35,18 @@ set -euo pipefail
 CONTAINERD_VERSION="${CONTAINERD_VERSION:-1.7.35}"
 FIRECRACKER_VERSION="${FIRECRACKER_VERSION:-1.17.0}"
 FLINTLOCK_VERSION="${FLINTLOCK_VERSION:-0.15.2}"
+GITLAB_RUNNER_VERSION="${GITLAB_RUNNER_VERSION:-19.0.1}"
+FR_VERSION="${FR_VERSION:-edge}"
+FR_BINARY="${FR_BINARY:-}"            # local firerunner binary instead of a release (development)
 
 FR_DISK="${FR_DISK:-}"
 FR_BRIDGE="${FR_BRIDGE:-br-fc}"
 FR_SUBNET="${FR_SUBNET:-10.200.0}"
+
+FR_GITLAB_URL="${FR_GITLAB_URL:-}"
+FR_RUNNER_TOKEN="${FR_RUNNER_TOKEN:-}"
+FR_RUNNER_CONCURRENT="${FR_RUNNER_CONCURRENT:-4}"
+FR_REPO=ismoilovdevml/firerunner
 
 BIN_DIR=/usr/local/bin
 LIB_DIR=/usr/local/lib/firerunner
@@ -57,11 +75,10 @@ preflight() {
     [[ $EUID -eq 0 ]] || die "run as root (curl ... | sudo bash)"
     command -v systemctl >/dev/null || die "systemd is required"
 
-    case "$(uname -m)" in
-        x86_64)  ARCH=amd64; FC_ARCH=x86_64 ;;
-        aarch64) ARCH=arm64; FC_ARCH=aarch64 ;;
-        *) die "unsupported architecture: $(uname -m)" ;;
-    esac
+    # Only x86_64 is built and tested for now.
+    [[ "$(uname -m)" == x86_64 ]] || die "unsupported architecture: $(uname -m) (x86_64 only)"
+    ARCH=amd64
+    FC_ARCH=x86_64
 
     # shellcheck disable=SC1091
     . /etc/os-release
@@ -90,9 +107,9 @@ install_packages() {
     if [[ $PKG == apt ]]; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq curl tar lvm2 thin-provisioning-tools dnsmasq-base nftables iproute2 >/dev/null
+        apt-get install -y -qq curl tar lvm2 thin-provisioning-tools dnsmasq-base nftables iproute2 openssh-client >/dev/null
     else
-        dnf install -y -q curl tar lvm2 device-mapper-persistent-data dnsmasq nftables iproute >/dev/null
+        dnf install -y -q curl tar lvm2 device-mapper-persistent-data dnsmasq nftables iproute openssh-clients >/dev/null
     fi
 }
 
@@ -406,6 +423,59 @@ EOF
 }
 
 # --------------------------------------------------------------------------
+# firerunner CLI + GitLab Runner
+# --------------------------------------------------------------------------
+
+install_firerunner() {
+    if [[ -n $FR_BINARY ]]; then
+        log "installing firerunner from $FR_BINARY"
+        install -m 0755 "$FR_BINARY" "$BIN_DIR/firerunner"
+    else
+        log "installing firerunner ${FR_VERSION}"
+        local base="https://github.com/${FR_REPO}/releases/download/${FR_VERSION}"
+        local bin="firerunner-linux-${ARCH}"
+        fetch "$base/$bin" "$TMP_DIR/$bin"
+        fetch "$base/checksums.txt" "$TMP_DIR/fr.sums"
+        verify "$TMP_DIR/$bin" "$(awk -v f="$bin" '$2==f {print $1}' "$TMP_DIR/fr.sums")"
+        install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/firerunner"
+    fi
+    log "  $($BIN_DIR/firerunner version)"
+
+    mkdir -p "$CONF_DIR/executor"
+    chmod 0700 "$CONF_DIR/executor"
+    [[ -f $CONF_DIR/executor/id_ed25519 ]] ||
+        ssh-keygen -q -t ed25519 -N "" -C firerunner-executor -f "$CONF_DIR/executor/id_ed25519"
+    # Write the default config once so it is visible and editable.
+    [[ -f $CONF_DIR/config.yaml ]] || $BIN_DIR/firerunner config set vm.vcpu 2 >/dev/null
+
+    local have=""
+    [[ -x $BIN_DIR/gitlab-runner ]] && have=$($BIN_DIR/gitlab-runner --version 2>/dev/null | awk '/^Version:/ {print $2}')
+    if [[ "$have" != "${GITLAB_RUNNER_VERSION}" ]]; then
+        log "installing gitlab-runner v${GITLAB_RUNNER_VERSION}"
+        local base="https://gitlab-runner-downloads.s3.amazonaws.com/v${GITLAB_RUNNER_VERSION}"
+        local bin="gitlab-runner-linux-${ARCH}"
+        fetch "$base/binaries/$bin" "$TMP_DIR/$bin"
+        fetch "$base/release.sha256" "$TMP_DIR/runner.sums"
+        verify "$TMP_DIR/$bin" "$(awk -v f="binaries/$bin" '$2==f {print $1}' "$TMP_DIR/runner.sums")"
+        systemctl stop gitlab-runner 2>/dev/null || true
+        install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/gitlab-runner"
+        systemctl start gitlab-runner 2>/dev/null || true
+    fi
+}
+
+register_runner() {
+    [[ -n $FR_GITLAB_URL || -n $FR_RUNNER_TOKEN ]] || return 0
+    [[ -n $FR_GITLAB_URL && -n $FR_RUNNER_TOKEN ]] || die "set both FR_GITLAB_URL and FR_RUNNER_TOKEN"
+    if $BIN_DIR/firerunner runner status >/dev/null 2>&1; then
+        log "a GitLab runner is already registered (firerunner runner status)"
+        return 0
+    fi
+    log "registering GitLab runner at ${FR_GITLAB_URL}"
+    FIRERUNNER_RUNNER_TOKEN="$FR_RUNNER_TOKEN" $BIN_DIR/firerunner runner register \
+        --url "$FR_GITLAB_URL" --concurrent "$FR_RUNNER_CONCURRENT"
+}
+
+# --------------------------------------------------------------------------
 # Start and verify
 # --------------------------------------------------------------------------
 
@@ -448,6 +518,12 @@ FireRunner host is ready.
   API token     : ${CONF_DIR}/flintlock.token (root only)
   microVM net   : ${FR_BRIDGE} ${FR_SUBNET}.0/24, DHCP + NAT
   versions      : containerd ${CONTAINERD_VERSION}, firecracker ${FIRECRACKER_VERSION}, flintlock ${FLINTLOCK_VERSION}
+
+Next steps:
+  firerunner doctor                  check the host
+  firerunner run -- uname -a         boot a throwaway microVM
+  firerunner runner register --url https://gitlab.example.com --token glrt-...
+  firerunner config set vm.vcpu 4    tune microVM size
 EOF
 }
 
@@ -455,12 +531,17 @@ uninstall() {
     [[ $EUID -eq 0 ]] || die "run as root"
     log "stopping and removing services (thin pool and images are kept)"
     local svc
+    if [[ -x $BIN_DIR/gitlab-runner ]]; then
+        # The runner stays registered in GitLab; delete it there if it is no longer needed.
+        $BIN_DIR/gitlab-runner uninstall --service gitlab-runner >/dev/null 2>&1 || true
+        rm -f "$BIN_DIR/gitlab-runner"
+    fi
     for svc in flintlockd firerunner-dnsmasq firerunner-net containerd-flintlock; do
         systemctl disable --now -q "$svc" 2>/dev/null || true
         rm -f "/etc/systemd/system/$svc.service"
     done
     systemctl daemon-reload
-    rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd"
+    rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner"
     rm -rf "$LIB_DIR"
     log "done. To also drop data: vgremove $VG && rm -rf $CONTAINERD_ROOT /var/lib/flintlock $CONF_DIR"
 }
@@ -480,7 +561,9 @@ main() {
     setup_network
     install_flintlock
     start_services
+    install_firerunner
     verify_install
+    register_runner
 }
 
 main "$@"
