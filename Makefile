@@ -1,11 +1,20 @@
-.PHONY: build test clean install docker-build run help
+.PHONY: build test clean install docker-build run dev help
 
 # Build variables
 BINARY_NAME=firerunner
 VERSION?=dev
-COMMIT=$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-BUILD_DATE=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
-LDFLAGS=-ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)"
+# main.version is the only build-time variable cmd/firerunner declares.
+LDFLAGS=-ldflags "-X main.version=$(VERSION)"
+
+# Pinned to the versions CI runs (.github/workflows/ci.yml).
+GOLANGCI_LINT_VERSION=v2.13.2
+GOVULNCHECK_VERSION=v1.8.0
+
+# Local tag for the microVM rootfs image; CI publishes to ghcr.io (images.yml).
+ROOTFS_IMAGE?=firerunner-rootfs:local
+
+# Arguments for `make run` / `make dev`, e.g. make run ARGS="vm list".
+ARGS?=status
 
 # Go parameters
 GOCMD=go
@@ -65,46 +74,41 @@ deps: ## Download dependencies
 	$(GOMOD) tidy
 	@echo "Dependencies updated"
 
-docker-build: ## Build Docker image for rootfs
-	@echo "Building rootfs Docker image..."
-	docker build -t firerunner/gitlab-runner:latest images/rootfs/
-	@echo "Docker image built"
+docker-build: ## Build the microVM rootfs image locally (tag: ROOTFS_IMAGE)
+	@echo "Building rootfs image $(ROOTFS_IMAGE)..."
+	docker build -t $(ROOTFS_IMAGE) images/rootfs/
+	@echo "Docker image built: $(ROOTFS_IMAGE)"
 
-docker-push: docker-build ## Push Docker image to registry
-	@echo "Pushing Docker image..."
-	docker push firerunner/gitlab-runner:latest
-	@echo "Docker image pushed"
+run: build ## Build and run a command (ARGS="status"; config from FIRERUNNER_CONFIG)
+	$(BUILD_DIR)/$(BINARY_NAME) $(ARGS)
 
-run: build ## Build and run locally
-	@echo "Starting FireRunner..."
-	$(BUILD_DIR)/$(BINARY_NAME) --config config.example.yaml
-
-dev: ## Run in development mode
-	@echo "Starting FireRunner (development)..."
-	$(GOCMD) run ./$(CMD_DIR) --config config.example.yaml
+dev: ## go run a command (ARGS="status"; config from FIRERUNNER_CONFIG)
+	$(GOCMD) run ./$(CMD_DIR) $(ARGS)
 
 fmt: ## Format Go code
 	@echo "Formatting code..."
 	$(GOCMD) fmt ./...
 	@echo "Format complete"
 
-lint: ## Run linter
-	@echo "Running linter..."
-	@which golangci-lint > /dev/null || (echo "Installing golangci-lint..." && go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest)
-	golangci-lint run ./...
+lint: ## Run golangci-lint (pinned version)
+	@echo "Running golangci-lint $(GOLANGCI_LINT_VERSION)..."
+	$(GOCMD) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run ./...
 	@echo "Lint complete"
+
+vulncheck: ## Run govulncheck (pinned version)
+	$(GOCMD) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 vet: ## Run go vet
 	@echo "Running go vet..."
 	$(GOCMD) vet ./...
 	@echo "Vet complete"
 
-check: fmt vet lint test ## Run all checks (fmt, vet, lint, test)
+check: fmt vet lint vulncheck test ## Run all checks (fmt, vet, lint, vulncheck, test)
 
 release: clean check build-linux ## Create release build
 	@echo "Creating release..."
 	cd $(BUILD_DIR) && tar -czf $(BINARY_NAME)-$(VERSION)-linux-amd64.tar.gz $(BINARY_NAME)-linux-amd64
 	@echo "Release created: $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-linux-amd64.tar.gz"
 
-.PHONY: all
+.PHONY: all build-linux test-coverage deps fmt lint vulncheck vet check release
 all: clean deps check build ## Run clean, deps, check, and build

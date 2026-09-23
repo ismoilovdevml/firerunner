@@ -2,6 +2,8 @@ module github.com/ismoilovdevml/firerunner
 
 go 1.25.0
 
+toolchain go1.26.8
+
 require (
 	github.com/liquidmetal-dev/flintlock/api v0.0.0-20251113072819-a7c62f33a780
 	github.com/prometheus/client_golang v1.24.1

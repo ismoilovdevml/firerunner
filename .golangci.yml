@@ -1,0 +1,28 @@
+version: "2"
+
+# The "standard" default set (errcheck, govet, ineffassign, staticcheck,
+# unused) plus misspell. Listed explicitly so a golangci-lint upgrade that
+# changes the defaults does not silently change what CI checks.
+linters:
+  default: standard
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - staticcheck
+    - unused
+  exclusions:
+    # std-error-handling is the v2 form of v1's default excludes: unchecked
+    # errors from Close/Flush/Print*/os.Remove. In this code base those are
+    # read-side closes, HTTP body closes, tabwriter/stdout writes and
+    # best-effort temp-file cleanup; writes whose Close matters are checked.
+    presets:
+      - std-error-handling
+
+formatters:
+  enable:
+    - gofmt
+  settings:
+    gofmt:
+      simplify: true
