@@ -1,0 +1,53 @@
+groups:
+  - name: firerunner
+    rules:
+      - alert: FireRunnerDown
+        expr: up{job="firerunner"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "FireRunner daemon on {{ $labels.instance }} is not reachable"
+          description: "No metrics for 5m. CI jobs may still cold-boot, but the pool and cleanup are stopped. Check: systemctl status firerunner"
+      - alert: FireRunnerServiceDown
+        expr: firerunner_service_up == 0
+        for: 3m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.service }} is down on {{ $labels.instance }}"
+          description: "Jobs on this host fail while it is down. Check: journalctl -u {{ $labels.service }} -n 100"
+      - alert: FireRunnerFlintlockDown
+        expr: firerunner_flintlock_up == 0
+        for: 3m
+        labels: {severity: critical}
+        annotations:
+          summary: "flintlock API unreachable on {{ $labels.instance }}"
+          description: "No microVM can be created. Check: systemctl status flintlockd containerd-flintlock"
+      - alert: FireRunnerThinPoolFull
+        expr: max by (instance) (firerunner_thinpool_usage_ratio) > 0.85
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "microVM thin pool {{ $value | humanizePercentage }} full on {{ $labels.instance }}"
+          description: "At 100% every microVM create fails. Extend the flintlock volume group or remove unused images."
+      - alert: FireRunnerBootFailures
+        expr: sum by (instance) (increase(firerunner_vm_boot_failures_total[15m])) >= 3
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value | humanize }} microVM boots failed in 15m on {{ $labels.instance }}"
+          description: "Jobs fail with a system error. Check: firerunner doctor; journalctl -u flintlockd -n 100"
+      - alert: FireRunnerJobsFailing
+        expr: |
+          sum by (instance) (increase(firerunner_jobs_total{result="failed"}[1h]))
+            / clamp_min(sum by (instance) (increase(firerunner_jobs_total[1h])), 1) > 0.5
+          and sum by (instance) (increase(firerunner_jobs_total[1h])) >= 10
+        labels: {severity: warning}
+        annotations:
+          summary: "More than half of the jobs failed in the last hour on {{ $labels.instance }}"
+          description: "May be the projects themselves; compare with other runners before blaming the host."
+      - alert: FireRunnerPoolEmpty
+        expr: firerunner_pool_target > 0 and firerunner_pool_ready == 0 and firerunner_pool_booting == 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Warm pool is empty and not refilling on {{ $labels.instance }}"
+          description: "Every job waits for a cold boot (~15s). Usually host memory: see firerunner_admission_waits_total."

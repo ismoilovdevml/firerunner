@@ -72,6 +72,8 @@ die()  { printf '[firerunner] ERROR: %s\n' "$*" >&2; exit 1; }
 
 cleanup() { [[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"; return 0; }
 trap cleanup EXIT
+# set -e exits silently; say where and why.
+trap 'printf "[firerunner] ERROR: line %s: %s (exit %s)\n" "$LINENO" "$BASH_COMMAND" "$?" >&2' ERR
 
 # --------------------------------------------------------------------------
 # Preflight
@@ -139,7 +141,7 @@ verify() {
 
 install_containerd() {
     local have=""
-    [[ -x $BIN_DIR/containerd ]] && have=$($BIN_DIR/containerd --version | awk '{print $3}')
+    [[ -x $BIN_DIR/containerd ]] && have=$($BIN_DIR/containerd --version | awk '{print $3}' || true)
     if [[ "$have" != "v${CONTAINERD_VERSION}" ]]; then
         log "installing containerd v${CONTAINERD_VERSION}"
         local base="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}"
@@ -253,7 +255,7 @@ EOF
 
 install_firecracker() {
     local have=""
-    [[ -x $BIN_DIR/firecracker ]] && have=$($BIN_DIR/firecracker --version 2>/dev/null | head -1 | awk '{print $2}')
+    [[ -x $BIN_DIR/firecracker ]] && have=$($BIN_DIR/firecracker --version 2>/dev/null | head -1 | awk '{print $2}' || true)
     if [[ "$have" == "v${FIRECRACKER_VERSION}" ]]; then
         log "firecracker v${FIRECRACKER_VERSION} already installed"
         return
@@ -382,7 +384,7 @@ EOF
 
 install_flintlock() {
     local have=""
-    [[ -x $BIN_DIR/flintlockd ]] && have=$($BIN_DIR/flintlockd version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [[ -x $BIN_DIR/flintlockd ]] && have=$($BIN_DIR/flintlockd version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
     if [[ "$have" != "${FLINTLOCK_VERSION}" ]]; then
         log "installing flintlockd v${FLINTLOCK_VERSION}"
         local base="https://github.com/liquidmetal-dev/flintlock/releases/download/v${FLINTLOCK_VERSION}"
@@ -435,8 +437,8 @@ EOF
 
 install_registry_mirror() {
     local have=""
-    [[ -x $BIN_DIR/registry ]] && have=$($BIN_DIR/registry --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    if [[ "$have" != "v${REGISTRY_VERSION}" ]]; then
+    [[ -x $BIN_DIR/registry ]] && have=$($BIN_DIR/registry --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+    if [[ "$have" != "${REGISTRY_VERSION}" ]]; then
         log "installing Docker Hub mirror (distribution v${REGISTRY_VERSION})"
         local base="https://github.com/distribution/distribution/releases/download/v${REGISTRY_VERSION}"
         local tgz="registry_${REGISTRY_VERSION}_linux_amd64.tar.gz"
@@ -546,7 +548,7 @@ WantedBy=multi-user.target
 EOF
 
     local have=""
-    [[ -x $BIN_DIR/gitlab-runner ]] && have=$($BIN_DIR/gitlab-runner --version 2>/dev/null | awk '/^Version:/ {print $2}')
+    [[ -x $BIN_DIR/gitlab-runner ]] && have=$($BIN_DIR/gitlab-runner --version 2>/dev/null | awk '/^Version:/ {print $2}' || true)
     if [[ "$have" != "${GITLAB_RUNNER_VERSION}" ]]; then
         log "installing gitlab-runner v${GITLAB_RUNNER_VERSION}"
         local base="https://gitlab-runner-downloads.s3.amazonaws.com/v${GITLAB_RUNNER_VERSION}"
