@@ -211,34 +211,39 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config) {
 	_, _ = rand.Read(suffix)
 	id := "pool-" + hex.EncodeToString(suffix)
 	start := time.Now()
+
+	// The VM counts as booting until it is fully ready (including preload),
+	// otherwise refill sees a gap and boots extra VMs.
 	inst, err := vm.Boot(ctx, cfg, d.fl, id, map[string]string{LabelRole: "pool"})
+	if err == nil {
+		d.metrics.bootSeconds.WithLabelValues("pool").Observe(time.Since(start).Seconds())
+		if len(cfg.Pool.PreloadImages) > 0 {
+			pullStart := time.Now()
+			if perr := preload(ctx, cfg, inst.IP); perr != nil {
+				d.metrics.bootFailures.WithLabelValues("preload").Inc()
+				d.log.Error("image preload failed, VM kept without it", "id", id, "err", perr)
+			} else {
+				d.metrics.preloadSeconds.Observe(time.Since(pullStart).Seconds())
+			}
+		}
+	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.booting--
 	d.metrics.poolBooting.Set(float64(d.booting))
-	if err != nil {
+	switch {
+	case err != nil:
 		d.metrics.bootFailures.WithLabelValues("pool").Inc()
 		d.log.Error("pool boot failed", "id", id, "err", err)
-		return
+	case ctx.Err() != nil:
+		// Shutting down: do not hand out a VM nobody will drain.
+		go d.delete(context.Background(), inst, "shutdown")
+	default:
+		d.ready = append(d.ready, &pooled{inst: inst, bornAt: time.Now(), specID: fingerprint(cfg)})
+		d.metrics.poolReady.Set(float64(len(d.ready)))
+		d.log.Info("pool VM ready", "id", id, "ip", inst.IP, "took", time.Since(start).Round(100*time.Millisecond).String())
 	}
-	d.metrics.bootSeconds.WithLabelValues("pool").Observe(time.Since(start).Seconds())
-	if len(cfg.Pool.PreloadImages) > 0 {
-		// Pull outside the lock: it can take a while and jobs may claim other VMs meanwhile.
-		d.mu.Unlock()
-		pullStart := time.Now()
-		err := preload(ctx, cfg, inst.IP)
-		d.mu.Lock()
-		if err != nil {
-			d.metrics.bootFailures.WithLabelValues("preload").Inc()
-			d.log.Error("image preload failed, VM kept without it", "id", id, "err", err)
-		} else {
-			d.metrics.preloadSeconds.Observe(time.Since(pullStart).Seconds())
-		}
-	}
-	d.ready = append(d.ready, &pooled{inst: inst, bornAt: time.Now(), specID: fingerprint(cfg)})
-	d.metrics.poolReady.Set(float64(len(d.ready)))
-	d.log.Info("pool VM ready", "id", id, "ip", inst.IP, "boot", time.Since(start).Round(100*time.Millisecond).String())
 }
 
 // preload pulls pool.preload_images into the VM's Docker.
