@@ -67,6 +67,21 @@ func NewMetrics() *Metrics {
 		memAvailable:     prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_host_memory_available_bytes", Help: "MemAvailable on the host."}),
 		runnerConcurrent: prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_runner_concurrent", Help: "gitlab-runner concurrent limit."}),
 	}
+	// Pre-create every label combination so dashboards show 0 instead of
+	// "No data" before the first job.
+	for _, r := range []string{"hit", "miss"} {
+		m.claims.WithLabelValues(r)
+	}
+	for _, r := range []string{"success", "failed"} {
+		m.jobs.WithLabelValues(r)
+	}
+	for _, k := range []string{"pool", "cold"} {
+		m.bootSeconds.WithLabelValues(k)
+		m.prepareSeconds.WithLabelValues(k)
+		m.bootFailures.WithLabelValues(k)
+	}
+	m.bootFailures.WithLabelValues("preload")
+
 	info := prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_build_info", Help: "Build version.",
 		ConstLabels: prometheus.Labels{"version": Version}})
 	info.Set(1)

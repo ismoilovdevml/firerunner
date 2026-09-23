@@ -62,6 +62,13 @@ func (d *Daemon) apiHandler() http.Handler {
 }
 
 func (d *Daemon) record(e Event) {
+	// Event fields become metric labels: only accept known values.
+	if e.Source != "pool" && e.Source != "cold" {
+		e.Source = "cold"
+	}
+	if e.Result != "success" {
+		e.Result = "failed"
+	}
 	switch e.Kind {
 	case "prepare":
 		if e.OK {
