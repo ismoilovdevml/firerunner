@@ -87,7 +87,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go func() { errc <- metricsSrv.ListenAndServe() }()
 	d.log.Info("daemon started", "socket", d.cfg.Daemon.Socket, "metrics", d.cfg.Daemon.MetricsListen, "pool", d.cfg.Pool.Size)
 
-	d.reconcile(ctx)
+	d.reconcile(ctx, true)
 	refill := time.NewTicker(2 * time.Second)
 	reconcile := time.NewTicker(d.cfg.Daemon.ReconcileInterval)
 	host := time.NewTicker(15 * time.Second)
@@ -114,7 +114,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.expireIdle(ctx)
 			d.refill(ctx)
 		case <-reconcile.C:
-			d.reconcile(ctx)
+			d.reconcile(ctx, false)
 		case <-host.C:
 			d.collectHost(ctx)
 		}
@@ -304,8 +304,41 @@ func (d *Daemon) reloadConfig(ctx context.Context) {
 // ---------------------------------------------------------------------------
 // reconcile: delete microVMs nobody owns
 
-func (d *Daemon) reconcile(ctx context.Context) {
-	lctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+// vmFacts is what reconcile knows about one microVM.
+type vmFacts struct {
+	State   string // flintlock state, e.g. CREATED, FAILED
+	Role    string // firerunner/role label
+	Job     string // firerunner/job label
+	Owned   bool   // in the pool, just claimed, or referenced by a job state file
+	Age     time.Duration
+	Startup bool // first reconcile of this daemon
+	Booting int  // pool VMs this daemon is booting right now
+}
+
+// decide returns why a microVM should be deleted, or "" to keep it.
+func decide(f vmFacts, cfg config.Config) string {
+	switch {
+	case f.State == "FAILED":
+		return "failed"
+	case f.Owned && f.Age > cfg.Daemon.JobMaxAge:
+		return "older than daemon.job_max_age"
+	case f.Owned:
+		return ""
+	case f.Role == "pool" && f.Startup:
+		// A fresh daemon owns no pool VMs: these were left by a previous run.
+		return "pool VM from a previous daemon run"
+	case f.Role == "pool" && f.Booting == 0 && f.Age > cfg.VM.BootTimeout:
+		return "orphaned pool VM"
+	case f.Role == "run" && f.Age > cfg.Daemon.JobMaxAge:
+		return "abandoned `firerunner run` VM"
+	case f.Job != "" && f.Age > 2*cfg.VM.BootTimeout:
+		return "job VM without a running job"
+	}
+	return ""
+}
+
+func (d *Daemon) reconcile(ctx context.Context, startup bool) {
+	lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	vms, err := d.fl.List(lctx)
 	if err != nil {
@@ -330,17 +363,28 @@ func (d *Daemon) reconcile(ctx context.Context) {
 	}
 	booting := d.booting
 	d.mu.Unlock()
-	for _, uid := range jobStateUIDs() {
-		owned[uid] = true
+
+	present := map[string]bool{}
+	for _, v := range vms {
+		present[v.GetSpec().GetUid()] = true
+	}
+	for uid, file := range jobStates() {
+		if present[uid] {
+			owned[uid] = true
+			continue
+		}
+		// The job's VM is gone (cleanup failed or the host rebooted): drop the stale state.
+		if fi, err := os.Stat(file); err == nil && time.Since(fi.ModTime()) > 10*time.Minute {
+			_ = os.Remove(file)
+			d.log.Info("removed stale job state", "file", file)
+		}
 	}
 
 	states := map[string]float64{}
-	seen := map[string]bool{}
 	for _, v := range vms {
 		uid, labels := v.GetSpec().GetUid(), v.GetSpec().GetLabels()
 		state := v.GetStatus().GetState().String()
 		states[state]++
-		seen[uid] = true
 		d.mu.Lock()
 		first, ok := d.firstSee[uid]
 		if !ok {
@@ -348,22 +392,9 @@ func (d *Daemon) reconcile(ctx context.Context) {
 			d.firstSee[uid] = first
 		}
 		d.mu.Unlock()
-		age := time.Since(first)
 
-		reason := ""
-		switch {
-		case state == "FAILED":
-			reason = "failed"
-		case owned[uid] && age > cfg.Daemon.JobMaxAge:
-			reason = "older than daemon.job_max_age"
-		case owned[uid]:
-		case labels[LabelRole] == "pool" && booting == 0 && age > cfg.VM.BootTimeout:
-			reason = "orphaned pool VM"
-		case labels[LabelRole] == "run" && age > cfg.Daemon.JobMaxAge:
-			reason = "abandoned `firerunner run` VM"
-		case labels[LabelJob] != "" && age > 2*cfg.VM.BootTimeout:
-			reason = "job VM without a running job"
-		}
+		reason := decide(vmFacts{State: state, Role: labels[LabelRole], Job: labels[LabelJob], Owned: owned[uid],
+			Age: time.Since(first), Startup: startup, Booting: booting}, cfg)
 		if reason != "" {
 			d.metrics.orphansDeleted.WithLabelValues(reason).Inc()
 			d.delete(ctx, &vm.Instance{ID: v.GetSpec().GetId(), UID: uid}, reason)
@@ -371,7 +402,7 @@ func (d *Daemon) reconcile(ctx context.Context) {
 	}
 	d.mu.Lock()
 	for uid := range d.firstSee {
-		if !seen[uid] {
+		if !present[uid] {
 			delete(d.firstSee, uid)
 		}
 	}
@@ -382,16 +413,16 @@ func (d *Daemon) reconcile(ctx context.Context) {
 	}
 }
 
-// jobStateUIDs lists microVMs that belong to jobs in progress (written by `executor prepare`).
-func jobStateUIDs() []string {
-	var uids []string
+// jobStates maps microVM uid -> state file for jobs in progress (written by `executor prepare`).
+func jobStates() map[string]string {
+	out := map[string]string{}
 	files, _ := filepath.Glob("/run/firerunner/jobs/*.json")
 	for _, f := range files {
 		if st, err := vm.LoadJobState(f); err == nil {
-			uids = append(uids, st.UID)
+			out[st.UID] = f
 		}
 	}
-	return uids
+	return out
 }
 
 func (d *Daemon) collectHost(ctx context.Context) {

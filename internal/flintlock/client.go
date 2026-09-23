@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	mvmv1 "github.com/liquidmetal-dev/flintlock/api/services/microvm/v1alpha1"
 	"github.com/liquidmetal-dev/flintlock/api/types"
@@ -69,12 +70,32 @@ func (c *Client) Delete(ctx context.Context, uid string) error {
 	return err
 }
 
+// List returns every microVM in the namespace. flintlockd can fail a list
+// while it garbage-collects the spec of a VM being deleted ("failed reading
+// from content store"); that is transient, so it is retried.
 func (c *Client) List(ctx context.Context) ([]*types.MicroVM, error) {
-	resp, err := c.api.ListMicroVMs(ctx, &mvmv1.ListMicroVMsRequest{Namespace: c.namespace})
-	if err != nil {
-		return nil, err
+	var err error
+	for attempt := 0; attempt < 6; attempt++ {
+		var resp *mvmv1.ListMicroVMsResponse
+		resp, err = c.api.ListMicroVMs(ctx, &mvmv1.ListMicroVMsRequest{Namespace: c.namespace})
+		if err == nil {
+			return resp.GetMicrovm(), nil
+		}
+		if !IsTransient(err) {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 300 * time.Millisecond):
+		}
 	}
-	return resp.GetMicrovm(), nil
+	return nil, err
+}
+
+// IsTransient reports errors flintlockd returns while a concurrent delete is in progress.
+func IsTransient(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "failed reading from content store")
 }
 
 // Find returns the microVM whose id or uid matches ref.

@@ -426,15 +426,21 @@ func cmdVM(cfg config.Config, args []string) error {
 		if len(refs) == 0 {
 			return errors.New("usage: firerunner vm rm <id|uid>... | --all")
 		}
+		failed := 0
 		for _, ref := range refs {
 			v, err := fl.Find(ctx, ref)
-			if err != nil {
-				return err
+			if err == nil {
+				err = fl.Delete(ctx, v.GetSpec().GetUid())
 			}
-			if err := fl.Delete(ctx, v.GetSpec().GetUid()); err != nil {
-				return fmt.Errorf("deleting %s: %w", ref, err)
+			if err != nil {
+				failed++
+				fmt.Fprintf(os.Stderr, "deleting %s: %v\n", ref, err)
+				continue
 			}
 			fmt.Printf("deleted %s (%s)\n", v.GetSpec().GetId(), v.GetSpec().GetUid())
+		}
+		if failed > 0 {
+			return fmt.Errorf("%d of %d deletes failed", failed, len(refs))
 		}
 		return nil
 	case "logs":
