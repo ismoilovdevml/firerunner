@@ -66,8 +66,10 @@ jobs:
 
       # Scans the stdlib of the toolchain setup-go installed from go.mod, i.e.
       # the one release.yml builds with.
+      # Scan what ships: the firerunner binary. Test helpers (e.g. the fake
+      # flintlock gRPC server in internal/flintlock/flintlocktest) are not in it.
       - name: govulncheck
-        run: go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ./...
+        run: go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ./cmd/...
 
   test:
     name: Test

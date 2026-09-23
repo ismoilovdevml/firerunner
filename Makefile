@@ -96,7 +96,7 @@ lint: ## Run golangci-lint (pinned version)
 	@echo "Lint complete"
 
 vulncheck: ## Run govulncheck (pinned version)
-	$(GOCMD) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+	$(GOCMD) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./cmd/...
 
 vet: ## Run go vet
 	@echo "Running go vet..."
