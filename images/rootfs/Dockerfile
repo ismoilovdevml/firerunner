@@ -1,10 +1,10 @@
 # Root filesystem for FireRunner job microVMs.
 # Flintlock turns this image into the VM's root disk and boots /sbin/init (systemd).
-ARG UBUNTU_VERSION=22.04
+ARG UBUNTU_VERSION=24.04
 FROM ubuntu:${UBUNTU_VERSION}
 
 ARG TARGETARCH=amd64
-ARG GITLAB_RUNNER_VERSION=19.0.1
+ARG GITLAB_RUNNER_VERSION=19.4.0
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -13,7 +13,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cloud-init openssh-server sudo \
         iproute2 iputils-ping dnsutils ca-certificates \
         curl wget git git-lfs jq unzip zip xz-utils tar gzip make python3 \
-        docker.io iptables \
+        iptables gnupg \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Docker CE from Docker's own repository (current stable, with buildx and compose).
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
+    && . /etc/os-release \
+    && echo "deb [arch=${TARGETARCH} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
+        >/etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # gitlab-runner inside the guest is used by the custom executor for artifacts and cache.

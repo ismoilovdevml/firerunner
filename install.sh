@@ -22,7 +22,7 @@
 #   FR_POOL_SIZE            pre-booted microVMs kept ready (default: 2)
 #   FR_METRICS_ALLOW        source CIDR allowed to scrape :9477/metrics (default: none, localhost only)
 #   REGISTRY_VERSION        Docker Hub pull-through mirror for microVMs (default: 3.1.1)
-#   GITLAB_RUNNER_VERSION   (default: 19.0.1)
+#   GITLAB_RUNNER_VERSION   (default: 19.4.0)
 #
 # Register a GitLab runner right away (optional, can be done later with
 # `firerunner runner register`):
@@ -39,7 +39,7 @@ CONTAINERD_VERSION="${CONTAINERD_VERSION:-1.7.35}"
 FIRECRACKER_VERSION="${FIRECRACKER_VERSION:-1.17.0}"
 FLINTLOCK_VERSION="${FLINTLOCK_VERSION:-0.15.2}"
 REGISTRY_VERSION="${REGISTRY_VERSION:-3.1.1}"
-GITLAB_RUNNER_VERSION="${GITLAB_RUNNER_VERSION:-19.0.1}"
+GITLAB_RUNNER_VERSION="${GITLAB_RUNNER_VERSION:-19.4.0}"
 FR_VERSION="${FR_VERSION:-edge}"
 FR_BINARY="${FR_BINARY:-}"            # local firerunner binary instead of a release (development)
 
