@@ -173,8 +173,11 @@ func (d *Daemon) refill(ctx context.Context) {
 	d.metrics.poolTarget.Set(float64(cfg.Pool.Size))
 
 	for i := 0; i < missing; i++ {
-		if ok, avail := host.MemoryFits(cfg.VM.MemoryMB, cfg.VM.HostReserveMB); !ok {
-			d.log.Debug("pool refill waits for memory", "available_mb", avail)
+		// VMs created in this loop are not listed by flintlock yet.
+		extra := i * cfg.VM.MemoryMB * 105 / 100
+		ok, why, err := vm.Fits(ctx, cfg, d.fl, extra)
+		if err != nil || !ok {
+			d.log.Debug("pool refill waits for memory", "why", why, "err", err)
 			d.metrics.admissionWaits.Inc()
 			return
 		}

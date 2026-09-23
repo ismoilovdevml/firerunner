@@ -180,7 +180,12 @@ func run(name string, args ...string) error {
 }
 
 // MemAvailableMB reads MemAvailable from /proc/meminfo.
-func MemAvailableMB() (int, error) {
+func MemAvailableMB() (int, error) { return meminfo("MemAvailable:") }
+
+// MemTotalMB reads MemTotal from /proc/meminfo.
+func MemTotalMB() (int, error) { return meminfo("MemTotal:") }
+
+func meminfo(key string) (int, error) {
 	f, err := os.Open("/proc/meminfo")
 	if err != nil {
 		return 0, err
@@ -189,20 +194,10 @@ func MemAvailableMB() (int, error) {
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
-		if len(fields) >= 2 && fields[0] == "MemAvailable:" {
+		if len(fields) >= 2 && fields[0] == key {
 			kb, err := strconv.Atoi(fields[1])
 			return kb / 1024, err
 		}
 	}
-	return 0, errors.New("MemAvailable not found in /proc/meminfo")
-}
-
-// MemoryFits reports whether a microVM of vmMB fits while keeping reserveMB free.
-// Firecracker adds a small per-VM overhead, counted as 5%.
-func MemoryFits(vmMB, reserveMB int) (bool, int) {
-	avail, err := MemAvailableMB()
-	if err != nil {
-		return true, 0 // cannot tell: do not block
-	}
-	return avail-reserveMB >= vmMB*105/100, avail
+	return 0, fmt.Errorf("%s not found in /proc/meminfo", key)
 }

@@ -19,7 +19,6 @@ import (
 	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/daemon"
 	"github.com/ismoilovdevml/firerunner/internal/flintlock"
-	"github.com/ismoilovdevml/firerunner/internal/host"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
@@ -102,28 +101,30 @@ func claim(cfg config.Config, dc *daemon.Client, id string) *vm.Instance {
 }
 
 func coldBoot(ctx context.Context, cfg config.Config, id string) (*vm.Instance, error) {
+	fl, err := flintlock.Dial(cfg.Flintlock)
+	if err != nil {
+		return nil, err
+	}
+	defer fl.Close()
 	deadline := time.Now().Add(cfg.VM.BootTimeout)
 	for {
-		ok, avail := host.MemoryFits(cfg.VM.MemoryMB, cfg.VM.HostReserveMB)
+		ok, why, err := vm.Fits(ctx, cfg, fl, 0)
+		if err != nil {
+			return nil, err
+		}
 		if ok {
 			break
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("host memory stays too low for a %d MB microVM (%d MB available, %d MB reserved)",
-				cfg.VM.MemoryMB, avail, cfg.VM.HostReserveMB)
+			return nil, fmt.Errorf("no host memory for another microVM within %s (%s); lower runner concurrent or pool.size", cfg.VM.BootTimeout, why)
 		}
-		fmt.Printf("waiting for host memory (%d MB available)...\n", avail)
+		fmt.Printf("waiting for host memory (%s)...\n", why)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-time.After(5 * time.Second):
 		}
 	}
-	fl, err := flintlock.Dial(cfg.Flintlock)
-	if err != nil {
-		return nil, err
-	}
-	defer fl.Close()
 	fmt.Printf("Creating microVM %s (%s)\n", id, cfg.VM.RootFSImage)
 	return vm.Boot(ctx, cfg, fl, id, map[string]string{
 		daemon.LabelRole:      "job",

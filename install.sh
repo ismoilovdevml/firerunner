@@ -424,6 +424,8 @@ ExecStart=${BIN_DIR}/flintlockd run \\
 Restart=always
 RestartSec=5
 KillMode=process
+# An OOM-killed microVM must not take the whole service (and every other VM) down.
+OOMPolicy=continue
 LimitNOFILE=1048576
 
 [Install]
