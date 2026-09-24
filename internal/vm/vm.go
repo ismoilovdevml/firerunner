@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -103,10 +104,15 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 			return fail(err)
 		}
 		if inst.IP == "" {
-			if err := sleep(ctx, time.Second); err != nil {
+			if err := sleep(ctx, bootPoll); err != nil {
 				return fail(err)
 			}
 		}
+	}
+	// Wait for sshd's port before spawning ssh: a TCP dial costs no process, so
+	// it can poll every bootPoll, and the first ssh then almost always succeeds.
+	if err := waitTCP(ctx, net.JoinHostPort(inst.IP, "22"), deadline); err != nil {
+		return fail(fmt.Errorf("microVM %s at %s did not open SSH within %s: %w", id, inst.IP, cfg.VM.BootTimeout, err))
 	}
 	for SSH(cfg, inst, "true").Run() != nil {
 		if time.Now().After(deadline) {
@@ -316,6 +322,27 @@ func ExitCode(err error) (int, error) {
 		return -1, err
 	}
 	return 0, nil
+}
+
+// bootPoll is how often Boot checks for the DHCP lease and for sshd's port (a
+// variable for tests). A boot takes 5-15 s; polling once a second added about
+// half a second per wait to every boot.
+var bootPoll = 250 * time.Millisecond
+
+// waitTCP dials addr every bootPoll until it accepts, ctx ends or the deadline passes.
+func waitTCP(ctx context.Context, addr string, deadline time.Time) error {
+	for {
+		c, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			return c.Close()
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		if err := sleep(ctx, bootPoll); err != nil {
+			return err
+		}
+	}
 }
 
 func sleep(ctx context.Context, d time.Duration) error {

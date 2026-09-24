@@ -1,13 +1,17 @@
 package vm
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/liquidmetal-dev/flintlock/api/types"
 	"golang.org/x/crypto/ssh"
@@ -175,4 +179,54 @@ func TestForgetReleasesLease(t *testing.T) {
 	if got != nil {
 		t.Fatalf("released %v for a VM without a lease", got)
 	}
+}
+
+func TestWaitTCP(t *testing.T) {
+	old := bootPoll
+	bootPoll = 20 * time.Millisecond
+	t.Cleanup(func() { bootPoll = old })
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	t.Run("closed port hits the deadline", func(t *testing.T) {
+		if err := waitTCP(context.Background(), addr, time.Now().Add(100*time.Millisecond)); err == nil {
+			t.Fatal("waitTCP = nil for a closed port")
+		}
+	})
+	t.Run("port that opens later is seen quickly", func(t *testing.T) {
+		ready := make(chan net.Listener, 1)
+		go func() {
+			time.Sleep(150 * time.Millisecond)
+			l, err := net.Listen("tcp", addr)
+			if err != nil {
+				ready <- nil
+				return
+			}
+			ready <- l
+		}()
+		start := time.Now()
+		err := waitTCP(context.Background(), addr, time.Now().Add(5*time.Second))
+		if l := <-ready; l != nil {
+			defer l.Close()
+		} else {
+			t.Skip("could not re-bind the port")
+		}
+		if err != nil {
+			t.Fatalf("waitTCP = %v", err)
+		}
+		if took := time.Since(start); took > time.Second {
+			t.Fatalf("noticed the open port after %s", took)
+		}
+	})
+	t.Run("cancel wins over the deadline", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := waitTCP(ctx, addr, time.Now().Add(time.Minute)); !errors.Is(err, context.Canceled) {
+			t.Fatalf("waitTCP = %v, want context.Canceled", err)
+		}
+	})
 }
