@@ -21,7 +21,10 @@
 #
 #   FR_VERSION              firerunner release to install (default: edge = latest main)
 #   FR_POOL_SIZE            pre-booted microVMs kept ready (default: 2)
-#   FR_METRICS_ALLOW        source CIDR allowed to scrape :9477/metrics (default: none, localhost only)
+#   FR_METRICS_ALLOW        source IPv4/CIDR allowed to scrape :9477/metrics (default: none, localhost only;
+#                           remembered for later re-runs)
+#   FR_EGRESS_DENY          comma-separated IPv4 CIDRs jobs must not reach, e.g. 192.168.0.0/16
+#                           (default: none; link-local 169.254.0.0/16 is always blocked)
 #   REGISTRY_VERSION        Docker Hub pull-through mirror for microVMs (default: 3.1.1)
 #   VERSITYGW_VERSION       S3 server for the runner's cache: (default: 1.8.0)
 #   FR_CACHE_DAYS           delete cache: archives not written for this many days (default: 14)
@@ -58,6 +61,7 @@ FR_RUNNER_TOKEN="${FR_RUNNER_TOKEN:-}"
 FR_RUNNER_CONCURRENT="${FR_RUNNER_CONCURRENT:-4}"
 FR_POOL_SIZE="${FR_POOL_SIZE:-2}"
 FR_METRICS_ALLOW="${FR_METRICS_ALLOW:-}"
+FR_EGRESS_DENY="${FR_EGRESS_DENY:-}"
 FR_REPO=ismoilovdevml/firerunner
 
 BIN_DIR=/usr/local/bin
@@ -88,6 +92,15 @@ trap 'printf "[firerunner] ERROR: line %s: %s (exit %s)\n" "$LINENO" "$BASH_COMM
 preflight() {
     [[ $EUID -eq 0 ]] || die "run as root (curl ... | sudo bash)"
     command -v systemctl >/dev/null || die "systemd is required"
+
+    # Both end up in firewall rules.
+    if [[ -n $FR_METRICS_ALLOW ]]; then
+        is_ipv4_cidr "$FR_METRICS_ALLOW" || die "FR_METRICS_ALLOW=$FR_METRICS_ALLOW is not an IPv4 address or CIDR"
+    fi
+    local cidr
+    for cidr in ${FR_EGRESS_DENY//,/ }; do
+        is_ipv4_cidr "$cidr" || die "FR_EGRESS_DENY: $cidr is not an IPv4 address or CIDR"
+    done
 
     # Only x86_64 is built and tested for now.
     [[ "$(uname -m)" == x86_64 ]] || die "unsupported architecture: $(uname -m) (x86_64 only)"
@@ -314,6 +327,35 @@ install_firecracker() {
 # microVM network: bridge + DHCP/DNS + NAT
 # --------------------------------------------------------------------------
 
+is_ipv4_cidr() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; }
+
+# The source allowed to scrape metrics. It is remembered, so a re-run without
+# FR_METRICS_ALLOW keeps the rule instead of opening :9477 to everyone.
+metrics_allow() {
+    if [[ -n $FR_METRICS_ALLOW ]]; then
+        echo "$FR_METRICS_ALLOW"
+    elif [[ -s $CONF_DIR/metrics-allow ]]; then
+        cat "$CONF_DIR/metrics-allow"
+    fi
+}
+
+# nft rules that keep :9477 to the allowed source, also on hosts without
+# firewalld or ufw. Nothing when metrics were never opened.
+metrics_input_rules() {
+    local allow
+    allow=$(metrics_allow)
+    [[ -n $allow ]] || return 0
+    printf '    tcp dport 9477 iifname "lo" accept\n'
+    printf '    tcp dport 9477 ip saddr %s accept\n' "$allow"
+    printf '    tcp dport 9477 drop\n'
+}
+
+# FR_EGRESS_DENY: extra destinations jobs must not reach, e.g. internal ranges.
+egress_deny_rules() {
+    [[ -n $FR_EGRESS_DENY ]] || return 0
+    printf '    iifname "%s" ip daddr { %s } drop\n' "$FR_BRIDGE" "${FR_EGRESS_DENY//,/, }"
+}
+
 setup_network() {
     log "configuring bridge ${FR_BRIDGE} (${FR_SUBNET}.0/24) with DHCP and NAT"
     mkdir -p "$LIB_DIR" "$CONF_DIR"
@@ -346,13 +388,15 @@ table inet firerunner {
   }
   chain input {
     type filter hook input priority filter; policy accept;
-    # microVMs may only use DHCP, DNS, the registry mirror and the cache server on the host
-    # (IPv4 and IPv6)
-    iifname "${FR_BRIDGE}" udp dport { 53, 67 } accept
-    iifname "${FR_BRIDGE}" tcp dport 53 accept
-    iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport { 5000, 9000 } accept
+    # microVMs may only use DHCP, DNS, the registry mirror and the cache server on
+    # the host (IPv4 and IPv6). DHCP requests are broadcasts, everything else must
+    # be addressed to the bridge address.
+    iifname "${FR_BRIDGE}" udp dport 67 accept
+    iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 udp dport 53 accept
+    iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport { 53, 5000, 9000 } accept
     iifname "${FR_BRIDGE}" ct state established,related accept
     iifname "${FR_BRIDGE}" drop
+$(metrics_input_rules)
   }
   chain forward {
     type filter hook forward priority filter; policy accept;
@@ -360,6 +404,10 @@ table inet firerunner {
     # below); any other traffic routed from one microVM to another is dropped.
     iifname "${FR_BRIDGE}" oifname "${FR_BRIDGE}" ct status dnat accept
     iifname "${FR_BRIDGE}" oifname "${FR_BRIDGE}" drop
+    # Link-local addresses (cloud instance metadata, 169.254.169.254) are never
+    # reachable from jobs. Firecracker answers the VM's own MMDS before the tap.
+    iifname "${FR_BRIDGE}" ip daddr 169.254.0.0/16 drop
+$(egress_deny_rules)
   }
   # Job VMs reach their project's BuildKit builder at ${FR_SUBNET}.1:<port>; the
   # firerunner daemon fills the map. Routed through the host, never VM to VM.
@@ -674,8 +722,15 @@ apply_vm_disk_size() {
 }
 
 open_metrics_port() {
-    [[ -n $FR_METRICS_ALLOW ]] || return 0
+    if [[ -z $FR_METRICS_ALLOW ]]; then
+        if [[ ! -s $CONF_DIR/metrics-allow && "$($BIN_DIR/firerunner config get daemon.metrics_listen 2>/dev/null)" == :* ]]; then
+            warn "metrics listen on all interfaces without an allowed source; re-run with FR_METRICS_ALLOW=<prometheus address>"
+        fi
+        return 0
+    fi
     log "allowing ${FR_METRICS_ALLOW} to scrape :9477/metrics"
+    # net-up.sh reads it to keep the port closed to anyone else (setup_network).
+    put "$CONF_DIR/metrics-allow" <<<"$FR_METRICS_ALLOW"
     # metrics listen on 127.0.0.1 by default; open them only together with the firewall rule
     if [[ "$($BIN_DIR/firerunner config get daemon.metrics_listen)" != ":9477" ]]; then
         $BIN_DIR/firerunner config set daemon.metrics_listen ":9477" >/dev/null
