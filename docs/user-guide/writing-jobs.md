@@ -76,6 +76,29 @@ image-build:
     `pool.preload_images`. For layer caching use BuildKit's registry cache:
     `docker buildx build --cache-from type=registry,ref=$CI_REGISTRY_IMAGE:cache --cache-to type=registry,ref=$CI_REGISTRY_IMAGE:cache,mode=max ...`
 
+## Services
+
+`services:` work like on the docker executor: each service runs as a container in your job's VM
+and is reachable under its alias (default: the image name without tag, e.g. `postgres`).
+
+```yaml
+integration:
+  tags: [firecracker]
+  image: python:3.12
+  services:
+    - name: postgres:16
+      variables:
+        POSTGRES_PASSWORD: test
+    - name: redis:7
+      alias: cache
+  script:
+    - pg_isready -h postgres
+    - python -m pytest
+```
+
+FireRunner waits up to 30 s for each port a service image exposes before your script starts. The
+alias also resolves in jobs without `image:` (it is written to `/etc/hosts` of the VM).
+
 ## Private images
 
 Set the standard `DOCKER_AUTH_CONFIG` CI/CD variable (project or group level). FireRunner writes
@@ -93,7 +116,7 @@ it into the job VM (`/root/.docker/config.json`) before your script runs, so bot
 | Isolation | container on a shared kernel | **own VM and kernel per job** |
 | Docker-in-Docker | `docker:dind` + privileged | **built in, not privileged** |
 | Leftovers from previous jobs | possible (volumes, cache) | **never** |
-| `services:` | supported | not yet ([#27](https://github.com/ismoilovdevml/firerunner/issues/27)) |
+| `services:` | supported | supported (containers in the job VM) |
 | `cache:` between jobs | local | not yet ([#26](https://github.com/ismoilovdevml/firerunner/issues/26)) |
 | Docker layer cache | shared on the host | per job (see tip above) |
 

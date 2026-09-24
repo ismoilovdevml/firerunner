@@ -114,6 +114,13 @@ only rewritten when they change and running microVMs are not touched.
      tags: [firecracker]
      script:
        - docker build -t app .                 # Docker is available in every VM
+
+   integration:
+     tags: [firecracker]
+     image: python:3.12
+     services: [postgres:16]                   # runs in the job VM, reachable as "postgres"
+     script:
+       - pytest
    ```
 
 ## Operate
@@ -172,7 +179,6 @@ found no confirmed vulnerability; its four open leads are fixed as described abo
 ## Limitations
 
 - x86_64 only; guest kernel is flintlock's 5.10 kernel (booted with `acpi=off`).
-- `services:` in `.gitlab-ci.yml` is not supported yet.
 - No shared Docker layer cache between jobs (by design); use `pool.preload_images` for base images.
 - Tested on Rocky Linux 9.6 hosts only.
 

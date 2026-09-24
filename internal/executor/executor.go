@@ -78,7 +78,15 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 		}
 	}
 
+	services, err := ParseServices(os.Getenv("CUSTOM_ENV_CI_JOB_SERVICES"))
+	if err != nil {
+		deleteVM(cfg, inst.UID)
+		return buildFailure(err)
+	}
 	st := &vm.JobState{Instance: *inst, Source: source, StartedAt: start}
+	if len(services) > 0 {
+		st.Network = ServiceNetwork
+	}
 	// Exclusive: a job must never replace another job's VM binding.
 	if err := vm.CreateJobState(statePath(id), st); err != nil {
 		deleteVM(cfg, inst.UID)
@@ -87,6 +95,13 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	if auth := os.Getenv("CUSTOM_ENV_DOCKER_AUTH_CONFIG"); auth != "" {
 		if err := writeDockerAuth(cfg, inst, auth); err != nil {
 			return systemFailure(fmt.Errorf("writing DOCKER_AUTH_CONFIG to the microVM: %w", err))
+		}
+	}
+	if len(services) > 0 {
+		cmd := vm.SSH(cfg, inst, "/bin/bash")
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = strings.NewReader(ServicesScript(services)), os.Stdout, os.Stderr
+		if code, err := vm.ExitCode(cmd.Run()); err != nil || code != 0 {
+			return systemFailure(fmt.Errorf("starting services failed (exit %d): %v", code, err))
 		}
 	}
 	took := time.Since(start)
@@ -173,7 +188,7 @@ func Run(cfg config.Config, script, stage string) error {
 		if strings.HasPrefix(image, "-") {
 			return buildFailure(fmt.Errorf("invalid image %q", image))
 		}
-		code, err = runInContainer(cfg, &st.Instance, image, f)
+		code, err = runInContainer(cfg, &st.Instance, image, st.Network, f)
 	} else {
 		code, err = vm.RunScript(cfg, &st.Instance, f, os.Stdout, os.Stderr)
 	}
@@ -196,15 +211,19 @@ func Run(cfg config.Config, script, stage string) error {
 // ContainerCommand is the command run in the microVM for image jobs. The build
 // and cache dirs are shared with the VM, which ran get_sources there.
 // Like the docker executor, bash is used when the image has it, sh otherwise.
-func ContainerCommand(image string) string {
-	return "docker run --rm -i --pull missing --network host --entrypoint '' " +
+// With services the container joins their network so their aliases resolve.
+func ContainerCommand(image, network string) string {
+	if network == "" {
+		network = "host"
+	}
+	return "docker run --rm -i --pull missing --network " + shellQuote(network) + " --entrypoint '' " +
 		"-v /root/builds:/root/builds -v /root/cache:/root/cache " +
 		shellQuote(image) + " " +
 		`sh -c 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi'`
 }
 
-func runInContainer(cfg config.Config, inst *vm.Instance, image string, script io.Reader) (int, error) {
-	cmd := vm.SSH(cfg, inst, ContainerCommand(image))
+func runInContainer(cfg config.Config, inst *vm.Instance, image, network string, script io.Reader) (int, error) {
+	cmd := vm.SSH(cfg, inst, ContainerCommand(image, network))
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = script, os.Stdout, os.Stderr
 	return vm.ExitCode(cmd.Run())
 }

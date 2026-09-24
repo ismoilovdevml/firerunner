@@ -20,6 +20,8 @@ microVM pool-551bf7 ready at 10.200.0.236 in 300ms (pool, 2 vCPU, 2048 MB)
 | `invalid image "--…"` | `image:` starts with `-` | fix the image name |
 | `Cannot connect to the Docker daemon` | Docker failed to start in the VM | report to the operator with the job URL |
 | `pull access denied` | private image without credentials | set `DOCKER_AUTH_CONFIG` |
+| `WARNING: service … did not open port … within 30s` | a service is slow or crashed; its last log lines follow | check the service's variables (e.g. `POSTGRES_PASSWORD`) |
+| `WARNING: Starting with version 17.0 the 'build_script' stage will be replaced with 'step_script'` | printed by gitlab-runner itself for every custom-executor job | harmless, ignore it |
 
 ## Reproduce locally on the runner host (operators)
 

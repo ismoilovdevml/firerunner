@@ -13,6 +13,8 @@ type JobState struct {
 	Source    string    `json:"source"` // pool | cold
 	StartedAt time.Time `json:"started_at"`
 	Failed    bool      `json:"failed"`
+	// Network is the Docker network job containers join (set when the job has services).
+	Network string `json:"network,omitempty"`
 }
 
 func SaveJobState(path string, st *JobState) error {
