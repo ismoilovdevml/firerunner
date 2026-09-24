@@ -35,6 +35,7 @@ jobs:
           platforms: linux/amd64
           push: true
           provenance: false
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/firerunner-rootfs:latest
             ghcr.io/${{ github.repository_owner }}/firerunner-rootfs:${{ github.sha }}

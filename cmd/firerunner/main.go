@@ -61,10 +61,10 @@ Usage:
 
   firerunner run [--keep] -- <command...>   boot a microVM, run a command, delete it
   firerunner pool [refresh]                 show pre-booted microVMs; refresh replaces them
+                                            (after a new rootfs image under the same tag)
   firerunner builder [list]                 per-project BuildKit builders (Docker layer cache)
   firerunner builder rm <project-id>|--all [--force]
-                                            delete a builder and its cache (after a new
-                                            rootfs image under the same tag); builders a
+                                            delete a builder and its cache; builders a
                                             running job builds on are kept without --force
 
   firerunner daemon                         pool + reconcile + metrics (systemd: firerunner.service)

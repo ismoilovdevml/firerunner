@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main ]
 
 permissions:
   contents: read
@@ -42,6 +42,9 @@ jobs:
 
       - name: Go Mod Verify
         run: go mod verify
+
+      - name: Go Mod Tidy
+        run: go mod tidy -diff
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
@@ -89,10 +92,6 @@ jobs:
       - name: Run Tests
         run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 
-      # Coverage is reported in the job log only. The codecov upload was
-      # removed: the repo has no CODECOV_TOKEN, so it could only ever fail
-      # (silently, with fail_ci_if_error: false) while holding an unpinned
-      # third-party action with access to the checkout.
       - name: Coverage Report
         run: go tool cover -func=coverage.out
 
@@ -114,13 +113,6 @@ jobs:
 
       - name: Verify Binary
         run: ./build/firerunner --help
-
-      - name: Upload Binary
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: firerunner-binary
-          path: build/firerunner
-          retention-days: 7
 
   network:
     name: Host firewall rules

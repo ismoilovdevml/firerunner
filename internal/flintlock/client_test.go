@@ -161,8 +161,8 @@ func TestDialSendsToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer fl.Close()
-	if fl.Namespace() != "test" {
-		t.Fatalf("namespace %q", fl.Namespace())
+	if fl.namespace != "test" {
+		t.Fatalf("namespace %q", fl.namespace)
 	}
 	if _, err := fl.List(context.Background()); err != nil {
 		t.Fatal(err)
