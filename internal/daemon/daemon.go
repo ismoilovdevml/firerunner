@@ -723,6 +723,35 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 		d.metrics.microvms.WithLabelValues(s).Set(n)
 	}
 	d.checkBuilders(present, listedAt)
+	live := map[string]bool{}
+	for _, v := range vms {
+		live[v.GetSpec().GetId()] = true
+	}
+	tidyVMDirs(filepath.Join(flintlockVMDir, cfg.Flintlock.Namespace), live)
+}
+
+// flintlockVMDir is where flintlockd keeps per-VM state (a variable for tests).
+var flintlockVMDir = "/var/lib/flintlock/vm"
+
+// tidyVMDirs removes the empty directories flintlockd leaves behind for every
+// deleted microVM (one per job: ~740 after the first trial day). Only empty
+// directories of VMs that are not listed and are older than an hour go; a VM
+// being created is listed well within that.
+func tidyVMDirs(root string, live map[string]bool) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || live[e.Name()] {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || time.Since(info.ModTime()) < time.Hour {
+			continue
+		}
+		_ = os.Remove(filepath.Join(root, e.Name())) // fails, and keeps it, unless empty
+	}
 }
 
 // jobStateGlob matches the state files `executor prepare` writes (a variable for tests).

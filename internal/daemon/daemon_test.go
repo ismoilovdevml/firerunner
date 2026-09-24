@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -77,4 +79,35 @@ func TestRoleOf(t *testing.T) {
 			t.Errorf("RoleOf(%q) = %q,%q want %v", id, r, j, want)
 		}
 	}
+}
+
+func TestTidyVMDirs(t *testing.T) {
+	root := t.TempDir()
+	old := time.Now().Add(-2 * time.Hour)
+	mk := func(name string, age time.Time, withFile bool) string {
+		p := filepath.Join(root, name)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if withFile {
+			if err := os.MkdirAll(filepath.Join(p, "01UID"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Chtimes(p, age, age); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	gone := mk("job-1", old, false)         // deleted VM, empty, old: removed
+	fresh := mk("job-2", time.Now(), false) // being created: kept
+	liveDir := mk("pool-a", old, false)     // listed: kept
+	withState := mk("job-3", old, true)     // not empty: kept
+	tidyVMDirs(root, map[string]bool{"pool-a": true})
+	for p, want := range map[string]bool{gone: false, fresh: true, liveDir: true, withState: true} {
+		if _, err := os.Stat(p); (err == nil) != want {
+			t.Errorf("%s exists=%v, want %v", filepath.Base(p), err == nil, want)
+		}
+	}
+	tidyVMDirs(filepath.Join(root, "missing"), nil) // no namespace dir yet: no-op
 }
