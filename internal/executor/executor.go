@@ -94,22 +94,33 @@ func jobID() (string, error) {
 func statePath(id string) string { return filepath.Join(StateDir, id+".json") }
 
 func Prepare(ctx context.Context, cfg config.Config) error {
-	id, err := jobID()
+	j, err := currentJob()
 	if err != nil {
 		return systemFailure(err)
 	}
+	id := j.ID
 	start := time.Now()
 	dc := daemon.NewClient(cfg.Daemon.Socket)
+	// finish reports a job that ends in prepare; cleanup has no state file to report it.
+	finish := func(result, reason string, err error) {
+		_ = dc.Send(daemon.Event{Kind: "finish", Result: result, Reason: reason, Seconds: time.Since(start).Seconds(),
+			Job: jobNumber(id), Project: j.Project, Err: errText(err)})
+	}
 
 	source := "pool"
+	var times bootTimes
 	inst := claim(cfg, dc, id)
 	if inst == nil {
-		inst, source, err = coldBoot(ctx, cfg, id, func() *vm.Instance { return claim(cfg, dc, id) })
+		inst, source, times, err = coldBoot(ctx, cfg, id, func() *vm.Instance { return claim(cfg, dc, id) })
 		if err != nil {
-			_ = dc.Send(daemon.Event{Kind: "prepare", Source: source})
+			reason := prepareReason(err)
+			_ = dc.Send(daemon.Event{Kind: "prepare", Source: source, Reason: reason, WaitSeconds: times.wait.Seconds(),
+				Job: jobNumber(id), Project: j.Project, Err: errText(err)})
+			finish(daemon.ResultSystemFailure, reason, err)
 			return systemFailure(err)
 		}
 	}
+	ready := time.Since(start) // what the job waited for its VM
 
 	// One SSH connection for the rest of the job (every later stage reuses it).
 	if err := vm.StartMux(cfg, inst); err != nil {
@@ -119,6 +130,7 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	services, err := ParseServices(os.Getenv("CUSTOM_ENV_CI_JOB_SERVICES"))
 	if err != nil {
 		deleteVM(cfg, inst)
+		finish(daemon.ResultScriptFailure, "", err)
 		return buildFailure(err)
 	}
 	st := &vm.JobState{Instance: *inst, Source: source, StartedAt: start}
@@ -128,18 +140,25 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	// Exclusive: a job must never replace another job's VM binding.
 	if err := vm.CreateJobState(statePath(id), st); err != nil {
 		deleteVM(cfg, inst)
+		finish(daemon.ResultSystemFailure, "state_file", err)
+		return systemFailure(err)
+	}
+	// From here on cleanup reports the job from its state file.
+	fail := func(reason string, err error) error {
+		recordFailure(st, daemon.ResultSystemFailure, reason)
+		_ = vm.SaveJobState(statePath(id), st)
 		return systemFailure(err)
 	}
 	if auth := os.Getenv("CUSTOM_ENV_DOCKER_AUTH_CONFIG"); auth != "" {
 		if err := writeDockerAuth(cfg, inst, auth); err != nil {
-			return systemFailure(fmt.Errorf("writing DOCKER_AUTH_CONFIG to the microVM: %w", err))
+			return fail("docker_auth", fmt.Errorf("writing DOCKER_AUTH_CONFIG to the microVM: %w", err))
 		}
 	}
 	if len(services) > 0 {
 		cmd := vm.SSH(cfg, inst, "/bin/bash")
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = strings.NewReader(ServicesScript(services)), os.Stdout, os.Stderr
 		if code, err := vm.ExitCode(cmd.Run()); err != nil || code != 0 {
-			return systemFailure(fmt.Errorf("starting services failed (exit %d): %v", code, err))
+			return fail("services", fmt.Errorf("starting services failed (exit %d): %v", code, err))
 		}
 	}
 	// Shell-mode jobs run docker on the VM; their builds can use the project's
@@ -152,10 +171,11 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 			_ = vm.SaveJobState(statePath(id), st)
 		}
 	}
-	took := time.Since(start)
-	_ = dc.Send(daemon.Event{Kind: "prepare", Source: source, Seconds: took.Seconds(), OK: true})
+	_ = dc.Send(daemon.Event{Kind: "prepare", Source: source, Seconds: ready.Seconds(), OK: true,
+		WaitSeconds: times.wait.Seconds(), BootSeconds: times.boot.Seconds(),
+		Job: jobNumber(id), Project: j.Project, VM: inst.ID})
 	fmt.Printf("microVM %s ready at %s in %s (%s, %d vCPU, %d MB)\n",
-		inst.ID, inst.IP, took.Round(100*time.Millisecond), source, cfg.VM.VCPU, cfg.VM.MemoryMB)
+		inst.ID, inst.IP, ready.Round(100*time.Millisecond), source, cfg.VM.VCPU, cfg.VM.MemoryMB)
 	return nil
 }
 
@@ -167,50 +187,62 @@ func claim(cfg config.Config, dc *daemon.Client, id string) *vm.Instance {
 	}
 	if err := vm.SSH(cfg, inst, "hostnamectl", "set-hostname", id).Run(); err != nil {
 		fmt.Printf("pool VM %s did not answer (%v), booting a new one\n", inst.ID, err)
+		_ = dc.Send(daemon.Event{Kind: "pool_vm_dead", VM: inst.ID, Job: jobNumber(id), Err: errText(err)})
 		deleteVM(cfg, inst)
 		return nil
 	}
 	return inst
 }
 
+// bootTimes is where a cold prepare spent its time.
+type bootTimes struct {
+	wait time.Duration // waiting for host memory
+	boot time.Duration // microVM create to SSH ready
+}
+
 // coldBoot boots a VM for the job once the host has memory for it. While it
 // waits, pool VMs that finish booting are taken instead (source "pool").
-func coldBoot(ctx context.Context, cfg config.Config, id string, fromPool func() *vm.Instance) (*vm.Instance, string, error) {
+func coldBoot(ctx context.Context, cfg config.Config, id string, fromPool func() *vm.Instance) (*vm.Instance, string, bootTimes, error) {
+	var t bootTimes
 	fl, err := flintlock.Dial(cfg.Flintlock)
 	if err != nil {
-		return nil, "cold", err
+		return nil, "cold", t, err
 	}
 	defer fl.Close()
-	deadline := time.Now().Add(cfg.VM.BootTimeout)
+	waitStart := time.Now()
+	deadline := waitStart.Add(cfg.VM.BootTimeout)
 	for {
 		ok, why, err := vm.Fits(ctx, cfg, fl, 0)
+		t.wait = time.Since(waitStart)
 		if err != nil {
-			return nil, "cold", err
+			return nil, "cold", t, err
 		}
 		if ok {
 			break
 		}
 		if inst := fromPool(); inst != nil {
-			return inst, "pool", nil
+			return inst, "pool", t, nil
 		}
 		if time.Now().After(deadline) {
-			return nil, "cold", fmt.Errorf("no host memory for another microVM within %s (%s); lower runner concurrent or pool.size", cfg.VM.BootTimeout, why)
+			return nil, "cold", t, fmt.Errorf("%w for another microVM within %s (%s); lower runner concurrent or pool.size", errNoMemory, cfg.VM.BootTimeout, why)
 		}
 		fmt.Printf("waiting for host memory (%s)...\n", why)
 		select {
 		case <-ctx.Done():
-			return nil, "cold", ctx.Err()
+			return nil, "cold", t, ctx.Err()
 		case <-time.After(5 * time.Second):
 		}
 	}
 	fmt.Printf("Creating microVM %s (%s)\n", id, cfg.VM.RootFSImage)
+	bootStart := time.Now()
 	inst, err := vm.Boot(ctx, cfg, fl, id, map[string]string{
 		daemon.LabelRole:      "job",
 		daemon.LabelJob:       id,
 		"firerunner/project":  strings.ReplaceAll(os.Getenv("CUSTOM_ENV_CI_PROJECT_PATH"), "/", "."),
 		"firerunner/pipeline": os.Getenv("CUSTOM_ENV_CI_PIPELINE_ID"),
 	})
-	return inst, "cold", err
+	t.boot = time.Since(bootStart)
+	return inst, "cold", t, err
 }
 
 // BuilderName is the buildx builder created in job VMs for the project's builder.
@@ -348,6 +380,10 @@ func Run(cfg config.Config, script, stage string) error {
 		}
 		code, err = vm.RunScript(cfg, &st.Instance, script, os.Stdout, os.Stderr)
 	}
+	if result, reason := stageOutcome(stage, code, err); result != daemon.ResultSuccess && st.Result == "" {
+		recordFailure(st, result, reason)
+		_ = vm.SaveJobState(statePath(id), st)
+	}
 	switch {
 	case err != nil:
 		return systemFailure(err)
@@ -356,8 +392,6 @@ func Run(cfg config.Config, script, stage string) error {
 	case code == 255: // ssh itself failed: the microVM is gone or unreachable
 		return systemFailure(fmt.Errorf("lost SSH connection to microVM %s", id))
 	case isUserStage(stage):
-		st.Failed = true
-		_ = vm.SaveJobState(statePath(id), st)
 		return buildFailure(fmt.Errorf("stage %s exited with %d", stage, code))
 	default:
 		return systemFailure(fmt.Errorf("stage %s exited with %d", stage, code))
@@ -420,11 +454,13 @@ func Cleanup(cfg config.Config) error {
 		}
 	}
 	if stErr == nil {
-		result := "success"
-		if st.Failed {
-			result = "failed"
+		result, reason := finishResult(st)
+		project := ""
+		if j, err := currentJob(); err == nil {
+			project = j.Project
 		}
-		_ = daemon.NewClient(cfg.Daemon.Socket).Send(daemon.Event{Kind: "finish", Result: result, Seconds: time.Since(st.StartedAt).Seconds()})
+		_ = daemon.NewClient(cfg.Daemon.Socket).Send(daemon.Event{Kind: "finish", Result: result, Reason: reason,
+			Seconds: time.Since(st.StartedAt).Seconds(), Job: jobNumber(id), Project: project, VM: st.ID})
 	}
 	// The state file goes even when the delete failed: nothing retries cleanup,
 	// and while the file exists reconcile treats the VM as a running job and

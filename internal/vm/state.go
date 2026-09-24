@@ -12,7 +12,11 @@ type JobState struct {
 	Instance
 	Source    string    `json:"source"` // pool | cold
 	StartedAt time.Time `json:"started_at"`
-	Failed    bool      `json:"failed"`
+	Failed    bool      `json:"failed"` // a user stage failed (kept for older readers; see Result)
+	// Result and Reason are the first failure of the job, as reported to the
+	// daemon at cleanup: script_failure, or system_failure with a reason.
+	Result string `json:"result,omitempty"`
+	Reason string `json:"reason,omitempty"`
 	// Network is the Docker network job containers join (set when the job has services).
 	Network string `json:"network,omitempty"`
 	// BuilderProject is the project whose BuildKit builder `docker build` in

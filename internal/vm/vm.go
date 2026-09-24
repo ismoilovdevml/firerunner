@@ -84,6 +84,15 @@ func NewHostKey() (HostKey, error) {
 	}, nil
 }
 
+// ErrNotReady matches the error of a microVM that was created but got no DHCP
+// lease or did not answer SSH within vm.boot_timeout.
+var ErrNotReady = errors.New("microVM not ready")
+
+type notReady struct{ msg string }
+
+func (e notReady) Error() string        { return e.msg }
+func (e notReady) Is(target error) bool { return target == ErrNotReady }
+
 // Boot creates the microVM and waits until it answers on SSH.
 // On failure the microVM is deleted before returning.
 func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id string, labels map[string]string) (*Instance, error) {
@@ -112,7 +121,7 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 	deadline := time.Now().Add(cfg.VM.BootTimeout)
 	for inst.IP == "" {
 		if time.Now().After(deadline) {
-			return fail(fmt.Errorf("microVM %s got no DHCP lease within %s (see: firerunner vm logs %s)", id, cfg.VM.BootTimeout, id))
+			return fail(notReady{fmt.Sprintf("microVM %s got no DHCP lease within %s (see: firerunner vm logs %s)", id, cfg.VM.BootTimeout, id)})
 		}
 		if inst.IP, err = LeaseIP(cfg.Network.LeasesFile, mac); err != nil {
 			return fail(err)
@@ -126,11 +135,11 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 	// Wait for sshd's port before spawning ssh: a TCP dial costs no process, so
 	// it can poll every bootPoll, and the first ssh then almost always succeeds.
 	if err := waitTCP(ctx, net.JoinHostPort(inst.IP, "22"), deadline); err != nil {
-		return fail(fmt.Errorf("microVM %s at %s did not open SSH within %s: %w", id, inst.IP, cfg.VM.BootTimeout, err))
+		return fail(notReady{fmt.Sprintf("microVM %s at %s did not open SSH within %s: %v", id, inst.IP, cfg.VM.BootTimeout, err)})
 	}
 	for SSH(cfg, inst, "true").Run() != nil {
 		if time.Now().After(deadline) {
-			return fail(fmt.Errorf("microVM %s at %s did not answer SSH within %s", id, inst.IP, cfg.VM.BootTimeout))
+			return fail(notReady{fmt.Sprintf("microVM %s at %s did not answer SSH within %s", id, inst.IP, cfg.VM.BootTimeout)})
 		}
 		if err := sleep(ctx, time.Second); err != nil {
 			return fail(err)
