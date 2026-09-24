@@ -212,3 +212,63 @@ func TestCreateJobStateIsExclusive(t *testing.T) {
 		t.Fatalf("mode %v", fi.Mode().Perm())
 	}
 }
+
+// Room admits a batch with one listing and matches Fits called once per VM.
+func TestRoom(t *testing.T) {
+	srv := flintlocktest.NewServer("")
+	srv.SetVMs(vmWith(types.MicroVMStatus_CREATED, 2000)) // 2100 with overhead
+	fl := dialFake(t, srv)
+	cfg := config.Default()
+	cfg.VM.MemoryMB = 1000 // 1050 each
+	cfg.VM.HostReserveMB = 0
+	cases := []struct {
+		name          string
+		totalMB, want int
+		room          int
+	}{
+		{"nothing fits", 3000, 4, 0},
+		{"exactly two fit", 4200, 4, 2},
+		{"one MB short of two", 4199, 4, 1},
+		{"capped at want", 20000, 3, 3},
+		{"already over capacity", 1000, 2, 0},
+		{"nothing wanted", 20000, 0, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pinMemTotal(t, c.totalMB, nil)
+			before := srv.ListCalls()
+			n, _, err := Room(context.Background(), cfg, fl, c.want)
+			if err != nil || n != c.room {
+				t.Fatalf("Room = %d, %v; want %d", n, err, c.room)
+			}
+			if lists := srv.ListCalls() - before; c.want > 0 && lists != 1 {
+				t.Fatalf("Room listed flintlock %d times, want 1", lists)
+			}
+			// Same answer as asking Fits once per VM with the memory already promised.
+			fits := 0
+			for fits < c.want {
+				ok, _, _ := Fits(context.Background(), cfg, fl, fits*withOverhead(cfg.VM.MemoryMB))
+				if !ok {
+					break
+				}
+				fits++
+			}
+			if fits != n {
+				t.Fatalf("Room = %d, Fits admits %d", n, fits)
+			}
+		})
+	}
+	t.Run("unknown host memory", func(t *testing.T) {
+		pinMemTotal(t, 0, errors.New("no /proc/meminfo"))
+		if n, _, err := Room(context.Background(), cfg, fl, 3); n != 3 || err == nil {
+			t.Fatalf("Room = %d, %v; want 3 with the error", n, err)
+		}
+	})
+	t.Run("flintlock down", func(t *testing.T) {
+		pinMemTotal(t, 1<<20, nil)
+		srv.FailList(status.Error(codes.Unavailable, "down"))
+		if n, _, err := Room(context.Background(), cfg, fl, 3); n != 0 || status.Code(err) != codes.Unavailable {
+			t.Fatalf("Room = %d, %v; want 0 with Unavailable", n, err)
+		}
+	})
+}

@@ -62,4 +62,25 @@ func Fits(ctx context.Context, cfg config.Config, fl *flintlock.Client, extraMB 
 	return committed+extraMB+need <= capacity, msg, nil
 }
 
+// Room reports how many of want more microVMs of the configured size fit now,
+// with a single flintlock List, so a pool refill of n VMs does not list n
+// times. Errors are those of Fits: unknown capacity (want is returned with
+// it) or flintlock down (0).
+func Room(ctx context.Context, cfg config.Config, fl *flintlock.Client, want int) (int, string, error) {
+	if want <= 0 {
+		return 0, "", nil
+	}
+	capacity, err := Capacity(cfg)
+	if err != nil {
+		return want, "", err
+	}
+	committed, err := CommittedMB(ctx, fl)
+	if err != nil {
+		return 0, "", err
+	}
+	need := withOverhead(cfg.VM.MemoryMB)
+	n := max(0, min(want, (capacity-committed)/need))
+	return n, fmt.Sprintf("committed %d MB, %d MB each, capacity %d MB", committed, need, capacity), nil
+}
+
 func withOverhead(mb int) int { return mb * (100 + overheadPct) / 100 }

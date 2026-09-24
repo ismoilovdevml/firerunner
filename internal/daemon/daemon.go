@@ -366,17 +366,23 @@ func (d *Daemon) refill(ctx context.Context) {
 	d.mu.Unlock()
 	d.metrics.poolTarget.Set(float64(cfg.Pool.Size))
 
-	for i := 0; i < missing; i++ {
-		// VMs created in this loop are not listed by flintlock yet.
-		extra := i * cfg.VM.MemoryMB * 105 / 100
-		fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		ok, why, err := vm.Fits(fctx, cfg, d.fl, extra)
-		cancel()
-		if err != nil || !ok {
-			d.log.Debug("pool refill waits for memory", "why", why, "err", err)
-			d.metrics.admissionWaits.Inc()
-			return
-		}
+	if missing <= 0 {
+		return
+	}
+	// One listing admits the whole batch (VMs booted here are not listed yet).
+	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	room, why, err := vm.Room(rctx, cfg, d.fl, missing)
+	cancel()
+	if err != nil {
+		d.log.Debug("pool refill waits", "why", why, "err", err)
+		d.metrics.admissionWaits.Inc()
+		return
+	}
+	if room < missing {
+		d.log.Debug("pool refill waits for memory", "why", why, "missing", missing, "room", room)
+		d.metrics.admissionWaits.Inc()
+	}
+	for i := 0; i < room; i++ {
 		d.mu.Lock()
 		d.booting++
 		d.metrics.poolBooting.Set(float64(d.booting))
