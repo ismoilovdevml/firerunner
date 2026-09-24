@@ -130,21 +130,61 @@ func (d *Daemon) record(e Event) {
 	if e.Source != "pool" && e.Source != "cold" {
 		e.Source = "cold"
 	}
-	if e.Result != "success" {
-		e.Result = "failed"
-	}
 	switch e.Kind {
 	case "prepare":
+		d.metrics.admissionWait.Observe(e.WaitSeconds)
 		if e.OK {
 			d.metrics.prepareSeconds.WithLabelValues(e.Source).Observe(e.Seconds)
-			if e.Source == "cold" {
+			switch {
+			case e.Source != "cold":
+			case e.BootSeconds > 0:
+				d.metrics.bootSeconds.WithLabelValues("cold").Observe(e.BootSeconds)
+			case e.WaitSeconds == 0:
+				// Executors older than BootSeconds only report the whole prepare.
 				d.metrics.bootSeconds.WithLabelValues("cold").Observe(e.Seconds)
 			}
-		} else {
+		} else if e.Reason == "" || e.Reason == "vm_boot" || e.Reason == "flintlock_error" {
+			// Cancelled jobs and memory timeouts are not boot failures
+			// (older executors send no reason).
 			d.metrics.bootFailures.WithLabelValues(e.Source).Inc()
 		}
+	case "pool_vm_dead":
+		d.metrics.bootFailures.WithLabelValues("pool_dead").Inc()
 	case "finish":
-		d.metrics.jobs.WithLabelValues(e.Result).Inc()
+		result, reason := normalizeResult(e.Result, e.Reason)
+		d.metrics.jobs.WithLabelValues(result, reason).Inc()
 		d.metrics.jobSeconds.Observe(e.Seconds)
+		e.Result, e.Reason = result, reason
+	default:
+		return
 	}
+	// One line per event, so `journalctl -u firerunner | grep '"job":"<id>"'`
+	// tells a job's story on the host.
+	attrs := []any{"kind", e.Kind, "job", e.Job, "project", e.Project, "vm", e.VM, "source", e.Source,
+		"result", e.Result, "reason", e.Reason, "seconds", e.Seconds, "wait_seconds", e.WaitSeconds, "boot_seconds", e.BootSeconds}
+	if e.Err != "" {
+		attrs = append(attrs, "err", e.Err)
+	}
+	if e.Kind == "pool_vm_dead" || (e.Kind == "prepare" && !e.OK) || (e.Kind == "finish" && e.Result == ResultSystemFailure) {
+		d.log.Warn("job event", attrs...)
+	} else {
+		d.log.Info("job event", attrs...)
+	}
+}
+
+// normalizeResult maps a finish event's result and reason to label values.
+// Executors older than the result field send "failed" for script failures.
+func normalizeResult(result, reason string) (string, string) {
+	switch result {
+	case ResultSuccess:
+		return ResultSuccess, "none"
+	case ResultScriptFailure, "failed":
+		return ResultScriptFailure, "none"
+	}
+	for _, r := range FailureReasons {
+		if r == reason {
+			return ResultSystemFailure, r
+		}
+	}
+	return ResultSystemFailure, "other"
 }

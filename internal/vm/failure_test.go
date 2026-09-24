@@ -247,7 +247,7 @@ func TestRoom(t *testing.T) {
 			// Same answer as asking Fits once per VM with the memory already promised.
 			fits := 0
 			for fits < c.want {
-				ok, _, _ := Fits(context.Background(), cfg, fl, fits*withOverhead(cfg.VM.MemoryMB))
+				ok, _, _ := Fits(context.Background(), cfg, fl, fits*WithOverhead(cfg.VM.MemoryMB))
 				if !ok {
 					break
 				}

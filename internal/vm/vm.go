@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -235,6 +236,40 @@ func LeaseIP(leasesFile, mac string) (string, error) {
 }
 
 type lease struct{ mac, ip, clientID string }
+
+// Lease is one line of the dnsmasq leases file.
+type Lease struct {
+	Expires time.Time
+	MAC     string
+	IP      string
+}
+
+// Leases reads the dnsmasq leases file; a missing file has no leases.
+func Leases(leasesFile string) ([]Lease, error) {
+	f, err := os.Open(leasesFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var out []Lease
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		// <expiry> <mac> <ip> <hostname> <client-id>
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		exp, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		out = append(out, Lease{Expires: time.Unix(exp, 0), MAC: strings.ToLower(fields[1]), IP: fields[2]})
+	}
+	return out, sc.Err()
+}
 
 func findLease(leasesFile, mac string) (*lease, error) {
 	f, err := os.Open(leasesFile)

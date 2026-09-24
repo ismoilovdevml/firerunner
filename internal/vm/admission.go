@@ -41,7 +41,7 @@ func CommittedMB(ctx context.Context, fl *flintlock.Client) (int, error) {
 		case types.MicroVMStatus_FAILED, types.MicroVMStatus_DELETING:
 			continue
 		}
-		total += withOverhead(int(v.GetSpec().GetMemoryInMb()))
+		total += WithOverhead(int(v.GetSpec().GetMemoryInMb()))
 	}
 	return total, nil
 }
@@ -57,7 +57,7 @@ func Fits(ctx context.Context, cfg config.Config, fl *flintlock.Client, extraMB 
 	if err != nil {
 		return false, "", err
 	}
-	need := withOverhead(cfg.VM.MemoryMB)
+	need := WithOverhead(cfg.VM.MemoryMB)
 	msg := fmt.Sprintf("committed %d MB + new %d MB, capacity %d MB", committed+extraMB, need, capacity)
 	return committed+extraMB+need <= capacity, msg, nil
 }
@@ -78,9 +78,10 @@ func Room(ctx context.Context, cfg config.Config, fl *flintlock.Client, want int
 	if err != nil {
 		return 0, "", err
 	}
-	need := withOverhead(cfg.VM.MemoryMB)
+	need := WithOverhead(cfg.VM.MemoryMB)
 	n := max(0, min(want, (capacity-committed)/need))
 	return n, fmt.Sprintf("committed %d MB, %d MB each, capacity %d MB", committed, need, capacity), nil
 }
 
-func withOverhead(mb int) int { return mb * (100 + overheadPct) / 100 }
+// WithOverhead is mb of guest memory plus Firecracker's per-VM overhead.
+func WithOverhead(mb int) int { return mb * (100 + overheadPct) / 100 }
