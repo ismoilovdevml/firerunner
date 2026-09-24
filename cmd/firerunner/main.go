@@ -67,7 +67,6 @@ Usage:
 
   firerunner daemon                         pool + reconcile + metrics (systemd: firerunner.service)
   firerunner executor prepare|run|cleanup   called by gitlab-runner (custom executor)
-  firerunner ksm-exec <cmd> [args...]       run cmd with kernel samepage merging (flintlockd.service)
   firerunner upgrade [--version edge|latest|vX.Y.Z] [--check]
                                             replace this binary with a release (default: edge)
   firerunner version | -v | --version
@@ -106,9 +105,6 @@ func dispatch(args []string) error {
 		return cmdConfig(rest)
 	case "upgrade":
 		return cmdUpgrade(rest)
-	case "ksm-exec":
-		// Starts flintlockd (systemd): must not depend on a readable config.
-		return host.ExecWithKSM(rest)
 	}
 
 	cfg, err := config.Load(config.Path())
