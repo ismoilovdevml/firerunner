@@ -61,6 +61,8 @@ Usage:
 
   firerunner run [--keep] -- <command...>   boot a microVM, run a command, delete it
   firerunner pool [refresh]                 show pre-booted microVMs; refresh replaces them
+  firerunner builder [list]                 per-project BuildKit builders (Docker layer cache)
+  firerunner builder rm <project-id>|--all  delete a builder and its cache
                                             (after a new rootfs image under the same tag)
 
   firerunner daemon                         pool + reconcile + metrics (systemd: firerunner.service)
@@ -124,6 +126,8 @@ func dispatch(args []string) error {
 		return cmdExecutor(cfg, rest)
 	case "daemon":
 		return cmdDaemon()
+	case "builder", "builders":
+		return cmdBuilder(cfg, rest)
 	case "pool":
 		dc := daemon.NewClient(cfg.Daemon.Socket)
 		if len(rest) > 0 && rest[0] == "refresh" {
@@ -143,6 +147,47 @@ func dispatch(args []string) error {
 		return nil
 	}
 	return fmt.Errorf("unknown command %q\n\n%s", cmd, usage)
+}
+
+func cmdBuilder(cfg config.Config, args []string) error {
+	dc := daemon.NewClient(cfg.Daemon.Socket)
+	if len(args) > 0 && args[0] == "rm" {
+		if len(args) != 2 {
+			return errors.New("usage: firerunner builder rm <project-id>|--all")
+		}
+		project := args[1]
+		if project == "--all" {
+			project = "all"
+		}
+		if err := dc.RemoveBuilder(project); err != nil {
+			return fmt.Errorf("daemon not reachable (systemctl status firerunner): %w", err)
+		}
+		fmt.Println("builder removed; the next job of the project starts a new one")
+		return nil
+	}
+	raw, err := dc.Builders()
+	if err != nil {
+		return fmt.Errorf("daemon not reachable (systemctl status firerunner): %w", err)
+	}
+	var list []struct {
+		Project, ID, IP string
+		Port            int
+		Ready           bool
+		Idle, Age       string
+	}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return err
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "PROJECT\tID\tIP\tPORT\tSTATE\tIDLE\tAGE")
+	for _, b := range list {
+		state := "booting"
+		if b.Ready {
+			state = "ready"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n", b.Project, b.ID, b.IP, b.Port, state, b.Idle, b.Age)
+	}
+	return w.Flush()
 }
 
 // ---------------------------------------------------------------------------
@@ -505,7 +550,7 @@ func cmdVM(cfg config.Config, args []string) error {
 				fmt.Fprintf(os.Stderr, "deleting %s: %v\n", ref, err)
 				continue
 			}
-			vm.RemoveKnownHosts(v.GetSpec().GetId())
+			vm.Forget(cfg, v.GetSpec().GetId())
 			fmt.Printf("deleted %s (%s)\n", v.GetSpec().GetId(), v.GetSpec().GetUid())
 		}
 		if failed > 0 {
@@ -575,7 +620,7 @@ func cmdRun(cfg config.Config, args []string) error {
 		if err := fl.Delete(dctx, inst.UID); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: deleting %s: %v\n", id, err)
 		} else {
-			vm.RemoveKnownHosts(id)
+			vm.Forget(cfg, id)
 			fmt.Fprintf(os.Stderr, "deleted %s (total %s)\n", id, time.Since(start).Round(100*time.Millisecond))
 		}
 	}

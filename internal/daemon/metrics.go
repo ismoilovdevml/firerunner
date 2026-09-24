@@ -30,11 +30,17 @@ type Metrics struct {
 	thinPool                           *prometheus.GaugeVec
 	memAvailable                       prometheus.Gauge
 	runnerConcurrent                   prometheus.Gauge
+	builders                           prometheus.Gauge
+	builderRequests                    *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
 	bootBuckets := []float64{2, 5, 8, 10, 12, 15, 20, 30, 45, 60, 90, 120}
 	m := &Metrics{
+		builders: prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_builders",
+			Help: "Per-project BuildKit builder microVMs (booting and ready)."}),
+		builderRequests: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_builder_requests_total",
+			Help: "Jobs asking for their project's builder, by answer: ready (warm cache), booting, busy, disabled."}, []string{"state"}),
 		reg:         prometheus.NewRegistry(),
 		poolTarget:  prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_pool_target", Help: "Configured number of pre-booted microVMs."}),
 		poolReady:   prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_pool_ready", Help: "Pre-booted microVMs ready to be claimed."}),
@@ -81,13 +87,18 @@ func NewMetrics() *Metrics {
 		m.bootFailures.WithLabelValues(k)
 	}
 	m.bootFailures.WithLabelValues("preload")
+	m.bootFailures.WithLabelValues("builder")
+	m.bootSeconds.WithLabelValues("builder")
+	for _, s := range []string{"ready", "booting", "busy", "disabled"} {
+		m.builderRequests.WithLabelValues(s)
+	}
 
 	info := prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_build_info", Help: "Build version.",
 		ConstLabels: prometheus.Labels{"version": Version}})
 	info.Set(1)
 	m.reg.MustRegister(m.poolTarget, m.poolReady, m.poolBooting, m.claims, m.bootSeconds, m.preloadSeconds, m.bootFailures,
 		m.prepareSeconds, m.jobs, m.jobSeconds, m.microvms, m.orphansDeleted, m.admissionWaits,
-		m.flintlockUp, m.serviceUp, m.thinPool, m.memAvailable, m.runnerConcurrent, info,
+		m.flintlockUp, m.serviceUp, m.thinPool, m.memAvailable, m.runnerConcurrent, m.builders, m.builderRequests, info,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
 }

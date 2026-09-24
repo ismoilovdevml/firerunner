@@ -29,6 +29,10 @@ func TestDecide(t *testing.T) {
 		{"fresh run VM", vmFacts{State: "CREATED", Role: "run", Age: time.Hour}, true},
 		{"abandoned run VM", vmFacts{State: "CREATED", Role: "run", Age: 4 * time.Hour}, false},
 		{"foreign VM without labels", vmFacts{State: "CREATED", Age: 10 * time.Hour}, true},
+		{"owned builder", vmFacts{State: "CREATED", Role: "builder", Owned: true, Age: 2 * time.Hour}, true},
+		{"builder from previous run", vmFacts{State: "CREATED", Role: "builder", Startup: true}, false},
+		{"booting builder", vmFacts{State: "CREATED", Role: "builder", Age: 5 * time.Minute}, true},
+		{"orphaned builder", vmFacts{State: "CREATED", Role: "builder", Age: 20 * time.Minute}, false},
 	}
 	for _, c := range cases {
 		if got := decide(c.f, cfg); (got == "") != c.keep {
@@ -63,7 +67,7 @@ func TestTransientListError(t *testing.T) {
 func TestRoleOf(t *testing.T) {
 	for id, want := range map[string][2]string{
 		"pool-ab12cd": {"pool", ""}, "job-74196": {"job", "job-74196"}, "run-1a2b3c": {"run", ""},
-		"smoke1": {"", ""}, "mvm-1": {"", ""},
+		"smoke1": {"", ""}, "mvm-1": {"", ""}, "bld-111": {"builder", ""},
 	} {
 		if r, j := RoleOf(id); r != want[0] || j != want[1] {
 			t.Errorf("RoleOf(%q) = %q,%q want %v", id, r, j, want)

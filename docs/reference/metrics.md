@@ -7,6 +7,8 @@ Endpoint: `http://<host>:9477/metrics` (see [Monitoring](../operator-guide/monit
 | `firerunner_build_info` | gauge | `version` | always 1 |
 | `firerunner_pool_target` | gauge | | configured `pool.size` |
 | `firerunner_pool_ready` | gauge | | pre-booted VMs ready to claim |
+| `firerunner_builders` | gauge | | per-project BuildKit builders (booting and ready) |
+| `firerunner_builder_requests_total` | counter | `state` | jobs asking for their builder: `ready`, `booting`, `busy`, `disabled` |
 | `firerunner_pool_booting` | gauge | | pool VMs booting (incl. image preload) |
 | `firerunner_pool_claims_total` | counter | `result` = hit\|miss | jobs that got a pool VM / had to cold-boot |
 | `firerunner_pool_preload_seconds` | histogram | | time to preload images into a pool VM |

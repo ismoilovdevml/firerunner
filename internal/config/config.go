@@ -32,6 +32,26 @@ type Config struct {
 	Pool      Pool      `yaml:"pool"`
 	Daemon    Daemon    `yaml:"daemon"`
 	Network   Network   `yaml:"network"`
+	Builder   Builder   `yaml:"builder"`
+}
+
+// Builder is a long-lived microVM per GitLab project that runs BuildKit, so
+// `docker build` in jobs of that project reuses the layer cache of earlier jobs
+// (like a shell runner) while projects stay isolated from each other.
+type Builder struct {
+	Enabled  bool `yaml:"enabled"`
+	VCPU     int  `yaml:"vcpu"`
+	MemoryMB int  `yaml:"memory_mb"`
+	// Max builders kept at once; the least recently used one is replaced.
+	Max int `yaml:"max"`
+	// IdleTTL deletes a builder (and its cache) after this long without a job.
+	IdleTTL time.Duration `yaml:"idle_ttl"`
+	// Image runs buildkitd inside the builder VM.
+	Image string `yaml:"image"`
+	// CacheMB is BuildKit's cache size before it garbage-collects old layers.
+	CacheMB int `yaml:"cache_mb"`
+	// PortBase: builder n is reached by job VMs at <bridge address>:PortBase+n.
+	PortBase int `yaml:"port_base"`
 }
 
 // Pool keeps pre-booted microVMs so a job starts without waiting for a boot.
@@ -107,6 +127,16 @@ func Default() Config {
 		Network: Network{
 			LeasesFile: "/var/lib/misc/firerunner-dnsmasq.leases",
 			SSHKey:     "/etc/firerunner/executor/id_ed25519",
+		},
+		Builder: Builder{
+			Enabled:  true,
+			VCPU:     4,
+			MemoryMB: 4096,
+			Max:      6,
+			IdleTTL:  12 * time.Hour,
+			Image:    "moby/buildkit:v0.33.0",
+			CacheMB:  25000,
+			PortBase: 20000,
 		},
 	}
 }
@@ -199,6 +229,27 @@ func (c Config) Validate() error {
 	}
 	if c.Daemon.JobMaxAge < 10*time.Minute {
 		errs = append(errs, "daemon.job_max_age must be at least 10m")
+	}
+	if c.Builder.VCPU < 1 || c.Builder.VCPU > 32 {
+		errs = append(errs, "builder.vcpu must be between 1 and 32")
+	}
+	if c.Builder.MemoryMB < 512 || c.Builder.MemoryMB > 65536 {
+		errs = append(errs, "builder.memory_mb must be between 512 and 65536")
+	}
+	if c.Builder.Max < 0 || c.Builder.Max > 64 {
+		errs = append(errs, "builder.max must be between 0 and 64")
+	}
+	if c.Builder.IdleTTL < 10*time.Minute {
+		errs = append(errs, "builder.idle_ttl must be at least 10m")
+	}
+	if c.Builder.Image == "" || strings.HasPrefix(c.Builder.Image, "-") {
+		errs = append(errs, "builder.image is required")
+	}
+	if c.Builder.CacheMB < 1000 {
+		errs = append(errs, "builder.cache_mb must be at least 1000")
+	}
+	if c.Builder.PortBase < 1024 || c.Builder.PortBase+c.Builder.Max > 65535 {
+		errs = append(errs, "builder.port_base must leave room for builder.max ports below 65536")
 	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))

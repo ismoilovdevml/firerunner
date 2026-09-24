@@ -29,6 +29,8 @@ A daemon keeps a small pool of pre-booted microVMs, so a job normally gets its V
    own scripts run in that container inside the VM, like the docker executor.
 3. **cleanup**: the VM is deleted. The daemon refills the pool.
 
+Per-project BuildKit builder microVMs keep the Docker layer cache between jobs.
+
 Host stack: containerd (devmapper thin pool), Firecracker, [flintlock](https://github.com/liquidmetal-dev/flintlock),
 dnsmasq, nftables, a Docker Hub pull-through cache, an S3 store for `cache:`, gitlab-runner.
 Guest: FireRunner's 6.18 LTS kernel and Ubuntu 24.04 with Docker CE (buildx, compose), git and gitlab-runner.
@@ -46,13 +48,13 @@ commit, same pipeline, jobs of the same project run side by side:
 | `dotnet test`, 44 tests, `image: mcr.microsoft.com/dotnet/sdk:8.0` | **27.7 s** (warm pool, image preloaded) | 31.1 s (docker executor) |
 | Same job, cold VM, image pulled | 104.3 s | |
 | Same `dotnet test`, NuGet packages in `cache:` | **25.5 s** (32.4 s without) | 23.4 s (docker executor) |
-| `docker build` of the same service | 24.6–31 s | 1–2.4 s (shell executor, warm layer cache) |
-| Same build, BuildKit cache in `cache:` | build 10–11 s + 8 s cache transfer | |
+| `docker build` of the same service, project's builder warm | **4.8 s** job, 2 s build | 2.0 s (shell executor, warm host cache) |
+| Same build without any layer cache | 26–31 s | |
 | 6-job demo pipeline | 60 s without pool, 38 s with pool 2, **19 s** with pool 4 | |
 
-The `docker build` rows are the price of isolation: a shell or docker runner reuses the
-host's layer cache between jobs, a FireRunner job starts from a clean VM and has to bring
-its cache along.
+`docker build` runs on a per-project BuildKit microVM that keeps its layer cache between jobs,
+so builds are as fast as on a shell runner while one project cannot read or poison another
+project's cache.
 
 ## Requirements
 
@@ -174,9 +176,9 @@ found no confirmed vulnerability; its four open leads are fixed as described abo
 ## Limitations
 
 - x86_64 only.
-- No shared Docker layer cache between jobs (by design): keep BuildKit's cache in `cache:` or a
-  registry, and use `pool.preload_images` for base images.
-- Tested on Rocky Linux 9.6 hosts only.
+- The layer cache is per project and lives in the project's builder: the first build of a
+  project, and the first after 12 idle hours, is cold.
+- Tested on Rocky Linux 9.6 and Ubuntu 24.04 hosts.
 
 ## Development
 

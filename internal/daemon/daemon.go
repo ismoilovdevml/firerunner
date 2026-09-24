@@ -48,6 +48,8 @@ func RoleOf(id string) (role, job string) {
 	switch prefix {
 	case "pool", "run":
 		return prefix, ""
+	case "bld":
+		return "builder", ""
 	case "job":
 		return "job", id
 	}
@@ -155,6 +157,8 @@ type Daemon struct {
 	preloading map[string]*preloadingVM
 	claimed    map[string]time.Time // uid -> claim time; protects it until the job writes its state
 	firstSee   map[string]time.Time // uid -> first time reconcile saw it
+	builders   map[string]*builder  // project id -> BuildKit builder
+	runCtx     context.Context      // cancelled on shutdown; builders boot under it
 }
 
 func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
@@ -167,7 +171,8 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 		return nil, err
 	}
 	d := &Daemon{cfgPath: cfgPath, log: log, cfg: cfg, fl: fl, metrics: NewMetrics(),
-		claimed: map[string]time.Time{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{}}
+		claimed: map[string]time.Time{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{},
+		builders: map[string]*builder{}, runCtx: context.Background()}
 	if fi, err := os.Stat(cfgPath); err == nil {
 		d.cfgMod = fi.ModTime()
 	}
@@ -189,7 +194,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go func() { errc <- metricsSrv.ListenAndServe() }()
 	d.log.Info("daemon started", "socket", d.cfg.Daemon.Socket, "metrics", d.cfg.Daemon.MetricsListen, "pool", d.cfg.Pool.Size)
 
+	d.mu.Lock()
+	d.runCtx = ctx
+	d.mu.Unlock()
 	d.adoptPool(ctx)
+	if vms, err := d.fl.List(ctx); err == nil {
+		live := map[string]bool{}
+		for _, v := range vms {
+			live[v.GetSpec().GetUid()] = true
+		}
+		d.adoptBuilders(live)
+	}
 	d.reconcile(ctx, true)
 	refill := time.NewTicker(2 * time.Second)
 	reconcile := time.NewTicker(d.cfg.Daemon.ReconcileInterval)
@@ -218,6 +233,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-refill.C:
 			d.reloadConfig(ctx)
 			d.expireIdle(ctx)
+			d.expireBuilders()
 			d.refill(ctx)
 		case <-reconcile.C:
 			d.reconcile(ctx, false)
@@ -446,8 +462,14 @@ func (d *Daemon) delete(ctx context.Context, inst *vm.Instance, reason string) {
 		d.log.Error("delete failed", "id", inst.ID, "reason", reason, "err", err)
 		return
 	}
-	vm.RemoveKnownHosts(inst.ID)
+	vm.Forget(d.cfgSnapshot(), inst.ID)
 	d.log.Info("deleted microVM", "id", inst.ID, "reason", reason)
+}
+
+func (d *Daemon) cfgSnapshot() config.Config {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.cfg
 }
 
 // reloadConfig picks up `firerunner config set` without a restart.
@@ -495,6 +517,10 @@ func decide(f vmFacts, cfg config.Config) string {
 		return "pool VM from a previous daemon run"
 	case f.Role == "pool" && f.Booting == 0 && f.Age > cfg.VM.BootTimeout:
 		return "orphaned pool VM"
+	case f.Role == "builder" && f.Startup:
+		return "builder from a previous daemon run"
+	case f.Role == "builder" && f.Age > 2*cfg.VM.BootTimeout+5*time.Minute:
+		return "orphaned builder"
 	case f.Role == "run" && f.Age > cfg.Daemon.JobMaxAge:
 		return "abandoned `firerunner run` VM"
 	case f.Job != "" && f.Age > 2*cfg.VM.BootTimeout:
@@ -519,6 +545,11 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 	owned := map[string]bool{}
 	for _, p := range d.ready {
 		owned[p.inst.UID] = true
+	}
+	for _, b := range d.builders {
+		if b.Instance.UID != "" {
+			owned[b.Instance.UID] = true
+		}
 	}
 	for uid, at := range d.claimed {
 		if time.Since(at) < 5*time.Minute {
@@ -578,6 +609,7 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 	for s, n := range states {
 		d.metrics.microvms.WithLabelValues(s).Set(n)
 	}
+	d.checkBuilders(present)
 }
 
 // jobStates maps microVM uid -> state file for jobs in progress (written by `executor prepare`).

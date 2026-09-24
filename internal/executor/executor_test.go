@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
+	"github.com/ismoilovdevml/firerunner/internal/daemon"
 )
 
 func TestIsUserStage(t *testing.T) {
@@ -114,5 +115,21 @@ func TestServicesScript(t *testing.T) {
 	}
 	if !strings.Contains(ContainerCommand("alpine", ServiceNetwork), "--network 'firerunner-job'") || !strings.Contains(ContainerCommand("alpine", ""), "--network 'host'") {
 		t.Fatal("container network")
+	}
+}
+
+func TestBuilderScript(t *testing.T) {
+	s := BuilderScript(&daemon.BuilderInfo{State: daemon.BuilderReady, Port: 20003,
+		CA: "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n", Cert: "CERT", Key: "KEY"})
+	for _, want := range []string{
+		"umask 077",
+		"cat > /etc/firerunner-buildkit/key.pem <<'FIRERUNNER_EOF'\nKEY\nFIRERUNNER_EOF",
+		"docker buildx create --name firerunner --driver remote",
+		"servername=builder,default-load=true",
+		`"tcp://$gw:20003"`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("builder script lacks %q:\n%s", want, s)
+		}
 	}
 }

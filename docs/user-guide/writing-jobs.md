@@ -70,9 +70,27 @@ image-build:
 
 `docker buildx` and `docker compose` are installed.
 
-Every job starts with an empty Docker layer cache. Base images from Docker Hub come from a
-cache on the runner host; ask your operator to add frequently used non-Docker-Hub images to
-`pool.preload_images`. To reuse layers between pipelines, keep BuildKit's cache in `cache:`:
+### Layer cache: nothing to do
+
+In jobs without `image:`, `docker build` runs on your **project's builder**: a BuildKit microVM
+that belongs to your project only and keeps its layer cache between jobs. The job log says
+which one was used:
+
+```text
+Docker layer cache: using this project's builder (warm cache)
+```
+
+The built image is loaded into the job VM as usual, so `docker push`, `docker run` and
+`docker image ls` work unchanged. Measured on a .NET service: 2 s with a warm builder, same as a
+shell runner with its host cache (26–30 s without any cache).
+
+The first job of a project starts the builder and builds without it. A builder that nobody used
+for 12 hours is deleted together with its cache.
+
+### Layer cache for jobs with `image:`
+
+Jobs that run in an `image:` container have no Docker daemon. If such a job builds images with a
+tool of its own, keep the cache in `cache:` or in a registry:
 
 ```yaml
 image-build:

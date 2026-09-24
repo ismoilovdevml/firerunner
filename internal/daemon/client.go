@@ -64,6 +64,42 @@ func (c *Client) Pool() (json.RawMessage, error) {
 	return raw, json.NewDecoder(resp.Body).Decode(&raw)
 }
 
+// Builder asks for the project's BuildKit builder; the daemon starts one when
+// there is none, so the answer may be "booting".
+func (c *Client) Builder(project string) (*BuilderInfo, error) {
+	resp, err := c.http.Post("http://daemon/builder?project="+url.QueryEscape(project), "", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("builder: %s", resp.Status)
+	}
+	info := &BuilderInfo{}
+	return info, json.NewDecoder(resp.Body).Decode(info)
+}
+
+// Builders returns the daemon's builder list as raw JSON.
+func (c *Client) Builders() (json.RawMessage, error) {
+	resp, err := c.http.Get("http://daemon/builders")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var raw json.RawMessage
+	return raw, json.NewDecoder(resp.Body).Decode(&raw)
+}
+
+// RemoveBuilder deletes a project's builder ("all" for every builder).
+func (c *Client) RemoveBuilder(project string) error {
+	req, _ := http.NewRequest(http.MethodDelete, "http://daemon/builder?project="+url.QueryEscape(project), nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
 // Refresh asks the daemon to replace all idle pool VMs.
 func (c *Client) Refresh() error {
 	resp, err := c.http.Post("http://daemon/pool/refresh", "", nil)

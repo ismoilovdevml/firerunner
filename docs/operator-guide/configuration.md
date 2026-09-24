@@ -42,6 +42,19 @@ and replaces pool VMs that were booted with the old settings.
 sudo firerunner config set pool.preload_images "[mcr.microsoft.com/dotnet/sdk:8.0, node:22-alpine]"
 ```
 
+### Docker layer cache (`builder.*`)
+
+| Key | Default | Notes |
+|---|---|---|
+| `builder.enabled` | `true` | one BuildKit microVM per GitLab project for `docker build` in jobs without `image:` |
+| `builder.vcpu` | `4` | builds run here, not in the job VM |
+| `builder.memory_mb` | `4096` | counted in memory admission like any microVM |
+| `builder.max` | `6` | builders kept at once; the least recently used idle one is replaced |
+| `builder.idle_ttl` | `12h` | a builder unused this long is deleted with its cache |
+| `builder.cache_mb` | `25000` | BuildKit garbage-collects above this |
+| `builder.image` | `moby/buildkit:v0.33.0` | pulled through the Docker Hub mirror |
+| `builder.port_base` | `20000` | job VMs reach builder *n* at `<subnet>.1:port_base+n` |
+
 ### Daemon (`daemon.*`)
 
 | Key | Default | Notes |

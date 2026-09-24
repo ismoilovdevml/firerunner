@@ -103,6 +103,13 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 			return systemFailure(fmt.Errorf("starting services failed (exit %d): %v", code, err))
 		}
 	}
+	// Shell-mode jobs run docker on the VM; their builds can use the project's
+	// warm BuildKit builder. A failure here only costs the cache, never the job.
+	if os.Getenv("CUSTOM_ENV_CI_JOB_IMAGE") == "" {
+		if st.Builder = useBuilder(cfg, dc, inst, os.Getenv("CUSTOM_ENV_CI_PROJECT_ID")); st.Builder {
+			_ = vm.SaveJobState(statePath(id), st)
+		}
+	}
 	took := time.Since(start)
 	_ = dc.Send(daemon.Event{Kind: "prepare", Source: source, Seconds: took.Seconds(), OK: true})
 	fmt.Printf("microVM %s ready at %s in %s (%s, %d vCPU, %d MB)\n",
@@ -164,6 +171,48 @@ func coldBoot(ctx context.Context, cfg config.Config, id string, fromPool func()
 	return inst, "cold", err
 }
 
+// BuilderName is the buildx builder created in job VMs for the project's builder.
+const BuilderName = "firerunner"
+
+// useBuilder points the VM's buildx at the project's builder when it is ready.
+func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project string) bool {
+	info, err := dc.Builder(project)
+	switch {
+	case err != nil || info.State == daemon.BuilderDisabled:
+		return false
+	case info.State == daemon.BuilderBooting:
+		fmt.Println("Docker layer cache: this project's builder is starting; this job builds without it")
+		return false
+	case info.State != daemon.BuilderReady:
+		fmt.Println("Docker layer cache: all builders are busy; this job builds without it")
+		return false
+	}
+	cmd := vm.SSH(cfg, inst, "bash")
+	cmd.Stdin = strings.NewReader(BuilderScript(info))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		fmt.Printf("Docker layer cache: could not attach the builder (%v): %s\n", err, strings.TrimSpace(string(out)))
+		return false
+	}
+	fmt.Printf("Docker layer cache: using this project's builder (warm cache)\n")
+	return true
+}
+
+// BuilderScript creates the buildx builder in the job VM. Builders are reached
+// through the bridge address (the VM's default gateway), which forwards the
+// port to the project's builder VM.
+func BuilderScript(info *daemon.BuilderInfo) string {
+	var b strings.Builder
+	b.WriteString("set -e\numask 077\nmkdir -p /etc/firerunner-buildkit\n")
+	for _, f := range []struct{ name, data string }{{"ca.pem", info.CA}, {"cert.pem", info.Cert}, {"key.pem", info.Key}} {
+		fmt.Fprintf(&b, "cat > /etc/firerunner-buildkit/%s <<'FIRERUNNER_EOF'\n%s\nFIRERUNNER_EOF\n", f.name, strings.TrimSpace(f.data))
+	}
+	fmt.Fprintf(&b, "gw=$(ip -4 route show default | awk '{print $3; exit}')\n"+
+		"docker buildx create --name %s --driver remote "+
+		"--driver-opt cacert=/etc/firerunner-buildkit/ca.pem,cert=/etc/firerunner-buildkit/cert.pem,key=/etc/firerunner-buildkit/key.pem,servername=%s,default-load=true "+
+		"\"tcp://$gw:%d\" >/dev/null\n", BuilderName, daemon.BuilderServerName, info.Port)
+	return b.String()
+}
+
 func writeDockerAuth(cfg config.Config, inst *vm.Instance, auth string) error {
 	cmd := vm.SSH(cfg, inst, "mkdir -p /root/.docker && umask 077 && cat > /root/.docker/config.json")
 	cmd.Stdin = strings.NewReader(auth)
@@ -195,7 +244,12 @@ func Run(cfg config.Config, script, stage string) error {
 		}
 		code, err = runInContainer(cfg, &st.Instance, image, st.Network, f)
 	} else {
-		code, err = vm.RunScript(cfg, &st.Instance, f, os.Stdout, os.Stderr)
+		var script io.Reader = f
+		if st.Builder && isUserStage(stage) {
+			// `docker build` only uses a buildx builder named in the environment.
+			script = io.MultiReader(strings.NewReader("export BUILDX_BUILDER="+BuilderName+"\n"), f)
+		}
+		code, err = vm.RunScript(cfg, &st.Instance, script, os.Stdout, os.Stderr)
 	}
 	switch {
 	case err != nil:
@@ -261,7 +315,7 @@ func Cleanup(cfg config.Config) error {
 		fmt.Printf("microVM %s deleted\n", id)
 	}
 	if stErr == nil {
-		vm.RemoveKnownHosts(st.ID)
+		vm.Forget(cfg, st.ID)
 	}
 	if stErr == nil {
 		result := "success"

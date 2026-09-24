@@ -43,6 +43,8 @@ All commands need root.
 | `firerunner vm logs <id\|uid> [-n 100]` | guest console output |
 | `firerunner pool` | pre-booted VMs (JSON) |
 | `firerunner pool refresh` | replace idle pool VMs (after a new guest image) |
+| `firerunner builder list` | per-project BuildKit builders: project, VM, port, idle time |
+| `firerunner builder rm <project-id> \| --all` | delete a builder and its layer cache |
 | `firerunner run [--keep] -- <command>` | boot a throwaway VM, run a shell command, delete it (`--keep` leaves it running) |
 
 ## Used by services

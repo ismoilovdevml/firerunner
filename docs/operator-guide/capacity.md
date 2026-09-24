@@ -36,6 +36,14 @@ exactly one job.
 `pool.preload_images` pulls images into pool VMs while they are idle. Use it for large images your
 jobs use a lot (e.g. .NET or JDK SDKs), especially from registries other than Docker Hub.
 
+## Builders
+
+Each GitLab project that runs `docker build` gets a builder microVM (`builder.vcpu`,
+`builder.memory_mb`), kept for `builder.idle_ttl` after its last job. Budget
+`builder.max × builder.memory_mb` on top of jobs and pool, for example on 64 GB:
+10 jobs × 2 GB + 6 pool × 2 GB + 6 builders × 4 GB ≈ 56 GB. Builders keep up to
+`builder.cache_mb` of layers each in the thin pool.
+
 ## Measured results
 
 Test host: 8 vCPU, 16 GB RAM, a VMware VM with nested virtualization. Same commit, same pipeline,
@@ -51,6 +59,7 @@ jobs run side by side with the organisation's existing runners.
 | Same `dotnet test` with NuGet packages in `cache:` | **25.5 s** (32.4 s without) | 23.4 s (docker executor) |
 | `docker build` of the same service | 24.6–31 s | 1–2.4 s (shell executor, warm layer cache) |
 | Same build with the BuildKit cache in `cache:` | build 10–11 s + 8 s cache transfer (367 MB) | |
+| Same build on the project's warm builder | **2 s** build, 4.8 s job | 2.0 s job (shell executor) |
 | 6-job pipeline | 60 s no pool · 38 s pool 2 · **19 s** pool 4 | — |
 
 The `docker build` gap is the cost of isolation: shell and docker runners reuse the host's layer

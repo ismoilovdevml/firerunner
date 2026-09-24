@@ -147,3 +147,32 @@ func TestSSHPinsHostKey(t *testing.T) {
 		t.Fatal("known_hosts not removed")
 	}
 }
+
+func TestForgetReleasesLease(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Network.LeasesFile = filepath.Join(dir, "leases")
+	mac := MAC("job-42")
+	leases := "1790286904 aa:fc:00:00:00:01 10.200.0.9 * *\n" +
+		"1790286905 " + mac + " 10.200.0.77 * 01:" + mac + "\n"
+	if err := os.WriteFile(cfg.Network.LeasesFile, []byte(leases), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	oldRelease, oldDev := releaseLease, routeDev
+	t.Cleanup(func() { releaseLease, routeDev = oldRelease, oldDev })
+	releaseLease = func(args ...string) error { got = args; return nil }
+	routeDev = func(ip string) string { return "br-fc" }
+
+	Forget(cfg, "job-42")
+	want := []string{"br-fc", "10.200.0.77", mac, "01:" + mac}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("dhcp_release %v, want %v", got, want)
+	}
+
+	got = nil
+	Forget(cfg, "job-43") // no lease: nothing to release
+	if got != nil {
+		t.Fatalf("released %v for a VM without a lease", got)
+	}
+}

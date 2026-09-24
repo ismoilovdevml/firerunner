@@ -42,6 +42,40 @@ func (d *Daemon) apiHandler() http.Handler {
 		go d.drain(context.Background(), "refresh")
 		w.WriteHeader(http.StatusAccepted)
 	})
+	mux.HandleFunc("POST /builder", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(d.Builder(r.URL.Query().Get("project")))
+	})
+	mux.HandleFunc("DELETE /builder", func(w http.ResponseWriter, r *http.Request) {
+		project := r.URL.Query().Get("project")
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		for _, b := range d.builders {
+			if (project == "all" || b.Project == project) && b.ready {
+				d.removeBuilderLocked(b, "removed by operator")
+			}
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("GET /builders", func(w http.ResponseWriter, _ *http.Request) {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		type entry struct {
+			Project, ID, IP string
+			Port            int
+			Ready           bool
+			Idle, Age       string
+		}
+		out := []entry{}
+		for _, b := range d.builders {
+			e := entry{Project: b.Project, ID: b.Instance.ID, IP: b.Instance.IP, Port: b.Port, Ready: b.ready,
+				Idle: time.Since(b.LastUsed).Round(time.Second).String()}
+			if b.ready {
+				e.Age = time.Since(b.BornAt).Round(time.Second).String()
+			}
+			out = append(out, e)
+		}
+		_ = json.NewEncoder(w).Encode(out)
+	})
 	mux.HandleFunc("GET /pool", func(w http.ResponseWriter, _ *http.Request) {
 		d.mu.Lock()
 		defer d.mu.Unlock()

@@ -90,6 +90,7 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		_ = fl.Delete(dctx, uid)
+		Forget(cfg, id)
 		return nil, err
 	}
 
@@ -197,24 +198,74 @@ func MAC(id string) string {
 
 // LeaseIP returns the address dnsmasq leased to mac, or "" if there is none yet.
 func LeaseIP(leasesFile, mac string) (string, error) {
-	f, err := os.Open(leasesFile)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", nil
-	}
-	if err != nil {
+	l, err := findLease(leasesFile, mac)
+	if l == nil {
 		return "", err
 	}
+	return l.ip, err
+}
+
+type lease struct{ mac, ip, clientID string }
+
+func findLease(leasesFile, mac string) (*lease, error) {
+	f, err := os.Open(leasesFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
 	defer f.Close()
-	ip := ""
+	var found *lease
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		// <expiry> <mac> <ip> <hostname> <client-id>
 		fields := strings.Fields(sc.Text())
 		if len(fields) >= 3 && strings.EqualFold(fields[1], mac) {
-			ip = fields[2]
+			found = &lease{mac: fields[1], ip: fields[2]}
+			if len(fields) >= 5 && fields[4] != "*" {
+				found.clientID = fields[4]
+			}
 		}
 	}
-	return ip, sc.Err()
+	return found, sc.Err()
+}
+
+// Forget drops what the host keeps about a deleted microVM: its pinned host
+// key and its DHCP lease. Releasing the lease frees the address at once;
+// without it every VM holds an address until the lease expires.
+func Forget(cfg config.Config, id string) {
+	RemoveKnownHosts(id)
+	l, err := findLease(cfg.Network.LeasesFile, MAC(id))
+	if err != nil || l == nil {
+		return
+	}
+	dev := routeDev(l.ip)
+	if dev == "" {
+		return
+	}
+	args := []string{dev, l.ip, l.mac}
+	if l.clientID != "" {
+		args = append(args, l.clientID)
+	}
+	_ = releaseLease(args...) // dnsmasq-utils missing: the lease just expires
+}
+
+// releaseLease and routeDev are variables so tests need no dnsmasq.
+var releaseLease = func(args ...string) error { return exec.Command("dhcp_release", args...).Run() }
+
+var routeDev = func(ip string) string {
+	out, err := exec.Command("ip", "-o", "route", "get", ip).Output()
+	if err != nil {
+		return ""
+	}
+	f := strings.Fields(string(out))
+	for i := 0; i+1 < len(f); i++ {
+		if f[i] == "dev" {
+			return f[i+1]
+		}
+	}
+	return ""
 }
 
 // SSH returns a command that runs args in the microVM as root. The VM's

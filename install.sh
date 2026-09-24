@@ -14,6 +14,7 @@
 #   FR_DISK                 empty block device for the thin pool (default: auto-detect a blank disk)
 #   FR_BRIDGE               bridge for microVM taps          (default: br-fc)
 #   FR_SUBNET               /24 prefix for microVMs           (default: 10.200.0)
+#   FR_VM_DISK              root disk of every microVM, thin-provisioned (default: 40GB)
 #   CONTAINERD_VERSION      (default: 1.7.35)
 #   FIRECRACKER_VERSION     (default: 1.17.0)
 #   FLINTLOCK_VERSION       (default: 0.15.2)
@@ -50,6 +51,7 @@ FR_BINARY="${FR_BINARY:-}"            # local firerunner binary instead of a rel
 FR_DISK="${FR_DISK:-}"
 FR_BRIDGE="${FR_BRIDGE:-br-fc}"
 FR_SUBNET="${FR_SUBNET:-10.200.0}"
+FR_VM_DISK="${FR_VM_DISK:-40GB}"
 
 FR_GITLAB_URL="${FR_GITLAB_URL:-}"
 FR_RUNNER_TOKEN="${FR_RUNNER_TOKEN:-}"
@@ -119,9 +121,9 @@ install_packages() {
     if [[ $PKG == apt ]]; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq curl tar lvm2 thin-provisioning-tools dnsmasq-base nftables iproute2 openssh-client >/dev/null
+        apt-get install -y -qq curl tar lvm2 thin-provisioning-tools dnsmasq-base dnsmasq-utils nftables iproute2 openssh-client >/dev/null
     else
-        dnf install -y -q curl tar lvm2 device-mapper-persistent-data dnsmasq nftables iproute openssh-clients >/dev/null
+        dnf install -y -q curl tar lvm2 device-mapper-persistent-data dnsmasq dnsmasq-utils nftables iproute openssh-clients >/dev/null
     fi
 }
 
@@ -189,6 +191,7 @@ install_containerd() {
     fi
 
     mkdir -p "$CONF_DIR" "$CONTAINERD_ROOT/snapshotter/devmapper"
+    OLD_VM_DISK=$(sed -n 's/^ *base_image_size = "\(.*\)"/\1/p' "$CONF_DIR/containerd.toml" 2>/dev/null || true)
     put "$CONF_DIR/containerd.toml" <<EOF
 version = 2
 root = "${CONTAINERD_ROOT}"
@@ -203,7 +206,7 @@ state = "${CONTAINERD_STATE}"
 [plugins."io.containerd.snapshotter.v1.devmapper"]
   pool_name = "${THINPOOL}"
   root_path = "${CONTAINERD_ROOT}/snapshotter/devmapper"
-  base_image_size = "10GB"
+  base_image_size = "${FR_VM_DISK}"
   discard_blocks = true
 EOF
 
@@ -335,6 +338,7 @@ table inet firerunner {
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
     ip saddr ${FR_SUBNET}.0/24 oifname != "${FR_BRIDGE}" masquerade
+    iifname "${FR_BRIDGE}" oifname "${FR_BRIDGE}" ct status dnat masquerade
   }
   chain input {
     type filter hook input priority filter; policy accept;
@@ -345,6 +349,13 @@ table inet firerunner {
     iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport { 5000, 9000 } accept
     iifname "${FR_BRIDGE}" ct state established,related accept
     iifname "${FR_BRIDGE}" drop
+  }
+  # Job VMs reach their project's BuildKit builder at ${FR_SUBNET}.1:<port>; the
+  # firerunner daemon fills the map. Routed through the host, never VM to VM.
+  map builders { type inet_service : ipv4_addr . inet_service; }
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 dnat ip to tcp dport map @builders
   }
 }
 # Jobs of different projects share the bridge: no frame may pass between two microVMs.
@@ -389,7 +400,9 @@ EOF
 interface=${FR_BRIDGE}
 bind-interfaces
 except-interface=lo
-dhcp-range=${FR_SUBNET}.10,${FR_SUBNET}.250,255.255.255.0,12h
+# Short leases: every job gets a new VM with a new MAC, and firerunner releases
+# a VM's lease when it deletes the VM.
+dhcp-range=${FR_SUBNET}.10,${FR_SUBNET}.250,255.255.255.0,15m
 dhcp-option=option:router,${FR_SUBNET}.1
 dhcp-option=option:dns-server,${FR_SUBNET}.1
 dhcp-leasefile=/var/lib/misc/firerunner-dnsmasq.leases
@@ -621,6 +634,17 @@ configure_runner_cache() {
     $BIN_DIR/firerunner runner cache local >/dev/null
 }
 
+# A new root disk size only applies to images unpacked after the change:
+# drop the unpacked images so flintlock pulls them again (running VMs keep theirs).
+apply_vm_disk_size() {
+    [[ -n ${OLD_VM_DISK:-} && $OLD_VM_DISK != "$FR_VM_DISK" ]] || return 0
+    log "microVM disk size ${OLD_VM_DISK} -> ${FR_VM_DISK}: images are pulled again for new VMs"
+    local ctr=("$BIN_DIR/ctr" -a "$CONTAINERD_SOCK" -n flintlock) img
+    for img in $("${ctr[@]}" images ls -q 2>/dev/null); do
+        "${ctr[@]}" images rm "$img" >/dev/null 2>&1 || warn "could not remove image $img"
+    done
+}
+
 open_metrics_port() {
     [[ -n $FR_METRICS_ALLOW ]] || return 0
     log "allowing ${FR_METRICS_ALLOW} to scrape :9477/metrics"
@@ -823,6 +847,7 @@ main() {
     install_registry_mirror
     install_cache_server
     start_services
+    apply_vm_disk_size
     install_firerunner
     systemctl daemon-reload
     systemctl enable -q firerunner
