@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -241,4 +242,34 @@ func handshake(server, client *builderCreds) error {
 		err = serr
 	}
 	return err
+}
+
+// A builder a running job uses is never expired or evicted, however long the build takes.
+func TestBusyBuilderIsKept(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	dir := t.TempDir()
+	old := jobStateGlob
+	jobStateGlob = filepath.Join(dir, "*.json")
+	t.Cleanup(func() { jobStateGlob = old })
+	if err := vm.SaveJobState(filepath.Join(dir, "75226.json"), &vm.JobState{BuilderProject: "2"}); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := newTestDaemon(t)
+	spec := builderSpec(d.cfg)
+	d.cfg.Builder.Max = 2
+	d.builders = map[string]*builder{
+		"1": readyBuilder("1", 20001, 30*time.Minute, spec),
+		"2": readyBuilder("2", 20002, d.cfg.Builder.IdleTTL+time.Hour, spec), // long build
+	}
+	d.expireBuilders()
+	if b := d.builders["2"]; b == nil || time.Since(b.LastUsed) > time.Minute {
+		t.Fatalf("busy builder expired or not refreshed: %+v", b)
+	}
+	d.builders["2"].LastUsed = time.Now().Add(-time.Hour)
+	if got := d.Builder("3").State; got != BuilderBooting {
+		t.Fatalf("new project with an idle builder to evict: %s", got)
+	}
+	if d.builders["2"] == nil || d.builders["1"] != nil {
+		t.Fatalf("evicted the busy builder instead of the idle one: %v", d.builders)
+	}
 }

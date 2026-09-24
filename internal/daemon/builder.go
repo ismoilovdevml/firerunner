@@ -127,11 +127,12 @@ func (d *Daemon) Builder(project string) BuilderInfo {
 var builderBoot = (*Daemon).bootBuilder
 
 // evictLRULocked deletes the least recently used ready builder that has been
-// idle for 10 minutes. It reports whether a slot was freed.
+// idle for 10 minutes and that no running job uses. It reports whether a slot was freed.
 func (d *Daemon) evictLRULocked() bool {
+	busy := busyBuilders()
 	var lru *builder
 	for _, b := range d.builders {
-		if b.ready && time.Since(b.LastUsed) > 10*time.Minute && (lru == nil || b.LastUsed.Before(lru.LastUsed)) {
+		if b.ready && !busy[b.Project] && time.Since(b.LastUsed) > 10*time.Minute && (lru == nil || b.LastUsed.Before(lru.LastUsed)) {
 			lru = b
 		}
 	}
@@ -311,12 +312,18 @@ func mapBuilderPort(b *builder) error {
 // than builderMaxAge, or booted with settings that changed and idle for 10
 // minutes, and deletes all of them when builders are disabled.
 func (d *Daemon) expireBuilders() {
+	busy := busyBuilders()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	cfg := d.cfg
 	spec := builderSpec(cfg)
 	for _, b := range d.builders {
 		if !b.ready {
+			continue
+		}
+		if busy[b.Project] {
+			// A running job builds here (maybe for longer than the idle limits).
+			b.LastUsed = time.Now()
 			continue
 		}
 		idle := time.Since(b.LastUsed)

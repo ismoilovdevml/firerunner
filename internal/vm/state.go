@@ -15,8 +15,9 @@ type JobState struct {
 	Failed    bool      `json:"failed"`
 	// Network is the Docker network job containers join (set when the job has services).
 	Network string `json:"network,omitempty"`
-	// Builder is set when `docker build` in this job uses the project's BuildKit builder.
-	Builder bool `json:"builder,omitempty"`
+	// BuilderProject is the project whose BuildKit builder `docker build` in
+	// this job uses; the daemon never deletes a builder a running job uses.
+	BuilderProject string `json:"builder_project,omitempty"`
 }
 
 func SaveJobState(path string, st *JobState) error {

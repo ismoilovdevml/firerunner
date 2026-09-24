@@ -612,10 +612,25 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 	d.checkBuilders(present)
 }
 
+// jobStateGlob matches the state files `executor prepare` writes (a variable for tests).
+var jobStateGlob = "/run/firerunner/jobs/*.json"
+
+// busyBuilders returns the projects whose builder a running job uses.
+func busyBuilders() map[string]bool {
+	out := map[string]bool{}
+	files, _ := filepath.Glob(jobStateGlob)
+	for _, f := range files {
+		if st, err := vm.LoadJobState(f); err == nil && st.BuilderProject != "" {
+			out[st.BuilderProject] = true
+		}
+	}
+	return out
+}
+
 // jobStates maps microVM uid -> state file for jobs in progress (written by `executor prepare`).
 func jobStates() map[string]string {
 	out := map[string]string{}
-	files, _ := filepath.Glob("/run/firerunner/jobs/*.json")
+	files, _ := filepath.Glob(jobStateGlob)
 	for _, f := range files {
 		if st, err := vm.LoadJobState(f); err == nil {
 			out[st.UID] = f

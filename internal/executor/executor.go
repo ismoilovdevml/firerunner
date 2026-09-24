@@ -106,7 +106,8 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	// Shell-mode jobs run docker on the VM; their builds can use the project's
 	// warm BuildKit builder. A failure here only costs the cache, never the job.
 	if os.Getenv("CUSTOM_ENV_CI_JOB_IMAGE") == "" {
-		if st.Builder = useBuilder(cfg, dc, inst, os.Getenv("CUSTOM_ENV_CI_PROJECT_ID")); st.Builder {
+		if project := os.Getenv("CUSTOM_ENV_CI_PROJECT_ID"); useBuilder(cfg, dc, inst, project) {
+			st.BuilderProject = project
 			_ = vm.SaveJobState(statePath(id), st)
 		}
 	}
@@ -257,7 +258,7 @@ func Run(cfg config.Config, script, stage string) error {
 		code, err = runInContainer(cfg, &st.Instance, image, st.Network, f)
 	} else {
 		var script io.Reader = f
-		if st.Builder && isUserStage(stage) {
+		if st.BuilderProject != "" && isUserStage(stage) {
 			// `docker build` only uses a buildx builder named in the environment.
 			script = io.MultiReader(strings.NewReader("export BUILDX_BUILDER="+BuilderName+"\n"), f)
 		}
