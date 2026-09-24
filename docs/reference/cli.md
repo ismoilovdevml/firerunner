@@ -44,7 +44,7 @@ All commands need root.
 | `firerunner pool` | pre-booted VMs (JSON) |
 | `firerunner pool refresh` | replace idle pool VMs (after a new guest image) |
 | `firerunner builder list` | per-project BuildKit builders: project, VM, port, idle time |
-| `firerunner builder rm <project-id> \| --all` | delete a builder and its layer cache |
+| `firerunner builder rm <project-id> \| --all [--force]` | delete a builder and its layer cache; a builder a running job builds on is kept (exit 1) unless `--force`, which fails that job's build |
 | `firerunner run [--keep] -- <command>` | boot a throwaway VM, run a shell command, delete it (`--keep` leaves it running) |
 
 ## Used by services

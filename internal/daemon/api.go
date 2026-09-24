@@ -47,15 +47,8 @@ func (d *Daemon) apiHandler() http.Handler {
 		_ = json.NewEncoder(w).Encode(d.Builder(q.Get("project"), q.Get("start") != "0"))
 	})
 	mux.HandleFunc("DELETE /builder", func(w http.ResponseWriter, r *http.Request) {
-		project := r.URL.Query().Get("project")
-		d.mu.Lock()
-		defer d.mu.Unlock()
-		for _, b := range d.builders {
-			if (project == "all" || b.Project == project) && b.ready {
-				d.removeBuilderLocked(b, "removed by operator")
-			}
-		}
-		w.WriteHeader(http.StatusNoContent)
+		q := r.URL.Query()
+		_ = json.NewEncoder(w).Encode(d.RemoveBuilders(q.Get("project"), q.Get("force") == "1"))
 	})
 	mux.HandleFunc("GET /builders", func(w http.ResponseWriter, _ *http.Request) {
 		d.mu.Lock()

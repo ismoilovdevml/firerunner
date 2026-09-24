@@ -94,14 +94,24 @@ func (c *Client) Builders() (json.RawMessage, error) {
 	return raw, json.NewDecoder(resp.Body).Decode(&raw)
 }
 
-// RemoveBuilder deletes a project's builder ("all" for every builder).
-func (c *Client) RemoveBuilder(project string) error {
-	req, _ := http.NewRequest(http.MethodDelete, "http://daemon/builder?project="+url.QueryEscape(project), nil)
+// RemoveBuilder deletes a project's builder ("all" for every builder). Builders
+// a running job builds on are skipped unless force is set.
+func (c *Client) RemoveBuilder(project string, force bool) (*Removal, error) {
+	u := "http://daemon/builder?project=" + url.QueryEscape(project)
+	if force {
+		u += "&force=1"
+	}
+	req, _ := http.NewRequest(http.MethodDelete, u, nil)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("remove builder: %s (restart firerunner if it runs an older version)", resp.Status)
+	}
+	out := &Removal{}
+	return out, json.NewDecoder(resp.Body).Decode(out)
 }
 
 // Refresh asks the daemon to replace all idle pool VMs.

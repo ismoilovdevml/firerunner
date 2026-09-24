@@ -216,6 +216,36 @@ func (d *Daemon) removeBuilderLocked(b *builder, reason string) {
 	})
 }
 
+// Removal is the result of an operator's builder removal, by project id.
+type Removal struct {
+	Removed []string `json:"removed"`
+	Skipped []string `json:"skipped"` // a running job builds on it; force removes it
+}
+
+// RemoveBuilders deletes the ready builder of project ("all": every ready
+// builder) with its layer cache. Builders a running job builds on are kept
+// unless force is set: deleting one fails that job's docker build.
+func (d *Daemon) RemoveBuilders(project string, force bool) Removal {
+	busy := busyBuilders() // file reads: outside the lock
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := Removal{Removed: []string{}, Skipped: []string{}}
+	for _, b := range d.builders {
+		if !b.ready || (project != "all" && b.Project != project) {
+			continue
+		}
+		if busy[b.Project] && !force {
+			out.Skipped = append(out.Skipped, b.Project)
+			continue
+		}
+		d.removeBuilderLocked(b, "removed by operator")
+		out.Removed = append(out.Removed, b.Project)
+	}
+	sort.Strings(out.Removed)
+	sort.Strings(out.Skipped)
+	return out
+}
+
 func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project string) {
 	start := time.Now()
 	bcfg := builderConfig(cfg)

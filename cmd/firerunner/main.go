@@ -62,8 +62,10 @@ Usage:
   firerunner run [--keep] -- <command...>   boot a microVM, run a command, delete it
   firerunner pool [refresh]                 show pre-booted microVMs; refresh replaces them
   firerunner builder [list]                 per-project BuildKit builders (Docker layer cache)
-  firerunner builder rm <project-id>|--all  delete a builder and its cache
-                                            (after a new rootfs image under the same tag)
+  firerunner builder rm <project-id>|--all [--force]
+                                            delete a builder and its cache (after a new
+                                            rootfs image under the same tag); builders a
+                                            running job builds on are kept without --force
 
   firerunner daemon                         pool + reconcile + metrics (systemd: firerunner.service)
   firerunner executor prepare|run|cleanup   called by gitlab-runner (custom executor)
@@ -149,20 +151,54 @@ func dispatch(args []string) error {
 	return fmt.Errorf("unknown command %q\n\n%s", cmd, usage)
 }
 
+const builderRmUsage = "usage: firerunner builder rm <project-id>|--all [--force]"
+
+// parseBuilderRm reads `builder rm` arguments: one project id or --all, and
+// --force, in any order.
+func parseBuilderRm(args []string) (project string, force bool, err error) {
+	for _, a := range args {
+		switch {
+		case a == "--force":
+			force = true
+		case project != "":
+			return "", false, errors.New(builderRmUsage)
+		case a == "--all":
+			project = "all"
+		case strings.HasPrefix(a, "-"):
+			return "", false, errors.New(builderRmUsage)
+		default:
+			project = a
+		}
+	}
+	if project == "" {
+		return "", false, errors.New(builderRmUsage)
+	}
+	return project, force, nil
+}
+
 func cmdBuilder(cfg config.Config, args []string) error {
 	dc := daemon.NewClient(cfg.Daemon.Socket)
 	if len(args) > 0 && args[0] == "rm" {
-		if len(args) != 2 {
-			return errors.New("usage: firerunner builder rm <project-id>|--all")
+		project, force, err := parseBuilderRm(args[1:])
+		if err != nil {
+			return err
 		}
-		project := args[1]
-		if project == "--all" {
-			project = "all"
+		res, err := dc.RemoveBuilder(project, force)
+		if err != nil {
+			return fmt.Errorf("daemon (systemctl status firerunner): %w", err)
 		}
-		if err := dc.RemoveBuilder(project); err != nil {
-			return fmt.Errorf("daemon not reachable (systemctl status firerunner): %w", err)
+		if len(res.Removed) > 0 {
+			fmt.Printf("removed the builder of project %s; its next build starts a new one\n", strings.Join(res.Removed, ", "))
 		}
-		fmt.Println("builder removed; the next job of the project starts a new one")
+		switch {
+		case len(res.Skipped) > 0:
+			return fmt.Errorf("kept the builder of project %s: a job is building on it (--force removes it and fails that build)",
+				strings.Join(res.Skipped, ", "))
+		case len(res.Removed) == 0 && project == "all":
+			return errors.New("no ready builder to remove")
+		case len(res.Removed) == 0:
+			return fmt.Errorf("no ready builder for project %s", project)
+		}
 		return nil
 	}
 	raw, err := dc.Builders()

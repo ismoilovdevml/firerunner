@@ -1,11 +1,14 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +16,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
@@ -463,5 +469,100 @@ func TestBuilderPersistsLastUsedAtMostOncePerMinute(t *testing.T) {
 	d.Builder("1", false)
 	if _, err := os.Stat(d.buildersFile()); err != nil {
 		t.Fatalf("LastUsed older than a minute not persisted: %v", err)
+	}
+}
+
+// serveAPI serves the daemon's socket API and returns a client for it.
+func serveAPI(t *testing.T, d *Daemon) *Client {
+	t.Helper()
+	l, err := d.listenSocket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: d.apiHandler(), ReadHeaderTimeout: time.Second}
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return NewClient(d.cfg.Daemon.Socket)
+}
+
+// An operator removal never kills a running build unless forced (#37).
+func TestRemoveBuildersKeepsBusyUnlessForced(t *testing.T) {
+	calls := stubBuilders(t, func(string) bool { return true })
+	dir := t.TempDir()
+	old := jobStateGlob
+	jobStateGlob = filepath.Join(dir, "*.json")
+	t.Cleanup(func() { jobStateGlob = old })
+	if err := vm.SaveJobState(filepath.Join(dir, "job-9.json"), &vm.JobState{BuilderProject: "101"}); err != nil {
+		t.Fatal(err)
+	}
+	d, srv := newTestDaemon(t)
+	spec := builderSpec(d.cfg)
+	d.builders = map[string]*builder{
+		"101": readyBuilder("101", 20001, 0, spec),               // a job builds on it
+		"8":   readyBuilder("8", 20002, time.Hour, spec),         // idle
+		"9":   {Project: "9", Port: 20003, LastUsed: time.Now()}, // still booting
+	}
+	dc := serveAPI(t, d)
+
+	res, err := dc.RemoveBuilder("all", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(res.Removed, ",") != "8" || strings.Join(res.Skipped, ",") != "101" {
+		t.Fatalf("rm --all = %+v, want removed [8] skipped [101]", res)
+	}
+	if d.builders["101"] == nil || d.builders["9"] == nil || d.builders["8"] != nil {
+		t.Fatalf("builders after rm --all: %v", d.builders)
+	}
+	srv.WaitDeleted(t, "uid-8", 2*time.Second)
+
+	if res, err = dc.RemoveBuilder("777", false); err != nil || len(res.Removed)+len(res.Skipped) != 0 {
+		t.Fatalf("rm of a project without builder = %+v, %v", res, err)
+	}
+
+	res, err = dc.RemoveBuilder("101", true)
+	if err != nil || strings.Join(res.Removed, ",") != "101" || len(res.Skipped) != 0 {
+		t.Fatalf("rm 101 --force = %+v, %v", res, err)
+	}
+	srv.WaitDeleted(t, "uid-101", 2*time.Second)
+	d.bg.Wait()
+	if !strings.Contains(calls(), "delete element inet firerunner builders { 20001 }") {
+		t.Errorf("forced removal left the port mapping: %v", calls())
+	}
+}
+
+// Stopping the daemon mid-preload or mid-delete is expected: INFO, not ERROR,
+// and not a boot failure (#37).
+func TestShutdownMessagesAreInfo(t *testing.T) {
+	d, srv := newTestDaemon(t)
+	var logs bytes.Buffer
+	d.log = slog.New(slog.NewTextHandler(&logs, nil))
+	down := status.Error(codes.Unavailable, "grpc: the client connection is closing")
+	stopped, stop := context.WithCancel(context.Background())
+	stop()
+
+	d.preloadFailed(context.Background(), "pool-a", errors.New("pull failed"))
+	d.preloadFailed(stopped, "pool-b", context.Canceled)
+	if got := metricValue(t, d, "firerunner_vm_boot_failures_total", "preload"); got != 1 {
+		t.Fatalf("preload failures = %v, want 1 (the shutdown one is not a failure)", got)
+	}
+
+	srv.FailDelete(down)
+	d.delete(context.Background(), &vm.Instance{ID: "pool-c", UID: "c"}, "expired")
+	d.mu.Lock()
+	d.runCtx = stopped
+	d.mu.Unlock()
+	srv.FailDelete(down)
+	d.delete(context.Background(), &vm.Instance{ID: "pool-d", UID: "d"}, "shutdown")
+
+	for _, want := range []string{
+		`level=ERROR msg="image preload failed, VM kept without it" id=pool-a`,
+		`level=INFO msg="image preload stopped: daemon shutting down" id=pool-b`,
+		`level=ERROR msg="delete failed" id=pool-c`,
+		`level=INFO msg="delete not finished before shutdown" id=pool-d`,
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log lacks %q:\n%s", want, logs.String())
+		}
 	}
 }

@@ -431,8 +431,7 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config) {
 				d.mu.Unlock()
 				return
 			case perr != nil:
-				d.metrics.bootFailures.WithLabelValues("preload").Inc()
-				d.log.Error("image preload failed, VM kept without it", "id", id, "err", perr)
+				d.preloadFailed(ctx, id, perr)
 			default:
 				d.metrics.preloadSeconds.Observe(time.Since(pullStart).Seconds())
 			}
@@ -541,11 +540,35 @@ func (d *Daemon) delete(ctx context.Context, inst *vm.Instance, reason string) {
 	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
 	defer cancel()
 	if err := d.fl.Delete(ctx, inst.UID); err != nil {
+		if d.stopping() {
+			// Expected when the shutdown wait ends first; reconcile removes it next start.
+			d.log.Info("delete not finished before shutdown", "id", inst.ID, "reason", reason, "err", err)
+			return
+		}
 		d.log.Error("delete failed", "id", inst.ID, "reason", reason, "err", err)
 		return
 	}
 	vm.Forget(d.cfgSnapshot(), inst.ID)
 	d.log.Info("deleted microVM", "id", inst.ID, "reason", reason)
+}
+
+// stopping reports whether the daemon is shutting down (Run's context is done).
+func (d *Daemon) stopping() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.runCtx.Err() != nil
+}
+
+// preloadFailed reports a pool VM whose image preload did not finish. At
+// shutdown that is expected, not a boot failure: the next start adopts or
+// reclaims the VM.
+func (d *Daemon) preloadFailed(ctx context.Context, id string, err error) {
+	if ctx.Err() != nil {
+		d.log.Info("image preload stopped: daemon shutting down", "id", id)
+		return
+	}
+	d.metrics.bootFailures.WithLabelValues("preload").Inc()
+	d.log.Error("image preload failed, VM kept without it", "id", id, "err", err)
 }
 
 func (d *Daemon) cfgSnapshot() config.Config {
