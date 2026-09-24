@@ -22,7 +22,8 @@ curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/instal
 
 The installer checks every download against its sha256, sets up the thin pool, the microVM
 network, the image and cache servers and the services, then verifies them. You can run it again:
-it only restarts what changed.
+it only restarts what changed, and it reloads the microVM firewall in place without touching
+running VMs.
 
 Options go before `bash`, for example `sudo FR_DISK=/dev/sdb bash`:
 
