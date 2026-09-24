@@ -27,13 +27,19 @@ All commands need root.
 | Metric | |
 |---|---|
 | `firerunner_pool_ready`, `firerunner_pool_target` | pre-booted VMs now and wanted |
-| `firerunner_pool_claims_total{result}` | jobs that got a pool VM (`hit`) or booted one (`miss`) |
-| `firerunner_job_prepare_seconds{source}` | how long jobs waited for a VM |
-| `firerunner_job_duration_seconds`, `firerunner_jobs_total{result}` | finished jobs |
+| `firerunner_pool_claims_total{result}` | claim requests; a job waiting for memory asks again, so use `firerunner_job_prepare_seconds_count{source}` for the hit rate |
+| `firerunner_job_prepare_seconds{source}` | how long jobs waited for a ready VM (`pool` or `cold`) |
+| `firerunner_job_admission_wait_seconds` | how long jobs waited for host memory |
+| `firerunner_jobs_total{result,reason}` | finished jobs: `success`, `script_failure` (the job's commands), `system_failure` (FireRunner or the host) with a `reason` such as `ssh_lost`, `vm_boot`, `flintlock_error`, `admission_timeout` |
+| `firerunner_job_duration_seconds` | job duration |
 | `firerunner_vm_boot_seconds{kind}`, `firerunner_vm_boot_failures_total{kind}` | boots |
 | `firerunner_builders`, `firerunner_builder_requests_total{state}` | builders and their use |
 | `firerunner_orphans_deleted_total{reason}` | VMs removed by cleanup |
-| `firerunner_admission_waits_total` | boots postponed for lack of memory |
+| `firerunner_admission_waits_total` | pool refill passes postponed for lack of memory |
+| `firerunner_memory_committed_bytes{role}`, `firerunner_memory_capacity_bytes` | memory promised to VMs by role, and the limit |
+| `firerunner_dhcp_leases{state}`, `firerunner_dhcp_leases_capacity` | leased VM addresses (`stale`: not held by a VM) |
+| `firerunner_host_oom_kills_total` | processes the host kernel OOM-killed |
+| `firerunner_loop_last_tick_timestamp_seconds` | last pass of the daemon loop; `/healthz` fails after 2 min |
 | `firerunner_thinpool_usage_ratio{type}` | disk pool usage, 0–1 |
 | `firerunner_service_up{service}`, `firerunner_flintlock_up` | health |
 

@@ -56,8 +56,6 @@ func newClient(conn *grpc.ClientConn, namespace string) *Client {
 
 func (c *Client) Close() error { return c.conn.Close() }
 
-func (c *Client) Namespace() string { return c.namespace }
-
 // Create submits the spec and returns the UID flintlock assigned to the microVM.
 func (c *Client) Create(ctx context.Context, spec *types.MicroVMSpec) (string, error) {
 	spec.Namespace = c.namespace

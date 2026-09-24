@@ -2,8 +2,9 @@
 # FireRunner host installer.
 #
 # Prepares a KVM host (bare metal or a VM with nested virtualization) to run
-# Firecracker microVMs through Flintlock:
-#   containerd (devmapper thin pool) + Firecracker/jailer + flintlockd + bridge/DHCP/NAT
+# GitLab CI jobs in Firecracker microVMs:
+#   containerd (devmapper thin pool) + Firecracker + flintlockd + bridge/DHCP/NAT/firewall
+#   + Docker Hub pull-through mirror + S3 store for cache: + firerunner + gitlab-runner
 #
 # Usage:
 #   curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash
@@ -21,7 +22,10 @@
 #
 #   FR_VERSION              firerunner release to install (default: edge = latest main)
 #   FR_POOL_SIZE            pre-booted microVMs kept ready (default: 2)
-#   FR_METRICS_ALLOW        source CIDR allowed to scrape :9477/metrics (default: none, localhost only)
+#   FR_METRICS_ALLOW        source IPv4/CIDR allowed to scrape :9477/metrics (default: none, localhost only;
+#                           remembered for later re-runs)
+#   FR_EGRESS_DENY          comma-separated IPv4 CIDRs jobs must not reach, e.g. 192.168.0.0/16
+#                           (default: none; link-local 169.254.0.0/16 is always blocked)
 #   REGISTRY_VERSION        Docker Hub pull-through mirror for microVMs (default: 3.1.1)
 #   VERSITYGW_VERSION       S3 server for the runner's cache: (default: 1.8.0)
 #   FR_CACHE_DAYS           delete cache: archives not written for this many days (default: 14)
@@ -58,6 +62,7 @@ FR_RUNNER_TOKEN="${FR_RUNNER_TOKEN:-}"
 FR_RUNNER_CONCURRENT="${FR_RUNNER_CONCURRENT:-4}"
 FR_POOL_SIZE="${FR_POOL_SIZE:-2}"
 FR_METRICS_ALLOW="${FR_METRICS_ALLOW:-}"
+FR_EGRESS_DENY="${FR_EGRESS_DENY:-}"
 FR_REPO=ismoilovdevml/firerunner
 
 BIN_DIR=/usr/local/bin
@@ -88,6 +93,15 @@ trap 'printf "[firerunner] ERROR: line %s: %s (exit %s)\n" "$LINENO" "$BASH_COMM
 preflight() {
     [[ $EUID -eq 0 ]] || die "run as root (curl ... | sudo bash)"
     command -v systemctl >/dev/null || die "systemd is required"
+
+    # Both end up in firewall rules.
+    if [[ -n $FR_METRICS_ALLOW ]]; then
+        is_ipv4_cidr "$FR_METRICS_ALLOW" || die "FR_METRICS_ALLOW=$FR_METRICS_ALLOW is not an IPv4 address or CIDR"
+    fi
+    local cidr
+    for cidr in ${FR_EGRESS_DENY//,/ }; do
+        is_ipv4_cidr "$cidr" || die "FR_EGRESS_DENY: $cidr is not an IPv4 address or CIDR"
+    done
 
     # Only x86_64 is built and tested for now.
     [[ "$(uname -m)" == x86_64 ]] || die "unsupported architecture: $(uname -m) (x86_64 only)"
@@ -200,14 +214,14 @@ state = "${CONTAINERD_STATE}"
 [grpc]
   address = "${CONTAINERD_SOCK}"
 
-[metrics]
-  address = "127.0.0.1:1338"
-
 [plugins."io.containerd.snapshotter.v1.devmapper"]
   pool_name = "${THINPOOL}"
   root_path = "${CONTAINERD_ROOT}/snapshotter/devmapper"
   base_image_size = "${FR_VM_DISK}"
-  discard_blocks = true
+  # Discarding a deleted VM's blocks runs inside the snapshotter's write
+  # transaction and stalls the next VM's snapshot; the thin pool frees the
+  # blocks of a deleted thin device anyway.
+  discard_blocks = false
 EOF
 
     # Dedicated instance so it never clashes with a Docker/Kubernetes containerd.
@@ -314,6 +328,40 @@ install_firecracker() {
 # microVM network: bridge + DHCP/DNS + NAT
 # --------------------------------------------------------------------------
 
+is_ipv4_cidr() {
+    [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/([0-9]{1,2}))?$ ]] || return 1
+    local i
+    for i in 1 2 3 4; do (( BASH_REMATCH[i] <= 255 )) || return 1; done
+    [[ -z ${BASH_REMATCH[6]} ]] || (( BASH_REMATCH[6] <= 32 ))
+}
+
+# The source allowed to scrape metrics. It is remembered, so a re-run without
+# FR_METRICS_ALLOW keeps the rule instead of opening :9477 to everyone.
+metrics_allow() {
+    if [[ -n $FR_METRICS_ALLOW ]]; then
+        echo "$FR_METRICS_ALLOW"
+    elif [[ -s $CONF_DIR/metrics-allow ]]; then
+        cat "$CONF_DIR/metrics-allow"
+    fi
+}
+
+# nft rules that keep :9477 to the allowed source, also on hosts without
+# firewalld or ufw. Nothing when metrics were never opened.
+metrics_input_rules() {
+    local allow
+    allow=$(metrics_allow)
+    [[ -n $allow ]] || return 0
+    printf '    tcp dport 9477 iifname "lo" accept\n'
+    printf '    tcp dport 9477 ip saddr %s accept\n' "$allow"
+    printf '    tcp dport 9477 drop\n'
+}
+
+# FR_EGRESS_DENY: extra destinations jobs must not reach, e.g. internal ranges.
+egress_deny_rules() {
+    [[ -n $FR_EGRESS_DENY ]] || return 0
+    printf '    iifname "%s" ip daddr { %s } drop\n' "$FR_BRIDGE" "${FR_EGRESS_DENY//,/, }"
+}
+
 setup_network() {
     log "configuring bridge ${FR_BRIDGE} (${FR_SUBNET}.0/24) with DHCP and NAT"
     mkdir -p "$LIB_DIR" "$CONF_DIR"
@@ -346,16 +394,18 @@ table inet firerunner {
   }
   chain input {
     type filter hook input priority filter; policy accept;
-    # microVMs may only use DHCP, DNS, the registry mirror and the cache server on the host
-    # (IPv4 and IPv6)
+    # microVMs may only use DHCP, DNS, the registry mirror and the cache server on
+    # the host (IPv4 and IPv6). DHCP requests are broadcasts, everything else must
+    # be addressed to the bridge address.
     # The services on the bridge address are for microVMs and the host only,
     # never for the uplink (a LAN host routing the microVM subnet here).
     ip daddr ${FR_SUBNET}.1 iifname != { "${FR_BRIDGE}", "lo" } drop
-    iifname "${FR_BRIDGE}" udp dport { 53, 67 } accept
-    iifname "${FR_BRIDGE}" tcp dport 53 accept
-    iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport { 5000, 9000 } accept
+    iifname "${FR_BRIDGE}" udp dport 67 accept
+    iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 udp dport 53 accept
+    iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport { 53, 5000, 9000 } accept
     iifname "${FR_BRIDGE}" ct state established,related accept
     iifname "${FR_BRIDGE}" drop
+$(metrics_input_rules)
   }
   chain forward {
     type filter hook forward priority filter; policy accept;
@@ -366,6 +416,10 @@ table inet firerunner {
     # From outside, microVMs only get replies to connections they opened.
     oifname "${FR_BRIDGE}" ct state established,related accept
     oifname "${FR_BRIDGE}" drop
+    # Link-local addresses (cloud instance metadata, 169.254.169.254) are never
+    # reachable from jobs. Firecracker answers the VM's own MMDS before the tap.
+    iifname "${FR_BRIDGE}" ip daddr 169.254.0.0/16 drop
+$(egress_deny_rules)
   }
   # Job VMs reach their project's BuildKit builder at ${FR_SUBNET}.1:<port>; the
   # firerunner daemon fills the map. Routed through the host, never VM to VM.
@@ -440,6 +494,11 @@ dhcp-range=${FR_SUBNET}.10,${FR_SUBNET}.250,255.255.255.0,15m
 dhcp-option=option:router,${FR_SUBNET}.1
 dhcp-option=option:dns-server,${FR_SUBNET}.1
 dhcp-leasefile=/var/lib/misc/firerunner-dnsmasq.leases
+# Do not ping an address before offering it: dnsmasq stops answering DHCP for
+# ~3 s per ping, which serialises boots. Only VMs on this bridge use the range.
+no-ping
+# Hostnames sent by guests are not published in DNS.
+dhcp-ignore-names
 no-hosts
 log-dhcp
 EOF
@@ -495,7 +554,7 @@ install_flintlock() {
         log "flintlockd v${FLINTLOCK_VERSION} already installed"
     fi
 
-    # API token: generated once, root-only. Clients send it as a bearer token.
+    # API token: generated once, root-only. Clients send it as basic auth (base64 of the token).
     if [[ ! -s $CONF_DIR/flintlock.token ]]; then
         (umask 077; head -c 32 /dev/urandom | base64 | tr -d '/+=\n' >"$CONF_DIR/flintlock.token")
     fi
@@ -535,7 +594,7 @@ EOF
 }
 
 # --------------------------------------------------------------------------
-# firerunner CLI + GitLab Runner
+# Shared services for microVMs: Docker Hub mirror, S3 store for cache:
 # --------------------------------------------------------------------------
 
 install_registry_mirror() {
@@ -680,8 +739,15 @@ apply_vm_disk_size() {
 }
 
 open_metrics_port() {
-    [[ -n $FR_METRICS_ALLOW ]] || return 0
+    if [[ -z $FR_METRICS_ALLOW ]]; then
+        if [[ ! -s $CONF_DIR/metrics-allow && "$($BIN_DIR/firerunner config get daemon.metrics_listen 2>/dev/null)" == :* ]]; then
+            warn "metrics listen on all interfaces without an allowed source; re-run with FR_METRICS_ALLOW=<prometheus address>"
+        fi
+        return 0
+    fi
     log "allowing ${FR_METRICS_ALLOW} to scrape :9477/metrics"
+    # net-up.sh reads it to keep the port closed to anyone else (setup_network).
+    put "$CONF_DIR/metrics-allow" <<<"$FR_METRICS_ALLOW"
     # metrics listen on 127.0.0.1 by default; open them only together with the firewall rule
     if [[ "$($BIN_DIR/firerunner config get daemon.metrics_listen)" != ":9477" ]]; then
         $BIN_DIR/firerunner config set daemon.metrics_listen ":9477" >/dev/null
@@ -830,7 +896,11 @@ verify_install() {
     else
         warn "  flintlock gRPC not listening on ${FLINTLOCK_ENDPOINT}"; ok=0
     fi
-    dmsetup status "$THINPOOL" >/dev/null 2>&1 && log "  thin pool ${THINPOOL}: ok" || { warn "  thin pool ${THINPOOL} missing"; ok=0; }
+    if dmsetup status "$THINPOOL" >/dev/null 2>&1; then
+        log "  thin pool ${THINPOOL}: ok"
+    else
+        warn "  thin pool ${THINPOOL} missing"; ok=0
+    fi
     [[ $ok -eq 1 ]] || die "installation finished with errors"
 
     cat <<EOF
@@ -869,9 +939,11 @@ uninstall() {
         rm -f "/etc/systemd/system/$svc.service"
     done
     systemctl daemon-reload
-    rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry" "$BIN_DIR/versitygw"
-    rm -rf "$LIB_DIR"
-    log "done. To also drop data: vgremove $VG && rm -rf $CONTAINERD_ROOT /var/lib/flintlock $CONF_DIR"
+    rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry" \
+        "$BIN_DIR/versitygw" "$BIN_DIR/firecracker" "$BIN_DIR/jailer"
+    rm -rf "$LIB_DIR" /etc/opt/flintlockd   # flintlockd's config holds the API token
+    log "done. containerd binaries in $BIN_DIR are kept (another containerd may use them)."
+    log "To also drop data: vgremove $VG && rm -rf $CONTAINERD_ROOT /var/lib/flintlock /var/lib/firerunner $CONF_DIR /etc/lvm/profile/${THINPOOL}.profile"
 }
 
 main() {

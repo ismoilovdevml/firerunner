@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Functional test of the firewall install.sh writes (net-up.sh): network
 # namespaces stand in for microVMs on the bridge (one tap not named fltap*),
-# a builder, the host and an outside host.
+# a builder, the host, a cloud metadata server and outside hosts (also used as
+# a LAN host that routes the microVM subnet through this host).
 #
 # It changes the network of the machine it runs on, so run it in a privileged
 # throwaway container, once with and once without br_netfilter:
@@ -22,6 +23,8 @@ sed '$d' "$INSTALL_SH" > $WORK/install-lib.sh
     source $WORK/install-lib.sh
     # shellcheck disable=SC2034  # read by the install.sh functions
     LIB_DIR=$WORK/lib CONF_DIR=$WORK/conf
+    # shellcheck disable=SC2034
+    FR_METRICS_ALLOW=192.0.2.10 FR_EGRESS_DENY=198.51.100.0/24
     systemctl() { return 1; }      # no firewalld
     put() { local f=$1 mode=${2:-0644}; mkdir -p "$(dirname "$f")"; cat >"$f"; chmod "$mode" "$f"; }
     setup_network >/dev/null
@@ -54,9 +57,12 @@ vm bld tapbld  10.200.0.13        # a tap NOT matching fltap*
 ip netns add out
 ip link add up0 type veth peer name eth0 netns out
 ip addr add 192.0.2.1/24 dev up0; ip link set up0 up
-ip -n out addr add 192.0.2.50/24 dev eth0
+ip -n out addr add 192.0.2.10/24 dev eth0; ip -n out addr add 192.0.2.50/24 dev eth0
+ip -n out addr add 169.254.169.254/32 dev eth0; ip -n out addr add 198.51.100.7/32 dev eth0
 ip -n out link set eth0 up; ip -n out link set lo up
 ip -n out route add default via 192.0.2.1
+ip route add 169.254.169.254/32 via 192.0.2.10
+ip route add 198.51.100.0/24 via 192.0.2.10
 
 # listeners
 listen() { ( while true; do "$@" -l -k -n 2>/dev/null; sleep 0.1; done ) & }
@@ -66,6 +72,8 @@ listen nc 10.200.0.1 53
 listen nc 10.200.0.1 22
 listen nc 10.200.0.1 5000
 listen nc 0.0.0.0 9477
+listen ip netns exec out nc 169.254.169.254 80
+listen ip netns exec out nc 198.51.100.7 80
 listen ip netns exec out nc 192.0.2.50 80
 sleep 1
 
@@ -83,7 +91,12 @@ check "VM->builder through DNAT .1:20001"         ok      $A nc -z -w2 10.200.0.
 ip -n vmA route add 10.200.0.13/32 via 10.200.0.1
 check "VM->builder routed via host, no DNAT"      blocked $A nc -z -w2 10.200.0.13 1234
 ip -n vmA route del 10.200.0.13/32
+check "VM->cloud metadata 169.254.169.254"        blocked $A nc -z -w2 169.254.169.254 80
+check "VM->FR_EGRESS_DENY 198.51.100.7"           blocked $A nc -z -w2 198.51.100.7 80
 check "VM->internet-like 192.0.2.50 (NAT)"        ok      $A nc -z -w2 192.0.2.50 80
+check "metrics from allowed 192.0.2.10"           ok      ip netns exec out nc -z -w2 -s 192.0.2.10 192.0.2.1 9477
+check "metrics from other 192.0.2.50"             blocked ip netns exec out nc -z -w2 -s 192.0.2.50 192.0.2.1 9477
+check "metrics from localhost"                    ok      nc -z -w2 127.0.0.1 9477
 
 # reload keeps the daemon's builder mapping
 $NETUP || { echo "reload failed"; fail=$((fail+1)); }
@@ -100,6 +113,7 @@ check "LAN->VM tcp/1234 (forwarded into the subnet)" blocked $L nc -z -w2 10.200
 check "LAN->bridge address registry .1:5000"        blocked $L nc -z -w2 10.200.0.1 5000
 check "LAN->bridge address DNS tcp .1:53"           blocked $L nc -z -w2 10.200.0.1 53
 check "host itself->bridge address .1:5000"         ok      nc -z -w2 10.200.0.1 5000
+check "host->VM (how the executor reaches sshd)"   ok      nc -z -w2 10.200.0.12 1234
 check "VM egress still gets replies"                ok      $A nc -z -w2 192.0.2.50 80
 echo "---- rendered rules"; nft list table inet firerunner | sed -n '/chain input/,/^}/p'
 echo "RESULT pass=$pass fail=$fail"

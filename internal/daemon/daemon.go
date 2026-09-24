@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -166,6 +167,9 @@ type Daemon struct {
 	// busy is the projects whose builder a running job uses, as expireBuilders
 	// last saw them (every 2 s), so Builder can evict without a scan under mu.
 	busy map[string]bool
+
+	lastTick atomic.Int64 // unix time of the main loop's last pass (/healthz)
+	oomKills int64        // host oom_kill count at the last collectHost, -1 before the first
 }
 
 // spawn runs fn in the background and lets Run wait for it at shutdown, so
@@ -222,7 +226,8 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 	d := &Daemon{cfgPath: cfgPath, log: log, cfg: cfg, fl: fl, metrics: NewMetrics(),
 		claimed: map[string]time.Time{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{},
 		bootingIDs: map[string]bool{},
-		builders:   map[string]*builder{}, builderFailed: map[string]time.Time{}, runCtx: context.Background()}
+		builders:   map[string]*builder{}, builderFailed: map[string]time.Time{}, runCtx: context.Background(),
+		oomKills: -1}
 	if fi, err := os.Stat(cfgPath); err == nil {
 		d.cfgMod = fi.ModTime()
 	}
@@ -232,6 +237,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 // Run blocks until ctx is cancelled, then deletes the idle pool.
 func (d *Daemon) Run(ctx context.Context) error {
 	defer d.fl.Close()
+	d.tick() // /healthz also catches a startup that hangs before the loop's first pass
 
 	sock, err := d.listenSocket()
 	if err != nil {
@@ -268,6 +274,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.collectHost(ctx)
 
 	for {
+		d.tick()
 		select {
 		case <-ctx.Done():
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -537,20 +544,22 @@ func (d *Daemon) drain(ctx context.Context, reason string) {
 // reconcile). Reconcile retries on its next pass. A variable for tests.
 var deleteTimeout = 60 * time.Second
 
-func (d *Daemon) delete(ctx context.Context, inst *vm.Instance, reason string) {
+// delete deletes a microVM and forgets it; it reports whether flintlock took the delete.
+func (d *Daemon) delete(ctx context.Context, inst *vm.Instance, reason string) bool {
 	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
 	defer cancel()
 	if err := d.fl.Delete(ctx, inst.UID); err != nil {
 		if d.stopping() {
 			// Expected when the shutdown wait ends first; reconcile removes it next start.
 			d.log.Info("delete not finished before shutdown", "id", inst.ID, "reason", reason, "err", err)
-			return
+			return false
 		}
 		d.log.Error("delete failed", "id", inst.ID, "reason", reason, "err", err)
-		return
+		return false
 	}
 	vm.Forget(d.cfgSnapshot(), inst.ID)
 	d.log.Info("deleted microVM", "id", inst.ID, "reason", reason)
+	return true
 }
 
 // stopping reports whether the daemon is shutting down (Run's context is done).
@@ -707,9 +716,8 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 		role, job := RoleOf(v.GetSpec().GetId())
 		reason := decide(vmFacts{State: state, Role: role, Job: job, Owned: owned[uid], InJob: inJob[uid],
 			Age: time.Since(first), Startup: startup, Booting: booting[v.GetSpec().GetId()]}, cfg)
-		if reason != "" {
+		if reason != "" && d.delete(ctx, &vm.Instance{ID: v.GetSpec().GetId(), UID: uid}, reason) {
 			d.metrics.orphansDeleted.WithLabelValues(reason).Inc()
-			d.delete(ctx, &vm.Instance{ID: v.GetSpec().GetId(), UID: uid}, reason)
 		}
 	}
 	d.mu.Lock()
@@ -719,6 +727,7 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 		}
 	}
 	d.mu.Unlock()
+	d.recordCapacity(cfg, vms)
 	d.metrics.microvms.Reset()
 	for s, n := range states {
 		d.metrics.microvms.WithLabelValues(s).Set(n)
@@ -779,6 +788,50 @@ func busyBuilders() map[string]bool {
 	return out
 }
 
+// recordCapacity exports who holds host memory and DHCP addresses, from the
+// listing reconcile already has: the two resources jobs wait for or fail on.
+func (d *Daemon) recordCapacity(cfg config.Config, vms []*types.MicroVM) {
+	committed := map[string]float64{}
+	macs := map[string]bool{}
+	for _, v := range vms {
+		// A VM being deleted still holds its address until it is forgotten.
+		macs[vm.MAC(v.GetSpec().GetId())] = true
+		switch v.GetStatus().GetState() {
+		case types.MicroVMStatus_FAILED, types.MicroVMStatus_DELETING:
+			continue // not counted by admission either
+		}
+		role, _ := RoleOf(v.GetSpec().GetId())
+		if role == "" {
+			role = "other"
+		}
+		committed[role] += float64(vm.WithOverhead(int(v.GetSpec().GetMemoryInMb()))) * 1024 * 1024
+	}
+	for _, r := range roles {
+		d.metrics.memCommitted.WithLabelValues(r).Set(committed[r])
+	}
+	if c, err := vm.Capacity(cfg); err == nil {
+		d.metrics.memCapacity.Set(float64(c) * 1024 * 1024)
+	}
+	if leases, err := vm.Leases(cfg.Network.LeasesFile); err == nil {
+		var live, stale float64
+		for _, l := range leases {
+			if l.Expires.Unix() != 0 && !l.Expires.After(time.Now()) {
+				continue // expired: dnsmasq hands the address out again
+			}
+			if macs[l.MAC] {
+				live++
+			} else {
+				stale++
+			}
+		}
+		d.metrics.dhcpLeases.WithLabelValues("live").Set(live)
+		d.metrics.dhcpLeases.WithLabelValues("stale").Set(stale)
+	}
+	if n, err := host.DHCPRangeSize(host.DnsmasqConfig); err == nil {
+		d.metrics.dhcpCapacity.Set(float64(n))
+	}
+}
+
 // jobStates maps microVM uid -> state file for jobs in progress (written by `executor prepare`).
 func jobStates() map[string]string {
 	out := map[string]string{}
@@ -808,5 +861,11 @@ func (d *Daemon) collectHost(ctx context.Context) {
 	}
 	if r, err := host.ReadRunner(); err == nil {
 		d.metrics.runnerConcurrent.Set(float64(r.Concurrent))
+	}
+	if n, err := host.OOMKills(); err == nil {
+		if d.oomKills >= 0 && n > d.oomKills {
+			d.metrics.hostOOMKills.Add(float64(n - d.oomKills))
+		}
+		d.oomKills = n
 	}
 }

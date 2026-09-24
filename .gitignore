@@ -10,7 +10,6 @@ build/
 # Test and coverage
 *.test
 *.out
-coverage.out
 coverage.html
 
 # Go workspace file
@@ -27,8 +26,7 @@ go.work
 .DS_Store
 Thumbs.db
 
-# Config files (keep examples)
-config.yaml
+# Never commit keys or certificates
 *.key
 *.pem
 *.crt
@@ -42,9 +40,10 @@ tmp/
 temp/
 *.tmp
 
-# Dependencies
-vendor/
-
 # Build artifacts
 dist/
-release/
+
+# Documentation build (mkdocs)
+site/
+.venv/
+__pycache__/

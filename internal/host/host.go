@@ -3,8 +3,11 @@ package host
 
 import (
 	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -18,8 +21,12 @@ const (
 	ThinPool     = "flintlock/thinpool"
 )
 
+// DnsmasqConfig is the microVM DHCP/DNS configuration install.sh writes.
+const DnsmasqConfig = "/etc/firerunner/dnsmasq.conf"
+
 // Services installed by install.sh, in start order.
-var Services = []string{"containerd-flintlock", "firerunner-net", "firerunner-dnsmasq", "flintlockd"}
+var Services = []string{"containerd-flintlock", "firerunner-net", "firerunner-dnsmasq", "firerunner-registry",
+	"firerunner-cache", "flintlockd"}
 
 func ServiceActive(name string) bool {
 	return exec.Command("systemctl", "is-active", "--quiet", name).Run() == nil
@@ -219,4 +226,65 @@ func meminfo(key string) (int, error) {
 		}
 	}
 	return 0, fmt.Errorf("%s not found in /proc/meminfo", key)
+}
+
+// OOMKills returns how many processes the kernel OOM-killed since boot.
+func OOMKills() (int64, error) {
+	f, err := os.Open("/proc/vmstat")
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return parseOOMKills(f)
+}
+
+func parseOOMKills(r io.Reader) (int64, error) {
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		if k, v, ok := strings.Cut(sc.Text(), " "); ok && k == "oom_kill" {
+			return strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return 0, err
+	}
+	return 0, errors.New("no oom_kill in /proc/vmstat")
+}
+
+// DHCPRangeSize returns how many addresses the dhcp-range in a dnsmasq
+// configuration hands out.
+func DHCPRangeSize(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return parseDHCPRange(f)
+}
+
+func parseDHCPRange(r io.Reader) (int, error) {
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		v, ok := strings.CutPrefix(strings.TrimSpace(sc.Text()), "dhcp-range=")
+		if !ok {
+			continue
+		}
+		f := strings.Split(v, ",")
+		if len(f) < 2 {
+			break
+		}
+		start, end := net.ParseIP(f[0]).To4(), net.ParseIP(f[1]).To4()
+		if start == nil || end == nil {
+			break
+		}
+		n := int(binary.BigEndian.Uint32(end)) - int(binary.BigEndian.Uint32(start)) + 1
+		if n <= 0 {
+			break
+		}
+		return n, nil
+	}
+	if err := sc.Err(); err != nil {
+		return 0, err
+	}
+	return 0, errors.New("no IPv4 dhcp-range")
 }

@@ -1,4 +1,4 @@
-.PHONY: build test clean install docker-build run dev help
+.PHONY: build test clean run dev help
 
 # Build variables
 BINARY_NAME=firerunner
@@ -20,7 +20,6 @@ ARGS?=status
 GOCMD=go
 GOBUILD=$(GOCMD) build
 GOTEST=$(GOCMD) test
-GOGET=$(GOCMD) get
 GOMOD=$(GOCMD) mod
 GOCLEAN=$(GOCMD) clean
 
@@ -41,10 +40,10 @@ build: ## Build the binary
 	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./$(CMD_DIR)
 	@echo "Build complete: $(BUILD_DIR)/$(BINARY_NAME)"
 
-build-linux: ## Build for Linux
+build-linux: ## Build for Linux with the release flags (static, stripped)
 	@echo "Building for Linux..."
 	@mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./$(CMD_DIR)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GOBUILD) -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./$(CMD_DIR)
 	@echo "Build complete: $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64"
 
 test: ## Run tests
@@ -63,18 +62,13 @@ clean: ## Clean build artifacts
 	rm -f coverage.out coverage.html
 	@echo "Clean complete"
 
-install: build ## Install binary to /usr/local/bin
-	@echo "Installing $(BINARY_NAME)..."
-	sudo cp $(BUILD_DIR)/$(BINARY_NAME) /usr/local/bin/
-	@echo "Installed to /usr/local/bin/$(BINARY_NAME)"
-
 deps: ## Download dependencies
 	@echo "Downloading dependencies..."
 	$(GOMOD) download
 	$(GOMOD) tidy
 	@echo "Dependencies updated"
 
-docker-build: ## Build the microVM rootfs image locally (tag: ROOTFS_IMAGE)
+rootfs-image: ## Build the microVM rootfs image locally (tag: ROOTFS_IMAGE)
 	@echo "Building rootfs image $(ROOTFS_IMAGE)..."
 	docker build -t $(ROOTFS_IMAGE) images/rootfs/
 	@echo "Docker image built: $(ROOTFS_IMAGE)"
@@ -103,12 +97,10 @@ vet: ## Run go vet
 	$(GOCMD) vet ./...
 	@echo "Vet complete"
 
-check: fmt vet lint vulncheck test ## Run all checks (fmt, vet, lint, vulncheck, test)
+fmt-check: ## Fail if any Go file is not gofmt -s formatted (as CI does)
+	@test -z "$$(gofmt -s -l .)" || { gofmt -s -l .; exit 1; }
 
-release: clean check build-linux ## Create release build
-	@echo "Creating release..."
-	cd $(BUILD_DIR) && tar -czf $(BINARY_NAME)-$(VERSION)-linux-amd64.tar.gz $(BINARY_NAME)-linux-amd64
-	@echo "Release created: $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-linux-amd64.tar.gz"
+check: fmt-check vet lint vulncheck test ## Run all checks CI runs (without changing files)
 
-.PHONY: all build-linux test-coverage deps fmt lint vulncheck vet check release
+.PHONY: all build-linux test-coverage deps fmt fmt-check lint vulncheck vet check rootfs-image
 all: clean deps check build ## Run clean, deps, check, and build

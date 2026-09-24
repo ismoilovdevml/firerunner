@@ -41,11 +41,16 @@ Prometheus metrics are on `127.0.0.1:9477/metrics`. To scrape from elsewhere, in
 `FR_METRICS_ALLOW=<prometheus-ip>/32`.
 
 Import the Grafana dashboard and the alert rules from
-[`deploy/`](https://github.com/ismoilovdevml/firerunner/tree/main/deploy). Watch:
+[`deploy/`](https://github.com/ismoilovdevml/firerunner/tree/main/deploy). Alerts page only for
+failures FireRunner or the host caused, never for failing project scripts. Watch:
 
+- **FireRunner failure rate** and **system failures by reason**.
 - **Pool hit rate**: below 80 %, raise `pool.size`.
-- **Thin pool data**: at 100 % no VM can start.
-- **Boot failures**: VMs that did not come up.
+- **Committed memory** and **wait for host memory**: jobs queue when memory is full.
+- **DHCP leases**: at capacity no VM gets an address.
+- **Thin pool**: at 100 % no VM can start.
+
+The daemon logs one line per job (`journalctl -u firerunner | grep '"job":"<id>"'`).
 
 Logs: `journalctl -u firerunner -u flintlockd -u gitlab-runner`.
 
@@ -73,5 +78,9 @@ Start with `sudo firerunner doctor`.
 | installer: `no blank disk found` | attach an empty disk or set `FR_DISK` |
 | jobs stay pending | the job needs `tags: [firecracker]`; check the runner is online in GitLab |
 | `got no DHCP lease` | `systemctl status firerunner-net firerunner-dnsmasq`; then `firerunner vm logs <id>` |
-| `waiting for host memory` for long | fewer parallel jobs, a smaller `pool.size`, or more RAM |
+| `waiting for host memory` for long | fewer parallel jobs, a smaller `pool.size`, or more RAM; `firerunner_memory_committed_bytes` shows who holds it |
+| alert: system failures | the `reason` label: `ssh_lost` usually a host OOM kill (`journalctl -k | grep -i oom`), `vm_boot` DHCP or boot, `flintlock_error` flintlockd or the thin pool |
+| alert: DHCP leases, `stale` grows | leases of deleted VMs are not released: install `dnsmasq-utils` (`dhcp_release`) |
+| alert: daemon down or stuck | `journalctl -u firerunner -n 200`, then `systemctl restart firerunner` |
+| firewall rules need re-applying | `systemctl reload firerunner-net`; never restart it while jobs run, stopping it removes the bridge |
 | jobs cannot reach an internal host | its network overlaps `10.200.0.0/24` or the VM Docker ranges; change `FR_SUBNET` or `vm.docker_bip` |

@@ -61,10 +61,10 @@ Usage:
 
   firerunner run [--keep] -- <command...>   boot a microVM, run a command, delete it
   firerunner pool [refresh]                 show pre-booted microVMs; refresh replaces them
+                                            (after a new rootfs image under the same tag)
   firerunner builder [list]                 per-project BuildKit builders (Docker layer cache)
   firerunner builder rm <project-id>|--all [--force]
-                                            delete a builder and its cache (after a new
-                                            rootfs image under the same tag); builders a
+                                            delete a builder and its cache; builders a
                                             running job builds on are kept without --force
 
   firerunner daemon                         pool + reconcile + metrics (systemd: firerunner.service)
@@ -699,7 +699,7 @@ func cmdExecutor(cfg config.Config, args []string) error {
 func cmdUpgrade(args []string) error {
 	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	tag := fs.String("version", "edge", "release to install: edge (main), latest (newest stable) or a tag like v1.2.0")
-	check := fs.Bool("check", false, "only show which version would be installed")
+	check := fs.Bool("check", false, "only tell whether the release differs from this binary (runs nothing)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -711,7 +711,7 @@ func cmdUpgrade(args []string) error {
 	case !res.Changed:
 		fmt.Printf("firerunner %s is already the %s release\n", res.From, *tag)
 	case *check:
-		fmt.Printf("firerunner %s -> %s available (run: firerunner upgrade --version %s)\n", res.From, res.To, *tag)
+		fmt.Printf("firerunner %s: a different %s build is available (run: firerunner upgrade --version %s)\n", res.From, *tag, *tag)
 	default:
 		fmt.Printf("firerunner upgraded %s -> %s\n", res.From, res.To)
 		if host.ServiceActive("firerunner") {

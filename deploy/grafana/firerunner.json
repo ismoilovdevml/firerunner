@@ -271,8 +271,8 @@
     {
       "id": 6,
       "type": "stat",
-      "title": "Job failure rate (24h)",
-      "description": "",
+      "title": "FireRunner failure rate (24h)",
+      "description": "Share of jobs that failed because of FireRunner or the host (system failures, not cancelled). Failing project scripts are not counted.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -286,7 +286,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(firerunner_jobs_total{instance=~\"$instance\",result=\"failed\"}[24h])) / clamp_min(sum(increase(firerunner_jobs_total{instance=~\"$instance\"}[24h])),1)",
+          "expr": "sum(increase(firerunner_jobs_total{instance=~\"$instance\",result=\"system_failure\",reason!=\"canceled\"}[24h])) / clamp_min(sum(increase(firerunner_jobs_total{instance=~\"$instance\"}[24h])),1)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -332,7 +332,7 @@
       "id": 7,
       "type": "stat",
       "title": "Pool hit rate (24h)",
-      "description": "Share of jobs that got a pre-booted VM. Low values mean pool.size is too small for the job burst.",
+      "description": "Share of jobs that got a pre-booted microVM. Below ~80 %: raise pool.size (if memory allows).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -346,7 +346,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(firerunner_pool_claims_total{instance=~\"$instance\",result=\"hit\"}[24h])) / clamp_min(sum(increase(firerunner_pool_claims_total{instance=~\"$instance\"}[24h])),1)",
+          "expr": "sum(increase(firerunner_job_prepare_seconds_count{instance=~\"$instance\",source=\"pool\"}[24h])) / clamp_min(sum(increase(firerunner_job_prepare_seconds_count{instance=~\"$instance\"}[24h])),1)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -442,7 +442,7 @@
     {
       "id": 9,
       "type": "stat",
-      "title": "Thin pool data",
+      "title": "Thin pool (fullest of data, metadata)",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -457,7 +457,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max(firerunner_thinpool_usage_ratio{instance=~\"$instance\",type=\"data\"})",
+          "expr": "max(firerunner_thinpool_usage_ratio{instance=~\"$instance\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -942,8 +942,8 @@
     {
       "id": 18,
       "type": "timeseries",
-      "title": "Pool claims per minute",
-      "description": "miss = the pool was empty and the job cold-booted.",
+      "title": "System failures by reason",
+      "description": "Jobs FireRunner or the host failed, by reason. See Troubleshooting > Jobs fail with a system failure.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -957,8 +957,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (result) (rate(firerunner_pool_claims_total{instance=~\"$instance\"}[$__rate_interval])) * 60",
-          "legendFormat": "{{result}}",
+          "expr": "sum by (reason) (increase(firerunner_jobs_total{instance=~\"$instance\",result=\"system_failure\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -978,7 +978,6 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 60,
@@ -1234,7 +1233,7 @@
     {
       "id": 23,
       "type": "timeseries",
-      "title": "Boot failures and cleanups",
+      "title": "Boot failures and reconciled VMs",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -1260,15 +1259,6 @@
           "refId": "B",
           "expr": "sum by (reason) (increase(firerunner_orphans_deleted_total{instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "reconciled: {{reason}}",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          }
-        },
-        {
-          "refId": "C",
-          "expr": "sum(increase(firerunner_admission_waits_total{instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "waited for memory",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -1338,7 +1328,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (state) (rate(firerunner_builder_requests_total{state!=\"disabled\"}[5m])) * 60",
+          "expr": "sum by (state) (rate(firerunner_builder_requests_total{instance=~\"$instance\",state!=\"disabled\"}[$__rate_interval])) * 60",
           "legendFormat": "{{state}}",
           "datasource": {
             "type": "prometheus",
@@ -1374,38 +1364,7 @@
             "mode": "palette-classic"
           }
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "hit"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "green"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "miss"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "orange"
-                }
-              }
-            ]
-          }
-        ]
+        "overrides": []
       }
     },
     {
@@ -1426,7 +1385,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "firerunner_builders",
+          "expr": "sum(firerunner_builders{instance=~\"$instance\"})",
           "legendFormat": "builders",
           "datasource": {
             "type": "prometheus",
@@ -1462,38 +1421,7 @@
             "mode": "palette-classic"
           }
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "hit"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "green"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "miss"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "orange"
-                }
-              }
-            ]
-          }
-        ]
+        "overrides": []
       }
     },
     {
@@ -1638,7 +1566,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 61
+        "y": 77
       },
       "targets": [
         {
@@ -1701,6 +1629,274 @@
           "color": {
             "mode": "thresholds"
           }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Committed microVM memory by role",
+      "description": "What admission counts, by role; the capacity line is where new VMs start to wait. A growing job share with few running jobs means leaked VMs.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (role) (firerunner_memory_committed_bytes{instance=~\"$instance\"})",
+          "legendFormat": "{{role}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(firerunner_memory_capacity_bytes{instance=~\"$instance\"})",
+          "legendFormat": "capacity",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Wait for host memory p50 / p90",
+      "description": "How long jobs without a pool VM waited for memory before their VM was created.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(firerunner_job_admission_wait_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(firerunner_job_admission_wait_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p90",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "DHCP leases",
+      "description": "Leased microVM addresses. At capacity jobs get no lease; a growing stale share means leases of deleted VMs are not released.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 69
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (state) (firerunner_dhcp_leases{instance=~\"$instance\"})",
+          "legendFormat": "{{state}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(firerunner_dhcp_leases_capacity{instance=~\"$instance\"})",
+          "legendFormat": "capacity",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Daemon loop age and host OOM kills",
+      "description": "Seconds since the daemon main loop last passed (normally < 3 s) and processes the host kernel OOM-killed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 69
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(time() - firerunner_loop_last_tick_timestamp_seconds{instance=~\"$instance\"})",
+          "legendFormat": "loop age (s)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(increase(firerunner_host_oom_kills_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "OOM kills",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
         },
         "overrides": []
       }

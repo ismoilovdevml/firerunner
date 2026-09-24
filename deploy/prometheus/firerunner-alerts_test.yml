@@ -1,0 +1,165 @@
+# promtool test rules deploy/prometheus/firerunner-alerts_test.yml
+rule_files:
+- firerunner-alerts.yml
+evaluation_interval: 1m
+tests:
+- interval: 1m
+  input_series:
+  - series: firerunner_jobs_total{instance="h1",job="firerunner",result="success",reason="none"}
+    values: 0+1x40
+  - series: firerunner_jobs_total{instance="h1",job="firerunner",result="system_failure",reason="vm_boot"}
+    values: 0x20 1 2 3 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4
+  - series: firerunner_jobs_total{instance="h2",job="firerunner",result="script_failure",reason="none"}
+    values: 0+1x40
+  - series: firerunner_jobs_total{instance="h2",job="firerunner",result="system_failure",reason="canceled"}
+    values: 0+1x40
+  - series: firerunner_dhcp_leases{instance="h1",job="firerunner",state="live"}
+    values: 20x40
+  - series: firerunner_dhcp_leases{instance="h1",job="firerunner",state="stale"}
+    values: 180x40
+  - series: firerunner_dhcp_leases_capacity{instance="h1",job="firerunner"}
+    values: 241x40
+  - series: up{instance="h1",job="firerunner"}
+    values: 1x40
+  - series: firerunner_loop_last_tick_timestamp_seconds{instance="h1",job="firerunner"}
+    values: 0+60x10 600x30
+  - series: firerunner_host_oom_kills_total{instance="h1",job="firerunner"}
+    values: 0x20 1x20
+  alert_rule_test:
+  - eval_time: 30m
+    alertname: FireRunnerSystemFailures
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        instance: h1
+      exp_annotations:
+        summary: Jobs on h1 fail because of FireRunner or the host
+        description: 'Not project bugs. See the reason: sum by (reason) (increase(firerunner_jobs_total{result="system_failure"}[30m])). ssh_lost: host OOM or a VM died; vm_boot: DHCP or boot; flintlock_error:
+          flintlockd or the thin pool; admission_timeout: memory. Per job: journalctl -u firerunner | grep ''"result":"system_failure"''.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+  - eval_time: 30m
+    alertname: FireRunnerDHCPLeasesExhausting
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        instance: h1
+      exp_annotations:
+        summary: 82.99% of the microVM DHCP addresses are in use on h1
+        description: 'At 100% jobs fail with ''got no DHCP lease''. If state="stale" dominates, leases of deleted VMs are not released: check that dhcp_release (dnsmasq-utils) is installed and journalctl
+          -u firerunner | grep ''delete failed''.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+  - eval_time: 30m
+    alertname: FireRunnerDaemonUnhealthy
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        instance: h1
+        job: firerunner
+      exp_annotations:
+        summary: FireRunner daemon on h1 is down or stuck
+        description: 'Jobs still run, but every one cold-boots, nothing reconciles and the other FireRunner alerts are blind. Check: journalctl -u firerunner -n 200; if it runs but is stuck: systemctl restart
+          firerunner.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+  - eval_time: 5m
+    alertname: FireRunnerDaemonUnhealthy
+    exp_alerts: []
+  - eval_time: 25m
+    alertname: FireRunnerHostOOMKill
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        instance: h1
+        job: firerunner
+      exp_annotations:
+        summary: The kernel OOM-killed a process on h1
+        description: 'Usually a firecracker microVM; its job fails with a lost SSH connection. Check: journalctl -k --since -15min | grep -iE ''out of memory|killed process''; raise vm.host_reserve_mb or
+          lower concurrent, pool.size or builder.max.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+  - eval_time: 40m
+    alertname: FireRunnerHostOOMKill
+    exp_alerts: []
+- interval: 1m
+  input_series:
+  - series: firerunner_flintlock_up{instance="h3",job="firerunner"}
+    values: 1x5 0x20
+  - series: firerunner_service_up{instance="h3",job="firerunner",service="flintlockd"}
+    values: 1x5 0x20
+  - series: firerunner_service_up{instance="h3",job="firerunner",service="firerunner-cache"}
+    values: 1x5 0x20
+  - series: firerunner_service_up{instance="h3",job="firerunner",service="firerunner-net"}
+    values: 1x25
+  - series: firerunner_thinpool_usage_ratio{instance="h3",job="firerunner",type="data"}
+    values: 0.5x25
+  - series: firerunner_thinpool_usage_ratio{instance="h3",job="firerunner",type="metadata"}
+    values: 0.8x25
+  - series: firerunner_job_admission_wait_seconds_bucket{instance="h3",job="firerunner",le="60"}
+    values: '0x40'
+  - series: firerunner_job_admission_wait_seconds_bucket{instance="h3",job="firerunner",le="120"}
+    values: 0+2x40
+  - series: firerunner_job_admission_wait_seconds_bucket{instance="h3",job="firerunner",le="+Inf"}
+    values: 0+2x40
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: FireRunnerFlintlockDown
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: FireRunnerFlintlockDown
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        instance: h3
+        job: firerunner
+      exp_annotations:
+        summary: 'flintlock API unreachable on h3: no microVM can be created'
+        description: 'Every new job fails in prepare. Check: systemctl status flintlockd containerd-flintlock; journalctl -u flintlockd -n 100; firerunner doctor.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+  - eval_time: 12m
+    alertname: FireRunnerServiceDown
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        instance: h3
+        job: firerunner
+        service: flintlockd
+      exp_annotations:
+        summary: flintlockd is down on h3
+        description: 'Jobs fail or are not picked up. Check: journalctl -u flintlockd -n 100; firerunner doctor.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+  - eval_time: 12m
+    alertname: FireRunnerCacheServiceDown
+    exp_alerts: []
+  - eval_time: 20m
+    alertname: FireRunnerCacheServiceDown
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        instance: h3
+        job: firerunner
+        service: firerunner-cache
+      exp_annotations:
+        summary: firerunner-cache is down on h3
+        description: 'Jobs run but slower: image pulls bypass the mirror (Docker Hub rate limits) or cache: is not restored. Check: journalctl -u firerunner-cache -n 100; df -h /var/lib/firerunner.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+  - eval_time: 20m
+    alertname: FireRunnerThinPoolFull
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        instance: h3
+        job: firerunner
+        type: metadata
+      exp_annotations:
+        summary: Thin pool metadata 80% full on h3
+        description: 'At 100% every microVM create fails; full metadata can damage the pool. Check: lvs flintlock; firerunner builder rm --all frees builder caches; extend the volume group.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+  - eval_time: 40m
+    alertname: FireRunnerJobsWaitForMemory
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        instance: h3
+      exp_annotations:
+        summary: Jobs on h3 wait 1m 54s (p90) for host memory
+        description: 'Committed microVM memory is at capacity. Check firerunner_memory_committed_bytes by role: more job VMs than running jobs means leaked VMs (firerunner vm list); a large builder share
+          means builder.max or builder.memory_mb is too high; otherwise lower concurrent or pool.size, or add memory.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting

@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,6 +85,15 @@ func NewHostKey() (HostKey, error) {
 	}, nil
 }
 
+// ErrNotReady matches the error of a microVM that was created but got no DHCP
+// lease or did not answer SSH within vm.boot_timeout.
+var ErrNotReady = errors.New("microVM not ready")
+
+type notReady struct{ msg string }
+
+func (e notReady) Error() string        { return e.msg }
+func (e notReady) Is(target error) bool { return target == ErrNotReady }
+
 // Boot creates the microVM and waits until it answers on SSH.
 // On failure the microVM is deleted before returning.
 func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id string, labels map[string]string) (*Instance, error) {
@@ -105,15 +115,14 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 	fail := func(err error) (*Instance, error) {
 		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = fl.Delete(dctx, uid)
-		Forget(cfg, id)
+		_ = Destroy(dctx, cfg, fl, id, uid)
 		return nil, err
 	}
 
 	deadline := time.Now().Add(cfg.VM.BootTimeout)
 	for inst.IP == "" {
 		if time.Now().After(deadline) {
-			return fail(fmt.Errorf("microVM %s got no DHCP lease within %s (see: firerunner vm logs %s)", id, cfg.VM.BootTimeout, id))
+			return fail(notReady{fmt.Sprintf("microVM %s got no DHCP lease within %s (see: firerunner vm logs %s)", id, cfg.VM.BootTimeout, id)})
 		}
 		if inst.IP, err = LeaseIP(cfg.Network.LeasesFile, mac); err != nil {
 			return fail(err)
@@ -127,11 +136,11 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 	// Wait for sshd's port before spawning ssh: a TCP dial costs no process, so
 	// it can poll every bootPoll, and the first ssh then almost always succeeds.
 	if err := waitTCP(ctx, net.JoinHostPort(inst.IP, "22"), deadline); err != nil {
-		return fail(fmt.Errorf("microVM %s at %s did not open SSH within %s: %w", id, inst.IP, cfg.VM.BootTimeout, err))
+		return fail(notReady{fmt.Sprintf("microVM %s at %s did not open SSH within %s: %v", id, inst.IP, cfg.VM.BootTimeout, err)})
 	}
 	for SSH(cfg, inst, "true").Run() != nil {
 		if time.Now().After(deadline) {
-			return fail(fmt.Errorf("microVM %s at %s did not answer SSH within %s", id, inst.IP, cfg.VM.BootTimeout))
+			return fail(notReady{fmt.Sprintf("microVM %s at %s did not answer SSH within %s", id, inst.IP, cfg.VM.BootTimeout)})
 		}
 		if err := sleep(ctx, time.Second); err != nil {
 			return fail(err)
@@ -228,6 +237,40 @@ func LeaseIP(leasesFile, mac string) (string, error) {
 
 type lease struct{ mac, ip, clientID string }
 
+// Lease is one line of the dnsmasq leases file.
+type Lease struct {
+	Expires time.Time
+	MAC     string
+	IP      string
+}
+
+// Leases reads the dnsmasq leases file; a missing file has no leases.
+func Leases(leasesFile string) ([]Lease, error) {
+	f, err := os.Open(leasesFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var out []Lease
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		// <expiry> <mac> <ip> <hostname> <client-id>
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		exp, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		out = append(out, Lease{Expires: time.Unix(exp, 0), MAC: strings.ToLower(fields[1]), IP: fields[2]})
+	}
+	return out, sc.Err()
+}
+
 func findLease(leasesFile, mac string) (*lease, error) {
 	f, err := os.Open(leasesFile)
 	if errors.Is(err, os.ErrNotExist) {
@@ -250,6 +293,17 @@ func findLease(leasesFile, mac string) (*lease, error) {
 		}
 	}
 	return found, sc.Err()
+}
+
+// Destroy deletes a microVM and, once flintlock took the delete, forgets its
+// pinned host key and DHCP lease. A VM whose delete failed may still run, so
+// it keeps both until whoever deletes it later (reconcile) forgets them.
+func Destroy(ctx context.Context, cfg config.Config, fl *flintlock.Client, id, uid string) error {
+	if err := fl.Delete(ctx, uid); err != nil {
+		return err
+	}
+	Forget(cfg, id)
+	return nil
 }
 
 // Forget drops what the host keeps about a deleted microVM: its pinned host

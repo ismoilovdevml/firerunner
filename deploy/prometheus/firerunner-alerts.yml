@@ -1,53 +1,85 @@
+# Every alert names what the on-call does next; runbooks are in
+# docs/operations.md (Troubleshooting). The scrape job is assumed to be named
+# "firerunner".
 groups:
   - name: firerunner
     rules:
-      - alert: FireRunnerDown
-        expr: up{job="firerunner"} == 0
-        for: 5m
-        labels: {severity: critical}
-        annotations:
-          summary: "FireRunner daemon on {{ $labels.instance }} is not reachable"
-          description: "No metrics for 5m. CI jobs may still cold-boot, but the pool and cleanup are stopped. Check: systemctl status firerunner"
-      - alert: FireRunnerServiceDown
-        expr: firerunner_service_up == 0
+      - alert: FireRunnerDaemonUnhealthy
+        expr: |
+          up{job="firerunner"} == 0
+          or (time() - firerunner_loop_last_tick_timestamp_seconds) > 120
         for: 3m
         labels: {severity: critical}
         annotations:
-          summary: "{{ $labels.service }} is down on {{ $labels.instance }}"
-          description: "Jobs on this host fail while it is down. Check: journalctl -u {{ $labels.service }} -n 100"
+          summary: "FireRunner daemon on {{ $labels.instance }} is down or stuck"
+          description: "Jobs still run, but every one cold-boots, nothing reconciles and the other FireRunner alerts are blind. Check: journalctl -u firerunner -n 200; if it runs but is stuck: systemctl restart firerunner."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
       - alert: FireRunnerFlintlockDown
         expr: firerunner_flintlock_up == 0
         for: 3m
         labels: {severity: critical}
         annotations:
-          summary: "flintlock API unreachable on {{ $labels.instance }}"
-          description: "No microVM can be created. Check: systemctl status flintlockd containerd-flintlock"
-      - alert: FireRunnerThinPoolFull
-        expr: max by (instance) (firerunner_thinpool_usage_ratio) > 0.85
+          summary: "flintlock API unreachable on {{ $labels.instance }}: no microVM can be created"
+          description: "Every new job fails in prepare. Check: systemctl status flintlockd containerd-flintlock; journalctl -u flintlockd -n 100; firerunner doctor."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+      - alert: FireRunnerServiceDown
+        expr: firerunner_service_up{service=~"flintlockd|containerd-flintlock|firerunner-net|firerunner-dnsmasq|gitlab-runner"} == 0
+        for: 3m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.service }} is down on {{ $labels.instance }}"
+          description: "Jobs fail or are not picked up. Check: journalctl -u {{ $labels.service }} -n 100; firerunner doctor."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+      - alert: FireRunnerCacheServiceDown
+        expr: firerunner_service_up{service=~"firerunner-registry|firerunner-cache"} == 0
         for: 10m
         labels: {severity: warning}
         annotations:
-          summary: "microVM thin pool {{ $value | humanizePercentage }} full on {{ $labels.instance }}"
-          description: "At 100% every microVM create fails. Extend the flintlock volume group or remove unused images."
-      - alert: FireRunnerBootFailures
-        expr: sum by (instance) (increase(firerunner_vm_boot_failures_total[15m])) >= 3
-        labels: {severity: warning}
-        annotations:
-          summary: "{{ $value | humanize }} microVM boots failed in 15m on {{ $labels.instance }}"
-          description: "Jobs fail with a system error. Check: firerunner doctor; journalctl -u flintlockd -n 100"
-      - alert: FireRunnerJobsFailing
+          summary: "{{ $labels.service }} is down on {{ $labels.instance }}"
+          description: "Jobs run but slower: image pulls bypass the mirror (Docker Hub rate limits) or cache: is not restored. Check: journalctl -u {{ $labels.service }} -n 100; df -h /var/lib/firerunner."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+      - alert: FireRunnerSystemFailures
+        # Only failures FireRunner or the host caused; failing project scripts never page.
         expr: |
-          sum by (instance) (increase(firerunner_jobs_total{result="failed"}[1h]))
-            / clamp_min(sum by (instance) (increase(firerunner_jobs_total[1h])), 1) > 0.5
-          and sum by (instance) (increase(firerunner_jobs_total[1h])) >= 10
-        labels: {severity: warning}
+          sum by (instance) (increase(firerunner_jobs_total{result="system_failure",reason!="canceled"}[30m])) >= 3
+          and
+          sum by (instance) (increase(firerunner_jobs_total{result="system_failure",reason!="canceled"}[30m]))
+            / clamp_min(sum by (instance) (increase(firerunner_jobs_total[30m])), 1) > 0.05
+        labels: {severity: critical}
         annotations:
-          summary: "More than half of the jobs failed in the last hour on {{ $labels.instance }}"
-          description: "May be the projects themselves; compare with other runners before blaming the host."
-      - alert: FireRunnerPoolEmpty
-        expr: firerunner_pool_target > 0 and firerunner_pool_ready == 0 and firerunner_pool_booting == 0
+          summary: "Jobs on {{ $labels.instance }} fail because of FireRunner or the host"
+          description: "Not project bugs. See the reason: sum by (reason) (increase(firerunner_jobs_total{result=\"system_failure\"}[30m])). ssh_lost: host OOM or a VM died; vm_boot: DHCP or boot; flintlock_error: flintlockd or the thin pool; admission_timeout: memory. Per job: journalctl -u firerunner | grep '\"result\":\"system_failure\"'."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+      - alert: FireRunnerJobsWaitForMemory
+        expr: histogram_quantile(0.9, sum by (instance, le) (rate(firerunner_job_admission_wait_seconds_bucket[15m]))) > 30
         for: 15m
         labels: {severity: warning}
         annotations:
-          summary: "Warm pool is empty and not refilling on {{ $labels.instance }}"
-          description: "Every job waits for a cold boot (~15s). Usually host memory: see firerunner_admission_waits_total."
+          summary: "Jobs on {{ $labels.instance }} wait {{ $value | humanizeDuration }} (p90) for host memory"
+          description: "Committed microVM memory is at capacity. Check firerunner_memory_committed_bytes by role: more job VMs than running jobs means leaked VMs (firerunner vm list); a large builder share means builder.max or builder.memory_mb is too high; otherwise lower concurrent or pool.size, or add memory."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+      - alert: FireRunnerHostOOMKill
+        expr: increase(firerunner_host_oom_kills_total[10m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "The kernel OOM-killed a process on {{ $labels.instance }}"
+          description: "Usually a firecracker microVM; its job fails with a lost SSH connection. Check: journalctl -k --since -15min | grep -iE 'out of memory|killed process'; raise vm.host_reserve_mb or lower concurrent, pool.size or builder.max."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+      - alert: FireRunnerThinPoolFull
+        expr: |
+          firerunner_thinpool_usage_ratio{type="data"} > 0.85
+          or firerunner_thinpool_usage_ratio{type="metadata"} > 0.75
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Thin pool {{ $labels.type }} {{ $value | humanizePercentage }} full on {{ $labels.instance }}"
+          description: "At 100% every microVM create fails; full metadata can damage the pool. Check: lvs flintlock; firerunner builder rm --all frees builder caches; extend the volume group."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting
+      - alert: FireRunnerDHCPLeasesExhausting
+        expr: sum by (instance) (firerunner_dhcp_leases) / sum by (instance) (firerunner_dhcp_leases_capacity) > 0.8
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of the microVM DHCP addresses are in use on {{ $labels.instance }}"
+          description: "At 100% jobs fail with 'got no DHCP lease'. If state=\"stale\" dominates, leases of deleted VMs are not released: check that dhcp_release (dnsmasq-utils) is installed and journalctl -u firerunner | grep 'delete failed'."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#troubleshooting

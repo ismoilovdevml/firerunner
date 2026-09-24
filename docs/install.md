@@ -32,7 +32,8 @@ Options go before `bash`, for example `sudo FR_DISK=/dev/sdb bash`:
 | `FR_DISK` | first blank disk | disk for microVM disks, wiped |
 | `FR_VM_DISK` | `40GB` | root disk of each microVM, thin-provisioned |
 | `FR_POOL_SIZE` | `2` | pre-booted microVMs |
-| `FR_METRICS_ALLOW` | none | CIDR that may scrape `:9477`; without it metrics stay local |
+| `FR_METRICS_ALLOW` | none | CIDR that may scrape `:9477`; without it metrics stay local. Kept for later runs |
+| `FR_EGRESS_DENY` | none | comma-separated CIDRs jobs must not reach, e.g. `192.168.0.0/16` |
 | `FR_GITLAB_URL`, `FR_RUNNER_TOKEN` | none | register the runner during install |
 | `FR_SUBNET` | `10.200.0` | /24 for microVMs |
 
@@ -63,5 +64,6 @@ For more hosts, install and register each one; GitLab spreads jobs over them.
 curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash -s -- uninstall
 ```
 
-It deletes the microVMs and removes services and binaries. The disk, images and `/etc/firerunner`
-stay. Delete the runner in GitLab yourself.
+It deletes the microVMs and removes services and binaries (containerd's binaries stay). The disk,
+images, `/var/lib/firerunner` and `/etc/firerunner` stay; the command prints how to remove them.
+Delete the runner in GitLab yourself.
