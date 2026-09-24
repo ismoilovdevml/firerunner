@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
@@ -70,7 +71,13 @@ type builder struct {
 	// creds are created with the entry, so jobs can be configured for the
 	// builder while it is still starting (only a starting builder needs them).
 	creds *builderCreds
+	// strikes counts consecutive reconciles whose buildkitd probe failed.
+	strikes int
 }
+
+// builderStrikes consecutive failed probes drop a builder. One missed 3 s dial
+// (a builder VM busy with a heavy build) must not throw its cache away.
+const builderStrikes = 2
 
 var projectID = regexp.MustCompile(`^[0-9]{1,20}$`)
 
@@ -374,8 +381,11 @@ func (d *Daemon) expireBuilders() {
 }
 
 // checkBuilders re-adds port mappings (restarting firerunner-net clears them)
-// and drops builders whose buildkitd stopped answering.
-func (d *Daemon) checkBuilders(present map[string]bool) {
+// and drops builders whose VM is gone, or whose buildkitd missed builderStrikes
+// probes in a row while no job uses it. present is the flintlock listing taken
+// at listedAt; a builder that became ready after that is not in it yet.
+func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
+	busy := busyBuilders()
 	d.mu.Lock()
 	var check []builder
 	for _, b := range d.builders {
@@ -384,27 +394,67 @@ func (d *Daemon) checkBuilders(present map[string]bool) {
 		}
 	}
 	d.mu.Unlock()
-	// Probe without the lock: a hung builder must not stall job claims.
-	dead := map[string]bool{}
+	// Probe without the lock (a hung builder must not stall job claims) and
+	// all at once (64 silent builders must not take 64 x 3 s).
+	gone, answers := map[string]bool{}, map[string]bool{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	for _, b := range check {
-		if !present[b.Instance.UID] || !tcpOpen(b.Instance.IP, 1234) {
-			dead[b.Project] = true
+		if !present[b.Instance.UID] {
+			if b.BornAt.Before(listedAt) {
+				gone[b.Project] = true
+			}
+			continue
 		}
+		wg.Add(1)
+		go func(project, ip string) {
+			defer wg.Done()
+			ok := tcpOpen(ip, 1234)
+			mu.Lock()
+			answers[project] = ok
+			mu.Unlock()
+		}(b.Project, b.Instance.IP)
 	}
+	wg.Wait()
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, b := range d.builders {
 		if !b.ready {
 			continue
 		}
-		if dead[b.Project] {
-			d.removeBuilderLocked(b, "not answering")
+		answered, probed := answers[b.Project]
+		switch {
+		case gone[b.Project]:
+			d.removeBuilderLocked(b, "VM gone")
 			continue
+		case !probed:
+			continue // became ready after the listing: check it next time
+		case answered:
+			b.strikes = 0
+		default:
+			b.strikes++
+			if b.strikes >= builderStrikes && !busy[b.Project] {
+				d.removeBuilderLocked(b, "not answering")
+				continue
+			}
+			d.log.Warn("builder not answering", "project", b.Project, "id", b.Instance.ID,
+				"strikes", b.strikes, "in_use", busy[b.Project])
 		}
 		if err := mapBuilderPort(b); err != nil {
 			d.log.Error("builder port mapping failed", "project", b.Project, "err", err)
 		}
 	}
+}
+
+// answersWithin probes a builder's buildkitd up to tries times.
+func answersWithin(ip string, tries int) bool {
+	for i := 0; i < tries; i++ {
+		if tcpOpen(ip, 1234) {
+			return true
+		}
+	}
+	return false
 }
 
 // tcpOpen is a variable so tests do not need a listener.
@@ -453,9 +503,15 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 	}
 	var keep []*builder
 	for _, b := range list {
-		if projectID.MatchString(b.Project) && live[b.Instance.UID] && tcpOpen(b.Instance.IP, 1234) {
-			keep = append(keep, b)
+		if !projectID.MatchString(b.Project) || !live[b.Instance.UID] {
+			continue
 		}
+		// Two tries: one missed probe must not cost a project its warm cache.
+		if !answersWithin(b.Instance.IP, 2) {
+			d.log.Warn("builder from previous run not answering, left for reconcile", "project", b.Project, "id", b.Instance.ID)
+			continue
+		}
+		keep = append(keep, b)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()

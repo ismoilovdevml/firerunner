@@ -141,12 +141,61 @@ func TestCheckBuildersDropsDeadAndRemapsLive(t *testing.T) {
 		"2": readyBuilder("2", 20002, 0, spec), // buildkitd not answering
 		"3": readyBuilder("3", 20003, 0, spec), // VM gone
 	}
-	d.checkBuilders(map[string]bool{"uid-1": true, "uid-2": true})
-	if len(d.builders) != 1 || d.builders["1"] == nil {
-		t.Fatalf("builders after check: %v", d.builders)
+	present := map[string]bool{"uid-1": true, "uid-2": true}
+	d.checkBuilders(present, time.Now())
+	// A gone VM goes at once; one missed probe is only a strike.
+	if len(d.builders) != 2 || d.builders["3"] != nil || d.builders["2"].strikes != 1 {
+		t.Fatalf("after one check: %v", d.builders)
+	}
+	d.checkBuilders(present, time.Now())
+	if len(d.builders) != 1 || d.builders["1"] == nil || d.builders["1"].strikes != 0 {
+		t.Fatalf("after two checks: %v", d.builders)
 	}
 	if !strings.Contains(strings.Join(*calls, "\n"), "add element inet firerunner builders { 20001 : 10.200.0.1 . 1234 }") {
 		t.Errorf("live builder not remapped: %v", *calls)
+	}
+}
+
+// A builder a job builds on is never dropped for missed probes (only when its
+// VM is gone), and one that became ready after the listing is not "gone".
+func TestCheckBuildersKeepsBusyAndNewBuilders(t *testing.T) {
+	stubBuilders(t, func(string) bool { return false })
+	dir := t.TempDir()
+	old := jobStateGlob
+	jobStateGlob = filepath.Join(dir, "*.json")
+	t.Cleanup(func() { jobStateGlob = old })
+	if err := vm.SaveJobState(filepath.Join(dir, "job-9.json"), &vm.JobState{BuilderProject: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := newTestDaemon(t)
+	spec := builderSpec(d.cfg)
+	listedAt := time.Now()
+	fresh := readyBuilder("2", 20002, 0, spec)
+	fresh.BornAt = listedAt.Add(time.Second) // ready after the listing
+	d.builders = map[string]*builder{"1": readyBuilder("1", 20001, 0, spec), "2": fresh}
+	for i := 0; i < 3; i++ {
+		d.checkBuilders(map[string]bool{"uid-1": true}, listedAt)
+	}
+	if d.builders["1"] == nil || d.builders["1"].strikes != 3 {
+		t.Fatalf("busy builder removed or not counted: %+v", d.builders["1"])
+	}
+	if d.builders["2"] == nil {
+		t.Fatal("builder that became ready after the listing was removed as gone")
+	}
+}
+
+func TestAdoptBuildersProbesTwice(t *testing.T) {
+	var probes atomic.Int32
+	stubBuilders(t, func(string) bool { return probes.Add(1) > 1 }) // first probe misses
+	d, _ := newTestDaemon(t)
+	d.builders["1"] = readyBuilder("1", 20001, 0, builderSpec(d.cfg))
+	d.mu.Lock()
+	d.saveBuildersLocked()
+	d.mu.Unlock()
+	d.builders = map[string]*builder{}
+	d.adoptBuilders(map[string]bool{"uid-1": true})
+	if d.builders["1"] == nil {
+		t.Fatal("builder dropped at startup after one missed probe")
 	}
 }
 

@@ -599,6 +599,7 @@ func decide(f vmFacts, cfg config.Config) string {
 func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 	lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	listedAt := time.Now()
 	vms, err := d.fl.List(lctx)
 	if err != nil {
 		d.metrics.flintlockUp.Set(0)
@@ -677,7 +678,7 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 	for s, n := range states {
 		d.metrics.microvms.WithLabelValues(s).Set(n)
 	}
-	d.checkBuilders(present)
+	d.checkBuilders(present, listedAt)
 }
 
 // jobStateGlob matches the state files `executor prepare` writes (a variable for tests).
