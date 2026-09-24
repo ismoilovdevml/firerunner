@@ -170,6 +170,9 @@ type Daemon struct {
 
 	lastTick atomic.Int64 // unix time of the main loop's last pass (/healthz)
 	oomKills int64        // host oom_kill count at the last collectHost, -1 before the first
+	// saving is closed when the project's deleted builder has copied its cache
+	// to the host (see removeBuilderLocked).
+	saving map[string]chan struct{}
 }
 
 // spawn runs fn in the background and lets Run wait for it at shutdown, so
@@ -226,7 +229,8 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 	d := &Daemon{cfgPath: cfgPath, log: log, cfg: cfg, fl: fl, metrics: NewMetrics(),
 		claimed: map[string]time.Time{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{},
 		bootingIDs: map[string]bool{},
-		builders:   map[string]*builder{}, builderFailed: map[string]time.Time{}, runCtx: context.Background(),
+		builders:   map[string]*builder{}, builderFailed: map[string]time.Time{},
+		saving: map[string]chan struct{}{}, runCtx: context.Background(),
 		oomKills: -1}
 	if fi, err := os.Stat(cfgPath); err == nil {
 		d.cfgMod = fi.ModTime()

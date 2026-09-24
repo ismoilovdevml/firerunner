@@ -40,6 +40,7 @@ type Metrics struct {
 	dhcpCapacity                       prometheus.Gauge
 	hostOOMKills                       prometheus.Counter
 	loopTick                           prometheus.Gauge
+	builderCache                       *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -50,6 +51,8 @@ func NewMetrics() *Metrics {
 			Help: "Per-project BuildKit builder microVMs (booting and ready)."}),
 		builderRequests: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_builder_requests_total",
 			Help: "Jobs asking for their project's builder, by answer: ready (warm cache), booting, busy, disabled."}, []string{"state"}),
+		builderCache: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_builder_cache_total",
+			Help: "Builder caches copied to the host when a builder is deleted (save) and loaded into the project's next builder (restore), by result: ok, failed, skipped (no room)."}, []string{"op", "result"}),
 		reg:         prometheus.NewRegistry(),
 		poolTarget:  prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_pool_target", Help: "Configured number of pre-booted microVMs."}),
 		poolReady:   prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_pool_ready", Help: "Pre-booted microVMs ready to be claimed."}),
@@ -127,13 +130,18 @@ func NewMetrics() *Metrics {
 	for _, s := range []string{"ready", "booting", "busy", "disabled"} {
 		m.builderRequests.WithLabelValues(s)
 	}
+	for _, r := range []string{"ok", "failed", "skipped"} {
+		m.builderCache.WithLabelValues("save", r)
+	}
+	m.builderCache.WithLabelValues("restore", "ok")
+	m.builderCache.WithLabelValues("restore", "failed")
 
 	info := prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_build_info", Help: "Build version.",
 		ConstLabels: prometheus.Labels{"version": Version}})
 	info.Set(1)
 	m.reg.MustRegister(m.poolTarget, m.poolReady, m.poolBooting, m.claims, m.bootSeconds, m.preloadSeconds, m.bootFailures,
 		m.prepareSeconds, m.jobs, m.jobSeconds, m.microvms, m.orphansDeleted, m.admissionWaits,
-		m.flintlockUp, m.serviceUp, m.thinPool, m.memAvailable, m.runnerConcurrent, m.builders, m.builderRequests, info,
+		m.flintlockUp, m.serviceUp, m.thinPool, m.memAvailable, m.runnerConcurrent, m.builders, m.builderRequests, m.builderCache, info,
 		m.admissionWait, m.memCommitted, m.memCapacity, m.dhcpLeases, m.dhcpCapacity, m.hostOOMKills, m.loopTick,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m

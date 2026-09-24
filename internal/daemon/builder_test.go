@@ -40,6 +40,10 @@ func stubBuilders(t *testing.T, alive func(ip string) bool) func() string {
 	tcpOpen = func(ip string, _ int) bool { return alive(ip) }
 	builderBoot = func(*Daemon, context.Context, config.Config, string) {}
 	t.Cleanup(func() { nftRun, tcpOpen, builderBoot = oldNft, oldTCP, oldBoot })
+	// No builder VMs to copy caches from: saves fail fast unless a test stubs them.
+	stubBuilderCache(t, func(context.Context, config.Config, *vm.Instance) (int64, error) {
+		return 0, errors.New("stub: no VM")
+	}, nil, nil)
 	return func() string {
 		mu.Lock()
 		defer mu.Unlock()

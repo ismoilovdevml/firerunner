@@ -776,8 +776,8 @@ install_firerunner() {
     fi
     log "  $($BIN_DIR/firerunner version)"
 
-    mkdir -p "$CONF_DIR/executor"
-    chmod 0700 "$CONF_DIR/executor"
+    mkdir -p "$CONF_DIR/executor" /var/lib/firerunner/builder-cache
+    chmod 0700 "$CONF_DIR/executor" /var/lib/firerunner/builder-cache
     [[ -f $CONF_DIR/executor/id_ed25519 ]] ||
         ssh-keygen -q -t ed25519 -N "" -C firerunner-executor -f "$CONF_DIR/executor/id_ed25519"
     # Write the default config once so it is visible and editable.
@@ -803,7 +803,8 @@ ProtectHome=read-only
 RuntimeDirectory=firerunner
 RuntimeDirectoryPreserve=yes
 # /var/lib/flintlock/vm: reconcile removes the state dirs flintlockd leaves for deleted VMs.
-ReadWritePaths=/run/firerunner -/run/lock -/run/lvm -/var/lib/flintlock/vm
+# builder-cache: layer caches of deleted builders, restored into the project's next one.
+ReadWritePaths=/run/firerunner -/run/lock -/run/lvm -/var/lib/flintlock/vm /var/lib/firerunner/builder-cache
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes

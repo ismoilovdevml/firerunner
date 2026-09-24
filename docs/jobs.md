@@ -36,8 +36,8 @@ project's layer cache between jobs. You change nothing; the job log says:
 Docker layer cache: using this project's builder (warm cache)
 ```
 
-The first build of a project starts its builder (about 30 s). A builder unused for 24 hours is
-deleted with its cache.
+The first build of a project starts its builder (about 30 s). A builder unused for a while is
+deleted, but its cache is kept on the host and comes back with the project's next builder.
 
 ## Cache
 

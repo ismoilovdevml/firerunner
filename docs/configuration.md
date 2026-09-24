@@ -28,7 +28,14 @@ Set `pool.size` to the number of jobs that usually start at once.
 | `builder.enabled` | `true` | one builder VM per project that runs `docker build` |
 | `builder.vcpu`, `builder.memory_mb` | `4`, `8192` | Node.js frontend builds need 4 GB or more |
 | `builder.max` | `4` | the least recently used idle builder makes room for a new one |
-| `builder.idle_ttl` | `24h` | an unused builder is deleted with its cache |
+| `builder.idle_ttl` | `24h` | an unused builder is deleted; its cache is saved |
+| `builder.saved_cache_gb` | `100` | host disk for the caches of deleted builders; `0` saves none |
+
+When a builder is deleted because it was idle or its slot was needed, its cache is copied to
+`/var/lib/firerunner/builder-cache/<project>.tar` and loaded into the project's next builder. So
+every project keeps a warm cache while only `builder.max` builders use memory. When the saved
+caches pass `builder.saved_cache_gb`, or the disk has less than 10% free, the least recently used
+are deleted. `firerunner builder rm` deletes a project's saved cache too.
 
 A new builder size applies to builders started later; existing caches are kept.
 

@@ -44,12 +44,16 @@ type Builder struct {
 	MemoryMB int  `yaml:"memory_mb"`
 	// Max builders kept at once; the least recently used one is replaced.
 	Max int `yaml:"max"`
-	// IdleTTL deletes a builder (and its cache) after this long without a job.
+	// IdleTTL deletes a builder after this long without a job.
 	IdleTTL time.Duration `yaml:"idle_ttl"`
 	// Image runs buildkitd inside the builder VM.
 	Image string `yaml:"image"`
 	// CacheMB is BuildKit's cache size before it garbage-collects old layers.
 	CacheMB int `yaml:"cache_mb"`
+	// SavedCacheGB is the host disk kept for the caches of builders that were
+	// deleted (idle or least recently used), so a project's next builder starts
+	// warm. The least recently used caches go first; 0 saves none.
+	SavedCacheGB int `yaml:"saved_cache_gb"`
 	// PortBase: builder n is reached by job VMs at <bridge address>:PortBase+n.
 	PortBase int `yaml:"port_base"`
 }
@@ -129,14 +133,15 @@ func Default() Config {
 			SSHKey:     "/etc/firerunner/executor/id_ed25519",
 		},
 		Builder: Builder{
-			Enabled:  true,
-			VCPU:     4,
-			MemoryMB: 8192, // Node sizes its heap from RAM: 4 GB is too small for frontend builds
-			Max:      4,
-			IdleTTL:  24 * time.Hour,
-			Image:    "moby/buildkit:v0.33.0",
-			CacheMB:  25000,
-			PortBase: 20000,
+			Enabled:      true,
+			VCPU:         4,
+			MemoryMB:     8192, // Node sizes its heap from RAM: 4 GB is too small for frontend builds
+			Max:          4,
+			IdleTTL:      24 * time.Hour,
+			Image:        "moby/buildkit:v0.33.0",
+			CacheMB:      25000,
+			SavedCacheGB: 100,
+			PortBase:     20000,
 		},
 	}
 }
@@ -247,6 +252,9 @@ func (c Config) Validate() error {
 	}
 	if c.Builder.CacheMB < 1000 {
 		errs = append(errs, "builder.cache_mb must be at least 1000")
+	}
+	if c.Builder.SavedCacheGB < 0 {
+		errs = append(errs, "builder.saved_cache_gb must not be negative")
 	}
 	if c.Builder.PortBase < 1024 || c.Builder.PortBase+c.Builder.Max > 65535 {
 		errs = append(errs, "builder.port_base must leave room for builder.max ports below 65536")

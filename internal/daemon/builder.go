@@ -202,14 +202,33 @@ func (d *Daemon) freePortLocked(cfg config.Config) int {
 
 // removeBuilderLocked forgets a builder and deletes its VM in the background.
 // The port mapping and the VM go away in the background, so the caller's lock
-// (and with it POST /claim) never waits for nft or flintlock.
+// (and with it POST /claim) never waits for nft or flintlock. For reasons that
+// keep the cache, its state is copied to the host before the VM is deleted; the
+// project's next builder waits for that copy (see bootBuilder).
 func (d *Daemon) removeBuilderLocked(b *builder, reason string) {
 	delete(d.builders, b.Project)
 	d.saveBuildersLocked()
 	d.metrics.builders.Set(float64(len(d.builders)))
-	port, inst, nft := b.Port, b.Instance, nftRun
+	project, port, inst, nft := b.Project, b.Port, b.Instance, nftRun
+	cfg, ctx := d.cfg, d.runCtx
+	var saved chan struct{}
+	if keepsCache(reason) && cfg.Builder.SavedCacheGB > 0 && inst.UID != "" && d.saving[project] == nil {
+		saved = make(chan struct{})
+		d.saving[project] = saved
+	}
 	d.spawn(func() {
 		_ = nft("delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", port))
+		if saved != nil {
+			if ctx.Err() == nil {
+				d.saveBuilderCache(ctx, cfg, project, &inst)
+			}
+			defer func() {
+				d.mu.Lock()
+				delete(d.saving, project)
+				d.mu.Unlock()
+				close(saved)
+			}()
+		}
 		if inst.UID != "" {
 			d.delete(context.Background(), &inst, "builder: "+reason)
 		}
@@ -223,8 +242,9 @@ type Removal struct {
 }
 
 // RemoveBuilders deletes the ready builder of project ("all": every ready
-// builder) with its layer cache. Builders a running job builds on are kept
-// unless force is set: deleting one fails that job's docker build.
+// builder) with its layer cache, and the saved cache of a deleted builder.
+// Builders a running job builds on are kept unless force is set: deleting one
+// fails that job's docker build.
 func (d *Daemon) RemoveBuilders(project string, force bool) Removal {
 	busy := busyBuilders() // file reads: outside the lock
 	d.mu.Lock()
@@ -241,6 +261,11 @@ func (d *Daemon) RemoveBuilders(project string, force bool) Removal {
 		d.removeBuilderLocked(b, "removed by operator")
 		out.Removed = append(out.Removed, b.Project)
 	}
+	keep := map[string]bool{}
+	for _, p := range out.Skipped {
+		keep[p] = true
+	}
+	dropSavedCaches(project, keep)
 	sort.Strings(out.Removed)
 	sort.Strings(out.Skipped)
 	return out
@@ -262,8 +287,18 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 			d.delete(context.Background(), inst, "builder setup failed")
 		}
 	}
-	if ok, why, err := vm.Fits(ctx, bcfg, d.fl, 0); err != nil || !ok {
-		fail(nil, fmt.Errorf("no host memory for a builder (%s, %v)", why, err))
+	// The project's previous builder may still be copying its cache out.
+	d.mu.Lock()
+	saving := d.saving[project]
+	d.mu.Unlock()
+	if saving != nil {
+		select {
+		case <-saving:
+		case <-ctx.Done():
+		}
+	}
+	if err := d.waitBuilderFits(ctx, bcfg); err != nil {
+		fail(nil, err)
 		return
 	}
 	inst, err := vm.Boot(ctx, bcfg, d.fl, "bld-"+project, map[string]string{LabelRole: "builder"})
@@ -281,7 +316,13 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		d.spawn(func() { d.delete(context.Background(), inst, "builder no longer needed") })
 		return
 	}
+	restored := d.restoreBuilderCache(ctx, bcfg, project, inst)
 	if err := setupBuildkit(ctx, bcfg, inst, creds); err != nil {
+		if restored && ctx.Err() == nil {
+			// Do not start every later builder of the project from a state
+			// buildkitd may have refused.
+			_ = os.Remove(builderCacheFile(project))
+		}
 		fail(inst, err)
 		return
 	}
@@ -304,6 +345,27 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	d.metrics.bootSeconds.WithLabelValues("builder").Observe(time.Since(start).Seconds())
 	d.log.Info("builder ready", "project", project, "id", inst.ID, "ip", inst.IP, "port", b.Port,
 		"took", time.Since(start).Round(100*time.Millisecond).String())
+}
+
+// builderFitWait is how long a builder boot waits for host memory: a builder
+// deleted to free its slot holds its memory until its cache is copied out.
+var builderFitWait = 2 * time.Minute
+
+func (d *Daemon) waitBuilderFits(ctx context.Context, bcfg config.Config) error {
+	deadline := time.Now().Add(builderFitWait)
+	for {
+		ok, why, err := vm.Fits(ctx, bcfg, d.fl, 0)
+		if err == nil && ok {
+			return nil
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return fmt.Errorf("no host memory for a builder (%s, %v)", why, err)
+		}
+		select {
+		case <-time.After(5 * time.Second):
+		case <-ctx.Done():
+		}
+	}
 }
 
 // setupBuildkit starts buildkitd with mutual TLS in the builder VM. Docker Hub

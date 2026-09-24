@@ -34,6 +34,7 @@ All commands need root.
 | `firerunner_job_duration_seconds` | job duration |
 | `firerunner_vm_boot_seconds{kind}`, `firerunner_vm_boot_failures_total{kind}` | boots |
 | `firerunner_builders`, `firerunner_builder_requests_total{state}` | builders and their use |
+| `firerunner_builder_cache_total{op,result}` | caches saved from deleted builders and restored into new ones |
 | `firerunner_orphans_deleted_total{reason}` | VMs removed by cleanup |
 | `firerunner_admission_waits_total` | pool refill passes postponed for lack of memory |
 | `firerunner_memory_committed_bytes{role}`, `firerunner_memory_capacity_bytes` | memory promised to VMs by role, and the limit |
@@ -46,5 +47,5 @@ All commands need root.
 ## Limits
 
 - x86_64 Linux hosts, Linux jobs.
-- The layer cache belongs to one project's builder: the first build of a project, and the first
-  after `builder.idle_ttl`, is cold.
+- The layer cache belongs to one project's builder: a project's first build is cold. After that
+  the cache survives the builder, up to `builder.saved_cache_gb` of saved caches.

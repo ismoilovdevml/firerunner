@@ -284,7 +284,7 @@ var buildCommand = regexp.MustCompile(`\bdocker(\s+buildx)?\s+build\b|\bdocker\s
 func BuildsImages(script []byte) bool { return buildCommand.Match(script) }
 
 // BuilderWait is how long `docker build` in a job waits for a starting builder.
-const BuilderWait = 90
+const BuilderWait = 150
 
 // BuilderScript creates the buildx builder in the job VM and a docker wrapper
 // that, for build commands, waits until the builder answers (a full mTLS
