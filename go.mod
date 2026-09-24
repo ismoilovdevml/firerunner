@@ -7,6 +7,7 @@ toolchain go1.26.8
 require (
 	github.com/liquidmetal-dev/flintlock/api v0.0.0-20251113072819-a7c62f33a780
 	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_model v0.6.2
 	golang.org/x/crypto v0.57.0
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.11
@@ -19,7 +20,6 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.24.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/rogpeppe/go-internal v1.10.0 // indirect

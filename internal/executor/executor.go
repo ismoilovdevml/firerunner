@@ -508,6 +508,7 @@ func deleteVM(cfg config.Config, inst *vm.Instance) {
 	defer fl.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	vm.StopMux(inst) // prepare may have started one; it would linger until ServerAlive ends it
 	_ = vm.Destroy(ctx, cfg, fl, inst.ID, inst.UID)
 }
 
