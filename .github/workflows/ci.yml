@@ -137,3 +137,20 @@ jobs:
           for brnf in 1 0; do
             docker run --rm --privileged -e BRNF=$brnf -v "$PWD":/src:ro ubuntu:24.04 bash /src/test/network/run.sh
           done
+
+  alerts:
+    name: Alert rules
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # Checks the rules and that each alert fires (and stays quiet) on sample data.
+      - name: promtool check and test
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/rules:ro" --entrypoint promtool \
+            prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0 \
+            check rules /rules/firerunner-alerts.yml
+          docker run --rm -v "$PWD/deploy/prometheus:/rules:ro" -w /rules --entrypoint promtool \
+            prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0 \
+            test rules firerunner-alerts_test.yml
