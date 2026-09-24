@@ -55,6 +55,10 @@ sudo firerunner config set pool.preload_images "[mcr.microsoft.com/dotnet/sdk:8.
 | `builder.image` | `moby/buildkit:v0.33.0` | pulled through the Docker Hub mirror |
 | `builder.port_base` | `20000` | job VMs reach builder *n* at `<subnet>.1:port_base+n` |
 
+A new `builder.vcpu` / `builder.memory_mb` applies to builders started afterwards, so resizing
+never throws away warm caches (`firerunner builder rm <project>` applies it at once). A new
+`builder.image`, `builder.cache_mb` or guest image replaces each builder after 10 idle minutes.
+
 ### Daemon (`daemon.*`)
 
 | Key | Default | Notes |

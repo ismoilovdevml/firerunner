@@ -114,6 +114,20 @@ func TestExpireBuilders(t *testing.T) {
 	}
 }
 
+func TestBuilderSpecIgnoresSize(t *testing.T) {
+	a := config.Default()
+	b := a
+	b.Builder.VCPU, b.Builder.MemoryMB = 16, 16384
+	if builderSpec(a) != builderSpec(b) {
+		t.Fatal("resizing builders must not replace existing ones (and their caches)")
+	}
+	c := a
+	c.Builder.Image = "moby/buildkit:v9"
+	if builderSpec(a) == builderSpec(c) {
+		t.Fatal("a new BuildKit image must replace builders")
+	}
+}
+
 func TestCheckBuildersDropsDeadAndRemapsLive(t *testing.T) {
 	calls := stubBuilders(t, func(ip string) bool { return ip != "10.200.0.2" })
 	d, _ := newTestDaemon(t)
@@ -147,6 +161,24 @@ func TestBuildersSurviveRestart(t *testing.T) {
 	d2.adoptBuilders(map[string]bool{"uid-1": true}) // builder 2's VM is gone
 	if len(d2.builders) != 1 || d2.builders["1"] == nil || !d2.builders["1"].ready || d2.builders["1"].Key != "key" {
 		t.Fatalf("adopted: %v", d2.builders)
+	}
+}
+
+func TestAdoptMigratesLegacySpec(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	d, _ := newTestDaemon(t)
+	d.builders["1"] = readyBuilder("1", 20001, 0, legacyBuilderSpec(d.cfg))
+	d.mu.Lock()
+	d.saveBuildersLocked()
+	d.mu.Unlock()
+	d.builders = map[string]*builder{}
+	d.adoptBuilders(map[string]bool{"uid-1": true})
+	if d.builders["1"] == nil || d.builders["1"].SpecID != builderSpec(d.cfg) {
+		t.Fatalf("legacy spec not migrated: %+v", d.builders["1"])
+	}
+	d.expireBuilders()
+	if d.builders["1"] == nil {
+		t.Fatal("upgraded daemon replaced a builder recorded by the old one")
 	}
 }
 

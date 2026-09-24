@@ -66,8 +66,17 @@ type builder struct {
 
 var projectID = regexp.MustCompile(`^[0-9]{1,20}$`)
 
-// builderSpec changes when a setting that shapes a builder VM changes.
+// builderSpec changes when a setting that changes what a builder runs changes.
+// Size (vcpu, memory) is left out on purpose: a new size applies to new
+// builders, and resizing must not throw away every project's warm cache.
 func builderSpec(c config.Config) string {
+	return fmt.Sprintf("v2|%s|%s|%s|%s|%d", c.Builder.Image,
+		c.VM.KernelImage, c.VM.RootFSImage, c.VM.RegistryMirror, c.Builder.CacheMB)
+}
+
+// legacyBuilderSpec is builderSpec before v2 (it included the size), so
+// builders recorded by an older daemon are not replaced after an upgrade.
+func legacyBuilderSpec(c config.Config) string {
 	return fmt.Sprintf("%d/%d/%s/%s/%s/%s/%d", c.Builder.VCPU, c.Builder.MemoryMB, c.Builder.Image,
 		c.VM.KernelImage, c.VM.RootFSImage, c.VM.RegistryMirror, c.Builder.CacheMB)
 }
@@ -412,6 +421,9 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 	defer d.mu.Unlock()
 	for _, b := range keep {
 		b.ready = true
+		if b.SpecID == legacyBuilderSpec(d.cfg) {
+			b.SpecID = builderSpec(d.cfg)
+		}
 		d.builders[b.Project] = b
 		if err := mapBuilderPort(b); err != nil {
 			d.log.Error("builder port mapping failed", "project", b.Project, "err", err)
