@@ -150,6 +150,9 @@ type Daemon struct {
 	fl      *flintlock.Client
 	ready   []*pooled
 	booting int
+	// bootingIDs are the ids of the pool VMs counted in booting, so reconcile
+	// can tell them from orphans while other boots are in flight.
+	bootingIDs map[string]bool
 	// booted pool VMs still preloading images, by uid; counted in booting
 	preloading map[string]*preloadingVM
 	claimed    map[string]time.Time // uid -> claim time; protects it until the job writes its state
@@ -217,7 +220,8 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 	}
 	d := &Daemon{cfgPath: cfgPath, log: log, cfg: cfg, fl: fl, metrics: NewMetrics(),
 		claimed: map[string]time.Time{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{},
-		builders: map[string]*builder{}, builderFailed: map[string]time.Time{}, runCtx: context.Background()}
+		bootingIDs: map[string]bool{},
+		builders:   map[string]*builder{}, builderFailed: map[string]time.Time{}, runCtx: context.Background()}
 	if fi, err := os.Stat(cfgPath); err == nil {
 		d.cfgMod = fi.ModTime()
 	}
@@ -396,6 +400,9 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config) {
 	_, _ = rand.Read(suffix)
 	id := "pool-" + hex.EncodeToString(suffix)
 	start := time.Now()
+	d.mu.Lock()
+	d.bootingIDs[id] = true
+	d.mu.Unlock()
 
 	// The VM counts as booting until it is fully ready (including preload),
 	// otherwise refill sees a gap and boots extra VMs.
@@ -419,6 +426,7 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config) {
 				// A job took the VM during the preload (Claim).
 				d.mu.Lock()
 				d.booting--
+				delete(d.bootingIDs, id)
 				d.metrics.poolBooting.Set(float64(d.booting))
 				d.mu.Unlock()
 				return
@@ -434,6 +442,7 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.booting--
+	delete(d.bootingIDs, id)
 	d.metrics.poolBooting.Set(float64(d.booting))
 	switch {
 	case err != nil:
@@ -574,7 +583,7 @@ type vmFacts struct {
 	InJob   bool   // referenced by a job state file: a job runs on it
 	Age     time.Duration
 	Startup bool // first reconcile of this daemon
-	Booting int  // pool VMs this daemon is booting right now
+	Booting bool // this daemon is booting this pool VM right now
 }
 
 // decide returns why a microVM should be deleted, or "" to keep it.
@@ -591,7 +600,7 @@ func decide(f vmFacts, cfg config.Config) string {
 	case f.Role == "pool" && f.Startup:
 		// A fresh daemon owns no pool VMs: these were left by a previous run.
 		return "pool VM from a previous daemon run"
-	case f.Role == "pool" && f.Booting == 0 && f.Age > cfg.VM.BootTimeout:
+	case f.Role == "pool" && !f.Booting && f.Age > cfg.VM.BootTimeout:
 		return "orphaned pool VM"
 	case f.Role == "builder" && f.Startup:
 		return "builder from a previous daemon run"
@@ -635,7 +644,10 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 			delete(d.claimed, uid)
 		}
 	}
-	booting := d.booting
+	booting := make(map[string]bool, len(d.bootingIDs))
+	for id := range d.bootingIDs {
+		booting[id] = true
+	}
 	d.mu.Unlock()
 
 	present := map[string]bool{}
@@ -670,7 +682,7 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 
 		role, job := RoleOf(v.GetSpec().GetId())
 		reason := decide(vmFacts{State: state, Role: role, Job: job, Owned: owned[uid], InJob: inJob[uid],
-			Age: time.Since(first), Startup: startup, Booting: booting}, cfg)
+			Age: time.Since(first), Startup: startup, Booting: booting[v.GetSpec().GetId()]}, cfg)
 		if reason != "" {
 			d.metrics.orphansDeleted.WithLabelValues(reason).Inc()
 			d.delete(ctx, &vm.Instance{ID: v.GetSpec().GetId(), UID: uid}, reason)

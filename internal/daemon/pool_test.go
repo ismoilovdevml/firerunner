@@ -376,3 +376,25 @@ func TestRunWaitsForBackgroundWork(t *testing.T) {
 		t.Fatalf("deleted %v, want [late] (connection closed too early?)", got)
 	}
 }
+
+// A pool VM nobody owns (e.g. a job took it and its cleanup could not delete
+// it) is reclaimed even while the daemon boots other pool VMs; only the VMs it
+// is booting itself are spared.
+func TestReconcileReclaimsOrphanWhileBooting(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	d, srv := newTestDaemon(t)
+	mk := func(id, uid string) *types.MicroVM {
+		return &types.MicroVM{Spec: &types.MicroVMSpec{Id: id, Uid: &uid},
+			Status: &types.MicroVMStatus{State: types.MicroVMStatus_CREATED}}
+	}
+	srv.SetVMs(mk("pool-b00t", "b"), mk("pool-0rph", "o"))
+	old := time.Now().Add(-10 * time.Minute) // older than vm.boot_timeout
+	d.firstSee["b"], d.firstSee["o"] = old, old
+	d.booting, d.bootingIDs["pool-b00t"] = 1, true
+
+	d.reconcile(context.Background(), false)
+	srv.WaitDeleted(t, "o", 2*time.Second)
+	if got := srv.Deleted(); len(got) != 1 {
+		t.Fatalf("deleted %v, want only the orphan [o]", got)
+	}
+}

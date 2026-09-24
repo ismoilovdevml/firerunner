@@ -25,7 +25,7 @@ func TestDecide(t *testing.T) {
 		{"pool VM from previous run", vmFacts{State: "CREATED", Role: "pool", Startup: true}, false},
 		{"young orphan pool VM", vmFacts{State: "CREATED", Role: "pool", Age: time.Minute}, true},
 		{"old orphan pool VM", vmFacts{State: "CREATED", Role: "pool", Age: 5 * time.Minute}, false},
-		{"orphan pool VM while booting", vmFacts{State: "CREATED", Role: "pool", Age: 5 * time.Minute, Booting: 1}, true},
+		{"pool VM this daemon is still booting", vmFacts{State: "CREATED", Role: "pool", Age: 5 * time.Minute, Booting: true}, true},
 		{"job VM still booting", vmFacts{State: "PENDING", Role: "job", Job: "job-2", Age: 2 * time.Minute}, true},
 		{"job VM without job", vmFacts{State: "CREATED", Role: "job", Job: "job-3", Age: 7 * time.Minute}, false},
 		{"fresh run VM", vmFacts{State: "CREATED", Role: "run", Age: time.Hour}, true},
