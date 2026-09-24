@@ -397,6 +397,9 @@ table inet firerunner {
     # microVMs may only use DHCP, DNS, the registry mirror and the cache server on
     # the host (IPv4 and IPv6). DHCP requests are broadcasts, everything else must
     # be addressed to the bridge address.
+    # The services on the bridge address are for microVMs and the host only,
+    # never for the uplink (a LAN host routing the microVM subnet here).
+    ip daddr ${FR_SUBNET}.1 iifname != { "${FR_BRIDGE}", "lo" } drop
     iifname "${FR_BRIDGE}" udp dport 67 accept
     iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 udp dport 53 accept
     iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport { 53, 5000, 9000 } accept
@@ -410,6 +413,9 @@ $(metrics_input_rules)
     # below); any other traffic routed from one microVM to another is dropped.
     iifname "${FR_BRIDGE}" oifname "${FR_BRIDGE}" ct status dnat accept
     iifname "${FR_BRIDGE}" oifname "${FR_BRIDGE}" drop
+    # From outside, microVMs only get replies to connections they opened.
+    oifname "${FR_BRIDGE}" ct state established,related accept
+    oifname "${FR_BRIDGE}" drop
     # Link-local addresses (cloud instance metadata, 169.254.169.254) are never
     # reachable from jobs. Firecracker answers the VM's own MMDS before the tap.
     iifname "${FR_BRIDGE}" ip daddr 169.254.0.0/16 drop
