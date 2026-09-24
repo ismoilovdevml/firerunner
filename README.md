@@ -16,6 +16,8 @@ artifacts and `docker build` behave like on the shell and docker executors. A da
 microVMs booted ahead of time, which lets a job start in about 0.3 seconds, and a per-project build
 cache keeps repeated `docker build` runs close to shared-runner speed.
 
+![Architecture](docs/images/architecture.svg)
+
 ## Why
 
 Shared CI runners trade isolation for speed. A shell executor runs every project's jobs on one host
@@ -48,6 +50,10 @@ test:
     - npm test
 ```
 
+`firerunner status` shows the host at a glance:
+
+![firerunner status](docs/images/cli-status.png)
+
 ## Documentation
 
 The documentation is at **[ismoilovdevml.github.io/firerunner](https://ismoilovdevml.github.io/firerunner/)**:
@@ -68,6 +74,11 @@ Measured next to the existing runners on the same pipelines:
 | Time to get a clean machine | 0.3 s (pre-booted) | not isolated (shell) |
 | `dotnet test`, 44 tests | 27.7 s | 31.1 s (docker executor) |
 | `docker build`, warm cache | 4.8 s | 2.0 s (shell executor) |
+
+Prometheus metrics and a Grafana dashboard ([`deploy/`](deploy/)) show pool hits, job start
+times, boots and host health:
+
+![Grafana dashboard](docs/images/grafana.png)
 
 ## Development
 
