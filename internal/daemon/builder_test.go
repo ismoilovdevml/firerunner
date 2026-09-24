@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,22 +18,27 @@ import (
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
-// stubBuilders records nft calls and answers builder probes without VMs.
-func stubBuilders(t *testing.T, alive func(ip string) bool) *[]string {
+// stubBuilders records nft calls and answers builder probes without VMs. The
+// returned function lists the calls so far, one per line.
+func stubBuilders(t *testing.T, alive func(ip string) bool) func() string {
 	t.Helper()
 	var mu sync.Mutex
-	calls := &[]string{}
+	var calls []string
 	oldNft, oldTCP, oldBoot := nftRun, tcpOpen, builderBoot
 	nftRun = func(args ...string) error {
 		mu.Lock()
 		defer mu.Unlock()
-		*calls = append(*calls, strings.Join(args, " "))
+		calls = append(calls, strings.Join(args, " "))
 		return nil
 	}
 	tcpOpen = func(ip string, _ int) bool { return alive(ip) }
 	builderBoot = func(*Daemon, context.Context, config.Config, string) {}
 	t.Cleanup(func() { nftRun, tcpOpen, builderBoot = oldNft, oldTCP, oldBoot })
-	return calls
+	return func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return strings.Join(calls, "\n")
+	}
 }
 
 func readyBuilder(project string, port int, lastUsed time.Duration, spec string) *builder {
@@ -113,8 +120,9 @@ func TestExpireBuilders(t *testing.T) {
 		}
 		srv.WaitDeleted(t, "uid-"+p, 2*time.Second)
 	}
-	if !strings.Contains(strings.Join(*calls, "\n"), "delete element inet firerunner builders { 20002 }") {
-		t.Errorf("port mapping not removed: %v", *calls)
+	d.bg.Wait()
+	if !strings.Contains(calls(), "delete element inet firerunner builders { 20002 }") {
+		t.Errorf("port mapping not removed: %v", calls())
 	}
 }
 
@@ -151,8 +159,8 @@ func TestCheckBuildersDropsDeadAndRemapsLive(t *testing.T) {
 	if len(d.builders) != 1 || d.builders["1"] == nil || d.builders["1"].strikes != 0 {
 		t.Fatalf("after two checks: %v", d.builders)
 	}
-	if !strings.Contains(strings.Join(*calls, "\n"), "add element inet firerunner builders { 20001 : 10.200.0.1 . 1234 }") {
-		t.Errorf("live builder not remapped: %v", *calls)
+	if !strings.Contains(calls(), "add element inet firerunner builders { 20001 : 10.200.0.1 . 1234 }") {
+		t.Errorf("live builder not remapped: %v", calls())
 	}
 }
 
@@ -380,5 +388,80 @@ func TestBuilderWithoutStartNeverBoots(t *testing.T) {
 	}
 	if time.Since(d.builders["7"].LastUsed) > time.Minute {
 		t.Fatal("using an existing builder must refresh LastUsed")
+	}
+}
+
+// blockNft makes every nft call wait until the test releases it, and reports
+// each call on entered.
+func blockNft(t *testing.T) (entered chan string, release func()) {
+	t.Helper()
+	entered, gate := make(chan string, 64), make(chan struct{})
+	old := nftRun
+	nftRun = func(args ...string) error {
+		entered <- strings.Join(args, " ")
+		<-gate
+		return nil
+	}
+	var once sync.Once
+	release = func() { once.Do(func() { close(gate) }) }
+	t.Cleanup(func() { release(); nftRun = old })
+	return entered, release
+}
+
+// claimWithin fails the test if POST /claim's Claim waits for the daemon lock.
+func claimWithin(t *testing.T, d *Daemon, what string) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { d.Claim(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Claim blocked while nft ran for %s: nft runs under the daemon lock", what)
+	}
+}
+
+func TestNftNeverBlocksClaims(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	d, _ := newTestDaemon(t)
+	spec := builderSpec(d.cfg)
+
+	t.Run("remapping live builders", func(t *testing.T) {
+		entered, release := blockNft(t)
+		d.builders = map[string]*builder{"1": readyBuilder("1", 20001, 0, spec)}
+		done := make(chan struct{})
+		go func() { d.checkBuilders(map[string]bool{"uid-1": true}, time.Now()); close(done) }()
+		<-entered
+		claimWithin(t, d, "a port mapping")
+		release()
+		<-done
+	})
+	t.Run("removing an expired builder", func(t *testing.T) {
+		entered, release := blockNft(t)
+		d.builders = map[string]*builder{"2": readyBuilder("2", 20002, d.cfg.Builder.IdleTTL+time.Hour, spec)}
+		done := make(chan struct{})
+		go func() { d.expireBuilders(); close(done) }()
+		<-entered
+		claimWithin(t, d, "a builder removal")
+		release()
+		<-done
+		d.bg.Wait()
+	})
+}
+
+func TestBuilderPersistsLastUsedAtMostOncePerMinute(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	d, _ := newTestDaemon(t)
+	d.builders["1"] = readyBuilder("1", d.cfg.Builder.PortBase+1, 0, builderSpec(d.cfg))
+	_ = os.Remove(d.buildersFile())
+	if d.Builder("1", false).State != BuilderReady {
+		t.Fatal("builder not ready")
+	}
+	if _, err := os.Stat(d.buildersFile()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("builders.json written for a builder used just now: %v", err)
+	}
+	d.builders["1"].LastUsed = time.Now().Add(-2 * time.Minute)
+	d.Builder("1", false)
+	if _, err := os.Stat(d.buildersFile()); err != nil {
+		t.Fatalf("LastUsed older than a minute not persisted: %v", err)
 	}
 }

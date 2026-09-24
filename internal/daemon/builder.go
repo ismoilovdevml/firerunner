@@ -123,12 +123,17 @@ func (d *Daemon) Builder(project string, start bool) BuilderInfo {
 		return BuilderInfo{State: BuilderBusy}
 	}
 	if b, ok := d.builders[project]; ok {
+		// LastUsed only matters at idle_ttl scale: persist it at most once a
+		// minute instead of writing builders.json for every job.
+		persist := time.Since(b.LastUsed) > time.Minute
 		b.LastUsed = time.Now()
 		if !b.ready {
 			d.metrics.builderRequests.WithLabelValues(BuilderBooting).Inc()
 			return BuilderInfo{State: BuilderBooting, Port: b.Port, CA: b.CA, Cert: b.Cert, Key: b.Key}
 		}
-		d.saveBuildersLocked()
+		if persist {
+			d.saveBuildersLocked()
+		}
 		d.metrics.builderRequests.WithLabelValues(BuilderReady).Inc()
 		return BuilderInfo{State: BuilderReady, Port: b.Port, CA: b.CA, Cert: b.Cert, Key: b.Key}
 	}
@@ -163,7 +168,12 @@ var builderBoot = (*Daemon).bootBuilder
 // evictLRULocked deletes the least recently used ready builder that has been
 // idle for 10 minutes and that no running job uses. It reports whether a slot was freed.
 func (d *Daemon) evictLRULocked() bool {
-	busy := busyBuilders()
+	// A job that started since expireBuilders last looked has just bumped its
+	// builder's LastUsed, so it is not idle enough to be evicted either way.
+	busy := d.busy
+	if busy == nil {
+		busy = busyBuilders() // before the first expireBuilders
+	}
 	var lru *builder
 	for _, b := range d.builders {
 		if b.ready && !busy[b.Project] && time.Since(b.LastUsed) > 10*time.Minute && (lru == nil || b.LastUsed.Before(lru.LastUsed)) {
@@ -191,15 +201,19 @@ func (d *Daemon) freePortLocked(cfg config.Config) int {
 }
 
 // removeBuilderLocked forgets a builder and deletes its VM in the background.
+// The port mapping and the VM go away in the background, so the caller's lock
+// (and with it POST /claim) never waits for nft or flintlock.
 func (d *Daemon) removeBuilderLocked(b *builder, reason string) {
 	delete(d.builders, b.Project)
 	d.saveBuildersLocked()
 	d.metrics.builders.Set(float64(len(d.builders)))
-	_ = nftRun("delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", b.Port))
-	if b.Instance.UID != "" {
-		inst := b.Instance
-		d.spawn(func() { d.delete(context.Background(), &inst, "builder: "+reason) })
-	}
+	port, inst, nft := b.Port, b.Instance, nftRun
+	d.spawn(func() {
+		_ = nft("delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", port))
+		if inst.UID != "" {
+			d.delete(context.Background(), &inst, "builder: "+reason)
+		}
+	})
 }
 
 func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project string) {
@@ -355,6 +369,7 @@ func (d *Daemon) expireBuilders() {
 	busy := busyBuilders()
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.busy = busy
 	cfg := d.cfg
 	spec := builderSpec(cfg)
 	for _, b := range d.builders {
@@ -418,7 +433,7 @@ func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
 	wg.Wait()
 
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	var remap []builder
 	for _, b := range d.builders {
 		if !b.ready {
 			continue
@@ -441,8 +456,13 @@ func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
 			d.log.Warn("builder not answering", "project", b.Project, "id", b.Instance.ID,
 				"strikes", b.strikes, "in_use", busy[b.Project])
 		}
-		if err := mapBuilderPort(b); err != nil {
-			d.log.Error("builder port mapping failed", "project", b.Project, "err", err)
+		remap = append(remap, *b)
+	}
+	d.mu.Unlock()
+	// Two nft execs per builder: outside the lock, so job claims never wait.
+	for i := range remap {
+		if err := mapBuilderPort(&remap[i]); err != nil {
+			d.log.Error("builder port mapping failed", "project", remap[i].Project, "err", err)
 		}
 	}
 }
@@ -514,20 +534,22 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 		keep = append(keep, b)
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	for _, b := range keep {
 		b.ready = true
 		if b.SpecID == legacyBuilderSpec(d.cfg) {
 			b.SpecID = builderSpec(d.cfg)
 		}
 		d.builders[b.Project] = b
-		if err := mapBuilderPort(b); err != nil {
-			d.log.Error("builder port mapping failed", "project", b.Project, "err", err)
-		}
 		d.log.Info("adopted builder from previous run", "project", b.Project, "id", b.Instance.ID)
 	}
 	d.saveBuildersLocked()
 	d.metrics.builders.Set(float64(len(d.builders)))
+	d.mu.Unlock()
+	for _, b := range keep {
+		if err := mapBuilderPort(b); err != nil {
+			d.log.Error("builder port mapping failed", "project", b.Project, "err", err)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

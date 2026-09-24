@@ -159,6 +159,9 @@ type Daemon struct {
 	builderFailed map[string]time.Time
 	runCtx        context.Context // cancelled on shutdown; builders boot under it
 	bg            sync.WaitGroup  // background goroutines that call flintlock; Run waits for them
+	// busy is the projects whose builder a running job uses, as expireBuilders
+	// last saw them (every 2 s), so Builder can evict without a scan under mu.
+	busy map[string]bool
 }
 
 // spawn runs fn in the background and lets Run wait for it at shutdown, so
