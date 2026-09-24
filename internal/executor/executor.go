@@ -207,28 +207,17 @@ func coldBoot(ctx context.Context, cfg config.Config, id string, fromPool func()
 // BuilderName is the buildx builder created in job VMs for the project's builder.
 const BuilderName = "firerunner"
 
-// builderWait is how long a job waits for its project's builder to start
-// (usually 20-40 s). Building without it would not fill its cache, so the
-// next job would be cold again.
-var builderWait = 90 * time.Second
-
-// useBuilder points the VM's buildx at the project's builder when it is ready.
+// useBuilder points the VM's buildx at the project's builder, ready or still
+// starting. Nothing waits here: jobs that never build (checks, deploys) start at
+// once, and the docker wrapper (BuilderScript) waits for a starting builder only
+// when the job actually builds.
 func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project string) bool {
 	info, err := dc.Builder(project)
-	if err == nil && info.State == daemon.BuilderBooting {
-		fmt.Println("Docker layer cache: starting this project's builder (first job of the project)...")
-		for deadline := time.Now().Add(builderWait); err == nil && info.State == daemon.BuilderBooting && time.Now().Before(deadline); {
-			time.Sleep(2 * time.Second)
-			info, err = dc.Builder(project)
-		}
-	}
 	switch {
 	case err != nil || info.State == daemon.BuilderDisabled:
 		return false
-	case info.State == daemon.BuilderBooting:
-		fmt.Println("Docker layer cache: this project's builder is starting; this job builds without it")
-		return false
-	case info.State != daemon.BuilderReady:
+	case (info.State == daemon.BuilderReady || info.State == daemon.BuilderBooting) && info.Port > 0 && info.Key != "":
+	default:
 		fmt.Println("Docker layer cache: all builders are busy; this job builds without it")
 		return false
 	}
@@ -238,13 +227,22 @@ func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project
 		fmt.Printf("Docker layer cache: could not attach the builder (%v): %s\n", err, strings.TrimSpace(string(out)))
 		return false
 	}
-	fmt.Printf("Docker layer cache: using this project's builder (warm cache)\n")
+	if info.State == daemon.BuilderReady {
+		fmt.Println("Docker layer cache: using this project's builder (warm cache)")
+	} else {
+		fmt.Println("Docker layer cache: this project's builder is starting; docker build will wait for it")
+	}
 	return true
 }
 
-// BuilderScript creates the buildx builder in the job VM. Builders are reached
-// through the bridge address (the VM's default gateway), which forwards the
-// port to the project's builder VM.
+// BuilderWait is how long `docker build` in a job waits for a starting builder.
+const BuilderWait = 90
+
+// BuilderScript creates the buildx builder in the job VM and a docker wrapper
+// that, for build commands, waits until the builder answers (a full mTLS
+// handshake with the job's certificate) and otherwise builds locally. Builders
+// are reached through the bridge address (the VM's default gateway), which
+// forwards the port to the project's builder VM.
 func BuilderScript(info *daemon.BuilderInfo) string {
 	var b strings.Builder
 	b.WriteString("set -e\numask 077\nmkdir -p /etc/firerunner-buildkit\n")
@@ -255,6 +253,30 @@ func BuilderScript(info *daemon.BuilderInfo) string {
 		"docker buildx create --name %s --driver remote "+
 		"--driver-opt cacert=/etc/firerunner-buildkit/ca.pem,cert=/etc/firerunner-buildkit/cert.pem,key=/etc/firerunner-buildkit/key.pem,servername=%s,default-load=true "+
 		"\"tcp://$gw:%d\" >/dev/null\n", BuilderName, daemon.BuilderServerName, info.Port)
+	fmt.Fprintf(&b, `cat > /usr/local/bin/docker <<'FIRERUNNER_EOF'
+#!/bin/bash
+# FireRunner: docker build uses this project's builder; wait for it while it starts.
+if [ -n "$BUILDX_BUILDER" ] && { [ "$1" = build ] || [ "$1" = buildx ]; }; then
+    if [ ! -e /run/firerunner-builder-ok ] && [ ! -e /run/firerunner-builder-down ]; then
+        end=$((SECONDS + %d))
+        while [ "$SECONDS" -lt "$end" ]; do
+            if timeout 5 /usr/bin/docker buildx inspect --bootstrap "$BUILDX_BUILDER" >/dev/null 2>&1; then
+                touch /run/firerunner-builder-ok
+                break
+            fi
+            sleep 1
+        done
+        [ -e /run/firerunner-builder-ok ] || touch /run/firerunner-builder-down
+    fi
+    if [ -e /run/firerunner-builder-down ]; then
+        echo "FireRunner: this project's builder did not answer; building without the layer cache" >&2
+        unset BUILDX_BUILDER
+    fi
+fi
+exec /usr/bin/docker "$@"
+FIRERUNNER_EOF
+chmod 0755 /usr/local/bin/docker
+`, BuilderWait)
 	return b.String()
 }
 

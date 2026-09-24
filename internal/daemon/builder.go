@@ -66,6 +66,9 @@ type builder struct {
 	BornAt   time.Time   `json:"born_at"`
 	LastUsed time.Time   `json:"last_used"`
 	ready    bool
+	// creds are created with the entry, so jobs can be configured for the
+	// builder while it is still starting (only a starting builder needs them).
+	creds *builderCreds
 }
 
 var projectID = regexp.MustCompile(`^[0-9]{1,20}$`)
@@ -110,7 +113,8 @@ func (d *Daemon) Builder(project string) BuilderInfo {
 	if b, ok := d.builders[project]; ok {
 		b.LastUsed = time.Now()
 		if !b.ready {
-			return BuilderInfo{State: BuilderBooting}
+			d.metrics.builderRequests.WithLabelValues(BuilderBooting).Inc()
+			return BuilderInfo{State: BuilderBooting, Port: b.Port, CA: b.CA, Cert: b.Cert, Key: b.Key}
 		}
 		d.saveBuildersLocked()
 		d.metrics.builderRequests.WithLabelValues(BuilderReady).Inc()
@@ -125,10 +129,19 @@ func (d *Daemon) Builder(project string) BuilderInfo {
 		d.metrics.builderRequests.WithLabelValues(BuilderBusy).Inc()
 		return BuilderInfo{State: BuilderBusy}
 	}
-	d.builders[project] = &builder{Project: project, Port: port, LastUsed: time.Now()}
+	creds, err := newBuilderCreds()
+	if err != nil {
+		d.log.Error("builder credentials", "err", err)
+		return BuilderInfo{State: BuilderBusy}
+	}
+	b := &builder{Project: project, Port: port, LastUsed: time.Now(),
+		CA: creds.caPEM, Cert: creds.clientCert, Key: creds.clientKey, creds: creds}
+	d.builders[project] = b
 	d.metrics.builderRequests.WithLabelValues(BuilderBooting).Inc()
 	go builderBoot(d, d.runCtx, cfg, project)
-	return BuilderInfo{State: BuilderBooting}
+	// The job gets the port and credentials now; its `docker build` waits for
+	// the builder, so jobs that do not build never wait.
+	return BuilderInfo{State: BuilderBooting, Port: b.Port, CA: b.CA, Cert: b.Cert, Key: b.Key}
 }
 
 // builderBoot is a variable so tests can skip real VM boots.
@@ -201,9 +214,14 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		fail(nil, err)
 		return
 	}
-	creds, err := newBuilderCreds()
-	if err != nil {
-		fail(inst, err)
+	d.mu.Lock()
+	var creds *builderCreds
+	if b, ok := d.builders[project]; ok {
+		creds = b.creds
+	}
+	d.mu.Unlock()
+	if creds == nil {
+		go d.delete(context.Background(), inst, "builder no longer needed")
 		return
 	}
 	if err := setupBuildkit(ctx, bcfg, inst, creds); err != nil {
@@ -219,7 +237,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		go d.delete(context.Background(), inst, "builder no longer needed")
 		return
 	}
-	b.Instance, b.CA, b.Cert, b.Key = *inst, creds.caPEM, creds.clientCert, creds.clientKey
+	b.Instance, b.creds = *inst, nil
 	b.SpecID, b.BornAt, b.ready = builderSpec(cfg), time.Now(), true
 	if err := mapBuilderPort(b); err != nil {
 		d.log.Error("builder port mapping failed", "project", project, "err", err)

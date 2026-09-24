@@ -161,6 +161,9 @@ func TestBuilderScript(t *testing.T) {
 		"docker buildx create --name firerunner --driver remote",
 		"servername=builder,default-load=true",
 		`"tcp://$gw:20003"`,
+		"cat > /usr/local/bin/docker <<'FIRERUNNER_EOF'",
+		"end=$((SECONDS + 90))",
+		"exec /usr/bin/docker \"$@\"",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("builder script lacks %q:\n%s", want, s)

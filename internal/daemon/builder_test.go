@@ -50,14 +50,16 @@ func TestBuilderRequest(t *testing.T) {
 			t.Errorf("Builder(%q) = %s, want disabled", bad, got)
 		}
 	}
-	// First request starts a builder on the first port; later ones see it booting.
-	if got := d.Builder("7"); got.State != BuilderBooting {
-		t.Fatalf("first request = %+v", got)
+	// First request starts a builder on the first port and already hands out its
+	// port and client credentials; later ones see it booting with the same ones.
+	first := d.Builder("7")
+	if first.State != BuilderBooting || first.Port != d.cfg.Builder.PortBase+1 || first.Key == "" || first.CA == "" {
+		t.Fatalf("first request = %+v", first)
 	}
 	if b := d.builders["7"]; b == nil || b.Port != d.cfg.Builder.PortBase+1 || b.ready {
 		t.Fatalf("builder entry = %+v", b)
 	}
-	if got := d.Builder("7"); got.State != BuilderBooting {
+	if got := d.Builder("7"); got.State != BuilderBooting || got.Key != first.Key {
 		t.Fatalf("second request = %+v", got)
 	}
 	// Once ready the job gets the port and the client credentials.
