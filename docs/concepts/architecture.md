@@ -1,19 +1,6 @@
 # Architecture
 
-```mermaid
-flowchart LR
-  GL[GitLab] -- job --> GR[gitlab-runner<br/>custom executor]
-  GR -- prepare / run / cleanup --> FE[firerunner executor]
-  FE -- claim VM --> D[firerunner daemon]
-  D -- create / delete --> FL[flintlockd]
-  FE -- create / delete --> FL
-  FL -- containerd images + thin pool --> CT[(containerd)]
-  FL --> VM1[microVM job-1]
-  FL --> VM2[microVM job-2]
-  FL --> P[pool microVMs]
-  FE -- SSH, pinned host key --> VM1
-  VM1 & VM2 & P --- BR{{br-fc bridge<br/>DHCP · DNS · NAT}}
-```
+![FireRunner architecture](../images/architecture.svg)
 
 ## Components
 
@@ -31,28 +18,7 @@ flowchart LR
 
 ## Job lifecycle
 
-```mermaid
-sequenceDiagram
-  participant G as gitlab-runner
-  participant E as executor
-  participant D as daemon
-  participant V as microVM
-  G->>E: prepare
-  E->>D: claim a pool VM
-  alt pool has one
-    D-->>E: VM (id, IP, host key)
-  else pool empty
-    E->>E: boot a VM (wait for memory, DHCP lease, SSH)
-  end
-  E->>E: record job state (exclusive)
-  loop every stage
-    G->>E: run script stage
-    E->>V: ssh (pinned key) — script, or docker run <image>
-  end
-  G->>E: cleanup
-  E->>V: delete VM
-  D->>D: refill the pool
-```
+![Job lifecycle](../images/job-lifecycle.svg)
 
 ## Why a custom executor and not webhooks
 

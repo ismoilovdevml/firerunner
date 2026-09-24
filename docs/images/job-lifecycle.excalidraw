@@ -1,0 +1,536 @@
+{
+  "type": "excalidraw",
+  "version": 2,
+  "source": "mcp-excalidraw-server",
+  "elements": [
+    {
+      "id": "mufa6bubrqej6lwzrt",
+      "type": "text",
+      "x": 40,
+      "y": 20,
+      "strokeColor": "#1e1e1e",
+      "text": "Job lifecycle",
+      "fontSize": 30,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubuqrg3qnw9f",
+      "type": "rectangle",
+      "x": 40,
+      "y": 190,
+      "width": 1060,
+      "height": 320,
+      "backgroundColor": "#e7f5ff",
+      "strokeColor": "#1971c2",
+      "strokeStyle": "dashed",
+      "opacity": 50,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6buborm98j1sw9",
+      "type": "text",
+      "x": 56,
+      "y": 200,
+      "strokeColor": "#1971c2",
+      "text": "prepare",
+      "fontSize": 20,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubq171ddxjpu",
+      "type": "rectangle",
+      "x": 40,
+      "y": 550,
+      "width": 1060,
+      "height": 130,
+      "backgroundColor": "#ebfbee",
+      "strokeColor": "#2f9e44",
+      "strokeStyle": "dashed",
+      "opacity": 50,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubmr1o7sh0jq",
+      "type": "text",
+      "x": 56,
+      "y": 560,
+      "strokeColor": "#2f9e44",
+      "text": "run",
+      "fontSize": 20,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubthxpolu8ceq",
+      "type": "rectangle",
+      "x": 40,
+      "y": 760,
+      "width": 1060,
+      "height": 130,
+      "backgroundColor": "#fff5f5",
+      "strokeColor": "#e03131",
+      "strokeStyle": "dashed",
+      "opacity": 50,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubkj083pgwi9s",
+      "type": "text",
+      "x": 56,
+      "y": 770,
+      "strokeColor": "#e03131",
+      "text": "cleanup",
+      "fontSize": 20,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "pick",
+      "type": "rectangle",
+      "x": 410,
+      "y": 80,
+      "width": 300,
+      "height": 80,
+      "backgroundColor": "#ffd8a8",
+      "strokeColor": "#e8590c",
+      "label": {
+        "text": "gitlab-runner picks up a job\nwith the firecracker tag"
+      },
+      "fontSize": 18,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "q",
+      "type": "diamond",
+      "x": 470,
+      "y": 220,
+      "width": 180,
+      "height": 130,
+      "backgroundColor": "#fff3bf",
+      "strokeColor": "#f08c00",
+      "label": {
+        "text": "pool VM\nready?"
+      },
+      "fontSize": 18,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "claim",
+      "type": "rectangle",
+      "x": 100,
+      "y": 245,
+      "width": 280,
+      "height": 80,
+      "backgroundColor": "#b2f2bb",
+      "strokeColor": "#2f9e44",
+      "label": {
+        "text": "claim it from the daemon\n~0.4 s"
+      },
+      "fontSize": 18,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "boot",
+      "type": "rectangle",
+      "x": 740,
+      "y": 245,
+      "width": 300,
+      "height": 80,
+      "backgroundColor": "#eebefa",
+      "strokeColor": "#9c36b5",
+      "label": {
+        "text": "boot a microVM\n~12 s, waits for memory"
+      },
+      "fontSize": 18,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "state",
+      "type": "rectangle",
+      "x": 360,
+      "y": 410,
+      "width": 400,
+      "height": 80,
+      "backgroundColor": "#a5d8ff",
+      "strokeColor": "#1971c2",
+      "label": {
+        "text": "pin its SSH host key, record the job,\nstart services: containers"
+      },
+      "fontSize": 18,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "run",
+      "type": "rectangle",
+      "x": 360,
+      "y": 580,
+      "width": 400,
+      "height": 80,
+      "backgroundColor": "#b2f2bb",
+      "strokeColor": "#2f9e44",
+      "label": {
+        "text": "every stage streamed over SSH:\non the VM, or in docker run <image>"
+      },
+      "fontSize": 18,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "del",
+      "type": "rectangle",
+      "x": 410,
+      "y": 790,
+      "width": 300,
+      "height": 80,
+      "backgroundColor": "#ffc9c9",
+      "strokeColor": "#e03131",
+      "label": {
+        "text": "delete the microVM\nnothing is reused"
+      },
+      "fontSize": 18,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "refill",
+      "type": "rectangle",
+      "x": 820,
+      "y": 790,
+      "width": 240,
+      "height": 80,
+      "backgroundColor": "#ffffff",
+      "strokeColor": "#1971c2",
+      "strokeStyle": "dashed",
+      "label": {
+        "text": "daemon boots a new\npool VM"
+      },
+      "fontSize": 18,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubcpuhcscj8ur",
+      "type": "arrow",
+      "x": 560,
+      "y": 168,
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "points": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          44
+        ]
+      ],
+      "start": {
+        "id": "pick"
+      },
+      "end": {
+        "id": "q"
+      },
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubw4bkct3rij",
+      "type": "arrow",
+      "x": 462,
+      "y": 285,
+      "strokeColor": "#2f9e44",
+      "strokeWidth": 2,
+      "label": {
+        "text": "yes"
+      },
+      "points": [
+        [
+          0,
+          0
+        ],
+        [
+          -74,
+          0
+        ]
+      ],
+      "start": {
+        "id": "q"
+      },
+      "end": {
+        "id": "claim"
+      },
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubsjooy37udi",
+      "type": "arrow",
+      "x": 658,
+      "y": 285,
+      "strokeColor": "#9c36b5",
+      "strokeWidth": 2,
+      "label": {
+        "text": "no"
+      },
+      "points": [
+        [
+          0,
+          0
+        ],
+        [
+          74,
+          0
+        ]
+      ],
+      "start": {
+        "id": "q"
+      },
+      "end": {
+        "id": "boot"
+      },
+      "createdAt": "2026-09-24T08:39:24.277Z",
+      "updatedAt": "2026-09-24T08:39:24.277Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubl4p9vlbql3",
+      "type": "arrow",
+      "x": 324.68618291502554,
+      "y": 328.66631306556,
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "points": [
+        [
+          0,
+          0
+        ],
+        [
+          150.62763416994886,
+          77.66737386887996
+        ]
+      ],
+      "start": {
+        "id": "claim"
+      },
+      "end": {
+        "id": "state"
+      },
+      "createdAt": "2026-09-24T08:39:24.278Z",
+      "updatedAt": "2026-09-24T08:39:24.278Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubbcw7sxr4nzu",
+      "type": "arrow",
+      "x": 802.8445824720006,
+      "y": 328.5777087639997,
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "points": [
+        [
+          0,
+          0
+        ],
+        [
+          -155.68916494400128,
+          77.84458247200064
+        ]
+      ],
+      "start": {
+        "id": "boot"
+      },
+      "end": {
+        "id": "state"
+      },
+      "createdAt": "2026-09-24T08:39:24.278Z",
+      "updatedAt": "2026-09-24T08:39:24.278Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubprzio1wc3fd",
+      "type": "arrow",
+      "x": 560,
+      "y": 498,
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "points": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          74
+        ]
+      ],
+      "start": {
+        "id": "state"
+      },
+      "end": {
+        "id": "run"
+      },
+      "createdAt": "2026-09-24T08:39:24.278Z",
+      "updatedAt": "2026-09-24T08:39:24.278Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubdggp5mv7x3",
+      "type": "arrow",
+      "x": 560,
+      "y": 668,
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "points": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          114
+        ]
+      ],
+      "start": {
+        "id": "run"
+      },
+      "end": {
+        "id": "del"
+      },
+      "createdAt": "2026-09-24T08:39:24.278Z",
+      "updatedAt": "2026-09-24T08:39:24.278Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubatm7zztzcwk",
+      "type": "text",
+      "x": 580,
+      "y": 705,
+      "strokeColor": "#495057",
+      "text": "done, failed or cancelled",
+      "fontSize": 16,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:24.278Z",
+      "updatedAt": "2026-09-24T08:39:24.278Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6bubbtmfmjetldu",
+      "type": "arrow",
+      "x": 718,
+      "y": 830,
+      "strokeColor": "#1971c2",
+      "strokeWidth": 2,
+      "strokeStyle": "dashed",
+      "points": [
+        [
+          0,
+          0
+        ],
+        [
+          94,
+          0
+        ]
+      ],
+      "start": {
+        "id": "del"
+      },
+      "end": {
+        "id": "refill"
+      },
+      "createdAt": "2026-09-24T08:39:24.278Z",
+      "updatedAt": "2026-09-24T08:39:24.278Z",
+      "version": 1
+    },
+    {
+      "id": "cache3",
+      "type": "rectangle",
+      "x": 840,
+      "y": 575,
+      "width": 240,
+      "height": 90,
+      "backgroundColor": "#99e9f2",
+      "strokeColor": "#0c8599",
+      "label": {
+        "text": "cache: → host S3\nartifacts → GitLab"
+      },
+      "fontSize": 18,
+      "fontFamily": 5,
+      "createdAt": "2026-09-24T08:39:51.347Z",
+      "updatedAt": "2026-09-24T08:39:51.347Z",
+      "version": 1
+    },
+    {
+      "id": "mufa6wqbzl54tfgc2bi",
+      "type": "arrow",
+      "x": 768,
+      "y": 620,
+      "strokeColor": "#0c8599",
+      "strokeWidth": 2,
+      "strokeStyle": "dashed",
+      "points": [
+        [
+          0,
+          0
+        ],
+        [
+          64,
+          0
+        ]
+      ],
+      "start": {
+        "id": "run"
+      },
+      "end": {
+        "id": "cache3"
+      },
+      "startArrowhead": "arrow",
+      "createdAt": "2026-09-24T08:39:51.347Z",
+      "updatedAt": "2026-09-24T08:39:51.347Z",
+      "version": 1
+    }
+  ],
+  "appState": {
+    "viewBackgroundColor": "#ffffff",
+    "gridSize": null
+  }
+}

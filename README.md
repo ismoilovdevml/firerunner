@@ -22,16 +22,7 @@ A daemon keeps a small pool of pre-booted microVMs, so a job normally gets its V
 
 ## How it works
 
-```mermaid
-flowchart LR
-  GL[GitLab] -- job --> GR[gitlab-runner<br/>custom executor]
-  GR -- prepare / run / cleanup --> FE[firerunner executor]
-  FE -- claim --> D[firerunner daemon<br/>warm pool, reconcile, metrics]
-  FE -- create / delete --> FL[flintlockd]
-  D -- create / delete --> FL
-  FL --> FC[Firecracker microVMs<br/>one per job]
-  FE -- SSH, pinned host key --> FC
-```
+![FireRunner architecture](docs/images/architecture.svg)
 
 1. **prepare**: claim a pre-booted VM from the daemon (or boot one), record it for the job.
 2. **run**: every stage script is streamed into the VM over SSH. With `image:` the job's
