@@ -699,7 +699,7 @@ func cmdExecutor(cfg config.Config, args []string) error {
 func cmdUpgrade(args []string) error {
 	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	tag := fs.String("version", "edge", "release to install: edge (main), latest (newest stable) or a tag like v1.2.0")
-	check := fs.Bool("check", false, "only show which version would be installed")
+	check := fs.Bool("check", false, "only tell whether the release differs from this binary (runs nothing)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -711,7 +711,7 @@ func cmdUpgrade(args []string) error {
 	case !res.Changed:
 		fmt.Printf("firerunner %s is already the %s release\n", res.From, *tag)
 	case *check:
-		fmt.Printf("firerunner %s -> %s available (run: firerunner upgrade --version %s)\n", res.From, res.To, *tag)
+		fmt.Printf("firerunner %s: a different %s build is available (run: firerunner upgrade --version %s)\n", res.From, *tag, *tag)
 	default:
 		fmt.Printf("firerunner upgraded %s -> %s\n", res.From, res.To)
 		if host.ServiceActive("firerunner") {

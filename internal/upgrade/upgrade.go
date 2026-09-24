@@ -30,6 +30,19 @@ func BaseURL(tag string) string {
 	return "https://github.com/" + repo + "/releases/download/" + tag
 }
 
+// releaseBase and executable are variables so tests need no GitHub and do not
+// replace the test binary.
+var (
+	releaseBase = BaseURL
+	executable  = func() (string, error) {
+		exe, err := os.Executable()
+		if err != nil {
+			return "", err
+		}
+		return filepath.EvalSymlinks(exe)
+	}
+)
+
 // Result describes what Run did.
 type Result struct {
 	From, To string
@@ -37,16 +50,15 @@ type Result struct {
 }
 
 // Run downloads the release, verifies its checksum and atomically replaces
-// the current executable. With checkOnly it stops after reporting the version.
+// the current executable. Whether the release differs from the running binary
+// is decided by checksum, so checkOnly downloads and runs nothing but
+// checksums.txt, and an identical release is not downloaded at all.
 func Run(ctx context.Context, tag, current string, checkOnly bool) (*Result, error) {
-	exe, err := os.Executable()
+	exe, err := executable()
 	if err != nil {
 		return nil, err
 	}
-	if exe, err = filepath.EvalSymlinks(exe); err != nil {
-		return nil, err
-	}
-	base := BaseURL(tag)
+	base := releaseBase(tag)
 
 	sums, err := fetch(ctx, base+"/checksums.txt")
 	if err != nil {
@@ -55,6 +67,17 @@ func Run(ctx context.Context, tag, current string, checkOnly bool) (*Result, err
 	want, err := checksumFor(string(sums), asset)
 	if err != nil {
 		return nil, err
+	}
+	have, err := fileSHA256(exe)
+	if err != nil {
+		return nil, err
+	}
+	if have == want {
+		return &Result{From: current, To: current}, nil
+	}
+	if checkOnly {
+		// The new version string would need running the new binary (as root).
+		return &Result{From: current, To: tag, Changed: true}, nil
 	}
 
 	// Download next to the executable so the final rename is atomic.
@@ -85,14 +108,23 @@ func Run(ctx context.Context, tag, current string, checkOnly bool) (*Result, err
 		return nil, fmt.Errorf("downloaded binary does not run: %w", err)
 	}
 	next := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(out)), "firerunner"))
-	res := &Result{From: current, To: next, Changed: next != current}
-	if checkOnly || !res.Changed {
-		return res, nil
-	}
 	if err := os.Rename(tmp.Name(), exe); err != nil {
 		return nil, fmt.Errorf("replacing %s: %w", exe, err)
 	}
-	return res, nil
+	return &Result{From: current, To: next, Changed: true}, nil
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func checksumFor(sums, name string) (string, error) {
