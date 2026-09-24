@@ -23,8 +23,19 @@ import (
 // builder.max builders running, every project that builds keeps a warm cache.
 // Each file only ever goes back into a builder of the same project.
 
+// cacheSave is a deleted builder whose cache is being copied to the host; its
+// VM stays until the copy ends, and reconcile must not take it (uid).
+type cacheSave struct {
+	done  chan struct{}
+	uid   string
+	start time.Time
+}
+
 // builderCacheDir holds <project>.tar files (a variable for tests).
 var builderCacheDir = "/var/lib/firerunner/builder-cache"
+
+// builderCacheLimit is builder.saved_cache_gb in bytes (a variable for tests).
+var builderCacheLimit = func(c config.Config) int64 { return int64(c.Builder.SavedCacheGB) << 30 }
 
 // builderCacheTimeout bounds one save or restore (17 GB takes about 30 s).
 var builderCacheTimeout = 15 * time.Minute
@@ -62,6 +73,15 @@ var (
 	}
 	builderCacheLoad = func(ctx context.Context, cfg config.Config, inst *vm.Instance, r io.Reader) error {
 		return streamSSH(ctx, cfg, inst, builderLoadScript, r, io.Discard)
+	}
+	// builderCacheWipe removes a partly loaded volume when the load script
+	// could not clean up itself (the connection dropped).
+	builderCacheWipe = func(ctx context.Context, cfg config.Config, inst *vm.Instance) error {
+		out, err := runWithContext(ctx, vm.SSH(cfg, inst, "docker volume rm -f buildkit >/dev/null"))
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, strings.TrimSpace(out))
+		}
+		return nil
 	}
 	// diskSpace reports free and total bytes of the file system holding dir.
 	diskSpace = func(dir string) (free, total uint64, err error) {
@@ -113,14 +133,17 @@ func keepsCache(reason string) bool {
 }
 
 // saveBuilderCache copies the builder's BuildKit state to the host. Any failure
-// leaves the previous saved copy (if any) in place.
-func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, project string, inst *vm.Instance) {
+// leaves the previous saved copy (if any) in place. Saves run one at a time;
+// started is when the builder was removed (see cacheDropped).
+func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, project string, inst *vm.Instance, started time.Time) {
+	d.cacheMu.Lock()
+	defer d.cacheMu.Unlock()
 	result := "failed"
 	defer func() { d.metrics.builderCache.WithLabelValues("save", result).Inc() }()
 	ctx, cancel := context.WithTimeout(ctx, builderCacheTimeout)
 	defer cancel()
 	start := time.Now()
-	limit := int64(cfg.Builder.SavedCacheGB) << 30
+	limit := builderCacheLimit(cfg)
 
 	size, err := builderCacheSize(ctx, cfg, inst)
 	if err != nil {
@@ -153,8 +176,21 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
+	dropped := false
 	if err == nil {
-		err = os.Rename(tmp.Name(), builderCacheFile(project))
+		// Under mu, as RemoveBuilders marks and deletes: an operator's
+		// `builder rm` since this save started wins over the save.
+		d.mu.Lock()
+		if dropped = d.cacheDropped[project].After(started); !dropped {
+			err = os.Rename(tmp.Name(), builderCacheFile(project))
+		}
+		d.mu.Unlock()
+	}
+	if dropped {
+		_ = os.Remove(tmp.Name())
+		result = "skipped"
+		d.log.Info("builder cache not saved: removed by the operator meanwhile", "project", project)
+		return
 	}
 	if err != nil {
 		_ = os.Remove(tmp.Name())
@@ -227,32 +263,45 @@ func (d *Daemon) makeRoomForCache(project string, size, limit int64) error {
 }
 
 // restoreBuilderCache loads the project's saved cache into a new builder VM
-// before buildkitd starts. It reports whether a cache was loaded. A copy that
-// cannot be loaded is deleted, so it is not tried again.
-func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, project string, inst *vm.Instance) bool {
+// before buildkitd starts, and reports whether it did. A copy that tar or the
+// completeness check refuses is deleted, so it is not tried again; one that
+// failed on the way (the SSH connection) is kept. After a failed load the
+// volume is removed, so buildkitd starts empty; err means the VM may still
+// hold part of a cache and must not be used.
+func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, project string, inst *vm.Instance) (bool, error) {
 	file := builderCacheFile(project)
 	f, err := os.Open(file)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			d.log.Warn("saved builder cache unreadable", "project", project, "err", err)
 		}
-		return false
+		return false, nil
 	}
 	defer f.Close()
 	var size int64
 	if info, err := f.Stat(); err == nil {
 		size = info.Size()
 	}
-	ctx, cancel := context.WithTimeout(ctx, builderCacheTimeout)
+	lctx, cancel := context.WithTimeout(ctx, builderCacheTimeout)
 	defer cancel()
 	start := time.Now()
-	if err := builderCacheLoad(ctx, cfg, inst, f); err != nil {
+	if err := builderCacheLoad(lctx, cfg, inst, f); err != nil {
 		d.metrics.builderCache.WithLabelValues("restore", "failed").Inc()
-		if ctx.Err() == nil {
+		if lctx.Err() == nil && exitCode(err) != 255 { // 255: ssh itself failed
 			_ = os.Remove(file)
+			d.log.Warn("saved builder cache refused and deleted, starting empty", "project", project, "err", err)
+		} else {
+			d.log.Warn("saved builder cache not restored (kept for the next builder)", "project", project, "err", err)
 		}
-		d.log.Warn("saved builder cache not restored, starting empty", "project", project, "err", err)
-		return false
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		wctx, wcancel := context.WithTimeout(ctx, time.Minute)
+		defer wcancel()
+		if werr := builderCacheWipe(wctx, cfg, inst); werr != nil {
+			return false, fmt.Errorf("partly restored builder cache could not be removed: %w", werr)
+		}
+		return false, nil
 	}
 	// The modification time orders caches for makeRoomForCache: this one is in use.
 	now := time.Now()
@@ -260,7 +309,7 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 	d.metrics.builderCache.WithLabelValues("restore", "ok").Inc()
 	d.log.Info("builder cache restored", "project", project, "bytes", size,
 		"took", time.Since(start).Round(100*time.Millisecond).String())
-	return true
+	return true, nil
 }
 
 // dropSavedCaches deletes the saved cache of project ("all": every project)

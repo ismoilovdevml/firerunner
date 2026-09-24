@@ -170,9 +170,15 @@ type Daemon struct {
 
 	lastTick atomic.Int64 // unix time of the main loop's last pass (/healthz)
 	oomKills int64        // host oom_kill count at the last collectHost, -1 before the first
-	// saving is closed when the project's deleted builder has copied its cache
-	// to the host (see removeBuilderLocked).
-	saving map[string]chan struct{}
+	// saving: projects whose deleted builder is copying its cache to the host
+	// (see removeBuilderLocked). cacheDropped: when an operator last threw a
+	// project's saved cache away ("all": every project's), so a save that
+	// started earlier does not bring it back.
+	saving       map[string]*cacheSave
+	cacheDropped map[string]time.Time
+	// cacheMu runs one cache save at a time: each checks the disk budget, and
+	// saves running side by side would all pass against the same free space.
+	cacheMu sync.Mutex
 }
 
 // spawn runs fn in the background and lets Run wait for it at shutdown, so
@@ -230,7 +236,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 		claimed: map[string]time.Time{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{},
 		bootingIDs: map[string]bool{},
 		builders:   map[string]*builder{}, builderFailed: map[string]time.Time{},
-		saving: map[string]chan struct{}{}, runCtx: context.Background(),
+		saving: map[string]*cacheSave{}, cacheDropped: map[string]time.Time{}, runCtx: context.Background(),
 		oomKills: -1}
 	if fi, err := os.Stat(cfgPath); err == nil {
 		d.cfgMod = fi.ModTime()
@@ -673,6 +679,9 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 		if b.Instance.UID != "" {
 			owned[b.Instance.UID] = true
 		}
+	}
+	for _, s := range d.saving {
+		owned[s.uid] = true // a deleted builder whose cache is being copied out
 	}
 	for uid, at := range d.claimed {
 		if time.Since(at) < 5*time.Minute {

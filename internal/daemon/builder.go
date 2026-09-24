@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -211,22 +212,23 @@ func (d *Daemon) removeBuilderLocked(b *builder, reason string) {
 	d.metrics.builders.Set(float64(len(d.builders)))
 	project, port, inst, nft := b.Project, b.Port, b.Instance, nftRun
 	cfg, ctx := d.cfg, d.runCtx
-	var saved chan struct{}
+	var saved *cacheSave
 	if keepsCache(reason) && cfg.Builder.SavedCacheGB > 0 && inst.UID != "" && d.saving[project] == nil {
-		saved = make(chan struct{})
+		saved = &cacheSave{done: make(chan struct{}), uid: inst.UID, start: time.Now()}
 		d.saving[project] = saved
 	}
 	d.spawn(func() {
 		_ = nft("delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", port))
 		if saved != nil {
 			if ctx.Err() == nil {
-				d.saveBuilderCache(ctx, cfg, project, &inst)
+				d.saveBuilderCache(ctx, cfg, project, &inst, saved.start)
 			}
 			defer func() {
 				d.mu.Lock()
 				delete(d.saving, project)
+				delete(d.cacheDropped, project)
 				d.mu.Unlock()
-				close(saved)
+				close(saved.done)
 			}()
 		}
 		if inst.UID != "" {
@@ -246,10 +248,13 @@ type Removal struct {
 // Builders a running job builds on are kept unless force is set: deleting one
 // fails that job's docker build.
 func (d *Daemon) RemoveBuilders(project string, force bool) Removal {
+	out := Removal{Removed: []string{}, Skipped: []string{}}
+	if project != "all" && !projectID.MatchString(project) {
+		return out
+	}
 	busy := busyBuilders() // file reads: outside the lock
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	out := Removal{Removed: []string{}, Skipped: []string{}}
 	for _, b := range d.builders {
 		if !b.ready || (project != "all" && b.Project != project) {
 			continue
@@ -264,6 +269,12 @@ func (d *Daemon) RemoveBuilders(project string, force bool) Removal {
 	keep := map[string]bool{}
 	for _, p := range out.Skipped {
 		keep[p] = true
+	}
+	// A save still running would bring a dropped cache back: mark it.
+	for p := range d.saving {
+		if !keep[p] && (project == "all" || p == project) {
+			d.cacheDropped[p] = time.Now()
+		}
 	}
 	dropSavedCaches(project, keep)
 	sort.Strings(out.Removed)
@@ -293,7 +304,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	d.mu.Unlock()
 	if saving != nil {
 		select {
-		case <-saving:
+		case <-saving.done:
 		case <-ctx.Done():
 		}
 	}
@@ -301,7 +312,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		fail(nil, err)
 		return
 	}
-	inst, err := vm.Boot(ctx, bcfg, d.fl, "bld-"+project, map[string]string{LabelRole: "builder"})
+	inst, err := builderVMBoot(ctx, bcfg, d.fl, "bld-"+project, map[string]string{LabelRole: "builder"})
 	if err != nil {
 		fail(nil, err)
 		return
@@ -310,18 +321,26 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	var creds *builderCreds
 	if b, ok := d.builders[project]; ok {
 		creds = b.creds
+		// Known to reconcile from now on: loading a large cache takes longer
+		// than reconcile waits before it deletes a VM nobody owns.
+		b.Instance = *inst
 	}
 	d.mu.Unlock()
 	if creds == nil {
 		d.spawn(func() { d.delete(context.Background(), inst, "builder no longer needed") })
 		return
 	}
-	restored := d.restoreBuilderCache(ctx, bcfg, project, inst)
-	if err := setupBuildkit(ctx, bcfg, inst, creds); err != nil {
-		if restored && ctx.Err() == nil {
-			// Do not start every later builder of the project from a state
-			// buildkitd may have refused.
+	restored, err := d.restoreBuilderCache(ctx, bcfg, project, inst)
+	if err != nil {
+		fail(inst, err) // the VM may hold part of a cache: start over in a new one
+		return
+	}
+	if err := builderSetup(ctx, bcfg, inst, creds); err != nil {
+		if restored && errors.Is(err, errBuildkitDown) {
+			// buildkitd ran but did not come up on the restored state: do not
+			// start every later builder of the project from it.
 			_ = os.Remove(builderCacheFile(project))
+			d.log.Warn("saved builder cache dropped: buildkitd did not start with it", "project", project)
 		}
 		fail(inst, err)
 		return
@@ -347,6 +366,17 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		"took", time.Since(start).Round(100*time.Millisecond).String())
 }
 
+// VM boot, admission and buildkitd setup are variables so tests can run
+// bootBuilder without VMs.
+var (
+	builderVMBoot = vm.Boot
+	builderFits   = vm.Fits
+	builderSetup  = setupBuildkit
+)
+
+// errBuildkitDown: buildkitd was started but never listened.
+var errBuildkitDown = errors.New("buildkitd did not start listening")
+
 // builderFitWait is how long a builder boot waits for host memory: a builder
 // deleted to free its slot holds its memory until its cache is copied out.
 var builderFitWait = 2 * time.Minute
@@ -354,7 +384,7 @@ var builderFitWait = 2 * time.Minute
 func (d *Daemon) waitBuilderFits(ctx context.Context, bcfg config.Config) error {
 	deadline := time.Now().Add(builderFitWait)
 	for {
-		ok, why, err := vm.Fits(ctx, bcfg, d.fl, 0)
+		ok, why, err := builderFits(ctx, bcfg, d.fl, 0)
 		if err == nil && ok {
 			return nil
 		}
@@ -387,7 +417,7 @@ func setupBuildkit(ctx context.Context, cfg config.Config, inst *vm.Instance, c 
 		"--tlscacert /etc/buildkit/ca.pem --tlscert /etc/buildkit/server.pem --tlskey /etc/buildkit/server.key "+
 		"--oci-worker-gc --oci-worker-gc-keepstorage %d >/dev/null\n", shellQuote(cfg.Builder.Image), cfg.Builder.CacheMB)
 	script.WriteString("for i in $(seq 1 60); do (</dev/tcp/127.0.0.1/1234) 2>/dev/null && exit 0; sleep 1; done\n" +
-		"docker logs --tail 20 buildkitd >&2; exit 1\n")
+		"docker logs --tail 20 buildkitd >&2; exit 3\n")
 
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
@@ -395,9 +425,21 @@ func setupBuildkit(ctx context.Context, cfg config.Config, inst *vm.Instance, c 
 	cmd.Stdin = strings.NewReader(script.String())
 	out, err := runWithContext(sctx, cmd)
 	if err != nil {
+		if exitCode(err) == 3 {
+			err = errBuildkitDown
+		}
 		return fmt.Errorf("starting buildkitd: %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil
+}
+
+// exitCode is the exit status of a finished command, or -1.
+func exitCode(err error) int {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
 }
 
 func runWithContext(ctx context.Context, cmd *exec.Cmd) (string, error) {
