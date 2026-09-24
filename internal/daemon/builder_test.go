@@ -97,7 +97,9 @@ func TestBuilderRequest(t *testing.T) {
 		t.Fatalf("freed port not reused: %d", d.builders["9"].Port)
 	}
 
+	d.mu.Lock() // the delete spawned by the eviction above reads d.cfg
 	d.cfg.Builder.Enabled = false
+	d.mu.Unlock()
 	if got := d.Builder("7", true).State; got != BuilderDisabled {
 		t.Fatalf("disabled: %s", got)
 	}
