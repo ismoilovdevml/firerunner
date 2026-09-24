@@ -1,0 +1,68 @@
+site_name: FireRunner
+site_description: Every GitLab CI job in its own fresh Firecracker microVM
+site_url: https://ismoilovdevml.github.io/firerunner/
+repo_url: https://github.com/ismoilovdevml/firerunner
+repo_name: ismoilovdevml/firerunner
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep orange
+      toggle:
+        icon: material/brightness-7
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep orange
+      toggle:
+        icon: material/brightness-4
+        name: Light mode
+
+markdown_extensions:
+  - admonition
+  - md_in_html
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Requirements: getting-started/requirements.md
+      - Install: getting-started/install.md
+      - Connect GitLab: getting-started/connect-gitlab.md
+  - For CI users:
+      - Writing jobs: user-guide/writing-jobs.md
+      - Inside the job VM: user-guide/job-environment.md
+      - Debugging a failed job: user-guide/debugging.md
+  - For operators:
+      - Configuration: operator-guide/configuration.md
+      - Capacity and performance: operator-guide/capacity.md
+      - Day-2 operations: operator-guide/operations.md
+      - Monitoring: operator-guide/monitoring.md
+      - Troubleshooting: operator-guide/troubleshooting.md
+  - Concepts:
+      - Architecture: concepts/architecture.md
+      - Security model: concepts/security.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Metrics: reference/metrics.md
+      - Limitations and roadmap: reference/limitations.md

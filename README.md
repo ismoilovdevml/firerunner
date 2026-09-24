@@ -5,6 +5,10 @@ Every GitLab CI job in its own fresh Firecracker microVM, on your own hardware.
 [![CI](https://github.com/ismoilovdevml/firerunner/actions/workflows/ci.yml/badge.svg)](https://github.com/ismoilovdevml/firerunner/actions/workflows/ci.yml)
 [![Release](https://github.com/ismoilovdevml/firerunner/actions/workflows/release.yml/badge.svg)](https://github.com/ismoilovdevml/firerunner/releases/tag/edge)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-ismoilovdevml.github.io%2Ffirerunner-orange)](https://ismoilovdevml.github.io/firerunner/)
+
+**Documentation: <https://ismoilovdevml.github.io/firerunner/>** — user guide for engineers writing
+`.gitlab-ci.yml`, and an operator guide (install, configuration, capacity, monitoring, troubleshooting).
 
 FireRunner is a [GitLab Runner custom executor](https://docs.gitlab.com/runner/executors/custom/).
 gitlab-runner picks up jobs as usual; for each job FireRunner hands out a clean microVM

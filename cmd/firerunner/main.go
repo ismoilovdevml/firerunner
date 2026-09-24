@@ -499,7 +499,8 @@ func cmdRun(cfg config.Config, args []string) error {
 
 	code, runErr := vm.RunScript(cfg, inst, strings.NewReader(strings.Join(command, " ")+"\n"), os.Stdout, os.Stderr)
 	if *keep {
-		fmt.Fprintf(os.Stderr, "kept %s: ssh -i %s root@%s   (delete: firerunner vm rm %s)\n", id, cfg.Network.SSHKey, inst.IP, id)
+		fmt.Fprintf(os.Stderr, "kept %s: ssh -i %s -o UserKnownHostsFile=%s/%s -o HostKeyAlias=%s root@%s   (delete: firerunner vm rm %s)\n",
+			id, cfg.Network.SSHKey, vm.KnownHostsDir, id, id, inst.IP, id)
 	} else {
 		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
