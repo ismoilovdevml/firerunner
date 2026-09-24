@@ -27,6 +27,7 @@ flowchart LR
 | **Firecracker** | the VMM: one process per microVM, KVM-backed |
 | **dnsmasq / nftables** | DHCP and DNS for microVMs, NAT to the outside, host and inter-VM isolation |
 | **registry** | Docker Hub pull-through cache for Docker inside the VMs |
+| **versitygw** | S3 store for gitlab-runner's `cache:`; jobs get presigned URLs only |
 
 ## Job lifecycle
 

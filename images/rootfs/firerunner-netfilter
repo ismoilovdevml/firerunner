@@ -1,0 +1,14 @@
+#!/bin/sh
+# Picks the iptables backend for Docker before it starts (docker.service ExecStartPre).
+# FireRunner's guest kernel has nf_tables with the raw table, so Docker runs with its
+# defaults. Older kernels (flintlock's 5.10 sample) only have legacy iptables and no
+# raw table: fall back to iptables-legacy and tell Docker to skip the raw rules.
+if iptables-nft -t raw -S >/dev/null 2>&1; then
+    backend=nft
+    : >/run/firerunner-docker.env
+else
+    backend=legacy
+    echo DOCKER_INSECURE_NO_IPTABLES_RAW=1 >/run/firerunner-docker.env
+fi
+update-alternatives --set iptables "/usr/sbin/iptables-$backend" >/dev/null
+update-alternatives --set ip6tables "/usr/sbin/ip6tables-$backend" >/dev/null

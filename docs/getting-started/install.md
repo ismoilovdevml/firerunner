@@ -14,7 +14,7 @@ The installer is non-interactive and safe to re-run. It:
 4. installs **Firecracker** + jailer and **flintlockd** (listening on 127.0.0.1 only, token in a 0600 file);
 5. creates the microVM network: bridge `br-fc`, DHCP/DNS (dnsmasq), NAT, host firewall rules,
    isolation between microVMs;
-6. installs a **Docker Hub pull-through cache** for the microVMs;
+6. installs a **Docker Hub pull-through cache** and an **S3 store for `cache:`** for the microVMs;
 7. installs **firerunner** and **gitlab-runner**, starts `firerunner.service`;
 8. verifies every service and prints next steps.
 

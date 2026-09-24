@@ -28,6 +28,10 @@ All commands need root.
 | `firerunner runner register --url URL --token glrt-... [--concurrent N] [--name NAME]` | register this host (token also from `FIRERUNNER_RUNNER_TOKEN`) |
 | `firerunner runner status` | name, URL, executor, concurrent, service state |
 | `firerunner runner concurrent N` | max parallel jobs |
+| `firerunner runner cache` | where `cache:` is stored |
+| `firerunner runner cache local` | use the S3 store on this host (installer default) |
+| `firerunner runner cache s3 --server HOST:PORT --bucket B [--insecure]` | use your own S3 (keys from `FIRERUNNER_CACHE_ACCESS_KEY` / `FIRERUNNER_CACHE_SECRET_KEY`) |
+| `firerunner runner cache off` | keep `cache:` inside the job VM only |
 | `firerunner runner unregister` | remove the registration from this host and GitLab |
 
 ## microVMs

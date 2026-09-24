@@ -12,7 +12,7 @@ func TestLoadMissingFileReturnsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.VM.VCPU != 2 || cfg.VM.KernelCmdline["acpi"] != "off" {
+	if cfg.VM.VCPU != 2 || cfg.VM.KernelImage != DefaultKernelImage || len(cfg.VM.KernelCmdline) != 0 {
 		t.Fatalf("unexpected defaults: %+v", cfg.VM)
 	}
 }
@@ -89,8 +89,39 @@ func TestSetRejects(t *testing.T) {
 	}
 }
 
+func TestLoadMigratesLegacyKernel(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "c.yaml")
+	legacy := "vm:\n  kernel_image: " + legacyKernelImage + "\n  kernel_cmdline:\n    acpi: \"off\"\n    quiet: \"1\"\n"
+	if err := os.WriteFile(p, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.VM.KernelImage != DefaultKernelImage {
+		t.Errorf("kernel_image = %q", cfg.VM.KernelImage)
+	}
+	if _, ok := cfg.VM.KernelCmdline["acpi"]; ok || cfg.VM.KernelCmdline["quiet"] != "1" {
+		t.Errorf("kernel_cmdline = %v", cfg.VM.KernelCmdline)
+	}
+
+	// Another kernel keeps its arguments.
+	own := "vm:\n  kernel_image: registry.example.com/kernel:5.10\n  kernel_cmdline:\n    acpi: \"off\"\n"
+	if err := os.WriteFile(p, []byte(own), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, _ = Load(p); cfg.VM.KernelCmdline["acpi"] != "off" {
+		t.Errorf("custom kernel lost acpi=off: %v", cfg.VM.KernelCmdline)
+	}
+}
+
 func TestUnsetOnlyKernelCmdline(t *testing.T) {
-	cfg, err := Unset(Default(), "vm.kernel_cmdline.acpi")
+	cfg, err := Set(Default(), "vm.kernel_cmdline.acpi", "off")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Unset(cfg, "vm.kernel_cmdline.acpi")
 	if err != nil || len(cfg.VM.KernelCmdline) != 0 {
 		t.Fatalf("unset: %v %v", err, cfg.VM.KernelCmdline)
 	}

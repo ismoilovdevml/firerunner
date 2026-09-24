@@ -51,6 +51,8 @@ Usage:
   firerunner runner register --url <gitlab-url> --token <glrt-...> [--concurrent 4] [--name NAME]
   firerunner runner status
   firerunner runner concurrent <n>          max parallel jobs (= microVMs)
+  firerunner runner cache [local|off|s3 --server HOST:PORT --bucket B [--insecure]]
+                                            where cache: is stored (default: local S3 on this host)
   firerunner runner unregister
 
   firerunner vm list
@@ -243,6 +245,7 @@ func cmdStatus(cfg config.Config) error {
 
 	if r, err := host.ReadRunner(); err == nil {
 		fmt.Fprintf(w, "Runner\t%s -> %s (executor %s, concurrent %d)\n", r.Name, r.URL, r.Executor, r.Concurrent)
+		fmt.Fprintf(w, "Cache\t%s\n", cacheDesc(r))
 	} else {
 		fmt.Fprintf(w, "Runner\tnot registered (firerunner runner register --url ... --token glrt-...)\n")
 	}
@@ -290,7 +293,7 @@ func cmdDoctor(cfg config.Config) error {
 	check("executor SSH key", err, "re-run install.sh")
 
 	fmt.Println("GitLab runner")
-	if _, err := host.ReadRunner(); err != nil {
+	if r, err := host.ReadRunner(); err != nil {
 		fmt.Println("  warn  not registered yet")
 		fmt.Println("        -> firerunner runner register --url <gitlab-url> --token <glrt-...>")
 	} else {
@@ -299,6 +302,17 @@ func cmdDoctor(cfg config.Config) error {
 			err = errors.New("not running")
 		}
 		check("service gitlab-runner", err, "journalctl -u gitlab-runner -n 50")
+		switch local, _ := host.LocalCache(); {
+		case r.CacheType == "":
+			fmt.Println("  warn  no shared cache: cache: is lost after each job")
+			fmt.Println("        -> firerunner runner cache local")
+		case local != nil && r.CacheServer == local.Server:
+			var err error
+			if !host.ServiceActive("firerunner-cache") {
+				err = errors.New("not running")
+			}
+			check("cache server "+local.Server, err, "journalctl -u firerunner-cache -n 50")
+		}
 	}
 
 	if failed > 0 {
@@ -343,8 +357,11 @@ func cmdRunner(args []string) error {
 		if host.ServiceActive("gitlab-runner") {
 			state = "up"
 		}
-		fmt.Printf("name        %s\nurl         %s\nexecutor    %s\nconcurrent  %d\nservice     %s\n", r.Name, r.URL, r.Executor, r.Concurrent, state)
+		fmt.Printf("name        %s\nurl         %s\nexecutor    %s\nconcurrent  %d\ncache       %s\nservice     %s\n",
+			r.Name, r.URL, r.Executor, r.Concurrent, cacheDesc(r), state)
 		return nil
+	case "cache":
+		return cmdRunnerCache(args[1:])
 	case "concurrent":
 		if len(args) != 2 {
 			return errors.New("usage: firerunner runner concurrent <n>")
@@ -361,7 +378,58 @@ func cmdRunner(args []string) error {
 	case "unregister":
 		return host.UnregisterRunner()
 	}
-	return errors.New("usage: firerunner runner register|status|concurrent|unregister")
+	return errors.New("usage: firerunner runner register|status|concurrent|cache|unregister")
+}
+
+func cacheDesc(r *host.Runner) string {
+	if r.CacheType == "" {
+		return "none (cache: stays in the job VM)"
+	}
+	return r.CacheType + " " + r.CacheServer
+}
+
+func cmdRunnerCache(args []string) error {
+	if len(args) == 0 {
+		r, err := host.ReadRunner()
+		if err != nil {
+			return err
+		}
+		fmt.Println(cacheDesc(r))
+		return nil
+	}
+	var c *host.Cache
+	switch args[0] {
+	case "local":
+		var err error
+		if c, err = host.LocalCache(); err != nil {
+			return err
+		}
+	case "off":
+	case "s3":
+		fs := flag.NewFlagSet("runner cache s3", flag.ContinueOnError)
+		server := fs.String("server", "", "S3 endpoint host:port, reachable from the host and from the microVMs")
+		bucket := fs.String("bucket", "", "existing bucket")
+		insecure := fs.Bool("insecure", false, "use plain HTTP")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		c = &host.Cache{Server: *server, Bucket: *bucket, Insecure: *insecure,
+			AccessKey: os.Getenv("FIRERUNNER_CACHE_ACCESS_KEY"), SecretKey: os.Getenv("FIRERUNNER_CACHE_SECRET_KEY")}
+		if c.AccessKey == "" || c.SecretKey == "" {
+			return errors.New("set FIRERUNNER_CACHE_ACCESS_KEY and FIRERUNNER_CACHE_SECRET_KEY")
+		}
+	default:
+		return errors.New("usage: firerunner runner cache [local|off|s3 --server HOST:PORT --bucket B [--insecure]]")
+	}
+	if err := host.SetCache(c); err != nil {
+		return err
+	}
+	if c == nil {
+		fmt.Println("shared cache off (gitlab-runner reloads config.toml automatically)")
+	} else {
+		fmt.Printf("cache: stored in s3://%s at %s (gitlab-runner reloads config.toml automatically)\n", c.Bucket, c.Server)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

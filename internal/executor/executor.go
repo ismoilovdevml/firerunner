@@ -70,8 +70,7 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	source := "pool"
 	inst := claim(cfg, dc, id)
 	if inst == nil {
-		source = "cold"
-		inst, err = coldBoot(ctx, cfg, id)
+		inst, source, err = coldBoot(ctx, cfg, id, func() *vm.Instance { return claim(cfg, dc, id) })
 		if err != nil {
 			_ = dc.Send(daemon.Event{Kind: "prepare", Source: source})
 			return systemFailure(err)
@@ -125,38 +124,44 @@ func claim(cfg config.Config, dc *daemon.Client, id string) *vm.Instance {
 	return inst
 }
 
-func coldBoot(ctx context.Context, cfg config.Config, id string) (*vm.Instance, error) {
+// coldBoot boots a VM for the job once the host has memory for it. While it
+// waits, pool VMs that finish booting are taken instead (source "pool").
+func coldBoot(ctx context.Context, cfg config.Config, id string, fromPool func() *vm.Instance) (*vm.Instance, string, error) {
 	fl, err := flintlock.Dial(cfg.Flintlock)
 	if err != nil {
-		return nil, err
+		return nil, "cold", err
 	}
 	defer fl.Close()
 	deadline := time.Now().Add(cfg.VM.BootTimeout)
 	for {
 		ok, why, err := vm.Fits(ctx, cfg, fl, 0)
 		if err != nil {
-			return nil, err
+			return nil, "cold", err
 		}
 		if ok {
 			break
 		}
+		if inst := fromPool(); inst != nil {
+			return inst, "pool", nil
+		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("no host memory for another microVM within %s (%s); lower runner concurrent or pool.size", cfg.VM.BootTimeout, why)
+			return nil, "cold", fmt.Errorf("no host memory for another microVM within %s (%s); lower runner concurrent or pool.size", cfg.VM.BootTimeout, why)
 		}
 		fmt.Printf("waiting for host memory (%s)...\n", why)
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, "cold", ctx.Err()
 		case <-time.After(5 * time.Second):
 		}
 	}
 	fmt.Printf("Creating microVM %s (%s)\n", id, cfg.VM.RootFSImage)
-	return vm.Boot(ctx, cfg, fl, id, map[string]string{
+	inst, err := vm.Boot(ctx, cfg, fl, id, map[string]string{
 		daemon.LabelRole:      "job",
 		daemon.LabelJob:       id,
 		"firerunner/project":  strings.ReplaceAll(os.Getenv("CUSTOM_ENV_CI_PROJECT_PATH"), "/", "."),
 		"firerunner/pipeline": os.Getenv("CUSTOM_ENV_CI_PIPELINE_ID"),
 	})
+	return inst, "cold", err
 }
 
 func writeDockerAuth(cfg config.Config, inst *vm.Instance, auth string) error {

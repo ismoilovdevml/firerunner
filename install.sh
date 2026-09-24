@@ -22,6 +22,8 @@
 #   FR_POOL_SIZE            pre-booted microVMs kept ready (default: 2)
 #   FR_METRICS_ALLOW        source CIDR allowed to scrape :9477/metrics (default: none, localhost only)
 #   REGISTRY_VERSION        Docker Hub pull-through mirror for microVMs (default: 3.1.1)
+#   VERSITYGW_VERSION       S3 server for the runner's cache: (default: 1.8.0)
+#   FR_CACHE_DAYS           delete cache: archives not written for this many days (default: 14)
 #   GITLAB_RUNNER_VERSION   (default: 19.4.0)
 #
 # Register a GitLab runner right away (optional, can be done later with
@@ -39,6 +41,8 @@ CONTAINERD_VERSION="${CONTAINERD_VERSION:-1.7.35}"
 FIRECRACKER_VERSION="${FIRECRACKER_VERSION:-1.17.0}"
 FLINTLOCK_VERSION="${FLINTLOCK_VERSION:-0.15.2}"
 REGISTRY_VERSION="${REGISTRY_VERSION:-3.1.1}"
+VERSITYGW_VERSION="${VERSITYGW_VERSION:-1.8.0}"
+FR_CACHE_DAYS="${FR_CACHE_DAYS:-14}"
 GITLAB_RUNNER_VERSION="${GITLAB_RUNNER_VERSION:-19.4.0}"
 FR_VERSION="${FR_VERSION:-edge}"
 FR_BINARY="${FR_BINARY:-}"            # local firerunner binary instead of a release (development)
@@ -334,10 +338,11 @@ table inet firerunner {
   }
   chain input {
     type filter hook input priority filter; policy accept;
-    # microVMs may only use DHCP, DNS and the registry mirror on the host (IPv4 and IPv6)
+    # microVMs may only use DHCP, DNS, the registry mirror and the cache server on the host
+    # (IPv4 and IPv6)
     iifname "${FR_BRIDGE}" udp dport { 53, 67 } accept
     iifname "${FR_BRIDGE}" tcp dport 53 accept
-    iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport 5000 accept
+    iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport { 5000, 9000 } accept
     iifname "${FR_BRIDGE}" ct state established,related accept
     iifname "${FR_BRIDGE}" drop
   }
@@ -536,6 +541,86 @@ WantedBy=multi-user.target
 EOF
 }
 
+# S3 server for gitlab-runner's cache: (versitygw, plain files on disk). Jobs only get
+# presigned URLs from the runner, so the keys stay on the host.
+install_cache_server() {
+    local have=""
+    [[ -x $BIN_DIR/versitygw ]] && have=$($BIN_DIR/versitygw --version 2>/dev/null | awk '/^Version/ {print $3}' || true)
+    if [[ "$have" != "${VERSITYGW_VERSION}" ]]; then
+        log "installing cache server (versitygw v${VERSITYGW_VERSION})"
+        local base="https://github.com/versity/versitygw/releases/download/v${VERSITYGW_VERSION}"
+        local dir="versitygw_v${VERSITYGW_VERSION}_Linux_x86_64"
+        fetch "$base/$dir.tar.gz" "$TMP_DIR/$dir.tar.gz"
+        fetch "$base/checksums.txt" "$TMP_DIR/versitygw.sums"
+        verify "$TMP_DIR/$dir.tar.gz" "$(awk -v f="$dir.tar.gz" '$2==f {print $1}' "$TMP_DIR/versitygw.sums")"
+        tar -xzf "$TMP_DIR/$dir.tar.gz" -C "$TMP_DIR" "$dir/versitygw"
+        install -m 0755 "$TMP_DIR/$dir/versitygw" "$BIN_DIR/versitygw"
+        installed "$BIN_DIR/versitygw"
+    fi
+    # The top-level directory is the S3 root; each sub-directory is a bucket.
+    mkdir -p /var/lib/firerunner/cache/runner-cache
+    local key secret
+    key=$(sed -n 's/^ROOT_ACCESS_KEY_ID=//p' "$CONF_DIR/cache.env" 2>/dev/null || true)
+    secret=$(sed -n 's/^ROOT_SECRET_ACCESS_KEY=//p' "$CONF_DIR/cache.env" 2>/dev/null || true)
+    # Read a fixed amount (no SIGPIPE under pipefail), then cut: ~70 and ~120 chars survive tr.
+    [[ -n $key ]] || { key=$(head -c 512 /dev/urandom | tr -dc 'A-Z0-9'); key=${key:0:20}; }
+    [[ -n $secret ]] || { secret=$(head -c 512 /dev/urandom | tr -dc 'A-Za-z0-9'); secret=${secret:0:40}; }
+    put "$CONF_DIR/cache.env" 0600 <<EOF
+VGW_PORT=${FR_SUBNET}.1:9000
+ROOT_ACCESS_KEY_ID=${key}
+ROOT_SECRET_ACCESS_KEY=${secret}
+FR_CACHE_BUCKET=runner-cache
+EOF
+    put /etc/systemd/system/firerunner-cache.service <<EOF
+[Unit]
+Description=FireRunner S3 cache server for GitLab cache:
+Requires=firerunner-net.service
+After=firerunner-net.service
+
+[Service]
+EnvironmentFile=${CONF_DIR}/cache.env
+ExecStart=${BIN_DIR}/versitygw posix /var/lib/firerunner/cache
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/firerunner/cache
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    put /etc/systemd/system/firerunner-cache-clean.service <<EOF
+[Unit]
+Description=Delete FireRunner cache: archives older than ${FR_CACHE_DAYS} days
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/find /var/lib/firerunner/cache/runner-cache -mindepth 1 -type f -mtime +${FR_CACHE_DAYS} -delete
+ExecStart=/usr/bin/find /var/lib/firerunner/cache/runner-cache -mindepth 1 -type d -empty -delete
+EOF
+    put /etc/systemd/system/firerunner-cache-clean.timer <<EOF
+[Unit]
+Description=Daily cleanup of the FireRunner cache
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# Point the registered runner's cache: at the local cache server, unless an
+# operator already configured one (firerunner runner cache s3 ...).
+configure_runner_cache() {
+    $BIN_DIR/firerunner runner status 2>/dev/null | grep -q '^cache *none' || return 0
+    log "storing cache: on this host (firerunner runner cache)"
+    $BIN_DIR/firerunner runner cache local >/dev/null
+}
+
 open_metrics_port() {
     [[ -n $FR_METRICS_ALLOW ]] || return 0
     log "allowing ${FR_METRICS_ALLOW} to scrape :9477/metrics"
@@ -638,13 +723,14 @@ register_runner() {
 start_services() {
     systemctl daemon-reload
     local svc files
-    for svc in containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry flintlockd; do
+    for svc in containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd; do
         systemctl enable -q "$svc"
         case $svc in
             containerd-flintlock) files="$CONF_DIR/containerd.toml $BIN_DIR/containerd" ;;
             firerunner-net)       files="$LIB_DIR/net-up.sh" ;;
             firerunner-dnsmasq)   files="$CONF_DIR/dnsmasq.conf" ;;
             firerunner-registry)  files="$CONF_DIR/registry.yml $BIN_DIR/registry" ;;
+            firerunner-cache)     files="$CONF_DIR/cache.env $BIN_DIR/versitygw" ;;
             flintlockd)           files="/etc/opt/flintlockd/config.yaml $BIN_DIR/flintlockd $BIN_DIR/firecracker" ;;
         esac
         # shellcheck disable=SC2086
@@ -653,12 +739,13 @@ start_services() {
             systemctl restart "$svc"
         fi
     done
+    systemctl enable -q --now firerunner-cache-clean.timer
 }
 
 verify_install() {
     log "verifying"
     local ok=1 svc
-    for svc in containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry flintlockd firerunner; do
+    for svc in containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd firerunner; do
         if systemctl is-active -q "$svc"; then
             log "  $svc: active"
         else
@@ -707,12 +794,14 @@ uninstall() {
         $BIN_DIR/gitlab-runner uninstall --service gitlab-runner >/dev/null 2>&1 || true
         rm -f "$BIN_DIR/gitlab-runner"
     fi
-    for svc in firerunner flintlockd firerunner-registry firerunner-dnsmasq firerunner-net containerd-flintlock; do
+    systemctl disable --now -q firerunner-cache-clean.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/firerunner-cache-clean.{service,timer}
+    for svc in firerunner flintlockd firerunner-cache firerunner-registry firerunner-dnsmasq firerunner-net containerd-flintlock; do
         systemctl disable --now -q "$svc" 2>/dev/null || true
         rm -f "/etc/systemd/system/$svc.service"
     done
     systemctl daemon-reload
-    rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry"
+    rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry" "$BIN_DIR/versitygw"
     rm -rf "$LIB_DIR"
     log "done. To also drop data: vgremove $VG && rm -rf $CONTAINERD_ROOT /var/lib/flintlock $CONF_DIR"
 }
@@ -732,6 +821,7 @@ main() {
     setup_network
     install_flintlock
     install_registry_mirror
+    install_cache_server
     start_services
     install_firerunner
     systemctl daemon-reload
@@ -742,6 +832,7 @@ main() {
     open_metrics_port
     verify_install
     register_runner
+    configure_runner_cache
 }
 
 main "$@"

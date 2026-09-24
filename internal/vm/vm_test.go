@@ -51,6 +51,7 @@ func TestLeaseIP(t *testing.T) {
 
 func TestSpec(t *testing.T) {
 	cfg := config.Default()
+	cfg.VM.KernelCmdline["quiet"] = "1"
 	s := Spec(cfg, "job-7", MAC("job-7"), "ssh-ed25519 AAAA test", HostKey{Private: "PRIV", Public: "ssh-ed25519 HOST"}, map[string]string{"a": "b"})
 	if s.GetVcpu() != 2 || s.GetMemoryInMb() != 2048 {
 		t.Fatalf("size: %d %d", s.GetVcpu(), s.GetMemoryInMb())
@@ -59,8 +60,8 @@ func TestSpec(t *testing.T) {
 	if iface.GetType() != types.NetworkInterface_TAP || iface.GetGuestMac() != MAC("job-7") {
 		t.Fatalf("interface: %v", iface)
 	}
-	if s.GetKernel().GetCmdline()["acpi"] != "off" {
-		t.Fatal("acpi=off missing")
+	if s.GetKernel().GetCmdline()["quiet"] != "1" || s.GetKernel().GetImage() != config.DefaultKernelImage {
+		t.Fatalf("kernel: %v", s.GetKernel())
 	}
 	ud, err := base64.StdEncoding.DecodeString(s.GetMetadata()["user-data"])
 	if err != nil || !strings.Contains(string(ud), "ssh-ed25519 AAAA test") || !strings.HasPrefix(string(ud), "#cloud-config") {

@@ -33,6 +33,8 @@ RUN curl -fsSL -o /usr/local/bin/gitlab-runner \
         | awk -v f="binaries/gitlab-runner-linux-${TARGETARCH}" '$2 == f {print $1 "  /usr/local/bin/gitlab-runner"}' | sha256sum -c - \
     && chmod 0755 /usr/local/bin/gitlab-runner
 
+COPY firerunner-netfilter /usr/local/sbin/firerunner-netfilter
+
 # /etc/resolv.conf is bind-mounted during the build, so link it at boot instead.
 RUN printf 'L+ /etc/resolv.conf - - - - /run/systemd/resolve/stub-resolv.conf\n' >/etc/tmpfiles.d/resolv.conf \
     # Flintlock serves meta-data/user-data over MMDS (ds=nocloud-net on the kernel cmdline).
@@ -43,12 +45,10 @@ RUN printf 'L+ /etc/resolv.conf - - - - /run/systemd/resolve/stub-resolv.conf\n'
     # Docker starts on first use (socket activation) so it does not slow down boot.
     && systemctl disable docker.service containerd.service \
     && systemctl enable docker.socket \
-    # The guest kernel has legacy iptables NAT built in; nf_tables is only a module.
-    && update-alternatives --set iptables /usr/sbin/iptables-legacy \
-    && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy \
-    # ...and no iptables raw table, which Docker 28 uses for direct-access filtering.
+    # iptables backend chosen at start from what the guest kernel supports.
     && mkdir -p /etc/systemd/system/docker.service.d \
-    && printf '[Service]\nEnvironment=DOCKER_INSECURE_NO_IPTABLES_RAW=1\n' >/etc/systemd/system/docker.service.d/firerunner.conf \
+    && printf '[Service]\nExecStartPre=/usr/local/sbin/firerunner-netfilter\nEnvironmentFile=-/run/firerunner-docker.env\n' \
+        >/etc/systemd/system/docker.service.d/firerunner.conf \
     && systemctl enable ssh \
     && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config \
     && rm -f /etc/ssh/ssh_host_*_key* \

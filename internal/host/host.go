@@ -62,6 +62,10 @@ type Runner struct {
 	URL        string
 	Executor   string
 	Concurrent int
+	// CacheType is the shared cache backend ("s3") or empty when cache: only
+	// lives inside the job VM.
+	CacheType   string
+	CacheServer string
 }
 
 func ReadRunner() (*Runner, error) {
@@ -92,7 +96,13 @@ func ReadRunner() (*Runner, error) {
 	if r.URL == "" {
 		return nil, errors.New("no runner registered")
 	}
-	return r, sc.Err()
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if b, err := os.ReadFile(RunnerConfig); err == nil {
+		r.CacheType, r.CacheServer = cacheFromConfig(string(b))
+	}
+	return r, nil
 }
 
 // RegisterRunner registers a runner that uses `firerunner executor` for every job.
@@ -130,6 +140,11 @@ func RegisterRunner(url, token, name string, concurrent int) error {
 	}
 	if err := SetConcurrent(concurrent); err != nil {
 		return err
+	}
+	if c, err := LocalCache(); err == nil {
+		if err := SetCache(c); err != nil {
+			return err
+		}
 	}
 	if err := os.Chmod(RunnerConfig, 0o600); err != nil {
 		return err

@@ -62,6 +62,7 @@ Orphans (VMs whose job is gone) are deleted automatically every `daemon.reconcil
 | `firerunner-net` | bridge, NAT, nftables |
 | `firerunner-dnsmasq` | DHCP/DNS for microVMs |
 | `firerunner-registry` | Docker Hub pull-through cache |
+| `firerunner-cache` | S3 store for `cache:` ([versitygw](https://github.com/versity/versitygw), files in `/var/lib/firerunner/cache`); `firerunner-cache-clean.timer` deletes archives older than `FR_CACHE_DAYS` (14) |
 | `firerunner` | daemon: pool, reconcile, metrics |
 | `gitlab-runner` | talks to GitLab, calls `firerunner executor` |
 

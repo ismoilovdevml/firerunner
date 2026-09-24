@@ -28,7 +28,8 @@ journalctl -u flintlockd -n 100
 | Symptom | Cause / fix |
 |---|---|
 | `got no DHCP lease within 3m` | `firerunner-dnsmasq` or `firerunner-net` down; the guest failed to boot (see `vm logs`) |
-| console shows `Unable to mount root fs`, virtio probe error `-22` | the guest kernel needs `acpi=off` (default); do not unset `vm.kernel_cmdline.acpi` with the 5.10 kernel |
+| console shows `Unable to mount root fs` / `Cannot open root device` | kernel and cmdline do not match: FireRunner's kernel needs ACPI (no `acpi=off`); flintlock's old 5.10 kernel needs `acpi=off` |
+| `cache:` shows `Failed to extract cache` on the first run | normal: nothing cached yet. If it repeats: `firerunner doctor` (cache server), `journalctl -u firerunner-cache` |
 | `did not answer SSH` | cloud-init failed in the guest; check `vm logs` |
 | `waiting for host memory` forever | lower `runner concurrent` or `pool.size`, or add RAM ([Capacity](capacity.md)) |
 | `failed reading from content store` | transient flintlockd race during deletes; retried automatically |

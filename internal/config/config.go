@@ -19,6 +19,13 @@ import (
 // DefaultPath is where install.sh writes the config. FIRERUNNER_CONFIG overrides it.
 const DefaultPath = "/etc/firerunner/config.yaml"
 
+// DefaultKernelImage is FireRunner's guest kernel (images/kernel).
+const DefaultKernelImage = "ghcr.io/ismoilovdevml/firerunner-kernel:6.18.53"
+
+// legacyKernelImage was the default before FireRunner built its own kernel. It
+// needed acpi=off; configs that still name it are moved to DefaultKernelImage.
+const legacyKernelImage = "ghcr.io/liquidmetal-dev/flintlock-kernel:5.10.77"
+
 type Config struct {
 	Flintlock Flintlock `yaml:"flintlock"`
 	VM        VM        `yaml:"vm"`
@@ -80,11 +87,10 @@ func Default() Config {
 			Namespace: "firerunner",
 		},
 		VM: VM{
-			VCPU:        2,
-			MemoryMB:    2048,
-			KernelImage: "ghcr.io/liquidmetal-dev/flintlock-kernel:5.10.77",
-			// The 5.10 kernel cannot parse the ACPI tables of Firecracker >= 1.11.
-			KernelCmdline:     map[string]string{"acpi": "off"},
+			VCPU:              2,
+			MemoryMB:          2048,
+			KernelImage:       DefaultKernelImage,
+			KernelCmdline:     map[string]string{},
 			RootFSImage:       "ghcr.io/ismoilovdevml/firerunner-rootfs:latest",
 			BootTimeout:       3 * time.Minute,
 			HostReserveMB:     1024,
@@ -126,7 +132,18 @@ func Load(path string) (Config, error) {
 	if err := decode(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("%s: %w", path, err)
 	}
+	migrate(&cfg)
 	return cfg, cfg.Validate()
+}
+
+// migrate moves configs written for the legacy kernel to the current one.
+func migrate(cfg *Config) {
+	if cfg.VM.KernelImage == legacyKernelImage {
+		cfg.VM.KernelImage = DefaultKernelImage
+		if cfg.VM.KernelCmdline["acpi"] == "off" {
+			delete(cfg.VM.KernelCmdline, "acpi")
+		}
+	}
 }
 
 func decode(data []byte, cfg *Config) error {

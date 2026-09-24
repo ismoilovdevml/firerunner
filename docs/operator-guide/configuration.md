@@ -23,8 +23,8 @@ and replaces pool VMs that were booted with the old settings.
 | `vm.memory_mb` | `2048` | 256–65536 |
 | `vm.boot_timeout` | `3m` | time to DHCP lease + SSH, min 10s |
 | `vm.rootfs_image` | `ghcr.io/ismoilovdevml/firerunner-rootfs:latest` | guest root filesystem (OCI image) |
-| `vm.kernel_image` | `ghcr.io/liquidmetal-dev/flintlock-kernel:5.10.77` | guest kernel (OCI image) |
-| `vm.kernel_cmdline.<arg>` | `acpi: off` | extra kernel arguments; remove with `config unset` |
+| `vm.kernel_image` | `ghcr.io/ismoilovdevml/firerunner-kernel:6.18.53` | guest kernel (OCI image, `/boot/vmlinux`), built from [`images/kernel`](https://github.com/ismoilovdevml/firerunner/tree/main/images/kernel) |
+| `vm.kernel_cmdline.<arg>` | none | extra kernel arguments; remove with `config unset` |
 | `vm.registry_mirror` | `http://<subnet>.1:5000` | Docker Hub mirror written to the guest's daemon.json |
 | `vm.docker_bip` | `10.201.0.1/24` | guest Docker default bridge |
 | `vm.docker_address_pool` | `10.202.0.0/16` | guest Docker user networks |

@@ -70,11 +70,47 @@ image-build:
 
 `docker buildx` and `docker compose` are installed.
 
-!!! tip "Build speed"
-    Every job starts with an empty Docker layer cache. Base images from Docker Hub come from a
-    cache on the runner host; ask your operator to add frequently used non-Docker-Hub images to
-    `pool.preload_images`. For layer caching use BuildKit's registry cache:
-    `docker buildx build --cache-from type=registry,ref=$CI_REGISTRY_IMAGE:cache --cache-to type=registry,ref=$CI_REGISTRY_IMAGE:cache,mode=max ...`
+Every job starts with an empty Docker layer cache. Base images from Docker Hub come from a
+cache on the runner host; ask your operator to add frequently used non-Docker-Hub images to
+`pool.preload_images`. To reuse layers between pipelines, keep BuildKit's cache in `cache:`:
+
+```yaml
+image-build:
+  tags: [firecracker]
+  cache:
+    key: buildx-$CI_COMMIT_REF_SLUG
+    paths: [.buildx-cache/]
+  script:
+    - docker buildx build
+        --cache-from type=local,src=.buildx-cache
+        --cache-to type=local,dest=.buildx-cache-new,mode=max
+        -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" --push .
+    - rm -rf .buildx-cache && mv .buildx-cache-new .buildx-cache
+```
+
+Or keep it in your registry instead: `--cache-from type=registry,ref=$CI_REGISTRY_IMAGE:cache
+--cache-to type=registry,ref=$CI_REGISTRY_IMAGE:cache,mode=max`.
+
+## Cache
+
+`cache:` works like on any runner. The runner host stores it (per project) and restores it in the
+next pipeline:
+
+```yaml
+test:
+  tags: [firecracker]
+  image: node:22-alpine
+  cache:
+    key: npm-$CI_COMMIT_REF_SLUG
+    paths: [.npm/]
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm test
+```
+
+Only paths inside the project directory can be cached (same as on other executors). Point tool
+caches there: `npm --cache .npm`, `pip --cache-dir .pip-cache`, `NUGET_PACKAGES: $CI_PROJECT_DIR/.nuget`,
+`GOMODCACHE: $CI_PROJECT_DIR/.go`, `GRADLE_USER_HOME: $CI_PROJECT_DIR/.gradle`.
 
 ## Services
 
@@ -117,8 +153,8 @@ it into the job VM (`/root/.docker/config.json`) before your script runs, so bot
 | Docker-in-Docker | `docker:dind` + privileged | **built in, not privileged** |
 | Leftovers from previous jobs | possible (volumes, cache) | **never** |
 | `services:` | supported | supported (containers in the job VM) |
-| `cache:` between jobs | local | not yet ([#26](https://github.com/ismoilovdevml/firerunner/issues/26)) |
-| Docker layer cache | shared on the host | per job (see tip above) |
+| `cache:` between jobs | local | stored on the runner host (S3), per project |
+| Docker layer cache | shared on the host | through `cache:` or your registry (see above) |
 
 ## Resources
 

@@ -1,9 +1,9 @@
-name: Images
+name: Kernel
 
 on:
   push:
     branches: [ main ]
-    paths: [ 'images/rootfs/**', '.github/workflows/images.yml' ]
+    paths: [ 'images/kernel/**', '.github/workflows/kernel.yml' ]
   workflow_dispatch:
 
 permissions:
@@ -11,12 +11,16 @@ permissions:
   packages: write
 
 jobs:
-  rootfs:
-    name: rootfs
+  kernel:
+    name: guest kernel
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Kernel version
+        id: version
+        run: echo "version=$(sed -n 's/^ARG KERNEL_VERSION=//p' images/kernel/Dockerfile)" >>"$GITHUB_OUTPUT"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -31,10 +35,11 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
-          context: images/rootfs
+          context: images/kernel
           platforms: linux/amd64
           push: true
           provenance: false
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/firerunner-rootfs:latest
-            ghcr.io/${{ github.repository_owner }}/firerunner-rootfs:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/firerunner-kernel:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/firerunner-kernel:${{ github.sha }}
