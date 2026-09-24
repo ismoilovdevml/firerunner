@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -271,5 +272,40 @@ func TestBusyBuilderIsKept(t *testing.T) {
 	}
 	if d.builders["2"] == nil || d.builders["1"] != nil {
 		t.Fatalf("evicted the busy builder instead of the idle one: %v", d.builders)
+	}
+}
+
+// After a failed boot the project gets "busy" for a while instead of a new
+// boot on every poll of its waiting jobs.
+func TestFailedBuilderBootCoolsDown(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	var boots atomic.Int32
+	done := make(chan struct{}, 4)
+	builderBoot = func(d *Daemon, _ context.Context, _ config.Config, project string) {
+		boots.Add(1)
+		d.mu.Lock()
+		delete(d.builders, project)
+		d.builderFailed[project] = time.Now()
+		d.mu.Unlock()
+		done <- struct{}{}
+	}
+	d, _ := newTestDaemon(t)
+	d.Builder("7")
+	<-done
+	for i := 0; i < 4; i++ {
+		if got := d.Builder("7").State; got != BuilderBusy {
+			t.Fatalf("during cooldown: %s, want busy", got)
+		}
+	}
+	if n := boots.Load(); n != 1 {
+		t.Fatalf("%d boots for one failing project, want 1", n)
+	}
+	d.mu.Lock()
+	d.builderFailed["7"] = time.Now().Add(-builderRetryAfter - time.Second)
+	d.mu.Unlock()
+	d.Builder("7")
+	<-done
+	if n := boots.Load(); n != 2 {
+		t.Fatalf("no retry after the cooldown (boots=%d)", n)
 	}
 }

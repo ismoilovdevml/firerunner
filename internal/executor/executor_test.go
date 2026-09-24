@@ -2,6 +2,8 @@ package executor
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -48,21 +50,53 @@ func TestRunWithoutPrepareIsSystemFailure(t *testing.T) {
 	}
 }
 
-func TestJobIDRejectsNonNumeric(t *testing.T) {
-	for _, v := range []string{"/../../../etc/x", "12 3", "1;reboot", "abc", "123456789012345678901"} {
-		t.Setenv("CUSTOM_ENV_CI_JOB_ID", v)
-		if id, err := jobID(); err == nil {
-			t.Errorf("%q accepted as %q", v, id)
+// writePayload points JOB_RESPONSE_FILE at a job payload like gitlab-runner writes.
+func writePayload(t *testing.T, payload string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "response.json")
+	if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("JOB_RESPONSE_FILE", path)
+}
+
+func TestJobIdentityComesFromThePayload(t *testing.T) {
+	writePayload(t, `{"id":74196,"token":"x","job_info":{"project_id":111,"name":"build"}}`)
+	// A job can set these variables to someone else's ids; they must not matter.
+	t.Setenv("CUSTOM_ENV_CI_JOB_ID", "75226")
+	t.Setenv("CUSTOM_ENV_CI_PROJECT_ID", "28")
+	j, err := currentJob()
+	if err != nil || j.ID != "job-74196" || j.Project != "111" {
+		t.Fatalf("currentJob = %+v, %v", j, err)
+	}
+}
+
+func TestJobIdentityFailures(t *testing.T) {
+	for name, payload := range map[string]string{
+		"no id":        `{"job_info":{"project_id":1}}`,
+		"negative id":  `{"id":-3}`,
+		"string id":    `{"id":"../../etc/x"}`,
+		"not json":     `id=5`,
+		"empty object": `{}`,
+	} {
+		writePayload(t, payload)
+		if j, err := currentJob(); err == nil {
+			t.Errorf("%s: accepted as %+v", name, j)
 		}
 	}
-	t.Setenv("CUSTOM_ENV_CI_JOB_ID", "74196")
-	if id, err := jobID(); err != nil || id != "job-74196" {
-		t.Fatalf("numeric id: %q %v", id, err)
+	writePayload(t, `{"id":5}`) // no project: builder is skipped, the job still runs
+	if j, err := currentJob(); err != nil || j.ID != "job-5" || j.Project != "" {
+		t.Errorf("payload without project: %+v %v", j, err)
+	}
+	t.Setenv("JOB_RESPONSE_FILE", "")
+	t.Setenv("CUSTOM_ENV_CI_JOB_ID", "5")
+	if _, err := jobID(); err == nil {
+		t.Error("CUSTOM_ENV_CI_JOB_ID must not be used without JOB_RESPONSE_FILE")
 	}
 }
 
 func TestLeadingDashImageIsRejected(t *testing.T) {
-	t.Setenv("CUSTOM_ENV_CI_JOB_ID", "77")
+	writePayload(t, `{"id":77}`)
 	t.Setenv("CUSTOM_ENV_CI_JOB_IMAGE", "--privileged")
 	// No state file exists, so a system failure is expected before the image check;
 	// the image check itself is covered by ContainerCommand never seeing it.

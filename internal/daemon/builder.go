@@ -40,6 +40,10 @@ const BuilderServerName = "builder"
 // builderMaxAge replaces a builder even when busy, so it picks up new images.
 const builderMaxAge = 7 * 24 * time.Hour
 
+// builderRetryAfter keeps a project from booting its builder again right after
+// a failed boot; jobs poll while they wait, and each poll would start a boot.
+const builderRetryAfter = 2 * time.Minute
+
 // BuilderInfo is what a job needs to use its project's builder.
 type BuilderInfo struct {
 	State string `json:"state"`
@@ -98,6 +102,10 @@ func (d *Daemon) Builder(project string) BuilderInfo {
 	cfg := d.cfg
 	if !cfg.Builder.Enabled || cfg.Builder.Max == 0 {
 		return BuilderInfo{State: BuilderDisabled}
+	}
+	if at, ok := d.builderFailed[project]; ok && time.Since(at) < builderRetryAfter {
+		d.metrics.builderRequests.WithLabelValues(BuilderBusy).Inc()
+		return BuilderInfo{State: BuilderBusy}
 	}
 	if b, ok := d.builders[project]; ok {
 		b.LastUsed = time.Now()
@@ -178,6 +186,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		if b, ok := d.builders[project]; ok && !b.ready {
 			delete(d.builders, project)
 		}
+		d.builderFailed[project] = time.Now()
 		d.mu.Unlock()
 		if inst != nil {
 			d.delete(context.Background(), inst, "builder setup failed")

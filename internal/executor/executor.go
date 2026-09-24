@@ -7,12 +7,12 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -42,19 +42,51 @@ func buildFailure(err error) error {
 	return &ExitError{Code: envInt("BUILD_FAILURE_EXIT_CODE", 1), Err: err}
 }
 
-var numericID = regexp.MustCompile(`^[0-9]{1,20}$`)
+// job is who the running job is, as gitlab-runner received it from GitLab.
+type job struct {
+	ID      string // microVM id: "job-<CI job id>"
+	Project string // GitLab project id, "" if unknown
+}
 
-// jobID derives the microVM id from the GitLab job id. It becomes a host file
-// name, a guest hostname and a flintlock id, so only a plain number is accepted.
+// currentJob reads the job from JOB_RESPONSE_FILE, which gitlab-runner writes
+// from the job payload for every stage. CUSTOM_ENV_CI_JOB_ID and
+// CUSTOM_ENV_CI_PROJECT_ID must not be used: they are job variables, and a job
+// can set them to another job's or project's id (to reach that job's VM or
+// that project's builder). Job variables always carry the CUSTOM_ENV_ prefix,
+// so they cannot replace JOB_RESPONSE_FILE itself.
+func currentJob() (job, error) {
+	path := os.Getenv("JOB_RESPONSE_FILE")
+	if path == "" {
+		return job{}, errors.New("JOB_RESPONSE_FILE is not set; this command is run by gitlab-runner")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return job{}, fmt.Errorf("reading the job payload: %w", err)
+	}
+	var payload struct {
+		ID      int64 `json:"id"`
+		JobInfo struct {
+			ProjectID int64 `json:"project_id"`
+		} `json:"job_info"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return job{}, fmt.Errorf("parsing the job payload: %w", err)
+	}
+	if payload.ID <= 0 {
+		return job{}, errors.New("the job payload has no job id")
+	}
+	j := job{ID: "job-" + strconv.FormatInt(payload.ID, 10)}
+	if payload.JobInfo.ProjectID > 0 {
+		j.Project = strconv.FormatInt(payload.JobInfo.ProjectID, 10)
+	}
+	return j, nil
+}
+
+// jobID is the microVM id of the running job. It becomes a host file name, a
+// guest hostname and a flintlock id; currentJob only yields "job-<number>".
 func jobID() (string, error) {
-	id := os.Getenv("CUSTOM_ENV_CI_JOB_ID")
-	if id == "" {
-		return "", errors.New("CUSTOM_ENV_CI_JOB_ID is not set; this command is run by gitlab-runner")
-	}
-	if !numericID.MatchString(id) {
-		return "", fmt.Errorf("CUSTOM_ENV_CI_JOB_ID %q is not a numeric job id", id)
-	}
-	return "job-" + id, nil
+	j, err := currentJob()
+	return j.ID, err
 }
 
 func statePath(id string) string { return filepath.Join(StateDir, id+".json") }
@@ -106,8 +138,8 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	// Shell-mode jobs run docker on the VM; their builds can use the project's
 	// warm BuildKit builder. A failure here only costs the cache, never the job.
 	if os.Getenv("CUSTOM_ENV_CI_JOB_IMAGE") == "" {
-		if project := os.Getenv("CUSTOM_ENV_CI_PROJECT_ID"); useBuilder(cfg, dc, inst, project) {
-			st.BuilderProject = project
+		if j, err := currentJob(); err == nil && j.Project != "" && useBuilder(cfg, dc, inst, j.Project) {
+			st.BuilderProject = j.Project
 			_ = vm.SaveJobState(statePath(id), st)
 		}
 	}

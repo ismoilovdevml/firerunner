@@ -158,7 +158,9 @@ type Daemon struct {
 	claimed    map[string]time.Time // uid -> claim time; protects it until the job writes its state
 	firstSee   map[string]time.Time // uid -> first time reconcile saw it
 	builders   map[string]*builder  // project id -> BuildKit builder
-	runCtx     context.Context      // cancelled on shutdown; builders boot under it
+	// project id -> last failed builder boot (see builderRetryAfter)
+	builderFailed map[string]time.Time
+	runCtx        context.Context // cancelled on shutdown; builders boot under it
 }
 
 func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
@@ -172,7 +174,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 	}
 	d := &Daemon{cfgPath: cfgPath, log: log, cfg: cfg, fl: fl, metrics: NewMetrics(),
 		claimed: map[string]time.Time{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{},
-		builders: map[string]*builder{}, runCtx: context.Background()}
+		builders: map[string]*builder{}, builderFailed: map[string]time.Time{}, runCtx: context.Background()}
 	if fi, err := os.Stat(cfgPath); err == nil {
 		d.cfgMod = fi.ModTime()
 	}
