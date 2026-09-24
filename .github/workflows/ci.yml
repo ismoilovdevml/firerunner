@@ -50,7 +50,7 @@ jobs:
 
       - name: ShellCheck install.sh
         # shellcheck is preinstalled on ubuntu-latest runners.
-        run: shellcheck -S warning install.sh
+        run: shellcheck -S warning install.sh test/network/run.sh
 
   vulncheck:
     name: Vulnerability check
@@ -121,3 +121,19 @@ jobs:
           name: firerunner-binary
           path: build/firerunner
           retention-days: 7
+
+  network:
+    name: Host firewall rules
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # The rules must hold with br_netfilter (bridged traffic also passes the
+      # inet hooks, e.g. when Docker runs on the host) and without it.
+      - name: Test net-up.sh rules in network namespaces
+        run: |
+          sudo modprobe br_netfilter
+          for brnf in 1 0; do
+            docker run --rm --privileged -e BRNF=$brnf -v "$PWD":/src:ro ubuntu:24.04 bash /src/test/network/run.sh
+          done

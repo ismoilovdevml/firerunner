@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Functional test of the firewall install.sh writes (net-up.sh): network
+# namespaces stand in for microVMs on the bridge (one tap not named fltap*),
+# a builder, the host and an outside host.
+#
+# It changes the network of the machine it runs on, so run it in a privileged
+# throwaway container, once with and once without br_netfilter:
+#   docker run --rm --privileged -e BRNF=1 -v "$PWD":/src:ro ubuntu:24.04 bash /src/test/network/run.sh
+set -uo pipefail
+apt-get update -qq >/dev/null && apt-get install -y -qq nftables iproute2 netcat-openbsd iputils-ping >/dev/null || exit 99
+
+WORK=/work; mkdir -p $WORK
+# BRNF=1: br_netfilter active (bridged IPv4 also passes the inet hooks); 0: pure bridging.
+sysctl -qw net.bridge.bridge-nf-call-iptables="${BRNF:-1}" 2>/dev/null
+echo "MODE bridge-nf-call-iptables=$(cat /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || echo absent)"
+# Render net-up.sh with install.sh's own code (everything but the final `main "$@"`).
+INSTALL_SH=${INSTALL_SH:-/src/install.sh}
+[[ $(tail -n1 "$INSTALL_SH") == 'main "$@"' ]] || { echo "install.sh no longer ends with main \"\$@\""; exit 95; }
+sed '$d' "$INSTALL_SH" > $WORK/install-lib.sh
+(
+    # shellcheck disable=SC1091
+    source $WORK/install-lib.sh
+    # shellcheck disable=SC2034  # read by the install.sh functions
+    LIB_DIR=$WORK/lib CONF_DIR=$WORK/conf
+    systemctl() { return 1; }      # no firewalld
+    put() { local f=$1 mode=${2:-0644}; mkdir -p "$(dirname "$f")"; cat >"$f"; chmod "$mode" "$f"; }
+    setup_network >/dev/null
+)
+NETUP=$WORK/lib/net-up.sh
+[[ -x $NETUP ]] || { echo "net-up.sh not rendered"; exit 98; }
+bash -n $NETUP || exit 97
+
+pass=0 fail=0
+check() { # check "name" expected(ok|blocked) command...
+    local name=$1 want=$2; shift 2
+    if timeout 3 "$@" >/dev/null 2>&1; then got=ok; else got=blocked; fi
+    if [[ $got == "$want" ]]; then pass=$((pass+1)); echo "PASS  $name ($got)"; else fail=$((fail+1)); echo "FAIL  $name (want $want, got $got)"; fi
+}
+
+# ---- topology
+$NETUP || { echo "net-up.sh failed"; cat $NETUP; exit 96; }
+vm() { # vm NAME HOSTIF IP
+    ip netns add "$1"
+    ip link add "$2" type veth peer name eth0 netns "$1"
+    ip link set "$2" master br-fc up
+    ip -n "$1" addr add "$3/24" dev eth0
+    ip -n "$1" link set eth0 up; ip -n "$1" link set lo up
+    ip -n "$1" route add default via 10.200.0.1
+}
+vm vmA fltapA 10.200.0.11
+vm vmB fltapB 10.200.0.12
+vm bld tapbld  10.200.0.13        # a tap NOT matching fltap*
+# outside world: one netns reachable via a veth from the host
+ip netns add out
+ip link add up0 type veth peer name eth0 netns out
+ip addr add 192.0.2.1/24 dev up0; ip link set up0 up
+ip -n out addr add 192.0.2.50/24 dev eth0
+ip -n out link set eth0 up; ip -n out link set lo up
+ip -n out route add default via 192.0.2.1
+
+# listeners
+listen() { ( while true; do "$@" -l -k -n 2>/dev/null; sleep 0.1; done ) & }
+listen ip netns exec vmB nc 10.200.0.12 1234
+listen ip netns exec bld nc 10.200.0.13 1234
+listen nc 10.200.0.1 53
+listen nc 10.200.0.1 22
+listen nc 10.200.0.1 5000
+listen nc 0.0.0.0 9477
+listen ip netns exec out nc 192.0.2.50 80
+sleep 1
+
+# builder port map (what the daemon does)
+nft add element inet firerunner builders '{ 20001 : 10.200.0.13 . 1234 }'
+
+A="ip netns exec vmA"
+check "VM->VM same bridge (fltap names)"          blocked $A ping -c1 -W1 10.200.0.12
+check "VM->VM tap without fltap name"             blocked $A ping -c1 -W1 10.200.0.13
+check "VM->host DNS tcp/53 on .1"                 ok      $A nc -z -w2 10.200.0.1 53
+check "VM->host sshd tcp/22"                      blocked $A nc -z -w2 10.200.0.1 22
+check "VM->host registry tcp/5000"                ok      $A nc -z -w2 10.200.0.1 5000
+check "VM->host metrics tcp/9477"                 blocked $A nc -z -w2 10.200.0.1 9477
+check "VM->builder through DNAT .1:20001"         ok      $A nc -z -w2 10.200.0.1 20001
+ip -n vmA route add 10.200.0.13/32 via 10.200.0.1
+check "VM->builder routed via host, no DNAT"      blocked $A nc -z -w2 10.200.0.13 1234
+ip -n vmA route del 10.200.0.13/32
+check "VM->internet-like 192.0.2.50 (NAT)"        ok      $A nc -z -w2 192.0.2.50 80
+
+# reload keeps the daemon's builder mapping
+$NETUP || { echo "reload failed"; fail=$((fail+1)); }
+check "builder mapping survives a reload"          ok      bash -c "nft list map inet firerunner builders | grep -q '20001 : 10.200.0.13 . 1234'"
+check "VM->builder through DNAT after reload"      ok      $A nc -z -w2 10.200.0.1 20001
+check "VM->VM TCP to vmB blocked"                   blocked $A nc -z -w2 10.200.0.12 1234
+check "VM->VM still blocked after reload"          blocked $A ping -c1 -W1 10.200.0.12
+
+echo "---- rendered rules"; nft list table inet firerunner | sed -n '/chain input/,/^}/p'
+echo "RESULT pass=$pass fail=$fail"
+[[ $fail -eq 0 ]]

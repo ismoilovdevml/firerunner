@@ -327,6 +327,8 @@ ip addr replace ${FR_SUBNET}.1/24 dev ${FR_BRIDGE}
 sysctl -qw net.ipv6.conf.${FR_BRIDGE}.disable_ipv6=1 2>/dev/null || true
 ip link set ${FR_BRIDGE} up
 sysctl -qw net.ipv4.ip_forward=1
+# Keep the daemon's builder port mappings across a reload of these rules.
+builders=\$(nft list map inet firerunner builders 2>/dev/null | tr -d '\n\t' | sed -n 's/.*elements = {\([^}]*\)}.*/\1/p' || true)
 nft -f - <<'NFT'
 table ip firerunner
 delete table ip firerunner
@@ -338,7 +340,9 @@ table inet firerunner {
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
     ip saddr ${FR_SUBNET}.0/24 oifname != "${FR_BRIDGE}" masquerade
-    iifname "${FR_BRIDGE}" oifname "${FR_BRIDGE}" ct status dnat masquerade
+    # builder hairpin: a builder answers the bridge address, not the job VM (iifname
+    # is not set here for bridged packets under br_netfilter, so match the source)
+    ip saddr ${FR_SUBNET}.0/24 oifname "${FR_BRIDGE}" ct status dnat masquerade
   }
   chain input {
     type filter hook input priority filter; policy accept;
@@ -350,6 +354,13 @@ table inet firerunner {
     iifname "${FR_BRIDGE}" ct state established,related accept
     iifname "${FR_BRIDGE}" drop
   }
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    # A job VM reaches its project's builder through the bridge address (DNAT
+    # below); any other traffic routed from one microVM to another is dropped.
+    iifname "${FR_BRIDGE}" oifname "${FR_BRIDGE}" ct status dnat accept
+    iifname "${FR_BRIDGE}" oifname "${FR_BRIDGE}" drop
+  }
   # Job VMs reach their project's BuildKit builder at ${FR_SUBNET}.1:<port>; the
   # firerunner daemon fills the map. Routed through the host, never VM to VM.
   map builders { type inet_service : ipv4_addr . inet_service; }
@@ -357,15 +368,30 @@ table inet firerunner {
     type nat hook prerouting priority dstnat; policy accept;
     iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 dnat ip to tcp dport map @builders
   }
+  # Every packet addressed to the bridge address is marked (before DNAT) for the
+  # bridge table below; it only reaches that table with br_netfilter.
+  chain tag_bridge_address {
+    type filter hook prerouting priority mangle; policy accept;
+    iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 meta mark set meta mark | 0x10000000
+  }
 }
-# Jobs of different projects share the bridge: no frame may pass between two microVMs.
+# Jobs of different projects share the bridge: no frame may pass between two
+# microVMs. Only frames from one bridge port to another reach this hook (traffic
+# to and from the host does not), so everything is dropped, whatever flintlock
+# names the taps. The exception is builder traffic: with br_netfilter loaded, a
+# connection DNAT'ed from the bridge address to a builder is bridged, not routed;
+# prerouting marks everything addressed to the bridge address. Without
+# br_netfilter the mark never reaches this table and nothing is bridged anyway.
 table bridge firerunner {
   chain forward {
-    type filter hook forward priority filter; policy accept;
-    iifname "fltap*" oifname "fltap*" drop
+    type filter hook forward priority filter; policy drop;
+    meta mark & 0x10000000 == 0x10000000 accept
   }
 }
 NFT
+if [[ -n \$builders ]]; then
+    nft add element inet firerunner builders "{ \$builders }" || true
+fi
 EOF
 
     put "$LIB_DIR/net-down.sh" 0755 <<EOF
@@ -390,6 +416,8 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=${LIB_DIR}/net-up.sh
+# Reload re-applies the rules in place; stop removes the bridge under running microVMs.
+ExecReload=${LIB_DIR}/net-up.sh
 ExecStop=${LIB_DIR}/net-down.sh
 
 [Install]
@@ -759,9 +787,18 @@ start_services() {
             flintlockd)           files="/etc/opt/flintlockd/config.yaml $BIN_DIR/flintlockd $BIN_DIR/firecracker" ;;
         esac
         # shellcheck disable=SC2086
-        if ! systemctl is-active -q "$svc" || changed "/etc/systemd/system/$svc.service" $files; then
-            log "  (re)starting $svc"
+        if ! systemctl is-active -q "$svc"; then
+            log "  starting $svc"
             systemctl restart "$svc"
+        elif changed "/etc/systemd/system/$svc.service" $files; then
+            if [[ $svc == firerunner-net ]]; then
+                # A restart would delete the bridge and cut every running microVM off.
+                log "  reloading $svc rules"
+                systemctl reload "$svc"
+            else
+                log "  restarting $svc"
+                systemctl restart "$svc"
+            fi
         fi
     done
     systemctl enable -q --now firerunner-cache-clean.timer

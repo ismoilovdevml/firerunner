@@ -28,7 +28,7 @@ control plane, or anything the next job will use.
 
 | Boundary | Control |
 |---|---|
-| Job and job | a new VM with its own kernel per job, never reused; frames between VMs are dropped on the bridge |
+| Job and job | a new VM with its own kernel per job, never reused; the host drops all traffic from one VM to another, on the bridge and routed through the host (a job reaches only its own project's builder, through the host) |
 | Job and host | the host accepts only DHCP, DNS, the Docker Hub cache and `cache:` storage from VMs |
 | Project and project | each builder has its own certificate authority; a job only gets the key for its own project's builder. `cache:` is stored per project and reached through short-lived signed URLs |
 | Host and VM | each VM gets its own SSH host key and every connection checks it, so scripts and secrets go only to the job's own VM. Job and project ids come from gitlab-runner, not from job variables |
@@ -40,7 +40,6 @@ Not covered yet:
 
 - VMs can reach your LAN through NAT, like a docker executor. Block it with a firewall rule for
   `10.200.0.0/24` if jobs must not.
-- A VM can still reach another VM by routing through the host. A fix is in review.
 
 The code was audited with
 [cloudflare/security-audit-skill](https://github.com/cloudflare/security-audit-skill); the findings
