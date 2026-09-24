@@ -41,6 +41,7 @@ type Server struct {
 	auth      []string
 	deletedCh chan string
 	hangDel   bool
+	delErrs   []error
 }
 
 // NewServer returns a server whose CreateMicroVM answers with createUID.
@@ -61,6 +62,13 @@ func (s *Server) HangDeletes() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hangDel = true
+}
+
+// FailDelete makes the next len(errs) DeleteMicroVM calls return errs in order.
+func (s *Server) FailDelete(errs ...error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.delErrs = append(s.delErrs, errs...)
 }
 
 // FailList makes the next len(errs) ListMicroVMs calls return errs in order.
@@ -131,7 +139,14 @@ func (s *Server) CreateMicroVM(_ context.Context, req *mvmv1.CreateMicroVMReques
 func (s *Server) DeleteMicroVM(ctx context.Context, req *mvmv1.DeleteMicroVMRequest) (*emptypb.Empty, error) {
 	s.mu.Lock()
 	hang := s.hangDel
+	var fail error
+	if len(s.delErrs) > 0 {
+		fail, s.delErrs = s.delErrs[0], s.delErrs[1:]
+	}
 	s.mu.Unlock()
+	if fail != nil {
+		return nil, fail
+	}
 	if hang {
 		<-ctx.Done()
 		return nil, ctx.Err()

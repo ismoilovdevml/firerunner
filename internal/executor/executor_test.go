@@ -6,9 +6,15 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/daemon"
+	"github.com/ismoilovdevml/firerunner/internal/flintlock/flintlocktest"
+	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
 func TestIsUserStage(t *testing.T) {
@@ -187,5 +193,57 @@ func TestBuildsImages(t *testing.T) {
 		if got := BuildsImages([]byte(script)); got != want {
 			t.Errorf("BuildsImages(%q) = %v, want %v", script, got, want)
 		}
+	}
+}
+
+// cleanupFixture points the executor at a fake flintlockd and a temporary
+// state dir holding job 555, whose microVM has uid "u1".
+func cleanupFixture(t *testing.T) (config.Config, *flintlocktest.Server) {
+	t.Helper()
+	srv := flintlocktest.NewServer("")
+	cfg := config.Default()
+	cfg.Flintlock = flintlocktest.StartUnix(t, srv)
+	cfg.Daemon.Socket = filepath.Join(t.TempDir(), "none.sock") // daemon down: events are dropped
+	cfg.Network.LeasesFile = filepath.Join(t.TempDir(), "leases")
+	oldDir, oldBackoff, oldKnown := StateDir, deleteBackoff, vm.KnownHostsDir
+	StateDir, deleteBackoff, vm.KnownHostsDir = t.TempDir(), 10*time.Millisecond, t.TempDir()
+	t.Cleanup(func() { StateDir, deleteBackoff, vm.KnownHostsDir = oldDir, oldBackoff, oldKnown })
+	writePayload(t, `{"id":555,"job_info":{"project_id":1}}`)
+	st := &vm.JobState{Instance: vm.Instance{ID: "job-555", UID: "u1"}, Source: "cold", StartedAt: time.Now()}
+	if err := vm.CreateJobState(statePath("job-555"), st); err != nil {
+		t.Fatal(err)
+	}
+	return cfg, srv
+}
+
+func TestCleanupRetriesTransientDelete(t *testing.T) {
+	cfg, srv := cleanupFixture(t)
+	srv.FailDelete(status.Error(codes.Unknown, "failed reading from content store"))
+	if err := Cleanup(cfg); err != nil {
+		t.Fatalf("Cleanup after one transient failure = %v", err)
+	}
+	if got := srv.Deleted(); len(got) != 1 || got[0] != "u1" {
+		t.Fatalf("deleted %v, want [u1]", got)
+	}
+	if _, err := os.Stat(statePath("job-555")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state file still there: %v", err)
+	}
+}
+
+// Nothing retries cleanup: a kept state file made reconcile treat the dead
+// job's VM as running for daemon.job_max_age.
+func TestCleanupDropsStateWhenDeleteKeepsFailing(t *testing.T) {
+	cfg, srv := cleanupFixture(t)
+	down := status.Error(codes.Unavailable, "down")
+	srv.FailDelete(down, down, down)
+	err := Cleanup(cfg)
+	if err == nil || !strings.Contains(err.Error(), "job-555") {
+		t.Fatalf("Cleanup = %v, want the delete error", err)
+	}
+	if _, err := os.Stat(statePath("job-555")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state file kept after a failed delete: %v", err)
+	}
+	if got := srv.Deleted(); len(got) != 0 {
+		t.Fatalf("deleted %v, want nothing", got)
 	}
 }

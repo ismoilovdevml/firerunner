@@ -25,8 +25,8 @@ import (
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
-// StateDir holds one JSON file per job in progress.
-const StateDir = "/run/firerunner/jobs"
+// StateDir holds one JSON file per job in progress (a variable for tests).
+var StateDir = "/run/firerunner/jobs"
 
 // ExitError carries the exit code gitlab-runner expects from a stage.
 type ExitError struct {
@@ -400,26 +400,58 @@ func Cleanup(cfg config.Config) error {
 		// The job was cancelled while prepare was still booting the microVM.
 		uid = found.GetSpec().GetUid()
 	}
+	var delErr error
 	if uid != "" {
-		if err := fl.Delete(ctx, uid); err != nil {
-			return fmt.Errorf("deleting microVM %s: %w", id, err)
+		if delErr = deleteWithRetry(ctx, fl, uid); delErr == nil {
+			fmt.Printf("microVM %s deleted\n", id)
 		}
-		fmt.Printf("microVM %s deleted\n", id)
 	}
 	if stErr == nil {
-		vm.Forget(cfg, st.ID)
-	}
-	if stErr == nil {
+		if delErr == nil {
+			// A VM that is still running keeps its lease and pinned key until
+			// the daemon deletes it (Daemon.delete forgets them then).
+			vm.Forget(cfg, st.ID)
+		}
 		result := "success"
 		if st.Failed {
 			result = "failed"
 		}
 		_ = daemon.NewClient(cfg.Daemon.Socket).Send(daemon.Event{Kind: "finish", Result: result, Seconds: time.Since(st.StartedAt).Seconds()})
 	}
+	// The state file goes even when the delete failed: nothing retries cleanup,
+	// and while the file exists reconcile treats the VM as a running job and
+	// keeps it (and its memory) for daemon.job_max_age. Without the file the
+	// daemon reclaims it as an orphan within minutes.
 	if err := os.Remove(statePath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+		return errors.Join(delErr, err)
+	}
+	if delErr != nil {
+		return fmt.Errorf("deleting microVM %s (the daemon reclaims it): %w", id, delErr)
 	}
 	return nil
+}
+
+// deleteBackoff is the pause before each retry of a failed delete (a variable for tests).
+var deleteBackoff = time.Second
+
+// deleteWithRetry retries a delete that flintlockd refuses transiently (it
+// fails calls while it garbage-collects another VM's spec).
+func deleteWithRetry(ctx context.Context, fl *flintlock.Client, uid string) error {
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if err = fl.Delete(ctx, uid); err == nil {
+			return nil
+		}
+		if attempt == 3 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(attempt) * deleteBackoff):
+		}
+	}
+	return err
 }
 
 func deleteVM(cfg config.Config, uid string) {
