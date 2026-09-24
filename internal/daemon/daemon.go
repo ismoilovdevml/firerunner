@@ -25,6 +25,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/liquidmetal-dev/flintlock/api/types"
+
 	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/flintlock"
 	"github.com/ismoilovdevml/firerunner/internal/host"
@@ -102,19 +104,14 @@ func (d *Daemon) savePoolLocked() {
 // adoptPool takes back idle pool VMs a previous daemon run left ready, so a
 // restart or upgrade does not throw the warm pool away. Anything that does not
 // match (gone, other config, too old, not answering) is left for reconcile.
-func (d *Daemon) adoptPool(ctx context.Context) {
+// vms is the flintlock listing taken at startup.
+func (d *Daemon) adoptPool(vms []*types.MicroVM) {
 	data, err := os.ReadFile(d.poolFile())
 	if err != nil {
 		return
 	}
 	var recs []poolRecord
 	if json.Unmarshal(data, &recs) != nil {
-		return
-	}
-	lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	vms, err := d.fl.List(lctx)
-	if err != nil {
 		return
 	}
 	live := map[string]bool{}
@@ -161,6 +158,49 @@ type Daemon struct {
 	// project id -> last failed builder boot (see builderRetryAfter)
 	builderFailed map[string]time.Time
 	runCtx        context.Context // cancelled on shutdown; builders boot under it
+	bg            sync.WaitGroup  // background goroutines that call flintlock; Run waits for them
+}
+
+// spawn runs fn in the background and lets Run wait for it at shutdown, so
+// deletes and boots in flight are not cut off when the flintlock connection closes.
+func (d *Daemon) spawn(fn func()) {
+	d.bg.Add(1)
+	go func() {
+		defer d.bg.Done()
+		fn()
+	}()
+}
+
+// startupListFor and startupRetry bound how long a starting daemon waits for
+// flintlockd, which systemd starts just before it (variables for tests).
+var (
+	startupListFor = time.Minute
+	startupRetry   = 5 * time.Second
+)
+
+// startupList lists microVMs at startup, retrying while flintlockd is not
+// answering yet. Without the listing nothing from the previous run can be
+// adopted; ok reports whether it succeeded.
+func (d *Daemon) startupList(ctx context.Context) (vms []*types.MicroVM, ok bool) {
+	deadline := time.Now().Add(startupListFor)
+	for {
+		lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		vms, err := d.fl.List(lctx)
+		cancel()
+		if err == nil {
+			return vms, true
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			d.log.Error("listing microVMs at startup failed; nothing adopted from the previous run", "err", err)
+			return nil, false
+		}
+		d.log.Warn("flintlock not answering yet, retrying", "err", err)
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(startupRetry):
+		}
+	}
 }
 
 func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
@@ -199,15 +239,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.mu.Lock()
 	d.runCtx = ctx
 	d.mu.Unlock()
-	d.adoptPool(ctx)
-	if vms, err := d.fl.List(ctx); err == nil {
+	vms, listed := d.startupList(ctx)
+	if listed {
+		d.adoptPool(vms)
 		live := map[string]bool{}
 		for _, v := range vms {
 			live[v.GetSpec().GetUid()] = true
 		}
 		d.adoptBuilders(live)
 	}
-	d.reconcile(ctx, true)
+	// Only a daemon that could adopt may treat leftover pool VMs and builders
+	// as a previous run's; otherwise the age-based orphan rules reclaim them.
+	d.reconcile(ctx, listed)
 	refill := time.NewTicker(2 * time.Second)
 	reconcile := time.NewTicker(d.cfg.Daemon.ReconcileInterval)
 	host := time.NewTicker(15 * time.Second)
@@ -227,6 +270,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.mu.Lock()
 			d.savePoolLocked()
 			d.mu.Unlock()
+			// Let deletes and boots in flight finish before fl.Close (deferred above).
+			done := make(chan struct{})
+			go func() { d.bg.Wait(); close(done) }()
+			select {
+			case <-done:
+			case <-shutdownCtx.Done():
+				d.log.Warn("flintlock calls still running at shutdown; the next start reconciles them")
+			}
 			return nil
 		case err := <-errc:
 			if !errors.Is(err, http.ErrServerClosed) {
@@ -286,7 +337,8 @@ func (d *Daemon) Claim() *vm.Instance {
 			return p.inst
 		}
 		// Booted with an old config: never hand it out.
-		go d.delete(context.Background(), p.inst, "stale config")
+		inst := p.inst
+		d.spawn(func() { d.delete(context.Background(), inst, "stale config") })
 	}
 	d.metrics.poolReady.Set(0)
 	for uid, p := range d.preloading {
@@ -314,7 +366,9 @@ func (d *Daemon) refill(ctx context.Context) {
 	for i := 0; i < missing; i++ {
 		// VMs created in this loop are not listed by flintlock yet.
 		extra := i * cfg.VM.MemoryMB * 105 / 100
-		ok, why, err := vm.Fits(ctx, cfg, d.fl, extra)
+		fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		ok, why, err := vm.Fits(fctx, cfg, d.fl, extra)
+		cancel()
 		if err != nil || !ok {
 			d.log.Debug("pool refill waits for memory", "why", why, "err", err)
 			d.metrics.admissionWaits.Inc()
@@ -324,7 +378,7 @@ func (d *Daemon) refill(ctx context.Context) {
 		d.booting++
 		d.metrics.poolBooting.Set(float64(d.booting))
 		d.mu.Unlock()
-		go d.bootOne(ctx, cfg)
+		d.spawn(func() { d.bootOne(ctx, cfg) })
 	}
 }
 
@@ -378,7 +432,7 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config) {
 		d.log.Error("pool boot failed", "id", id, "err", err)
 	case ctx.Err() != nil:
 		// Shutting down: do not hand out a VM nobody will drain.
-		go d.delete(context.Background(), inst, "shutdown")
+		d.spawn(func() { d.delete(context.Background(), inst, "shutdown") })
 	default:
 		d.ready = append(d.ready, &pooled{inst: inst, bornAt: time.Now(), specID: fingerprint(cfg)})
 		d.metrics.poolReady.Set(float64(len(d.ready)))
@@ -459,7 +513,15 @@ func (d *Daemon) drain(ctx context.Context, reason string) {
 	}
 }
 
+// deleteTimeout bounds one flintlock delete. flintlockd stops Firecracker and
+// removes the containerd snapshot; when containerd or device-mapper hangs the
+// call would never return and would stall the daemon loop (no refill, no
+// reconcile). Reconcile retries on its next pass. A variable for tests.
+var deleteTimeout = 60 * time.Second
+
 func (d *Daemon) delete(ctx context.Context, inst *vm.Instance, reason string) {
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
 	if err := d.fl.Delete(ctx, inst.UID); err != nil {
 		d.log.Error("delete failed", "id", inst.ID, "reason", reason, "err", err)
 		return

@@ -4,16 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/ismoilovdevml/firerunner/internal/config"
-	"github.com/liquidmetal-dev/flintlock/api/types"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/liquidmetal-dev/flintlock/api/types"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/flintlock/flintlocktest"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
@@ -41,6 +45,9 @@ func newTestDaemon(t *testing.T) (*Daemon, *flintlocktest.Server) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.fl.Close() })
+	// Runs first (cleanups are LIFO): background work started by the test ends
+	// before the connection closes and before stubbed hooks are restored.
+	t.Cleanup(d.bg.Wait)
 	return d, srv
 }
 
@@ -243,12 +250,129 @@ func TestAdoptPoolAfterRestart(t *testing.T) {
 	alive = func(_ config.Config, inst *vm.Instance) bool { return inst.UID != "dead" }
 	t.Cleanup(func() { alive = orig })
 
-	d.adoptPool(context.Background())
+	vms, err := d.fl.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.adoptPool(vms)
 	if len(d.ready) != 1 || d.ready[0].inst.UID != "ok" {
 		ids := []string{}
 		for _, p := range d.ready {
 			ids = append(ids, p.inst.UID)
 		}
 		t.Fatalf("adopted %v, want [ok]", ids)
+	}
+}
+
+// A delete stuck in flintlockd must not block its caller (the daemon loop) forever.
+func TestDeleteGivesUpOnHungFlintlock(t *testing.T) {
+	old := deleteTimeout
+	deleteTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { deleteTimeout = old })
+	d, srv := newTestDaemon(t)
+	srv.HangDeletes()
+
+	done := make(chan struct{})
+	go func() {
+		d.delete(context.Background(), &vm.Instance{ID: "pool-hung", UID: "hung"}, "test")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("delete blocked on a hung flintlockd; the daemon loop would stall")
+	}
+	if got := srv.Deleted(); len(got) != 0 {
+		t.Fatalf("deleted %v, want nothing (the call timed out)", got)
+	}
+}
+
+func TestStartupListRetries(t *testing.T) {
+	oldFor, oldRetry := startupListFor, startupRetry
+	startupListFor, startupRetry = time.Second, 10*time.Millisecond
+	t.Cleanup(func() { startupListFor, startupRetry = oldFor, oldRetry })
+
+	d, srv := newTestDaemon(t)
+	down := status.Error(codes.Unavailable, "flintlockd starting")
+	srv.FailList(down, down)
+	if _, ok := d.startupList(context.Background()); !ok || srv.ListCalls() != 3 {
+		t.Fatalf("ok %v after %d calls; want success on the third", ok, srv.ListCalls())
+	}
+
+	d2, srv2 := newTestDaemon(t)
+	startupListFor = 50 * time.Millisecond
+	for i := 0; i < 100; i++ {
+		srv2.FailList(down)
+	}
+	start := time.Now()
+	if _, ok := d2.startupList(context.Background()); ok {
+		t.Fatal("startupList succeeded while flintlock was down")
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("startupList gave up after %s, want about startupListFor", took)
+	}
+}
+
+// When the startup listing fails, nothing was adopted, so reconcile must not
+// treat a previous run's builder as garbage: it would throw away its cache.
+func TestStartupListFailureKeepsBuilders(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	oldFor, oldRetry := startupListFor, startupRetry
+	startupListFor, startupRetry = 0, 10*time.Millisecond
+	t.Cleanup(func() { startupListFor, startupRetry = oldFor, oldRetry })
+
+	d, srv := newTestDaemon(t)
+	uid := "bld-uid"
+	srv.SetVMs(&types.MicroVM{Spec: &types.MicroVMSpec{Id: "bld-7", Uid: &uid},
+		Status: &types.MicroVMStatus{State: types.MicroVMStatus_CREATED}})
+	srv.FailList(status.Error(codes.Unavailable, "down")) // only the startup listing fails
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for srv.ListCalls() < 2 { // startup list, then reconcile's
+		if time.Now().After(deadline) {
+			t.Fatal("daemon never reconciled")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	if got := srv.Deleted(); len(got) != 0 {
+		t.Fatalf("deleted %v after a failed startup listing; want the builder kept", got)
+	}
+}
+
+// Shutdown waits for background flintlock calls before closing the connection.
+func TestRunWaitsForBackgroundWork(t *testing.T) {
+	d, srv := newTestDaemon(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for srv.ListCalls() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("daemon never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var finished atomic.Bool
+	d.spawn(func() {
+		time.Sleep(300 * time.Millisecond)
+		d.delete(context.Background(), &vm.Instance{ID: "pool-late", UID: "late"}, "test")
+		finished.Store(true)
+	})
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	if !finished.Load() {
+		t.Fatal("Run returned before a background delete finished")
+	}
+	if got := srv.Deleted(); len(got) != 1 || got[0] != "late" {
+		t.Fatalf("deleted %v, want [late] (connection closed too early?)", got)
 	}
 }

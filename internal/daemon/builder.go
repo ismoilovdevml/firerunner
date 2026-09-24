@@ -143,7 +143,8 @@ func (d *Daemon) Builder(project string, start bool) BuilderInfo {
 		CA: creds.caPEM, Cert: creds.clientCert, Key: creds.clientKey, creds: creds}
 	d.builders[project] = b
 	d.metrics.builderRequests.WithLabelValues(BuilderBooting).Inc()
-	go builderBoot(d, d.runCtx, cfg, project)
+	ctx, boot := d.runCtx, builderBoot
+	d.spawn(func() { boot(d, ctx, cfg, project) })
 	// The job gets the port and credentials now; its `docker build` waits for
 	// the builder, so jobs that do not build never wait.
 	return BuilderInfo{State: BuilderBooting, Port: b.Port, CA: b.CA, Cert: b.Cert, Key: b.Key}
@@ -190,7 +191,7 @@ func (d *Daemon) removeBuilderLocked(b *builder, reason string) {
 	_ = nftRun("delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", b.Port))
 	if b.Instance.UID != "" {
 		inst := b.Instance
-		go d.delete(context.Background(), &inst, "builder: "+reason)
+		d.spawn(func() { d.delete(context.Background(), &inst, "builder: "+reason) })
 	}
 }
 
@@ -226,7 +227,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	}
 	d.mu.Unlock()
 	if creds == nil {
-		go d.delete(context.Background(), inst, "builder no longer needed")
+		d.spawn(func() { d.delete(context.Background(), inst, "builder no longer needed") })
 		return
 	}
 	if err := setupBuildkit(ctx, bcfg, inst, creds); err != nil {
@@ -239,7 +240,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	b, ok := d.builders[project]
 	if !ok || ctx.Err() != nil {
 		// Removed while booting, or shutting down.
-		go d.delete(context.Background(), inst, "builder no longer needed")
+		d.spawn(func() { d.delete(context.Background(), inst, "builder no longer needed") })
 		return
 	}
 	b.Instance, b.creds = *inst, nil

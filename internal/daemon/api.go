@@ -39,7 +39,7 @@ func (d *Daemon) apiHandler() http.Handler {
 	})
 	mux.HandleFunc("POST /pool/refresh", func(w http.ResponseWriter, r *http.Request) {
 		// Replace every idle VM, e.g. after a new rootfs image was published under the same tag.
-		go d.drain(context.Background(), "refresh")
+		d.spawn(func() { d.drain(context.Background(), "refresh") })
 		w.WriteHeader(http.StatusAccepted)
 	})
 	mux.HandleFunc("POST /builder", func(w http.ResponseWriter, r *http.Request) {
