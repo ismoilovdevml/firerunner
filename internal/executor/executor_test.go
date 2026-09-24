@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/liquidmetal-dev/flintlock/api/types"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -246,4 +247,82 @@ func TestCleanupDropsStateWhenDeleteKeepsFailing(t *testing.T) {
 	if got := srv.Deleted(); len(got) != 0 {
 		t.Fatalf("deleted %v, want nothing", got)
 	}
+}
+
+// pinned writes the known_hosts file vm.Forget removes, so a test can see
+// that the VM's host key and DHCP lease were forgotten.
+func pinned(t *testing.T, id string) string {
+	t.Helper()
+	path := filepath.Join(vm.KnownHostsDir, id)
+	if err := os.WriteFile(path, []byte(id+" ssh-ed25519 AAAA\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func forgotten(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("%s kept: the VM's lease and host key were not forgotten", filepath.Base(path))
+	}
+}
+
+// A claimed pool VM keeps its pool-<rand> flintlock id; its lease is keyed by it.
+func TestCleanupForgetsAClaimedPoolVMByItsOwnID(t *testing.T) {
+	cfg, srv := cleanupFixture(t)
+	st := &vm.JobState{Instance: vm.Instance{ID: "pool-a1b2c3", UID: "u2"}, Source: "pool", StartedAt: time.Now()}
+	if err := vm.SaveJobState(statePath("job-555"), st); err != nil {
+		t.Fatal(err)
+	}
+	key := pinned(t, "pool-a1b2c3")
+	if err := Cleanup(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.Deleted(); len(got) != 1 || got[0] != "u2" {
+		t.Fatalf("deleted %v, want [u2]", got)
+	}
+	forgotten(t, key)
+}
+
+// Cancelled while prepare was still booting: no state file, the VM is found
+// by id, and its lease must be released like any other.
+func TestCleanupForgetsAVMCancelledDuringBoot(t *testing.T) {
+	cfg, srv := cleanupFixture(t)
+	if err := os.Remove(statePath("job-555")); err != nil {
+		t.Fatal(err)
+	}
+	uid := "u9"
+	srv.SetVMs(&types.MicroVM{Spec: &types.MicroVMSpec{Id: "job-555", Uid: &uid}})
+	key := pinned(t, "job-555")
+	if err := Cleanup(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.Deleted(); len(got) != 1 || got[0] != "u9" {
+		t.Fatalf("deleted %v, want [u9]", got)
+	}
+	forgotten(t, key)
+}
+
+// A VM whose delete failed may still run: its lease and key stay for reconcile.
+func TestCleanupKeepsLeaseOfAVMItCouldNotDelete(t *testing.T) {
+	cfg, srv := cleanupFixture(t)
+	down := status.Error(codes.Unavailable, "down")
+	srv.FailDelete(down, down, down)
+	key := pinned(t, "job-555")
+	_ = Cleanup(cfg)
+	if _, err := os.Stat(key); err != nil {
+		t.Fatalf("lease/key of a VM that was not deleted were dropped: %v", err)
+	}
+}
+
+// Prepare's own deletes (a dead pool VM, services that do not parse, a state
+// file it cannot write) release the address at once instead of after 15 min.
+func TestDeleteVMForgetsTheVM(t *testing.T) {
+	cfg, srv := cleanupFixture(t)
+	key := pinned(t, "pool-dead01")
+	deleteVM(cfg, &vm.Instance{ID: "pool-dead01", UID: "u3"})
+	if got := srv.Deleted(); len(got) != 1 || got[0] != "u3" {
+		t.Fatalf("deleted %v, want [u3]", got)
+	}
+	forgotten(t, key)
 }

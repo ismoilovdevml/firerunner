@@ -105,8 +105,7 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 	fail := func(err error) (*Instance, error) {
 		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = fl.Delete(dctx, uid)
-		Forget(cfg, id)
+		_ = Destroy(dctx, cfg, fl, id, uid)
 		return nil, err
 	}
 
@@ -250,6 +249,17 @@ func findLease(leasesFile, mac string) (*lease, error) {
 		}
 	}
 	return found, sc.Err()
+}
+
+// Destroy deletes a microVM and, once flintlock took the delete, forgets its
+// pinned host key and DHCP lease. A VM whose delete failed may still run, so
+// it keeps both until whoever deletes it later (reconcile) forgets them.
+func Destroy(ctx context.Context, cfg config.Config, fl *flintlock.Client, id, uid string) error {
+	if err := fl.Delete(ctx, uid); err != nil {
+		return err
+	}
+	Forget(cfg, id)
+	return nil
 }
 
 // Forget drops what the host keeps about a deleted microVM: its pinned host

@@ -118,7 +118,7 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 
 	services, err := ParseServices(os.Getenv("CUSTOM_ENV_CI_JOB_SERVICES"))
 	if err != nil {
-		deleteVM(cfg, inst.UID)
+		deleteVM(cfg, inst)
 		return buildFailure(err)
 	}
 	st := &vm.JobState{Instance: *inst, Source: source, StartedAt: start}
@@ -127,7 +127,7 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	}
 	// Exclusive: a job must never replace another job's VM binding.
 	if err := vm.CreateJobState(statePath(id), st); err != nil {
-		deleteVM(cfg, inst.UID)
+		deleteVM(cfg, inst)
 		return systemFailure(err)
 	}
 	if auth := os.Getenv("CUSTOM_ENV_DOCKER_AUTH_CONFIG"); auth != "" {
@@ -167,7 +167,7 @@ func claim(cfg config.Config, dc *daemon.Client, id string) *vm.Instance {
 	}
 	if err := vm.SSH(cfg, inst, "hostnamectl", "set-hostname", id).Run(); err != nil {
 		fmt.Printf("pool VM %s did not answer (%v), booting a new one\n", inst.ID, err)
-		deleteVM(cfg, inst.UID)
+		deleteVM(cfg, inst)
 		return nil
 	}
 	return inst
@@ -397,10 +397,12 @@ func Cleanup(cfg config.Config) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	uid := ""
+	// vmID is the flintlock id: job-<id> for a cold boot, pool-<rand> for a
+	// claimed pool VM. The DHCP lease and pinned key are keyed by it.
+	uid, vmID := "", id
 	st, stErr := vm.LoadJobState(statePath(id))
 	if stErr == nil {
-		uid = st.UID
+		uid, vmID = st.UID, st.ID
 	} else if found, err := fl.Find(ctx, id); err == nil {
 		// The job was cancelled while prepare was still booting the microVM.
 		uid = found.GetSpec().GetUid()
@@ -412,14 +414,12 @@ func Cleanup(cfg config.Config) error {
 	if uid != "" {
 		if delErr = deleteWithRetry(ctx, fl, uid); delErr == nil {
 			fmt.Printf("microVM %s deleted\n", id)
+			// A VM that is still running keeps its lease and pinned key until
+			// the daemon deletes it (Daemon.delete forgets them then).
+			vm.Forget(cfg, vmID)
 		}
 	}
 	if stErr == nil {
-		if delErr == nil {
-			// A VM that is still running keeps its lease and pinned key until
-			// the daemon deletes it (Daemon.delete forgets them then).
-			vm.Forget(cfg, st.ID)
-		}
 		result := "success"
 		if st.Failed {
 			result = "failed"
@@ -462,7 +462,9 @@ func deleteWithRetry(ctx context.Context, fl *flintlock.Client, uid string) erro
 	return err
 }
 
-func deleteVM(cfg config.Config, uid string) {
+// deleteVM deletes a VM prepare took or booted but cannot use, and frees its
+// DHCP address right away (a leaked lease holds an address for 15 minutes).
+func deleteVM(cfg config.Config, inst *vm.Instance) {
 	fl, err := flintlock.Dial(cfg.Flintlock)
 	if err != nil {
 		return
@@ -470,7 +472,7 @@ func deleteVM(cfg config.Config, uid string) {
 	defer fl.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_ = fl.Delete(ctx, uid)
+	_ = vm.Destroy(ctx, cfg, fl, inst.ID, inst.UID)
 }
 
 // Only failures of the job's own commands count as build failures.
