@@ -9,11 +9,47 @@ import (
 
 // Event is sent by `firerunner executor` so job metrics live in the daemon.
 type Event struct {
-	Kind    string  `json:"kind"`   // prepare | finish
-	Source  string  `json:"source"` // pool | cold (prepare)
-	Result  string  `json:"result"` // success | failed (finish)
-	Seconds float64 `json:"seconds"`
-	OK      bool    `json:"ok"`
+	Kind   string `json:"kind"`   // prepare | finish
+	Source string `json:"source"` // pool | cold (prepare)
+	// Result of a finished job: success, script_failure (the job's own
+	// commands failed) or system_failure (FireRunner or the host failed it).
+	// Executors older than this field send "failed" for script failures.
+	Result string `json:"result"`
+	// Reason says why a prepare or a job failed with a system failure; one of
+	// FailureReasons.
+	Reason      string  `json:"reason,omitempty"`
+	Seconds     float64 `json:"seconds"`
+	WaitSeconds float64 `json:"wait_seconds,omitempty"` // prepare: time spent waiting for host memory
+	BootSeconds float64 `json:"boot_seconds,omitempty"` // prepare, cold: microVM create to SSH ready
+	OK          bool    `json:"ok"`
+
+	// Only logged, never metric labels.
+	Job     string `json:"job,omitempty"`     // numeric GitLab job id
+	Project string `json:"project,omitempty"` // numeric GitLab project id
+	VM      string `json:"vm,omitempty"`      // microVM id
+	Err     string `json:"err,omitempty"`     // error text, truncated by the sender
+}
+
+// Job results carried in Event.Result.
+const (
+	ResultSuccess       = "success"
+	ResultScriptFailure = "script_failure"
+	ResultSystemFailure = "system_failure"
+)
+
+// FailureReasons are the values Event.Reason may take; record maps anything
+// else to "other" so a sender can never create new metric series.
+var FailureReasons = []string{
+	"admission_timeout", // no host memory for a microVM within vm.boot_timeout
+	"flintlock_error",   // flintlockd refused or failed a call
+	"vm_boot",           // the microVM did not get a lease or answer SSH in time
+	"services",          // services: containers did not start
+	"docker_auth",       // DOCKER_AUTH_CONFIG could not be written into the VM
+	"state_file",        // the job state file could not be written or read
+	"ssh_lost",          // SSH to the microVM broke during a stage (VM gone or killed)
+	"helper_stage",      // a FireRunner-run stage (sources, cache, artifacts) failed
+	"canceled",          // the job was cancelled during prepare
+	"other",
 }
 
 // apiHandler serves the local unix socket (root only).
