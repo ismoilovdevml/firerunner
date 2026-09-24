@@ -104,8 +104,13 @@ func TestHealthzFailsWhenTheLoopIsStuck(t *testing.T) {
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 		return rec.Code
 	}
+	d.tick() // Run does this before its startup work
 	if code := get(); code != http.StatusOK {
-		t.Fatalf("healthz before the first pass = %d", code)
+		t.Fatalf("healthz at start = %d", code)
+	}
+	d.lastTick.Store(time.Now().Add(-stuckAfter - time.Minute).Unix())
+	if code := get(); code != http.StatusServiceUnavailable {
+		t.Fatalf("healthz when startup hangs = %d, want 503", code)
 	}
 	d.tick()
 	if code := get(); code != http.StatusOK {

@@ -237,6 +237,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 // Run blocks until ctx is cancelled, then deletes the idle pool.
 func (d *Daemon) Run(ctx context.Context) error {
 	defer d.fl.Close()
+	d.tick() // /healthz also catches a startup that hangs before the loop's first pass
 
 	sock, err := d.listenSocket()
 	if err != nil {

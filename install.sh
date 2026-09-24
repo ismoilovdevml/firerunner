@@ -328,7 +328,12 @@ install_firecracker() {
 # microVM network: bridge + DHCP/DNS + NAT
 # --------------------------------------------------------------------------
 
-is_ipv4_cidr() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; }
+is_ipv4_cidr() {
+    [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/([0-9]{1,2}))?$ ]] || return 1
+    local i
+    for i in 1 2 3 4; do (( BASH_REMATCH[i] <= 255 )) || return 1; done
+    [[ -z ${BASH_REMATCH[6]} ]] || (( BASH_REMATCH[6] <= 32 ))
+}
 
 # The source allowed to scrape metrics. It is remembered, so a re-run without
 # FR_METRICS_ALLOW keeps the rule instead of opening :9477 to everyone.
