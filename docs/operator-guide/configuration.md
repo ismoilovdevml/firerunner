@@ -48,8 +48,8 @@ sudo firerunner config set pool.preload_images "[mcr.microsoft.com/dotnet/sdk:8.
 |---|---|---|
 | `builder.enabled` | `true` | one BuildKit microVM per GitLab project for `docker build` in jobs without `image:` |
 | `builder.vcpu` | `4` | builds run here, not in the job VM |
-| `builder.memory_mb` | `4096` | counted in memory admission like any microVM |
-| `builder.max` | `6` | builders kept at once; the least recently used idle one is replaced |
+| `builder.memory_mb` | `8192` | counted in memory admission like any microVM; Node.js sizes its heap from RAM, so frontend builds fail with less |
+| `builder.max` | `4` | builders kept at once; the least recently used idle one is replaced |
 | `builder.idle_ttl` | `24h` | a builder unused this long is deleted with its cache |
 | `builder.cache_mb` | `25000` | BuildKit garbage-collects above this |
 | `builder.image` | `moby/buildkit:v0.33.0` | pulled through the Docker Hub mirror |

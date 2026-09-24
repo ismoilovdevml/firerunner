@@ -131,8 +131,8 @@ func Default() Config {
 		Builder: Builder{
 			Enabled:  true,
 			VCPU:     4,
-			MemoryMB: 4096,
-			Max:      6,
+			MemoryMB: 8192, // Node sizes its heap from RAM: 4 GB is too small for frontend builds
+			Max:      4,
 			IdleTTL:  24 * time.Hour,
 			Image:    "moby/buildkit:v0.33.0",
 			CacheMB:  25000,

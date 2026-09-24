@@ -41,7 +41,8 @@ jobs use a lot (e.g. .NET or JDK SDKs), especially from registries other than Do
 Each GitLab project that runs `docker build` gets a builder microVM (`builder.vcpu`,
 `builder.memory_mb`), kept for `builder.idle_ttl` after its last job. Budget
 `builder.max × builder.memory_mb` on top of jobs and pool, for example on 64 GB:
-10 jobs × 2 GB + 6 pool × 2 GB + 6 builders × 4 GB ≈ 56 GB. Builders keep up to
+8 jobs × 2 GB + 2 pool × 2 GB + 4 builders × 8 GB ≈ 52 GB. Builds run in the builders, so
+give them the memory your builds need (a Node.js frontend build needs 4+ GB). Builders keep up to
 `builder.cache_mb` of layers each in the thin pool.
 
 ## Measured results
