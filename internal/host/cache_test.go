@@ -59,6 +59,23 @@ func TestReplaceCacheSection(t *testing.T) {
 	}
 }
 
+func TestEnsureRunnerEnv(t *testing.T) {
+	out := ensureRunnerEnv(registered, cacheEnv...)
+	if !strings.Contains(out, "[[runners]]\n  environment = [\"FF_USE_FASTZIP=true\", \"CACHE_COMPRESSION_LEVEL=fastest\"]\n  name =") {
+		t.Fatalf("environment not added after [[runners]]:\n%s", out)
+	}
+	if again := ensureRunnerEnv(out, cacheEnv...); again != out {
+		t.Fatalf("not idempotent:\n%s", again)
+	}
+
+	// An operator's own values win and other entries are kept.
+	own := strings.Replace(registered, "  executor = \"custom\"\n", "  executor = \"custom\"\n  environment = [\"FF_USE_FASTZIP=false\", \"NO_PROXY=a,b\"]\n", 1)
+	out = ensureRunnerEnv(own, cacheEnv...)
+	if !strings.Contains(out, `environment = ["FF_USE_FASTZIP=false", "NO_PROXY=a,b", "CACHE_COMPRESSION_LEVEL=fastest"]`) || strings.Count(out, "environment") != 1 {
+		t.Fatalf("existing environment not merged:\n%s", out)
+	}
+}
+
 func TestReplaceCacheSectionAppendsWhenMissing(t *testing.T) {
 	conf := strings.Replace(registered, "  [runners.cache]\n    MaxUploadedArchiveSize = 0\n    [runners.cache.s3]\n    [runners.cache.gcs]\n    [runners.cache.azure]\n", "", 1)
 	out, err := replaceCacheSection(conf, cacheSection(testCache))

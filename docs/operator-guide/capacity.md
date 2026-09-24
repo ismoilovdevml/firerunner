@@ -48,8 +48,12 @@ jobs run side by side with the organisation's existing runners.
 | Job waits for its VM (p50) | 0.25 s (pool) · 16.7 s (cold) | — |
 | .NET service, `dotnet test` (44 tests), `image: mcr.microsoft.com/dotnet/sdk:8.0` | **27.7 s** | 31.1 s (docker executor) |
 | Same, cold VM, SDK image pulled | 104.3 s | — |
-| `docker build` of the same service | 24.6 s | 2.4 s (shell executor, warm layer cache) |
+| Same `dotnet test` with NuGet packages in `cache:` | **25.5 s** (32.4 s without) | 23.4 s (docker executor) |
+| `docker build` of the same service | 24.6–31 s | 1–2.4 s (shell executor, warm layer cache) |
+| Same build with the BuildKit cache in `cache:` | build 10–11 s + 8 s cache transfer (367 MB) | |
 | 6-job pipeline | 60 s no pool · 38 s pool 2 · **19 s** pool 4 | — |
 
 The `docker build` gap is the cost of isolation: shell and docker runners reuse the host's layer
-cache between jobs. See [#25](https://github.com/ismoilovdevml/firerunner/issues/25).
+cache between jobs, a FireRunner job has to download and upload its cache
+([Writing jobs](../user-guide/writing-jobs.md#docker-builds)). See
+[#25](https://github.com/ismoilovdevml/firerunner/issues/25).

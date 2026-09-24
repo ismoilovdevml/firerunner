@@ -54,11 +54,14 @@ commit, same pipeline, jobs of the same project run side by side:
 | Job waits for its VM (p50) | **0.25 s** warm pool, 16.7 s cold | n/a |
 | `dotnet test`, 44 tests, `image: mcr.microsoft.com/dotnet/sdk:8.0` | **27.7 s** (warm pool, image preloaded) | 31.1 s (docker executor) |
 | Same job, cold VM, image pulled | 104.3 s | |
-| `docker build` of the same service | 24.6 s | 2.4 s (shell executor, warm layer cache) |
+| Same `dotnet test`, NuGet packages in `cache:` | **25.5 s** (32.4 s without) | 23.4 s (docker executor) |
+| `docker build` of the same service | 24.6–31 s | 1–2.4 s (shell executor, warm layer cache) |
+| Same build, BuildKit cache in `cache:` | build 10–11 s + 8 s cache transfer | |
 | 6-job demo pipeline | 60 s without pool, 38 s with pool 2, **19 s** with pool 4 | |
 
-The `docker build` row is the price of isolation: a shell or docker runner reuses the
-host's layer cache between jobs, FireRunner starts from a clean VM every time.
+The `docker build` rows are the price of isolation: a shell or docker runner reuses the
+host's layer cache between jobs, a FireRunner job starts from a clean VM and has to bring
+its cache along.
 
 ## Requirements
 
@@ -180,7 +183,8 @@ found no confirmed vulnerability; its four open leads are fixed as described abo
 ## Limitations
 
 - x86_64 only.
-- No shared Docker layer cache between jobs (by design); use `pool.preload_images` for base images.
+- No shared Docker layer cache between jobs (by design): keep BuildKit's cache in `cache:` or a
+  registry, and use `pool.preload_images` for base images.
 - Tested on Rocky Linux 9.6 hosts only.
 
 ## Development
