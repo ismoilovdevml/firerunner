@@ -64,5 +64,6 @@ For more hosts, install and register each one; GitLab spreads jobs over them.
 curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash -s -- uninstall
 ```
 
-It deletes the microVMs and removes services and binaries. The disk, images and `/etc/firerunner`
-stay. Delete the runner in GitLab yourself.
+It deletes the microVMs and removes services and binaries (containerd's binaries stay). The disk,
+images, `/var/lib/firerunner` and `/etc/firerunner` stay; the command prints how to remove them.
+Delete the runner in GitLab yourself.

@@ -2,8 +2,9 @@
 # FireRunner host installer.
 #
 # Prepares a KVM host (bare metal or a VM with nested virtualization) to run
-# Firecracker microVMs through Flintlock:
-#   containerd (devmapper thin pool) + Firecracker/jailer + flintlockd + bridge/DHCP/NAT
+# GitLab CI jobs in Firecracker microVMs:
+#   containerd (devmapper thin pool) + Firecracker + flintlockd + bridge/DHCP/NAT/firewall
+#   + Docker Hub pull-through mirror + S3 store for cache: + firerunner + gitlab-runner
 #
 # Usage:
 #   curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash
@@ -542,7 +543,7 @@ install_flintlock() {
         log "flintlockd v${FLINTLOCK_VERSION} already installed"
     fi
 
-    # API token: generated once, root-only. Clients send it as a bearer token.
+    # API token: generated once, root-only. Clients send it as basic auth (base64 of the token).
     if [[ ! -s $CONF_DIR/flintlock.token ]]; then
         (umask 077; head -c 32 /dev/urandom | base64 | tr -d '/+=\n' >"$CONF_DIR/flintlock.token")
     fi
@@ -582,7 +583,7 @@ EOF
 }
 
 # --------------------------------------------------------------------------
-# firerunner CLI + GitLab Runner
+# Shared services for microVMs: Docker Hub mirror, S3 store for cache:
 # --------------------------------------------------------------------------
 
 install_registry_mirror() {
@@ -884,7 +885,11 @@ verify_install() {
     else
         warn "  flintlock gRPC not listening on ${FLINTLOCK_ENDPOINT}"; ok=0
     fi
-    dmsetup status "$THINPOOL" >/dev/null 2>&1 && log "  thin pool ${THINPOOL}: ok" || { warn "  thin pool ${THINPOOL} missing"; ok=0; }
+    if dmsetup status "$THINPOOL" >/dev/null 2>&1; then
+        log "  thin pool ${THINPOOL}: ok"
+    else
+        warn "  thin pool ${THINPOOL} missing"; ok=0
+    fi
     [[ $ok -eq 1 ]] || die "installation finished with errors"
 
     cat <<EOF
@@ -923,9 +928,11 @@ uninstall() {
         rm -f "/etc/systemd/system/$svc.service"
     done
     systemctl daemon-reload
-    rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry" "$BIN_DIR/versitygw"
-    rm -rf "$LIB_DIR"
-    log "done. To also drop data: vgremove $VG && rm -rf $CONTAINERD_ROOT /var/lib/flintlock $CONF_DIR"
+    rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry" \
+        "$BIN_DIR/versitygw" "$BIN_DIR/firecracker" "$BIN_DIR/jailer"
+    rm -rf "$LIB_DIR" /etc/opt/flintlockd   # flintlockd's config holds the API token
+    log "done. containerd binaries in $BIN_DIR are kept (another containerd may use them)."
+    log "To also drop data: vgremove $VG && rm -rf $CONTAINERD_ROOT /var/lib/flintlock /var/lib/firerunner $CONF_DIR /etc/lvm/profile/${THINPOOL}.profile"
 }
 
 main() {
