@@ -482,6 +482,11 @@ dhcp-range=${FR_SUBNET}.10,${FR_SUBNET}.250,255.255.255.0,15m
 dhcp-option=option:router,${FR_SUBNET}.1
 dhcp-option=option:dns-server,${FR_SUBNET}.1
 dhcp-leasefile=/var/lib/misc/firerunner-dnsmasq.leases
+# Do not ping an address before offering it: dnsmasq stops answering DHCP for
+# ~3 s per ping, which serialises boots. Only VMs on this bridge use the range.
+no-ping
+# Hostnames sent by guests are not published in DNS.
+dhcp-ignore-names
 no-hosts
 log-dhcp
 EOF
