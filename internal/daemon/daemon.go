@@ -8,6 +8,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -57,6 +58,14 @@ type pooled struct {
 	inst   *vm.Instance
 	bornAt time.Time
 	specID string // config fingerprint the VM was booted with
+}
+
+// preloadingVM is a pool VM that has booted and is still pulling
+// pool.preload_images. A job may take it; its preload is then cancelled.
+type preloadingVM struct {
+	inst   *vm.Instance
+	specID string
+	cancel context.CancelFunc
 }
 
 // poolRecord is how the ready pool is persisted across daemon restarts.
@@ -136,14 +145,16 @@ type Daemon struct {
 	log     *slog.Logger
 	metrics *Metrics
 
-	mu       sync.Mutex
-	cfg      config.Config
-	cfgMod   time.Time
-	fl       *flintlock.Client
-	ready    []*pooled
-	booting  int
-	claimed  map[string]time.Time // uid -> claim time; protects it until the job writes its state
-	firstSee map[string]time.Time // uid -> first time reconcile saw it
+	mu      sync.Mutex
+	cfg     config.Config
+	cfgMod  time.Time
+	fl      *flintlock.Client
+	ready   []*pooled
+	booting int
+	// booted pool VMs still preloading images, by uid; counted in booting
+	preloading map[string]*preloadingVM
+	claimed    map[string]time.Time // uid -> claim time; protects it until the job writes its state
+	firstSee   map[string]time.Time // uid -> first time reconcile saw it
 }
 
 func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
@@ -156,7 +167,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 		return nil, err
 	}
 	d := &Daemon{cfgPath: cfgPath, log: log, cfg: cfg, fl: fl, metrics: NewMetrics(),
-		claimed: map[string]time.Time{}, firstSee: map[string]time.Time{}}
+		claimed: map[string]time.Time{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{}}
 	if fi, err := os.Stat(cfgPath); err == nil {
 		d.cfgMod = fi.ModTime()
 	}
@@ -238,7 +249,10 @@ func fingerprint(c config.Config) string {
 		c.VM.KernelCmdline, c.VM.RegistryMirror, c.VM.DockerBIP, c.VM.DockerAddressPool, c.Pool.PreloadImages)
 }
 
-// Claim hands a ready pool VM to a job. It returns nil when the pool is empty.
+// Claim hands a ready pool VM to a job, or else one that has booted but is
+// still preloading images; that preload is cancelled, because a job should not
+// wait for memory held by a VM that is only warming its image cache. nil means
+// the pool has nothing to give.
 func (d *Daemon) Claim() *vm.Instance {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -257,6 +271,17 @@ func (d *Daemon) Claim() *vm.Instance {
 		go d.delete(context.Background(), p.inst, "stale config")
 	}
 	d.metrics.poolReady.Set(0)
+	for uid, p := range d.preloading {
+		if p.specID != fp {
+			continue
+		}
+		delete(d.preloading, uid)
+		p.cancel()
+		d.claimed[uid] = time.Now()
+		d.metrics.claims.WithLabelValues("hit").Inc()
+		d.log.Info("pool VM claimed before its preload finished", "id", p.inst.ID)
+		return p.inst
+	}
 	d.metrics.claims.WithLabelValues("miss").Inc()
 	return nil
 }
@@ -297,11 +322,29 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config) {
 	if err == nil {
 		d.metrics.bootSeconds.WithLabelValues("pool").Observe(time.Since(start).Seconds())
 		if len(cfg.Pool.PreloadImages) > 0 {
+			pctx, cancel := context.WithCancel(ctx)
+			d.mu.Lock()
+			d.preloading[inst.UID] = &preloadingVM{inst: inst, specID: fingerprint(cfg), cancel: cancel}
+			d.mu.Unlock()
 			pullStart := time.Now()
-			if perr := preload(ctx, cfg, inst); perr != nil {
+			perr := preload(pctx, cfg, inst)
+			cancel()
+			d.mu.Lock()
+			_, stillOurs := d.preloading[inst.UID]
+			delete(d.preloading, inst.UID)
+			d.mu.Unlock()
+			switch {
+			case !stillOurs:
+				// A job took the VM during the preload (Claim).
+				d.mu.Lock()
+				d.booting--
+				d.metrics.poolBooting.Set(float64(d.booting))
+				d.mu.Unlock()
+				return
+			case perr != nil:
 				d.metrics.bootFailures.WithLabelValues("preload").Inc()
 				d.log.Error("image preload failed, VM kept without it", "id", id, "err", perr)
-			} else {
+			default:
 				d.metrics.preloadSeconds.Observe(time.Since(pullStart).Seconds())
 			}
 		}
@@ -335,12 +378,25 @@ func preload(ctx context.Context, cfg config.Config, inst *vm.Instance) error {
 		args += "; docker pull -q " + shellQuote(img)
 	}
 	cmd := vm.SSH(cfg, inst, args)
-	out, err := cmd.CombinedOutput()
-	if ctx.Err() != nil {
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	var err error
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		// Timeout or a job claimed the VM: stop pulling (docker cancels the
+		// pull when its client goes away).
+		_ = cmd.Process.Kill()
+		<-done
 		return ctx.Err()
 	}
 	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(out.String()))
 	}
 	return nil
 }

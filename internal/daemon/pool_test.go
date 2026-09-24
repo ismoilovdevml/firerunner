@@ -139,6 +139,37 @@ func TestExpireIdle(t *testing.T) {
 	}
 }
 
+func TestClaimTakesPreloadingVM(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	fp := fingerprint(d.cfg)
+	cancelled := map[string]bool{}
+	for _, uid := range []string{"stale", "warm"} {
+		spec := fp
+		if uid == "stale" {
+			spec = "old-config"
+		}
+		d.preloading[uid] = &preloadingVM{inst: &vm.Instance{ID: "pool-" + uid, UID: uid}, specID: spec,
+			cancel: func() { cancelled[uid] = true }}
+	}
+
+	inst := d.Claim()
+	if inst == nil || inst.UID != "warm" {
+		t.Fatalf("Claim = %v, want the preloading VM with the current config", inst)
+	}
+	if !cancelled["warm"] || cancelled["stale"] {
+		t.Fatalf("cancelled %v, want only warm", cancelled)
+	}
+	if _, ok := d.preloading["warm"]; ok {
+		t.Fatal("claimed VM still listed as preloading")
+	}
+	if _, ok := d.claimed["warm"]; !ok {
+		t.Fatal("claimed VM must be protected from reconcile")
+	}
+	if d.Claim() != nil {
+		t.Fatal("a VM with an old config must not be handed out")
+	}
+}
+
 func TestExpireIdleTrimsToPoolSize(t *testing.T) {
 	d, srv := newTestDaemon(t)
 	fp := fingerprint(d.cfg)
