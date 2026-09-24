@@ -213,14 +213,14 @@ state = "${CONTAINERD_STATE}"
 [grpc]
   address = "${CONTAINERD_SOCK}"
 
-[metrics]
-  address = "127.0.0.1:1338"
-
 [plugins."io.containerd.snapshotter.v1.devmapper"]
   pool_name = "${THINPOOL}"
   root_path = "${CONTAINERD_ROOT}/snapshotter/devmapper"
   base_image_size = "${FR_VM_DISK}"
-  discard_blocks = true
+  # Discarding a deleted VM's blocks runs inside the snapshotter's write
+  # transaction and stalls the next VM's snapshot; the thin pool frees the
+  # blocks of a deleted thin device anyway.
+  discard_blocks = false
 EOF
 
     # Dedicated instance so it never clashes with a Docker/Kubernetes containerd.
