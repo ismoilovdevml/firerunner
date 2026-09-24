@@ -139,6 +139,21 @@ func TestExpireIdle(t *testing.T) {
 	}
 }
 
+func TestExpireIdleTrimsToPoolSize(t *testing.T) {
+	d, srv := newTestDaemon(t)
+	fp := fingerprint(d.cfg)
+	d.cfg.Pool.Size = 1
+	d.ready = []*pooled{pooledVM("old", fp, 3*time.Minute), pooledVM("new", fp, time.Minute)}
+	d.expireIdle(context.Background())
+
+	if len(d.ready) != 1 || d.ready[0].inst.UID != "new" {
+		t.Fatalf("ready after trim: %v", d.ready)
+	}
+	if got := srv.Deleted(); len(got) != 1 || got[0] != "old" {
+		t.Fatalf("deleted %v, want [old]", got)
+	}
+}
+
 func TestRunShutdownKeepsAndRecordsPool(t *testing.T) {
 	d, srv := newTestDaemon(t)
 	fp := fingerprint(d.cfg)

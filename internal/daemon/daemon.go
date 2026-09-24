@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -346,18 +347,23 @@ func preload(ctx context.Context, cfg config.Config, inst *vm.Instance) error {
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// expireIdle recycles pool VMs that sat idle too long or were booted with an old config.
+// expireIdle recycles pool VMs that sat idle too long or were booted with an
+// old config, and the oldest ones above pool.size (after the size was lowered).
 func (d *Daemon) expireIdle(ctx context.Context) {
 	d.mu.Lock()
-	fp, maxIdle := fingerprint(d.cfg), d.cfg.Pool.MaxIdle
-	keep := d.ready[:0]
-	var drop []*pooled
+	fp, maxIdle, size := fingerprint(d.cfg), d.cfg.Pool.MaxIdle, d.cfg.Pool.Size
+	var keep, drop []*pooled
 	for _, p := range d.ready {
 		if p.specID != fp || time.Since(p.bornAt) > maxIdle {
 			drop = append(drop, p)
 		} else {
 			keep = append(keep, p)
 		}
+	}
+	sort.Slice(keep, func(i, j int) bool { return keep[i].bornAt.After(keep[j].bornAt) })
+	if len(keep) > size {
+		drop = append(drop, keep[size:]...)
+		keep = keep[:size]
 	}
 	d.ready = keep
 	d.metrics.poolReady.Set(float64(len(d.ready)))
