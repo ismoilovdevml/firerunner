@@ -92,6 +92,15 @@ check "VM->builder through DNAT after reload"      ok      $A nc -z -w2 10.200.0
 check "VM->VM TCP to vmB blocked"                   blocked $A nc -z -w2 10.200.0.12 1234
 check "VM->VM still blocked after reload"          blocked $A ping -c1 -W1 10.200.0.12
 
+
+# ingress from the uplink: a LAN host that routes the microVM subnet via this host
+ip -n out route add 10.200.0.0/24 via 192.0.2.1
+L="ip netns exec out"
+check "LAN->VM tcp/1234 (forwarded into the subnet)" blocked $L nc -z -w2 10.200.0.12 1234
+check "LAN->bridge address registry .1:5000"        blocked $L nc -z -w2 10.200.0.1 5000
+check "LAN->bridge address DNS tcp .1:53"           blocked $L nc -z -w2 10.200.0.1 53
+check "host itself->bridge address .1:5000"         ok      nc -z -w2 10.200.0.1 5000
+check "VM egress still gets replies"                ok      $A nc -z -w2 192.0.2.50 80
 echo "---- rendered rules"; nft list table inet firerunner | sed -n '/chain input/,/^}/p'
 echo "RESULT pass=$pass fail=$fail"
 [[ $fail -eq 0 ]]

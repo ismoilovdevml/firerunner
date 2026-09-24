@@ -348,6 +348,9 @@ table inet firerunner {
     type filter hook input priority filter; policy accept;
     # microVMs may only use DHCP, DNS, the registry mirror and the cache server on the host
     # (IPv4 and IPv6)
+    # The services on the bridge address are for microVMs and the host only,
+    # never for the uplink (a LAN host routing the microVM subnet here).
+    ip daddr ${FR_SUBNET}.1 iifname != { "${FR_BRIDGE}", "lo" } drop
     iifname "${FR_BRIDGE}" udp dport { 53, 67 } accept
     iifname "${FR_BRIDGE}" tcp dport 53 accept
     iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport { 5000, 9000 } accept
@@ -360,6 +363,9 @@ table inet firerunner {
     # below); any other traffic routed from one microVM to another is dropped.
     iifname "${FR_BRIDGE}" oifname "${FR_BRIDGE}" ct status dnat accept
     iifname "${FR_BRIDGE}" oifname "${FR_BRIDGE}" drop
+    # From outside, microVMs only get replies to connections they opened.
+    oifname "${FR_BRIDGE}" ct state established,related accept
+    oifname "${FR_BRIDGE}" drop
   }
   # Job VMs reach their project's BuildKit builder at ${FR_SUBNET}.1:<port>; the
   # firerunner daemon fills the map. Routed through the host, never VM to VM.
