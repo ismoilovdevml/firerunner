@@ -111,6 +111,11 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 		}
 	}
 
+	// One SSH connection for the rest of the job (every later stage reuses it).
+	if err := vm.StartMux(cfg, inst); err != nil {
+		fmt.Fprintf(os.Stderr, "ssh multiplexing unavailable (%v); stages connect one by one\n", err)
+	}
+
 	services, err := ParseServices(os.Getenv("CUSTOM_ENV_CI_JOB_SERVICES"))
 	if err != nil {
 		deleteVM(cfg, inst.UID)
@@ -399,6 +404,9 @@ func Cleanup(cfg config.Config) error {
 	} else if found, err := fl.Find(ctx, id); err == nil {
 		// The job was cancelled while prepare was still booting the microVM.
 		uid = found.GetSpec().GetUid()
+	}
+	if stErr == nil {
+		vm.StopMux(&st.Instance)
 	}
 	var delErr error
 	if uid != "" {

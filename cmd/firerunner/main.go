@@ -676,6 +676,7 @@ func cmdExecutor(cfg config.Config, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: firerunner executor prepare|run <script> <stage>|cleanup")
 	}
+	vm.Multiplex = true
 	switch args[0] {
 	case "prepare":
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

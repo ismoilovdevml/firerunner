@@ -43,6 +43,21 @@ type Instance struct {
 // KnownHostsDir holds one pinned known_hosts file per microVM.
 var KnownHostsDir = "/run/firerunner/known_hosts"
 
+// MuxDir holds one ssh control socket per microVM (see Multiplex).
+var MuxDir = "/run/firerunner/ssh-mux"
+
+// Multiplex makes SSH reuse one connection per microVM. The executor turns it
+// on: StartMux opens the connection in prepare and every later stage skips the
+// handshake (measured on the trial host: 145 ms -> 10 ms per session, about
+// ten sessions per job). The daemon leaves it off: restarting its service
+// would kill the masters it started.
+var Multiplex bool
+
+// MuxPersist is how long an idle master stays up; an active session keeps it.
+const MuxPersist = "10m"
+
+func muxPath(id string) string { return filepath.Join(MuxDir, filepath.Base(id)) }
+
 // HostKey is a per-VM SSH host key pair in OpenSSH formats.
 type HostKey struct {
 	Private string
@@ -242,6 +257,7 @@ func findLease(leasesFile, mac string) (*lease, error) {
 // without it every VM holds an address until the lease expires.
 func Forget(cfg config.Config, id string) {
 	RemoveKnownHosts(id)
+	_ = os.Remove(muxPath(id)) // a master exits by itself when its VM is gone
 	l, err := findLease(cfg.Network.LeasesFile, MAC(id))
 	if err != nil || l == nil {
 		return
@@ -286,8 +302,54 @@ func SSH(cfg config.Config, inst *Instance, args ...string) *exec.Cmd {
 		fmt.Fprintf(os.Stderr, "warning: %v; connecting to %s without host key verification\n", err, inst.ID)
 		base = append(base, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null")
 	}
+	if Multiplex && inst.HostKey != "" {
+		// Client only: never become a master here. A master started by a stage
+		// would inherit that stage's output pipes and keep gitlab-runner waiting.
+		// Without a live master, ssh connects directly.
+		base = append(base, "-o", "ControlMaster=no", "-o", "ControlPath="+muxPath(inst.ID))
+	}
 	base = append(base, "root@"+inst.IP)
 	return exec.Command("ssh", append(base, args...)...)
+}
+
+// StartMux opens the shared connection for a pinned microVM: ssh
+// authenticates, then detaches (-f) with its standard streams on /dev/null,
+// so no stage waits for it. Errors only cost the speed-up.
+func StartMux(cfg config.Config, inst *Instance) error {
+	if !Multiplex || inst.HostKey == "" {
+		return nil
+	}
+	if err := os.MkdirAll(MuxDir, 0o700); err != nil {
+		return err
+	}
+	file, err := knownHosts(inst)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command("ssh", "-q", "-N", "-f", "-i", cfg.Network.SSHKey, "-o", "LogLevel=ERROR",
+		"-o", "ConnectTimeout=3", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+		"-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile="+file, "-o", "HostKeyAlias="+inst.ID,
+		"-o", "ControlMaster=yes", "-o", "ControlPath="+muxPath(inst.ID), "-o", "ControlPersist="+MuxPersist,
+		"root@"+inst.IP)
+	return cmd.Run()
+}
+
+// StopMux closes the shared connection of a microVM, if any, and removes its socket.
+func StopMux(inst *Instance) {
+	path := muxPath(inst.ID)
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	cmd := exec.Command("ssh", "-o", "ControlPath="+path, "-O", "exit", "root@"+inst.IP)
+	_ = cmd.Start()
+	done := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+	}
+	_ = os.Remove(path)
 }
 
 func knownHosts(inst *Instance) (string, error) {
