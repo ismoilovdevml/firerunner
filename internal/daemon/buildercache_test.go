@@ -228,7 +228,7 @@ func TestBuilderCacheFailedRestoreDropsCopy(t *testing.T) {
 	stubBuilders(t, func(string) bool { return true })
 	dir := stubBuilderCache(t, nil, nil,
 		func(context.Context, config.Config, *vm.Instance, io.Reader) error {
-			return errors.New("tar: unexpected EOF")
+			return fmt.Errorf("tar: unexpected EOF: %w", exec.Command("sh", "-c", "exit 1").Run())
 		})
 	writeFile(t, filepath.Join(dir, "7.tar"), "broken", time.Hour)
 	d, _ := newTestDaemon(t)
@@ -256,7 +256,7 @@ func TestMakeRoomForCache(t *testing.T) {
 	exists := func(name string) bool { _, err := os.Stat(filepath.Join(dir, name)); return err == nil }
 
 	// Budget 120 with 120 used by others: a 30-byte cache needs the oldest gone.
-	if err := d.makeRoomForCache("9", 30, 120); err != nil {
+	if err := d.makeRoomForCache("9", 30, 120, 0); err != nil {
 		t.Fatal(err)
 	}
 	if exists("1.tar") || !exists("2.tar") || !exists("3.tar") || !exists("9.tar") || exists("4.tar.tmp-1") {
@@ -266,7 +266,7 @@ func TestMakeRoomForCache(t *testing.T) {
 	// Disk nearly full: 100 of 1000 bytes must stay free and 100 are, so a
 	// 30-byte cache needs 2.tar (40 bytes) gone too, but not 3.tar.
 	diskSpace = func(string) (uint64, uint64, error) { return 100, 1000, nil }
-	if err := d.makeRoomForCache("9", 30, 1<<30); err != nil {
+	if err := d.makeRoomForCache("9", 30, 1<<30, 0); err != nil {
 		t.Fatal(err)
 	}
 	if exists("2.tar") || !exists("3.tar") {
@@ -275,8 +275,21 @@ func TestMakeRoomForCache(t *testing.T) {
 
 	// Nothing left to drop and still no room: refuse.
 	diskSpace = func(string) (uint64, uint64, error) { return 10, 1000, nil }
-	if err := d.makeRoomForCache("9", 500, 1<<30); err == nil {
+	if err := d.makeRoomForCache("9", 500, 1<<30, 0); err == nil {
 		t.Fatal("no error without room")
+	}
+
+	// Bytes reserved by saves still being written count against the budget:
+	// 3.tar (40) + 50 reserved + 30 new > 100, and nothing is left to drop.
+	diskSpace = func(string) (uint64, uint64, error) { return 1 << 40, 2 << 40, nil }
+	if err := d.makeRoomForCache("9", 30, 100, 50); err != nil {
+		t.Fatal(err) // dropping 3.tar makes room
+	}
+	if exists("3.tar") {
+		t.Fatal("reserved bytes were not counted")
+	}
+	if err := d.makeRoomForCache("9", 60, 100, 50); err == nil {
+		t.Fatal("reservation ignored: 50 reserved + 60 new fit a 100-byte budget")
 	}
 }
 
@@ -410,8 +423,9 @@ func TestConcurrentSavesStayWithinBudget(t *testing.T) {
 	if total > 100 {
 		t.Fatalf("saved %d bytes under a 100-byte budget: %v", total, listDir(dir))
 	}
-	if n := cacheCount(d, "save", "ok"); n != 4 {
-		t.Fatalf("save ok = %v, want 4 (older copies make room)", n)
+	ok, skipped := cacheCount(d, "save", "ok"), cacheCount(d, "save", "skipped")
+	if ok < 2 || ok+skipped != 4 {
+		t.Fatalf("save ok = %v, skipped = %v; want at least 2 saved, the rest skipped", ok, skipped)
 	}
 }
 
@@ -598,4 +612,51 @@ func TestRemoveBuildersRejectsBadProject(t *testing.T) {
 	if readFile(t, filepath.Join(dir, "x.tar")) != "x" {
 		t.Fatal("path from a project id was used")
 	}
+}
+
+// Review round 2, N1: one project's slow save neither holds up another
+// project's save nor keeps the project's next builder waiting forever.
+func TestSlowSaveDoesNotStallOthers(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	release := make(chan struct{})
+	dir := stubBuilderCache(t, sizeOf(1), func(_ context.Context, _ config.Config, inst *vm.Instance, w io.Writer) error {
+		if inst.ID == "bld-1" {
+			<-release // project 1's copy hangs
+		}
+		_, err := io.WriteString(w, "x")
+		return err
+	}, nil)
+	d, _ := newTestDaemon(t)
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(free)
+	d.builders = map[string]*builder{"1": readyBuilder("1", 20001, d.cfg.Builder.IdleTTL+time.Hour, builderSpec(d.cfg))}
+	d.expireBuilders()
+	d.builders = map[string]*builder{"2": readyBuilder("2", 20002, d.cfg.Builder.IdleTTL+time.Hour, builderSpec(d.cfg))}
+	d.expireBuilders()
+	deadline := time.Now().Add(2 * time.Second)
+	for readFile(t, filepath.Join(dir, "2.tar")) != "x" {
+		if time.Now().After(deadline) {
+			t.Fatal("project 2's save waited for project 1's hung save")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Project 1's next builder boots after builderSaveWait, not after the save.
+	old := builderSaveWait
+	builderSaveWait = 50 * time.Millisecond
+	t.Cleanup(func() { builderSaveWait = old })
+	boots := stubBoot(t, nil)
+	d.Builder("1", true)
+	done := make(chan struct{})
+	go func() { d.bootBuilder(context.Background(), d.cfg, "1"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("builder boot still waiting for the hung save")
+	}
+	if boots.Load() != 1 {
+		t.Fatalf("boots = %d", boots.Load())
+	}
+	free()
 }

@@ -133,11 +133,10 @@ func keepsCache(reason string) bool {
 }
 
 // saveBuilderCache copies the builder's BuildKit state to the host. Any failure
-// leaves the previous saved copy (if any) in place. Saves run one at a time;
-// started is when the builder was removed (see cacheDropped).
+// leaves the previous saved copy (if any) in place. Saves copy side by side,
+// but each reserves its size first (see makeRoomForCache); started is when the
+// builder was removed (see cacheDropped).
 func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, project string, inst *vm.Instance, started time.Time) {
-	d.cacheMu.Lock()
-	defer d.cacheMu.Unlock()
 	result := "failed"
 	defer func() { d.metrics.builderCache.WithLabelValues("save", result).Inc() }()
 	ctx, cancel := context.WithTimeout(ctx, builderCacheTimeout)
@@ -159,11 +158,22 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 		d.log.Warn("builder cache not saved", "project", project, "err", err)
 		return
 	}
-	if err := d.makeRoomForCache(project, size, limit); err != nil {
+	d.cacheMu.Lock()
+	err = d.makeRoomForCache(project, size, limit, d.cacheReserved)
+	if err == nil {
+		d.cacheReserved += size
+	}
+	d.cacheMu.Unlock()
+	if err != nil {
 		result = "skipped"
 		d.log.Warn("builder cache not saved", "project", project, "err", err)
 		return
 	}
+	defer func() {
+		d.cacheMu.Lock()
+		d.cacheReserved -= size
+		d.cacheMu.Unlock()
+	}()
 	tmp, err := os.CreateTemp(builderCacheDir, project+".tar.tmp-*")
 	if err != nil {
 		d.log.Warn("builder cache not saved", "project", project, "err", err)
@@ -204,8 +214,9 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 
 // makeRoomForCache deletes other projects' saved caches, least recently used
 // first, until a new one of size fits into limit and leaves builderCacheMinFree
-// of the disk free. The project's own old copy stays until the new one replaces it.
-func (d *Daemon) makeRoomForCache(project string, size, limit int64) error {
+// of the disk free, counting reserved bytes of saves still being written. The
+// project's own old copy stays until the new one replaces it. Callers hold cacheMu.
+func (d *Daemon) makeRoomForCache(project string, size, limit, reserved int64) error {
 	type saved struct {
 		path string
 		size int64
@@ -245,7 +256,8 @@ func (d *Daemon) makeRoomForCache(project string, size, limit int64) error {
 		return err
 	}
 	minFree := int64(float64(disk) * builderCacheMinFree)
-	avail := int64(free)
+	avail := int64(free) - reserved // written as the other saves go on
+	total += reserved
 	for len(others) > 0 && (total+size > limit || avail-size < minFree) {
 		o := others[0]
 		others = others[1:]
@@ -287,7 +299,9 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 	start := time.Now()
 	if err := builderCacheLoad(lctx, cfg, inst, f); err != nil {
 		d.metrics.builderCache.WithLabelValues("restore", "failed").Inc()
-		if lctx.Err() == nil && exitCode(err) != 255 { // 255: ssh itself failed
+		// Only the VM's own verdict (tar or the marker check: exit 1..254) says the
+		// copy is bad. 255 is ssh failing, -1 ssh killed (e.g. by the OOM killer).
+		if code := exitCode(err); lctx.Err() == nil && code > 0 && code != 255 {
 			_ = os.Remove(file)
 			d.log.Warn("saved builder cache refused and deleted, starting empty", "project", project, "err", err)
 		} else {

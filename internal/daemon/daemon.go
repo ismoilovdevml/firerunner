@@ -176,9 +176,11 @@ type Daemon struct {
 	// started earlier does not bring it back.
 	saving       map[string]*cacheSave
 	cacheDropped map[string]time.Time
-	// cacheMu runs one cache save at a time: each checks the disk budget, and
-	// saves running side by side would all pass against the same free space.
-	cacheMu sync.Mutex
+	// cacheMu guards cacheReserved: the bytes that saves still being written
+	// will take, so saves side by side do not all pass the disk budget against
+	// the same free space.
+	cacheMu       sync.Mutex
+	cacheReserved int64
 }
 
 // spawn runs fn in the background and lets Run wait for it at shutdown, so

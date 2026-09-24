@@ -303,8 +303,12 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	saving := d.saving[project]
 	d.mu.Unlock()
 	if saving != nil {
+		// A slow save must not keep the project without a builder: after
+		// builderSaveWait the new builder starts from the older copy, if any.
 		select {
 		case <-saving.done:
+		case <-time.After(builderSaveWait):
+			d.log.Warn("builder boots before its previous cache copy finished", "project", project)
 		case <-ctx.Done():
 		}
 	}
@@ -377,6 +381,10 @@ var (
 // errBuildkitDown: buildkitd was started but never listened.
 var errBuildkitDown = errors.New("buildkitd did not start listening")
 
+// builderSaveWait bounds how long a builder boot waits for the project's
+// previous builder to finish copying its cache out.
+var builderSaveWait = 5 * time.Minute
+
 // builderFitWait is how long a builder boot waits for host memory: a builder
 // deleted to free its slot holds its memory until its cache is copied out.
 var builderFitWait = 2 * time.Minute
@@ -416,7 +424,7 @@ func setupBuildkit(ctx context.Context, cfg config.Config, inst *vm.Instance, c 
 		"--addr tcp://0.0.0.0:1234 --config /etc/buildkit/buildkitd.toml "+
 		"--tlscacert /etc/buildkit/ca.pem --tlscert /etc/buildkit/server.pem --tlskey /etc/buildkit/server.key "+
 		"--oci-worker-gc --oci-worker-gc-keepstorage %d >/dev/null\n", shellQuote(cfg.Builder.Image), cfg.Builder.CacheMB)
-	script.WriteString("for i in $(seq 1 60); do (</dev/tcp/127.0.0.1/1234) 2>/dev/null && exit 0; sleep 1; done\n" +
+	script.WriteString("for i in $(seq 1 180); do (</dev/tcp/127.0.0.1/1234) 2>/dev/null && exit 0; sleep 1; done\n" +
 		"docker logs --tail 20 buildkitd >&2; exit 3\n")
 
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
