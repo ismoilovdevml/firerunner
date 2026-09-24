@@ -31,6 +31,7 @@ const (
 	BuilderBooting  = "booting"  // build locally this time
 	BuilderBusy     = "busy"     // all builder slots in use
 	BuilderDisabled = "disabled" // builder.enabled is false
+	BuilderNone     = "none"     // the project has no builder and none was started
 )
 
 // BuilderServerName is the TLS name in every builder certificate; job VMs
@@ -94,9 +95,10 @@ func builderConfig(c config.Config) config.Config {
 	return c
 }
 
-// Builder returns the project's builder, starting one when there is none.
-// It never blocks on a boot: a job whose builder is not ready builds locally.
-func (d *Daemon) Builder(project string) BuilderInfo {
+// Builder returns the project's builder. With start it boots one when there
+// is none; without, it only reports an existing one, so projects that never
+// build do not occupy a builder. It never blocks on a boot.
+func (d *Daemon) Builder(project string, start bool) BuilderInfo {
 	if !projectID.MatchString(project) {
 		return BuilderInfo{State: BuilderDisabled}
 	}
@@ -105,6 +107,9 @@ func (d *Daemon) Builder(project string) BuilderInfo {
 	cfg := d.cfg
 	if !cfg.Builder.Enabled || cfg.Builder.Max == 0 {
 		return BuilderInfo{State: BuilderDisabled}
+	}
+	if _, ok := d.builders[project]; !ok && !start {
+		return BuilderInfo{State: BuilderNone}
 	}
 	if at, ok := d.builderFailed[project]; ok && time.Since(at) < builderRetryAfter {
 		d.metrics.builderRequests.WithLabelValues(BuilderBusy).Inc()

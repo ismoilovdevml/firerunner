@@ -64,10 +64,14 @@ func (c *Client) Pool() (json.RawMessage, error) {
 	return raw, json.NewDecoder(resp.Body).Decode(&raw)
 }
 
-// Builder asks for the project's BuildKit builder; the daemon starts one when
-// there is none, so the answer may be "booting".
-func (c *Client) Builder(project string) (*BuilderInfo, error) {
-	resp, err := c.http.Post("http://daemon/builder?project="+url.QueryEscape(project), "", nil)
+// Builder asks for the project's BuildKit builder. With start the daemon boots
+// one when there is none (answer "booting"); without, the answer is "none".
+func (c *Client) Builder(project string, start bool) (*BuilderInfo, error) {
+	s := "0"
+	if start {
+		s = "1"
+	}
+	resp, err := c.http.Post("http://daemon/builder?start="+s+"&project="+url.QueryEscape(project), "", nil)
 	if err != nil {
 		return nil, err
 	}

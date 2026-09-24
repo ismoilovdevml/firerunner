@@ -46,35 +46,35 @@ func TestBuilderRequest(t *testing.T) {
 	d.cfg.Builder.Max = 2
 
 	for _, bad := range []string{"", "abc", "1;rm -rf /", "../1"} {
-		if got := d.Builder(bad).State; got != BuilderDisabled {
+		if got := d.Builder(bad, true).State; got != BuilderDisabled {
 			t.Errorf("Builder(%q) = %s, want disabled", bad, got)
 		}
 	}
 	// First request starts a builder on the first port and already hands out its
 	// port and client credentials; later ones see it booting with the same ones.
-	first := d.Builder("7")
+	first := d.Builder("7", true)
 	if first.State != BuilderBooting || first.Port != d.cfg.Builder.PortBase+1 || first.Key == "" || first.CA == "" {
 		t.Fatalf("first request = %+v", first)
 	}
 	if b := d.builders["7"]; b == nil || b.Port != d.cfg.Builder.PortBase+1 || b.ready {
 		t.Fatalf("builder entry = %+v", b)
 	}
-	if got := d.Builder("7"); got.State != BuilderBooting || got.Key != first.Key {
+	if got := d.Builder("7", true); got.State != BuilderBooting || got.Key != first.Key {
 		t.Fatalf("second request = %+v", got)
 	}
 	// Once ready the job gets the port and the client credentials.
 	d.builders["7"] = readyBuilder("7", d.cfg.Builder.PortBase+1, 0, builderSpec(d.cfg))
-	if got := d.Builder("7"); got.State != BuilderReady || got.Port != d.cfg.Builder.PortBase+1 || got.Key != "key" {
+	if got := d.Builder("7", true); got.State != BuilderReady || got.Port != d.cfg.Builder.PortBase+1 || got.Key != "key" {
 		t.Fatalf("ready request = %+v", got)
 	}
 
 	// Slots full: a busy builder is never evicted, an idle one is.
 	d.builders["8"] = readyBuilder("8", d.cfg.Builder.PortBase+2, time.Minute, builderSpec(d.cfg))
-	if got := d.Builder("9").State; got != BuilderBusy {
+	if got := d.Builder("9", true).State; got != BuilderBusy {
 		t.Fatalf("with all builders recently used: %s, want busy", got)
 	}
 	d.builders["8"].LastUsed = time.Now().Add(-time.Hour)
-	if got := d.Builder("9").State; got != BuilderBooting {
+	if got := d.Builder("9", true).State; got != BuilderBooting {
 		t.Fatalf("with an idle builder: %s, want booting", got)
 	}
 	if _, ok := d.builders["8"]; ok {
@@ -85,7 +85,7 @@ func TestBuilderRequest(t *testing.T) {
 	}
 
 	d.cfg.Builder.Enabled = false
-	if got := d.Builder("7").State; got != BuilderDisabled {
+	if got := d.Builder("7", true).State; got != BuilderDisabled {
 		t.Fatalf("disabled: %s", got)
 	}
 }
@@ -269,7 +269,7 @@ func TestBusyBuilderIsKept(t *testing.T) {
 		t.Fatalf("busy builder expired or not refreshed: %+v", b)
 	}
 	d.builders["2"].LastUsed = time.Now().Add(-time.Hour)
-	if got := d.Builder("3").State; got != BuilderBooting {
+	if got := d.Builder("3", true).State; got != BuilderBooting {
 		t.Fatalf("new project with an idle builder to evict: %s", got)
 	}
 	if d.builders["2"] == nil || d.builders["1"] != nil {
@@ -292,10 +292,10 @@ func TestFailedBuilderBootCoolsDown(t *testing.T) {
 		done <- struct{}{}
 	}
 	d, _ := newTestDaemon(t)
-	d.Builder("7")
+	d.Builder("7", true)
 	<-done
 	for i := 0; i < 4; i++ {
-		if got := d.Builder("7").State; got != BuilderBusy {
+		if got := d.Builder("7", true).State; got != BuilderBusy {
 			t.Fatalf("during cooldown: %s, want busy", got)
 		}
 	}
@@ -305,9 +305,31 @@ func TestFailedBuilderBootCoolsDown(t *testing.T) {
 	d.mu.Lock()
 	d.builderFailed["7"] = time.Now().Add(-builderRetryAfter - time.Second)
 	d.mu.Unlock()
-	d.Builder("7")
+	d.Builder("7", true)
 	<-done
 	if n := boots.Load(); n != 2 {
 		t.Fatalf("no retry after the cooldown (boots=%d)", n)
+	}
+}
+
+// Without start, a project with no builder gets "none" and nothing boots:
+// projects that never build do not occupy a builder slot.
+func TestBuilderWithoutStartNeverBoots(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	var boots atomic.Int32
+	builderBoot = func(*Daemon, context.Context, config.Config, string) { boots.Add(1) }
+	d, _ := newTestDaemon(t)
+	if got := d.Builder("7", false).State; got != BuilderNone {
+		t.Fatalf("no builder, start=false: %s, want none", got)
+	}
+	if boots.Load() != 0 || len(d.builders) != 0 {
+		t.Fatalf("start=false booted a builder (boots=%d, builders=%v)", boots.Load(), d.builders)
+	}
+	d.builders["7"] = readyBuilder("7", 20001, time.Hour, builderSpec(d.cfg))
+	if got := d.Builder("7", false); got.State != BuilderReady || got.Key == "" {
+		t.Fatalf("existing builder, start=false: %+v", got)
+	}
+	if time.Since(d.builders["7"].LastUsed) > time.Minute {
+		t.Fatal("using an existing builder must refresh LastUsed")
 	}
 }

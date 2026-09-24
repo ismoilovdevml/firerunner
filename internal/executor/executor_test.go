@@ -170,3 +170,22 @@ func TestBuilderScript(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildsImages(t *testing.T) {
+	for script, want := range map[string]bool{
+		"docker build -t app .":                         true,
+		"echo x\n  docker buildx build --push .":        true,
+		"docker buildx bake":                            true,
+		"docker compose -f a.yml build api":             true,
+		"docker-compose build":                          true,
+		"docker push harbor/x:1\ndocker image prune -f": false,
+		"ssh host 'docker pull x && docker run -d x'":   false,
+		"docker compose up -d":                          false,
+		"npm run build":                                 false,
+		"dotnet build":                                  false,
+	} {
+		if got := BuildsImages([]byte(script)); got != want {
+			t.Errorf("BuildsImages(%q) = %v, want %v", script, got, want)
+		}
+	}
+}

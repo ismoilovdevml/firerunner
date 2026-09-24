@@ -6,6 +6,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -136,9 +138,11 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 		}
 	}
 	// Shell-mode jobs run docker on the VM; their builds can use the project's
-	// warm BuildKit builder. A failure here only costs the cache, never the job.
+	// warm BuildKit builder. Prepare only attaches a builder the project already
+	// has; Run starts one when a stage actually builds. A failure here only costs
+	// the cache, never the job.
 	if os.Getenv("CUSTOM_ENV_CI_JOB_IMAGE") == "" {
-		if j, err := currentJob(); err == nil && j.Project != "" && useBuilder(cfg, dc, inst, j.Project) {
+		if j, err := currentJob(); err == nil && j.Project != "" && useBuilder(cfg, dc, inst, j.Project, false) {
 			st.BuilderProject = j.Project
 			_ = vm.SaveJobState(statePath(id), st)
 		}
@@ -211,10 +215,10 @@ const BuilderName = "firerunner"
 // starting. Nothing waits here: jobs that never build (checks, deploys) start at
 // once, and the docker wrapper (BuilderScript) waits for a starting builder only
 // when the job actually builds.
-func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project string) bool {
-	info, err := dc.Builder(project)
+func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project string, start bool) bool {
+	info, err := dc.Builder(project, start)
 	switch {
-	case err != nil || info.State == daemon.BuilderDisabled:
+	case err != nil || info.State == daemon.BuilderDisabled || info.State == daemon.BuilderNone:
 		return false
 	case (info.State == daemon.BuilderReady || info.State == daemon.BuilderBooting) && info.Port > 0 && info.Key != "":
 	default:
@@ -234,6 +238,13 @@ func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project
 	}
 	return true
 }
+
+// buildCommand matches a command in a stage script that builds images.
+var buildCommand = regexp.MustCompile(`\bdocker(\s+buildx)?\s+build\b|\bdocker\s+buildx\s+bake\b|\bdocker(-|\s+)compose\b[^\n]*\bbuild\b`)
+
+// BuildsImages reports whether a stage script runs docker build (or buildx
+// build/bake, compose build). Only such stages need the project's builder.
+func BuildsImages(script []byte) bool { return buildCommand.Match(script) }
 
 // BuilderWait is how long `docker build` in a job waits for a starting builder.
 const BuilderWait = 90
@@ -312,6 +323,20 @@ func Run(cfg config.Config, script, stage string) error {
 		code, err = runInContainer(cfg, &st.Instance, image, st.Network, f)
 	} else {
 		var script io.Reader = f
+		if st.BuilderProject == "" && isUserStage(stage) {
+			// The stage builds images: give the project a builder now (its
+			// docker wrapper waits while the builder starts).
+			if body, rerr := io.ReadAll(f); rerr == nil {
+				script = bytes.NewReader(body)
+				if BuildsImages(body) {
+					if j, jerr := currentJob(); jerr == nil && j.Project != "" &&
+						useBuilder(cfg, daemon.NewClient(cfg.Daemon.Socket), &st.Instance, j.Project, true) {
+						st.BuilderProject = j.Project
+						_ = vm.SaveJobState(statePath(id), st)
+					}
+				}
+			}
+		}
 		if st.BuilderProject != "" && isUserStage(stage) {
 			// `docker build` only uses a buildx builder named in the environment.
 			script = io.MultiReader(strings.NewReader("export BUILDX_BUILDER="+BuilderName+"\n"), f)

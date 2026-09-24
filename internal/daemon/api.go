@@ -43,7 +43,8 @@ func (d *Daemon) apiHandler() http.Handler {
 		w.WriteHeader(http.StatusAccepted)
 	})
 	mux.HandleFunc("POST /builder", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(d.Builder(r.URL.Query().Get("project")))
+		q := r.URL.Query()
+		_ = json.NewEncoder(w).Encode(d.Builder(q.Get("project"), q.Get("start") != "0"))
 	})
 	mux.HandleFunc("DELETE /builder", func(w http.ResponseWriter, r *http.Request) {
 		project := r.URL.Query().Get("project")

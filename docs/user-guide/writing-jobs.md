@@ -84,8 +84,9 @@ The built image is loaded into the job VM as usual, so `docker push`, `docker ru
 `docker image ls` work unchanged. Measured on a .NET service: 2 s with a warm builder, same as a
 shell runner with its host cache (26–30 s without any cache).
 
-The first job of a project starts the builder (about 30 s); `docker build` in that job waits for
-it, so even the first build fills the cache. Jobs that do not build never wait. A builder that nobody used for 24 hours is deleted together with its cache.
+The first job of a project that runs `docker build` starts the builder (about 30 s) and waits
+for it, so even the first build fills the cache. Projects and jobs that do not build never start
+a builder and never wait. A builder that nobody used for 24 hours is deleted together with its cache.
 
 ### Layer cache for jobs with `image:`
 
