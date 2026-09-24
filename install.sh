@@ -702,7 +702,8 @@ ProtectSystem=strict
 ProtectHome=read-only
 RuntimeDirectory=firerunner
 RuntimeDirectoryPreserve=yes
-ReadWritePaths=/run/firerunner -/run/lock -/run/lvm
+# /var/lib/flintlock/vm: reconcile removes the state dirs flintlockd leaves for deleted VMs.
+ReadWritePaths=/run/firerunner -/run/lock -/run/lvm -/var/lib/flintlock/vm
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes

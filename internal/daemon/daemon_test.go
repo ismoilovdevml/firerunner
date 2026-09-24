@@ -103,11 +103,27 @@ func TestTidyVMDirs(t *testing.T) {
 	fresh := mk("job-2", time.Now(), false) // being created: kept
 	liveDir := mk("pool-a", old, false)     // listed: kept
 	withState := mk("job-3", old, true)     // not empty: kept
-	tidyVMDirs(root, map[string]bool{"pool-a": true})
+	if err := tidyVMDirs(root, map[string]bool{"pool-a": true}); err != nil {
+		t.Fatalf("a non-empty dir is not an error: %v", err)
+	}
 	for p, want := range map[string]bool{gone: false, fresh: true, liveDir: true, withState: true} {
 		if _, err := os.Stat(p); (err == nil) != want {
 			t.Errorf("%s exists=%v, want %v", filepath.Base(p), err == nil, want)
 		}
 	}
-	tidyVMDirs(filepath.Join(root, "missing"), nil) // no namespace dir yet: no-op
+	if err := tidyVMDirs(filepath.Join(root, "missing"), nil); err != nil { // no namespace dir yet
+		t.Fatal(err)
+	}
+	// A read-only state dir (e.g. a hardened unit without write access) is reported.
+	ro := mk("ro", old, false)
+	mk("ro/job-9", old, false)
+	if err := os.Chmod(ro, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(ro, 0o755) })
+	if os.Geteuid() != 0 {
+		if err := tidyVMDirs(ro, nil); err == nil {
+			t.Fatal("a failed removal must be reported")
+		}
+	}
 }

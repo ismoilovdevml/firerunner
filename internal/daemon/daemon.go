@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/liquidmetal-dev/flintlock/api/types"
@@ -727,7 +728,9 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 	for _, v := range vms {
 		live[v.GetSpec().GetId()] = true
 	}
-	tidyVMDirs(filepath.Join(flintlockVMDir, cfg.Flintlock.Namespace), live)
+	if err := tidyVMDirs(filepath.Join(flintlockVMDir, cfg.Flintlock.Namespace), live); err != nil {
+		d.log.Warn("cannot remove leftover microVM state dirs", "err", err)
+	}
 }
 
 // flintlockVMDir is where flintlockd keeps per-VM state (a variable for tests).
@@ -737,11 +740,13 @@ var flintlockVMDir = "/var/lib/flintlock/vm"
 // deleted microVM (one per job: ~740 after the first trial day). Only empty
 // directories of VMs that are not listed and are older than an hour go; a VM
 // being created is listed well within that.
-func tidyVMDirs(root string, live map[string]bool) {
+// It returns the first error other than "directory not empty".
+func tidyVMDirs(root string, live map[string]bool) error {
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return
+		return nil // no namespace dir yet
 	}
+	var first error
 	for _, e := range entries {
 		if !e.IsDir() || live[e.Name()] {
 			continue
@@ -750,8 +755,13 @@ func tidyVMDirs(root string, live map[string]bool) {
 		if err != nil || time.Since(info.ModTime()) < time.Hour {
 			continue
 		}
-		_ = os.Remove(filepath.Join(root, e.Name())) // fails, and keeps it, unless empty
+		// os.Remove never deletes a directory that is not empty.
+		if err := os.Remove(filepath.Join(root, e.Name())); err != nil && first == nil &&
+			!errors.Is(err, syscall.ENOTEMPTY) && !errors.Is(err, syscall.EEXIST) {
+			first = err
+		}
 	}
+	return first
 }
 
 // jobStateGlob matches the state files `executor prepare` writes (a variable for tests).
