@@ -487,7 +487,8 @@ After=containerd-flintlock.service firerunner-net.service
 
 [Service]
 # All settings, including the API token, come from /etc/opt/flintlockd/config.yaml (0600).
-ExecStart=${BIN_DIR}/flintlockd run
+# ksm-exec marks flintlockd (and so every Firecracker VM) for kernel samepage merging.
+ExecStart=${BIN_DIR}/firerunner ksm-exec ${BIN_DIR}/flintlockd run
 Restart=always
 RestartSec=5
 KillMode=process
@@ -632,6 +633,19 @@ configure_runner_cache() {
     $BIN_DIR/firerunner runner status 2>/dev/null | grep -q '^cache *none' || return 0
     log "storing cache: on this host (firerunner runner cache)"
     $BIN_DIR/firerunner runner cache local >/dev/null
+}
+
+# Kernel samepage merging: all microVMs run the same kernel, rootfs and often the
+# same images, so identical guest pages are stored once. ksmd costs some CPU.
+setup_ksm() {
+    [[ -d /sys/kernel/mm/ksm ]] || { warn "kernel has no KSM; microVM memory is not deduplicated"; return 0; }
+    put /etc/tmpfiles.d/firerunner-ksm.conf <<EOF
+w /sys/kernel/mm/ksm/run - - - - 1
+w /sys/kernel/mm/ksm/pages_to_scan - - - - 1000
+w /sys/kernel/mm/ksm/sleep_millisecs - - - - 20
+w /sys/kernel/mm/ksm/use_zero_pages - - - - 1
+EOF
+    systemd-tmpfiles --create /etc/tmpfiles.d/firerunner-ksm.conf
 }
 
 # A new root disk size only applies to images unpacked after the change:
@@ -825,7 +839,7 @@ uninstall() {
         rm -f "/etc/systemd/system/$svc.service"
     done
     systemctl daemon-reload
-    rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry" "$BIN_DIR/versitygw"
+    rm -f /etc/sysctl.d/90-firerunner.conf /etc/tmpfiles.d/firerunner-ksm.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry" "$BIN_DIR/versitygw"
     rm -rf "$LIB_DIR"
     log "done. To also drop data: vgremove $VG && rm -rf $CONTAINERD_ROOT /var/lib/flintlock $CONF_DIR"
 }
@@ -846,9 +860,11 @@ main() {
     install_flintlock
     install_registry_mirror
     install_cache_server
+    setup_ksm
+    # before start_services: flintlockd.service starts through `firerunner ksm-exec`
+    install_firerunner
     start_services
     apply_vm_disk_size
-    install_firerunner
     systemctl daemon-reload
     systemctl enable -q firerunner
     if ! systemctl is-active -q firerunner || changed /etc/systemd/system/firerunner.service "$BIN_DIR/firerunner"; then

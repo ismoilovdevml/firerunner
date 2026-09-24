@@ -36,6 +36,14 @@ exactly one job.
 `pool.preload_images` pulls images into pool VMs while they are idle. Use it for large images your
 jobs use a lot (e.g. .NET or JDK SDKs), especially from registries other than Docker Hub.
 
+## Memory deduplication (KSM)
+
+A microVM keeps every page it has touched: after a build or an image preload its full
+`memory_mb` is in use on the host. The installer turns on kernel samepage merging and starts
+flintlockd through `firerunner ksm-exec`, so all Firecracker processes are merge candidates:
+the same kernel, rootfs and base images in many VMs are stored once. Check the effect with
+`cat /sys/kernel/mm/ksm/general_profit` (bytes saved) or `pages_sharing`.
+
 ## Builders
 
 Each GitLab project that runs `docker build` gets a builder microVM (`builder.vcpu`,
