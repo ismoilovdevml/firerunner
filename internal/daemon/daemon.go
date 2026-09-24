@@ -499,7 +499,8 @@ type vmFacts struct {
 	State   string // flintlock state, e.g. CREATED, FAILED
 	Role    string // firerunner/role label
 	Job     string // firerunner/job label
-	Owned   bool   // in the pool, just claimed, or referenced by a job state file
+	Owned   bool   // in the pool, a builder, just claimed, or referenced by a job state file
+	InJob   bool   // referenced by a job state file: a job runs on it
 	Age     time.Duration
 	Startup bool // first reconcile of this daemon
 	Booting int  // pool VMs this daemon is booting right now
@@ -510,9 +511,11 @@ func decide(f vmFacts, cfg config.Config) string {
 	switch {
 	case f.State == "FAILED":
 		return "failed"
-	case f.Owned && f.Age > cfg.Daemon.JobMaxAge:
+	case f.InJob && f.Age > cfg.Daemon.JobMaxAge:
 		return "older than daemon.job_max_age"
 	case f.Owned:
+		// Idle pool VMs are bounded by pool.max_idle (expireIdle), builders by
+		// builder.idle_ttl and builderMaxAge (expireBuilders): never by job_max_age.
 		return ""
 	case f.Role == "pool" && f.Startup:
 		// A fresh daemon owns no pool VMs: these were left by a previous run.
@@ -567,9 +570,10 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 	for _, v := range vms {
 		present[v.GetSpec().GetUid()] = true
 	}
+	inJob := map[string]bool{}
 	for uid, file := range jobStates() {
 		if present[uid] {
-			owned[uid] = true
+			owned[uid], inJob[uid] = true, true
 			continue
 		}
 		// The job's VM is gone (cleanup failed or the host rebooted): drop the stale state.
@@ -593,7 +597,7 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 		d.mu.Unlock()
 
 		role, job := RoleOf(v.GetSpec().GetId())
-		reason := decide(vmFacts{State: state, Role: role, Job: job, Owned: owned[uid],
+		reason := decide(vmFacts{State: state, Role: role, Job: job, Owned: owned[uid], InJob: inJob[uid],
 			Age: time.Since(first), Startup: startup, Booting: booting}, cfg)
 		if reason != "" {
 			d.metrics.orphansDeleted.WithLabelValues(reason).Inc()
