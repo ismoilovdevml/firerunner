@@ -133,7 +133,7 @@ func Default() Config {
 			VCPU:     4,
 			MemoryMB: 4096,
 			Max:      6,
-			IdleTTL:  12 * time.Hour,
+			IdleTTL:  24 * time.Hour,
 			Image:    "moby/buildkit:v0.33.0",
 			CacheMB:  25000,
 			PortBase: 20000,

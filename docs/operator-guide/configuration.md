@@ -50,7 +50,7 @@ sudo firerunner config set pool.preload_images "[mcr.microsoft.com/dotnet/sdk:8.
 | `builder.vcpu` | `4` | builds run here, not in the job VM |
 | `builder.memory_mb` | `4096` | counted in memory admission like any microVM |
 | `builder.max` | `6` | builders kept at once; the least recently used idle one is replaced |
-| `builder.idle_ttl` | `12h` | a builder unused this long is deleted with its cache |
+| `builder.idle_ttl` | `24h` | a builder unused this long is deleted with its cache |
 | `builder.cache_mb` | `25000` | BuildKit garbage-collects above this |
 | `builder.image` | `moby/buildkit:v0.33.0` | pulled through the Docker Hub mirror |
 | `builder.port_base` | `20000` | job VMs reach builder *n* at `<subnet>.1:port_base+n` |

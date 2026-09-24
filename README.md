@@ -177,7 +177,7 @@ found no confirmed vulnerability; its four open leads are fixed as described abo
 
 - x86_64 only.
 - The layer cache is per project and lives in the project's builder: the first build of a
-  project, and the first after 12 idle hours, is cold.
+  project, and the first after 24 idle hours, is cold.
 - Tested on Rocky Linux 9.6 and Ubuntu 24.04 hosts.
 
 ## Development

@@ -174,9 +174,21 @@ func coldBoot(ctx context.Context, cfg config.Config, id string, fromPool func()
 // BuilderName is the buildx builder created in job VMs for the project's builder.
 const BuilderName = "firerunner"
 
+// builderWait is how long a job waits for its project's builder to start
+// (usually 20-40 s). Building without it would not fill its cache, so the
+// next job would be cold again.
+var builderWait = 90 * time.Second
+
 // useBuilder points the VM's buildx at the project's builder when it is ready.
 func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project string) bool {
 	info, err := dc.Builder(project)
+	if err == nil && info.State == daemon.BuilderBooting {
+		fmt.Println("Docker layer cache: starting this project's builder (first job of the project)...")
+		for deadline := time.Now().Add(builderWait); err == nil && info.State == daemon.BuilderBooting && time.Now().Before(deadline); {
+			time.Sleep(2 * time.Second)
+			info, err = dc.Builder(project)
+		}
+	}
 	switch {
 	case err != nil || info.State == daemon.BuilderDisabled:
 		return false

@@ -92,7 +92,7 @@ func TestExpireBuilders(t *testing.T) {
 	spec := builderSpec(d.cfg)
 	d.builders = map[string]*builder{
 		"1": readyBuilder("1", 20001, time.Minute, spec),                            // in use
-		"2": readyBuilder("2", 20002, 13*time.Hour, spec),                           // idle past ttl
+		"2": readyBuilder("2", 20002, d.cfg.Builder.IdleTTL+time.Hour, spec),        // idle past ttl
 		"3": readyBuilder("3", 20003, 20*time.Minute, "old"),                        // old config, idle
 		"4": readyBuilder("4", 20004, time.Minute, "old"),                           // old config, busy
 		"5": {Project: "5", Port: 20005, LastUsed: time.Now().Add(-24 * time.Hour)}, // still booting
