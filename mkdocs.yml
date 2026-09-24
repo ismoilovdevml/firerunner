@@ -1,5 +1,5 @@
 site_name: FireRunner
-site_description: Every GitLab CI job in its own fresh Firecracker microVM
+site_description: Run every GitLab CI job in its own Firecracker microVM, on your own hardware.
 site_url: https://ismoilovdevml.github.io/firerunner/
 repo_url: https://github.com/ismoilovdevml/firerunner
 repo_name: ismoilovdevml/firerunner
@@ -40,25 +40,10 @@ markdown_extensions:
       alternate_style: true
 
 nav:
-  - Home: index.md
-  - Getting started:
-      - Requirements: getting-started/requirements.md
-      - Install: getting-started/install.md
-      - Connect GitLab: getting-started/connect-gitlab.md
-  - For CI users:
-      - Writing jobs: user-guide/writing-jobs.md
-      - Inside the job VM: user-guide/job-environment.md
-      - Debugging a failed job: user-guide/debugging.md
-  - For operators:
-      - Configuration: operator-guide/configuration.md
-      - Capacity and performance: operator-guide/capacity.md
-      - Day-2 operations: operator-guide/operations.md
-      - Monitoring: operator-guide/monitoring.md
-      - Troubleshooting: operator-guide/troubleshooting.md
-  - Concepts:
-      - Architecture: concepts/architecture.md
-      - Security model: concepts/security.md
-  - Reference:
-      - CLI: reference/cli.md
-      - Metrics: reference/metrics.md
-      - Limitations and roadmap: reference/limitations.md
+  - Overview: index.md
+  - Install: install.md
+  - Writing jobs: jobs.md
+  - Configuration: configuration.md
+  - Operations: operations.md
+  - How it works: how-it-works.md
+  - Reference: reference.md

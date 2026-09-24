@@ -1,57 +1,45 @@
 # FireRunner
 
-**Every GitLab CI job in its own fresh Firecracker microVM, on your own hardware.**
+Run every GitLab CI job in its own Firecracker microVM, on your own hardware.
 
-FireRunner is a [GitLab Runner custom executor](https://docs.gitlab.com/runner/executors/custom/).
-gitlab-runner picks up jobs as usual. For each job FireRunner hands out a clean microVM — its
-own kernel, root filesystem, Docker daemon and network identity — runs every stage of the job
-inside it, and deletes it when the job ends. Nothing survives between jobs.
+FireRunner is a GitLab Runner [custom executor](https://docs.gitlab.com/runner/executors/custom/).
+gitlab-runner picks up jobs as usual. For each job FireRunner hands out a new microVM, runs every
+stage in it and deletes it when the job ends.
 
-A daemon keeps a pool of pre-booted microVMs, so a job normally gets its VM in **~0.3 s**
-instead of a 15–17 s cold boot.
-
-![FireRunner Grafana dashboard](images/grafana.png)
-
-## Who this documentation is for
-
-<div class="grid cards" markdown>
-
-- **CI users** — engineers writing `.gitlab-ci.yml`.
-  Start with [Writing jobs](user-guide/writing-jobs.md).
-- **Operators** — the people who run the runner hosts.
-  Start with [Requirements](getting-started/requirements.md) and [Install](getting-started/install.md).
-
-</div>
+| | Shell executor | Docker executor | FireRunner |
+|---|---|---|---|
+| Isolation | none | containers, shared kernel | own VM and kernel per job |
+| Leftovers from earlier jobs | files, processes, images | images, volumes | none |
+| `docker build` | host Docker | privileged DinD or socket | Docker in the VM, not privileged |
+| Start | instant | image pull | 0.3 s from pre-booted VMs |
 
 ## Quick start
 
-```bash
-# 1. On a Linux host with /dev/kvm (bare metal, or a VM with nested virtualization)
-curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash
+1. On a Linux host with `/dev/kvm` and a blank disk:
 
-# 2. Create a runner in GitLab (tag: firecracker) and register it
-sudo firerunner runner register --url https://gitlab.example.com --token glrt-...
+    ```bash
+    curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash
+    ```
 
-# 3. Check everything
-sudo firerunner doctor
-```
+2. In GitLab, create a runner with the tag `firecracker` and copy its `glrt-` token.
+3. Register it and check the host:
 
-```yaml
-# 4. Use it in .gitlab-ci.yml
-test:
-  tags: [firecracker]
-  image: python:3.12-alpine
-  script:
-    - python -m unittest -v
-```
+    ```bash
+    sudo firerunner runner register --url https://gitlab.example.com --token glrt-...
+    sudo firerunner doctor
+    ```
 
-## Why microVMs
+4. Send a job to it:
 
-| | Shell executor | Docker executor | **FireRunner** |
-|---|---|---|---|
-| Job isolation | none (shared host) | containers on a shared kernel and Docker daemon | **separate VM and kernel per job** |
-| Leftovers between jobs | files, processes, Docker cache | Docker cache, volumes | **none — the VM is deleted** |
-| `docker build` / Docker-in-Docker | host Docker | privileged DinD or socket mount | **native Docker in the VM, no privileged mode** |
-| Start time | instant | image pull | **~0.3 s** from the warm pool |
+    ```yaml
+    test:
+      tags: [firecracker]
+      script:
+        - echo "running in $(hostname)"
+    ```
 
-Measured results are on the [Capacity and performance](operator-guide/capacity.md) page.
+## Where next
+
+- Writing `.gitlab-ci.yml`: [Writing jobs](jobs.md)
+- Running the hosts: [Install](install.md), [Configuration](configuration.md), [Operations](operations.md)
+- How it works and what it protects: [How it works](how-it-works.md)
