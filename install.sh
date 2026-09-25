@@ -681,8 +681,13 @@ ip addr replace ${FR_SUBNET}.1/24 dev ${FR_BRIDGE}
 sysctl -qw net.ipv6.conf.${FR_BRIDGE}.disable_ipv6=1 2>/dev/null || true
 ip link set ${FR_BRIDGE} up
 sysctl -qw net.ipv4.ip_forward=1
-# Keep the daemon's builder port mappings across a reload of these rules.
-builders=\$(nft list map inet firerunner builders 2>/dev/null | tr -d '\n\t' | sed -n 's/.*elements = {\([^}]*\)}.*/\1/p' || true)
+# Keep what the daemon added (builder port mappings, microVM bindings) across a
+# reload of these rules.
+elements() { nft list "\$1" "\$2" firerunner "\$3" 2>/dev/null | tr -d '\n\t' | sed -n 's/.*elements = {\([^}]*\)}.*/\1/p' || true; }
+builders=\$(elements map inet builders)
+vm_taps=\$(elements set bridge vm_taps)
+vm_macs=\$(elements set bridge vm_macs)
+vm_addrs=\$(elements set bridge vm_addrs)
 nft -f - <<'NFT'
 table ip firerunner
 delete table ip firerunner
@@ -761,10 +766,38 @@ table bridge firerunner {
     type filter hook forward priority filter; policy drop;
     meta mark & 0x10000000 == 0x10000000 accept
   }
+  # A microVM sends only from its own MAC and address, so it cannot take over
+  # another microVM's address on the host (ARP, the bridge's MAC table) and get
+  # that microVM's traffic. The daemon adds each microVM's tap, MAC and leased
+  # address once it has them; frames from a tap it did not add are not checked,
+  # so a microVM whose tap is unknown keeps working.
+  set vm_taps { type ifname; }
+  set vm_macs { type ifname . ether_addr; }
+  set vm_addrs { type ifname . ether_addr . ipv4_addr; }
+  chain prerouting {
+    type filter hook prerouting priority filter; policy accept;
+    iifname != @vm_taps accept
+    iifname . ether saddr != @vm_macs drop
+    iifname . ether saddr . ip saddr @vm_addrs accept
+    # DHCP sent before the VM uses its address (from 0.0.0.0), and ARP probes (RFC 5227).
+    ip saddr 0.0.0.0 ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept
+    arp htype 1 arp ptype ip arp hlen 6 arp plen 4 iifname . arp saddr ether . arp saddr ip @vm_addrs accept
+    arp htype 1 arp ptype ip arp hlen 6 arp plen 4 arp saddr ip 0.0.0.0 iifname . arp saddr ether @vm_macs accept
+    # Anything else: other addresses, IPv6 (off on the bridge), VLAN tags.
+    drop
+  }
 }
 NFT
 if [[ -n \$builders ]]; then
     nft add element inet firerunner builders "{ \$builders }" || true
+fi
+# One transaction: a tap is checked only together with its MAC and address.
+if [[ -n \$vm_taps ]]; then
+    nft -f - <<NFT || true
+add element bridge firerunner vm_macs { \${vm_macs:-} }
+add element bridge firerunner vm_addrs { \${vm_addrs:-} }
+add element bridge firerunner vm_taps { \$vm_taps }
+NFT
 fi
 EOF
 
