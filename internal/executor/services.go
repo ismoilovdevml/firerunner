@@ -80,6 +80,20 @@ func ServicesScript(services []Service, noProxy string, extra ...string) string 
 			shellQuote("no_proxy="+noProxy), shellQuote("NO_PROXY="+noProxy))
 	}
 	fmt.Fprintf(&b, "docker network create %s >/dev/null\n", ServiceNetwork)
+	// Several services: fetch their images at once instead of one `docker run`
+	// after another. Only a head start: a pull that fails here is tried again,
+	// with its error, by `docker run --pull missing` below.
+	if len(services) > 1 {
+		seen := map[string]bool{}
+		for _, svc := range services {
+			if seen[svc.Name] {
+				continue
+			}
+			seen[svc.Name] = true
+			fmt.Fprintf(&b, "(docker image inspect %[1]s >/dev/null 2>&1 || docker pull -q %[1]s >/dev/null 2>&1) &\n", shellQuote(svc.Name))
+		}
+		b.WriteString("wait\n")
+	}
 	for i, svc := range services {
 		name := fmt.Sprintf("svc-%d", i)
 		args := []string{"docker", "run", "-d", "--name", name, "--network", ServiceNetwork, "--pull", "missing"}
@@ -112,7 +126,7 @@ for c in $(docker ps -q --filter network=` + ServiceNetwork + `); do
   done
   for p in $(docker inspect -f '{{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}' "$c"); do
     case $p in */tcp) port=${p%/tcp} ;; *) continue ;; esac
-    if timeout 30 bash -c "until (</dev/tcp/$ip/$port) 2>/dev/null; do sleep 1; done"; then
+    if timeout 30 bash -c "until (</dev/tcp/$ip/$port) 2>/dev/null; do sleep 0.2; done"; then
       echo "Service $(docker inspect -f '{{.Config.Image}}' "$c") is listening on $port"
     else
       echo "WARNING: service $(docker inspect -f '{{.Config.Image}}' "$c") did not open port $port within 30s"

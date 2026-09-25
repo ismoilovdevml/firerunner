@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -200,6 +201,46 @@ func TestServicesScript(t *testing.T) {
 	}
 	if !strings.Contains(ContainerCommand("alpine", ServiceNetwork), "--network 'firerunner-job'") || !strings.Contains(ContainerCommand("alpine", ""), "--network 'host'") {
 		t.Fatal("container network")
+	}
+}
+
+// The services script pulls the images of several services at once, before
+// any service starts; a failed pull does not stop it (docker run pulls again).
+// It runs under bash with a fake docker that logs its calls.
+func TestServicesScriptPullsImagesAtOnce(t *testing.T) {
+	bin, calls := t.TempDir(), filepath.Join(t.TempDir(), "calls")
+	fake := `#!/bin/bash
+log=` + calls + `
+case "$1 $2" in
+  "image inspect") exit 1 ;;
+  "pull -q") echo "pull-start $3" >>"$log"; sleep 0.3; echo "pull-end $3" >>"$log"
+             [ "$3" = redis:7 ] && exit 1; exit 0 ;;
+  "run -d") echo "run $4" >>"$log" ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sc := ServicesScript([]Service{{Name: "postgres:16"}, {Name: "redis:7"}, {Name: "postgres:16", Alias: "db2"}}, "")
+	cmd := exec.Command("bash", "-c", sc)
+	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("script failed: %v\n%s", err, out)
+	}
+	b, _ := os.ReadFile(calls)
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 7 {
+		t.Fatalf("docker calls:\n%s\nwant 2 pulls (postgres once) and 3 runs", b)
+	}
+	for i, prefix := range []string{"pull-start", "pull-start", "pull-end", "pull-end", "run", "run", "run"} {
+		if !strings.HasPrefix(lines[i], prefix) {
+			t.Fatalf("call %d is %q, want %s…: the pulls did not overlap before the services started\n%s", i, lines[i], prefix, b)
+		}
+	}
+	// One service: nothing to overlap, docker run pulls it.
+	if sc := ServicesScript([]Service{{Name: "postgres:16"}}, ""); strings.Contains(sc, "docker pull") {
+		t.Errorf("single service pulled ahead:\n%s", sc)
 	}
 }
 
