@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
+	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
@@ -227,5 +229,35 @@ func TestThinPoolUsageUnknownWhenLvsFails(t *testing.T) {
 	}
 	if n := strings.Count(logs.String(), "level=WARN"); n != 1 {
 		t.Fatalf("%d warnings for two failed passes, want 1:\n%s", n, logs)
+	}
+}
+
+// firerunner_orphans_deleted_total{reason} takes short slugs only, all of
+// them shown (as 0) before the first delete.
+func TestOrphanReasonsAreSlugs(t *testing.T) {
+	cfg := config.Default()
+	slug := regexp.MustCompile(`^[a-z][a-z_]*$`)
+	known := map[string]bool{}
+	for _, r := range orphanReasons {
+		known[r] = true
+	}
+	for _, f := range []vmFacts{
+		{State: "FAILED"},
+		{State: "CREATED", Role: "job", Job: "job-1", InJob: true, Owned: true, JobAge: 4 * time.Hour},
+		{State: "CREATED", Role: "pool", Startup: true},
+		{State: "CREATED", Role: "pool", Age: time.Hour},
+		{State: "CREATED", Role: "builder", Startup: true},
+		{State: "CREATED", Role: "builder", Age: time.Hour},
+		{State: "CREATED", Role: "run", Age: 4 * time.Hour},
+		{State: "CREATED", Role: "job", Job: "job-2", Age: time.Hour},
+	} {
+		r := decide(f, cfg)
+		if !slug.MatchString(r) || !known[r] {
+			t.Errorf("decide(%+v) = %q: not one of the pre-created slugs %v", f, r, orphanReasons)
+		}
+	}
+	d, _ := newTestDaemon(t)
+	if n := series(t, d.metrics.orphansDeleted); n != len(orphanReasons) {
+		t.Errorf("orphans_deleted_total has %d series before any delete, want %d", n, len(orphanReasons))
 	}
 }

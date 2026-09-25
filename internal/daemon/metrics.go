@@ -91,7 +91,7 @@ func NewMetrics() *Metrics {
 		microvms: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "firerunner_microvms",
 			Help: "microVMs known to flintlock by state."}, []string{"state"}),
 		orphansDeleted: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_orphans_deleted_total",
-			Help: "microVMs deleted by reconcile."}, []string{"reason"}),
+			Help: "microVMs deleted by reconcile, by reason: failed, job_max_age, pool_previous_run, pool_orphan, builder_previous_run, builder_orphan, run_abandoned, job_orphan."}, []string{"reason"}),
 		admissionWaits: prometheus.NewCounter(prometheus.CounterOpts{Name: "firerunner_admission_waits_total",
 			Help: "Pool refill passes (every 2 s) that could not boot every missing pool VM because host memory was short."}),
 		flintlockUp: prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_flintlock_up", Help: "1 if the flintlock API answers."}),
@@ -117,6 +117,9 @@ func NewMetrics() *Metrics {
 	}
 	for _, s := range []string{"live", "stale"} {
 		m.dhcpLeases.WithLabelValues(s)
+	}
+	for _, r := range orphanReasons {
+		m.orphansDeleted.WithLabelValues(r)
 	}
 	for _, k := range []string{"pool", "cold"} {
 		m.bootSeconds.WithLabelValues(k)

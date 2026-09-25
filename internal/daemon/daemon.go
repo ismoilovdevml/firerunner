@@ -788,30 +788,44 @@ type vmFacts struct {
 	Booting bool // this daemon is booting this pool VM right now
 }
 
-// decide returns why a microVM should be deleted, or "" to keep it.
+// orphanReasons are the reasons reconcile deletes a microVM for, and so the
+// values of firerunner_orphans_deleted_total{reason} (all pre-created).
+var orphanReasons = []string{
+	"failed",               // flintlock reports it FAILED
+	"job_max_age",          // its job runs longer than daemon.job_max_age
+	"pool_previous_run",    // an idle pool VM a previous daemon run left
+	"pool_orphan",          // a pool VM nobody owns (e.g. its job's cleanup failed)
+	"builder_previous_run", // a builder a previous daemon run left
+	"builder_orphan",       // a builder VM nobody owns
+	"run_abandoned",        // a `firerunner run` VM older than daemon.job_max_age
+	"job_orphan",           // a job VM without a running job
+}
+
+// decide returns why a microVM should be deleted (one of orphanReasons), or
+// "" to keep it.
 func decide(f vmFacts, cfg config.Config) string {
 	switch {
 	case f.State == "FAILED":
 		return "failed"
 	case f.InJob && f.JobAge > cfg.Daemon.JobMaxAge:
-		return "older than daemon.job_max_age"
+		return "job_max_age"
 	case f.Owned:
 		// Idle pool VMs are bounded by pool.max_idle (expireIdle), builders by
 		// builder.idle_ttl and builderMaxAge (expireBuilders): never by job_max_age.
 		return ""
 	case f.Role == "pool" && f.Startup:
 		// A fresh daemon owns no pool VMs: these were left by a previous run.
-		return "pool VM from a previous daemon run"
+		return "pool_previous_run"
 	case f.Role == "pool" && !f.Booting && f.Age > cfg.VM.BootTimeout:
-		return "orphaned pool VM"
+		return "pool_orphan"
 	case f.Role == "builder" && f.Startup && !f.Booting:
-		return "builder from a previous daemon run"
+		return "builder_previous_run"
 	case f.Role == "builder" && !f.Booting && f.Age > 2*cfg.VM.BootTimeout+5*time.Minute:
-		return "orphaned builder"
+		return "builder_orphan"
 	case f.Role == "run" && f.Age > cfg.Daemon.JobMaxAge:
-		return "abandoned `firerunner run` VM"
+		return "run_abandoned"
 	case f.Job != "" && f.Age > 2*cfg.VM.BootTimeout:
-		return "job VM without a running job"
+		return "job_orphan"
 	}
 	return ""
 }
