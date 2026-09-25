@@ -249,12 +249,14 @@ func coldBoot(ctx context.Context, cfg config.Config, id string, fromPool func()
 	waitStart := time.Now()
 	deadline := waitStart.Add(cfg.VM.BootTimeout)
 	for {
-		ok, why, err := vm.Fits(ctx, cfg, fl, 0)
+		// Admitted host-wide: the memory stays reserved for this VM, against
+		// every other prepare, pool VM and builder, until the boot returned.
+		n, why, err := vm.Admit(ctx, cfg, fl, id)
 		t.wait = time.Since(waitStart)
 		if err != nil {
 			return nil, "cold", t, err
 		}
-		if ok {
+		if n == 1 {
 			break
 		}
 		if inst := fromPool(); inst != nil {
@@ -274,6 +276,9 @@ func coldBoot(ctx context.Context, cfg config.Config, id string, fromPool func()
 	bootStart := time.Now()
 	inst, err := vm.Boot(ctx, cfg, fl, id, jobLabels(id))
 	t.boot = time.Since(bootStart)
+	// Listed by flintlock now, or never created: the reservation has done its
+	// job (if this fails it expires, or goes with this process).
+	_ = vm.Unreserve(id)
 	return inst, "cold", t, err
 }
 

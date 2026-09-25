@@ -321,10 +321,12 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		case <-ctx.Done():
 		}
 	}
-	if err := d.waitBuilderFits(ctx, bcfg); err != nil {
+	release, err := d.admitBuilder(ctx, bcfg, "bld-"+project)
+	if err != nil {
 		fail(nil, err)
 		return
 	}
+	defer release()
 	// A daemon that just started reconciles builder VMs it did not adopt as
 	// left over: this one is ours, though its uid is not known until Boot returns.
 	id := "bld-" + project

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -31,6 +32,10 @@ func TestMain(m *testing.M) {
 	builderCacheDir = filepath.Join(root, "builder-cache")
 	vm.KnownHostsDir = filepath.Join(root, "known_hosts")
 	vm.MuxDir = filepath.Join(root, "ssh-mux")
+	vm.AdmissionFile = filepath.Join(root, "admission.json")
+	poolBoot = func(context.Context, config.Config, *flintlock.Client, string, map[string]string) (*vm.Instance, error) {
+		return nil, errors.New("no microVMs in tests")
+	}
 	nftRun = func(...string) error { return errors.New("nft is not run in tests") }
 	alive = func(config.Config, *vm.Instance) bool { return false }
 	tcpOpen = func(string, int) bool { return false }
@@ -173,6 +178,7 @@ func TestHostPathsAreIsolated(t *testing.T) {
 		"builderCacheDir":     builderCacheDir,
 		"vm.KnownHostsDir":    vm.KnownHostsDir,
 		"vm.MuxDir":           vm.MuxDir,
+		"vm.AdmissionFile":    vm.AdmissionFile,
 		"network.leases_file": d.cfgSnapshot().Network.LeasesFile,
 		"daemon.socket":       d.cfgSnapshot().Daemon.Socket,
 	} {

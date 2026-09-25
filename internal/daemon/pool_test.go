@@ -3,12 +3,14 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
+	"github.com/ismoilovdevml/firerunner/internal/flintlock"
 	"github.com/ismoilovdevml/firerunner/internal/flintlock/flintlocktest"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
@@ -397,5 +400,67 @@ func TestReconcileReclaimsOrphanWhileBooting(t *testing.T) {
 	srv.WaitDeleted(t, "o", 2*time.Second)
 	if got := srv.Deleted(); len(got) != 1 {
 		t.Fatalf("deleted %v, want only the orphan [o]", got)
+	}
+}
+
+// Pool VMs being booted and a builder being admitted never count on the same
+// memory: every admission sees what the others reserved until their boots
+// returned. Without it a refill and a builder boot (and cold boots of jobs)
+// listed flintlock before each other's creates landed and over-committed.
+func TestPoolAndBuilderAdmissionsShareTheHost(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	d.cfg.VM.MemoryMB, d.cfg.Pool.Size = 256, 2
+	release := make(chan struct{})
+	var booting sync.WaitGroup
+	booting.Add(2)
+	var mu sync.Mutex
+	var reserved []int // extraMB of every builder admission check
+	oldBoot, oldFits := poolBoot, builderFits
+	t.Cleanup(func() { poolBoot, builderFits = oldBoot, oldFits })
+	poolBoot = func(context.Context, config.Config, *flintlock.Client, string, map[string]string) (*vm.Instance, error) {
+		booting.Done()
+		<-release
+		return nil, errors.New("stub: boot failed")
+	}
+	builderFits = func(_ context.Context, _ config.Config, _ *flintlock.Client, extraMB int) (bool, string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reserved = append(reserved, extraMB)
+		return true, "", nil
+	}
+	lastReserved := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return reserved[len(reserved)-1]
+	}
+
+	d.refill(context.Background())
+	booting.Wait()
+	bcfg := builderConfig(d.cfgSnapshot())
+	drop7, err := d.admitBuilder(context.Background(), bcfg, "bld-7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := lastReserved(), 2*vm.WithOverhead(256); got != want {
+		t.Fatalf("builder admitted next to %d MB reserved, want the booting pool VMs' %d", got, want)
+	}
+	close(release)
+	d.bg.Wait() // the pool boots returned (and failed)
+	drop8, err := d.admitBuilder(context.Background(), bcfg, "bld-8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := lastReserved(), vm.WithOverhead(bcfg.VM.MemoryMB); got != want {
+		t.Fatalf("after the pool boots returned: %d MB reserved, want only bld-7's %d", got, want)
+	}
+	drop7()
+	drop8()
+	drop9, err := d.admitBuilder(context.Background(), bcfg, "bld-9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drop9()
+	if got := lastReserved(); got != 0 {
+		t.Fatalf("%d MB still reserved after every boot returned", got)
 	}
 }

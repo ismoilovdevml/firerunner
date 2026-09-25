@@ -410,10 +410,16 @@ func (d *Daemon) refill(ctx context.Context) {
 	if missing <= 0 {
 		return
 	}
-	// One listing admits the whole batch (VMs booted here are not listed yet).
-	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	room, why, err := vm.Room(rctx, cfg, d.fl, missing)
-	cancel()
+	// One admission for the whole batch. It reserves the memory of each VM
+	// host-wide until its boot returned, so cold boots of jobs and builders
+	// admitted meanwhile do not count on the same memory.
+	ids := make([]string, missing)
+	for i := range ids {
+		suffix := make([]byte, 3)
+		_, _ = rand.Read(suffix)
+		ids[i] = "pool-" + hex.EncodeToString(suffix)
+	}
+	room, why, err := vm.Admit(ctx, cfg, d.fl, ids...)
 	if err != nil {
 		d.log.Debug("pool refill waits", "why", why, "err", err)
 		d.metrics.admissionWaits.Inc()
@@ -423,19 +429,20 @@ func (d *Daemon) refill(ctx context.Context) {
 		d.log.Debug("pool refill waits for memory", "why", why, "missing", missing, "room", room)
 		d.metrics.admissionWaits.Inc()
 	}
-	for i := 0; i < room; i++ {
+	for _, id := range ids[:room] {
 		d.mu.Lock()
 		d.booting++
 		d.metrics.poolBooting.Set(float64(d.booting))
 		d.mu.Unlock()
-		d.spawn(func() { d.bootOne(ctx, cfg) })
+		d.spawn(func() { d.bootOne(ctx, cfg, id) })
 	}
 }
 
-func (d *Daemon) bootOne(ctx context.Context, cfg config.Config) {
-	suffix := make([]byte, 3)
-	_, _ = rand.Read(suffix)
-	id := "pool-" + hex.EncodeToString(suffix)
+// poolBoot boots a pool VM (a variable so tests need no VMs).
+var poolBoot = vm.Boot
+
+// bootOne boots the pool VM id, which refill admitted.
+func (d *Daemon) bootOne(ctx context.Context, cfg config.Config, id string) {
 	start := time.Now()
 	d.mu.Lock()
 	d.bootingIDs[id] = true
@@ -443,7 +450,12 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config) {
 
 	// The VM counts as booting until it is fully ready (including preload),
 	// otherwise refill sees a gap and boots extra VMs.
-	inst, err := vm.Boot(ctx, cfg, d.fl, id, map[string]string{LabelRole: "pool"})
+	inst, err := poolBoot(ctx, cfg, d.fl, id, map[string]string{LabelRole: "pool"})
+	// Created and listed by flintlock, or never created: either way the
+	// admission's reservation no longer stands for it.
+	if uerr := vm.Unreserve(id); uerr != nil {
+		d.log.Warn("cannot drop the admission of a booted pool VM; it expires", "vm", id, "err", uerr)
+	}
 	if err == nil {
 		d.metrics.bootSeconds.WithLabelValues("pool").Observe(time.Since(start).Seconds())
 		if len(cfg.Pool.PreloadImages) > 0 {
@@ -631,6 +643,35 @@ func (d *Daemon) reloadConfig(ctx context.Context) {
 	d.cfg, d.cfgMod = cfg, fi.ModTime()
 	d.mu.Unlock()
 	d.log.Info("config reloaded", "pool", cfg.Pool.Size, "vcpu", cfg.VM.VCPU, "memory_mb", cfg.VM.MemoryMB)
+}
+
+// admitBuilder waits until a builder of bcfg's size fits (waitBuilderFits,
+// which holds nothing while it waits) and then admits it host-wide, so a pool
+// VM or a job's cold boot admitted at the same moment cannot count on the same
+// memory. The returned function drops the reservation: call it once the boot
+// of id returned.
+func (d *Daemon) admitBuilder(ctx context.Context, bcfg config.Config, id string) (func(), error) {
+	deadline := time.Now().Add(builderFitWait)
+	for {
+		if err := d.waitBuilderFits(ctx, bcfg); err != nil {
+			return nil, err
+		}
+		ok, why, err := vm.AdmitFits(ctx, bcfg, d.fl, id, builderFits)
+		if err == nil && ok {
+			return func() {
+				if err := vm.Unreserve(id); err != nil {
+					d.log.Warn("cannot drop the admission of a builder; it expires", "vm", id, "err", err)
+				}
+			}, nil
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return nil, fmt.Errorf("no host memory for a builder (%s, %v)", why, err)
+		}
+		select {
+		case <-time.After(5 * time.Second):
+		case <-ctx.Done():
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
