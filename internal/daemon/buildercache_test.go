@@ -714,3 +714,74 @@ func TestStartupReconcileSparesBootingBuilder(t *testing.T) {
 		t.Fatalf("booting mark of %q left after the boot", booted)
 	}
 }
+
+// blockUnlink makes unlinking a saved cache wait until the test releases it,
+// and reports each file on entered.
+func blockUnlink(t *testing.T) (entered chan string, release func()) {
+	t.Helper()
+	entered, gate := make(chan string, 16), make(chan struct{})
+	old := unlinkCache
+	unlinkCache = func(path string) error {
+		entered <- path
+		<-gate
+		return os.Remove(path)
+	}
+	var once sync.Once
+	release = func() { once.Do(func() { close(gate) }) }
+	t.Cleanup(func() { release(); unlinkCache = old })
+	return entered, release
+}
+
+// Unlinking a large saved cache frees its blocks, which takes a while; it
+// never happens while POST /claim waits for the daemon lock.
+func TestCacheUnlinkNeverBlocksClaims(t *testing.T) {
+	wait := func(t *testing.T, entered chan string) string {
+		t.Helper()
+		select {
+		case f := <-entered:
+			return f
+		case <-time.After(2 * time.Second):
+			t.Fatal("the old copy was never unlinked on its own (renamed over or removed under the lock)")
+		}
+		return ""
+	}
+	t.Run("builder rm drops a saved cache", func(t *testing.T) {
+		stubBuilders(t, func(string) bool { return true })
+		dir := stubBuilderCache(t, nil, nil, nil)
+		writeFile(t, filepath.Join(dir, "7.tar"), "old", time.Hour)
+		writeFile(t, filepath.Join(dir, "8.tar"), "old", time.Hour)
+		d, _ := newTestDaemon(t)
+		entered, release := blockUnlink(t)
+		done := make(chan struct{})
+		go func() { d.RemoveBuilders("all", false); close(done) }()
+		wait(t, entered)
+		claimWithin(t, d, "unlinking a dropped cache")
+		release()
+		<-done
+		if names := listDir(dir); len(names) != 0 {
+			t.Fatalf("left behind: %v", names)
+		}
+	})
+	t.Run("a save replaces the previous copy", func(t *testing.T) {
+		stubBuilders(t, func(string) bool { return true })
+		dir := stubBuilderCache(t, sizeOf(3), func(_ context.Context, _ config.Config, _ *vm.Instance, w io.Writer) error {
+			_, err := io.WriteString(w, "new")
+			return err
+		}, nil)
+		writeFile(t, filepath.Join(dir, "7.tar"), "old", time.Hour)
+		d, _ := newTestDaemon(t)
+		entered, release := blockUnlink(t)
+		d.builders = map[string]*builder{"7": readyBuilder("7", 20001, d.cfg.Builder.IdleTTL+time.Hour, builderSpec(d.cfg))}
+		d.expireBuilders()
+		wait(t, entered)
+		claimWithin(t, d, "unlinking the replaced copy")
+		release()
+		d.bg.Wait()
+		if got := readFile(t, filepath.Join(dir, "7.tar")); !strings.HasSuffix(got, "new") {
+			t.Fatalf("saved cache = %q", got)
+		}
+		if names := listDir(dir); len(names) != 1 {
+			t.Fatalf("left behind: %v", names)
+		}
+	})
+}

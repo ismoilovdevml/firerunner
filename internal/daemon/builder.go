@@ -266,7 +266,6 @@ func (d *Daemon) RemoveBuilders(project string, force bool) Removal {
 	}
 	busy := busyBuilders() // file reads: outside the lock
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	for _, b := range d.builders {
 		if !b.ready || (project != "all" && b.Project != project) {
 			continue
@@ -288,7 +287,11 @@ func (d *Daemon) RemoveBuilders(project string, force bool) Removal {
 			d.cacheDropped[p] = time.Now()
 		}
 	}
-	dropSavedCaches(project, keep)
+	aside := dropSavedCachesLocked(project, keep)
+	d.mu.Unlock()
+	for _, f := range aside {
+		_ = unlinkCache(f)
+	}
 	sort.Strings(out.Removed)
 	sort.Strings(out.Skipped)
 	return out
@@ -376,19 +379,37 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		return
 	}
 
+	// The port is mapped before jobs see the builder ready, and outside the
+	// lock: nft must not hold up POST /claim. A booting builder keeps its port.
+	d.mu.Lock()
+	port := 0
+	if b, ok := d.builders[project]; ok {
+		port = b.Port
+	}
+	d.mu.Unlock()
+	if port != 0 {
+		if err := mapBuilderPorts(builder{Port: port, Instance: *inst}); err != nil {
+			d.log.Error("builder port mapping failed", "project", project, "err", err)
+		}
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	b, ok := d.builders[project]
 	if !ok || ctx.Err() != nil {
-		// Removed while booting, or shutting down.
-		d.spawn(func() { d.delete(context.Background(), inst, "builder no longer needed") })
+		// Removed while booting, or shutting down. The port leads to this VM
+		// unless another builder took it meanwhile.
+		unmap := port != 0 && (ok || !d.portUsedLocked(port))
+		d.spawn(func() {
+			if unmap {
+				_, _ = nftRun("", "delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", port))
+			}
+			d.delete(context.Background(), inst, "builder no longer needed")
+		})
 		return
 	}
 	b.Instance, b.creds = *inst, nil
 	b.SpecID, b.BornAt, b.ready = builderSpec(cfg), time.Now(), true
-	if err := mapBuilderPorts(*b); err != nil {
-		d.log.Error("builder port mapping failed", "project", project, "err", err)
-	}
 	d.saveBuildersLocked()
 	d.metrics.builders.Set(float64(len(d.builders)))
 	d.metrics.bootSeconds.WithLabelValues("builder").Observe(time.Since(start).Seconds())

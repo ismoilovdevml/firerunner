@@ -189,12 +189,22 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 	dropped := false
 	if err == nil {
 		// Under mu, as RemoveBuilders marks and deletes: an operator's
-		// `builder rm` since this save started wins over the save.
+		// `builder rm` since this save started wins over the save. The
+		// previous copy is set aside rather than renamed over, so its blocks
+		// are freed after the lock is released.
+		file, aside := builderCacheFile(project), ""
 		d.mu.Lock()
 		if dropped = d.cacheDropped[project].After(started); !dropped {
-			err = os.Rename(tmp.Name(), builderCacheFile(project))
+			aside = setAside(file)
+			if err = os.Rename(tmp.Name(), file); err != nil && aside != "" {
+				_ = os.Rename(aside, file) // keep the previous copy
+				aside = ""
+			}
 		}
 		d.mu.Unlock()
+		if aside != "" {
+			_ = unlinkCache(aside)
+		}
 	}
 	if dropped {
 		_ = os.Remove(tmp.Name())
@@ -324,19 +334,43 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 	return true, nil
 }
 
-// dropSavedCaches deletes the saved cache of project ("all": every project)
-// except those in keep, for an operator's `builder rm`.
-func dropSavedCaches(project string, keep map[string]bool) {
+// dropSavedCachesLocked moves the saved cache of project ("all": every
+// project) except those in keep aside, for an operator's `builder rm`, and
+// returns the moved files: the caller unlinks them after releasing d.mu (see
+// setAside).
+func dropSavedCachesLocked(project string, keep map[string]bool) []string {
+	var aside []string
 	if project != "all" {
 		if !keep[project] {
-			_ = os.Remove(builderCacheFile(project))
+			if f := setAside(builderCacheFile(project)); f != "" {
+				aside = append(aside, f)
+			}
 		}
-		return
+		return aside
 	}
 	entries, _ := os.ReadDir(builderCacheDir)
 	for _, e := range entries {
 		if p, ok := strings.CutSuffix(e.Name(), ".tar"); ok && projectID.MatchString(p) && !keep[p] {
-			_ = os.Remove(filepath.Join(builderCacheDir, e.Name()))
+			if f := setAside(filepath.Join(builderCacheDir, e.Name())); f != "" {
+				aside = append(aside, f)
+			}
 		}
 	}
+	return aside
 }
+
+// setAside renames a saved cache to a temp name next to it and returns that
+// name ("" if there was nothing to move). A rename is quick; unlinking the
+// last name of a large file frees its blocks, which takes a while, so it is
+// done with unlinkCache after the lock POST /claim needs is released. A crash
+// in between leaves a temp file that makeRoomForCache removes later.
+func setAside(path string) string {
+	aside := fmt.Sprintf("%s.tmp-old-%d", path, time.Now().UnixNano())
+	if os.Rename(path, aside) != nil {
+		return ""
+	}
+	return aside
+}
+
+// unlinkCache deletes a file set aside (a variable for tests).
+var unlinkCache = os.Remove

@@ -513,7 +513,8 @@ func blockNft(t *testing.T) (entered chan string, release func()) {
 	return entered, release
 }
 
-// claimWithin fails the test if POST /claim's Claim waits for the daemon lock.
+// claimWithin fails the test if POST /claim's Claim waits for the daemon lock
+// while what (slow work) runs.
 func claimWithin(t *testing.T, d *Daemon, what string) {
 	t.Helper()
 	done := make(chan struct{})
@@ -521,7 +522,7 @@ func claimWithin(t *testing.T, d *Daemon, what string) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatalf("Claim blocked while nft ran for %s: nft runs under the daemon lock", what)
+		t.Fatalf("Claim blocked during %s: it runs under the daemon lock", what)
 	}
 }
 
@@ -551,6 +552,51 @@ func TestNftNeverBlocksClaims(t *testing.T) {
 		<-done
 		d.bg.Wait()
 	})
+	t.Run("a builder becoming ready", func(t *testing.T) {
+		stubBoot(t, nil)
+		entered, release := blockNft(t)
+		d.builders = map[string]*builder{}
+		d.Builder("3", true)
+		done := make(chan struct{})
+		go func() { d.bootBuilder(context.Background(), d.cfg, "3"); close(done) }()
+		<-entered
+		claimWithin(t, d, "a new builder's port mapping")
+		release()
+		<-done
+		d.mu.Lock()
+		b := d.builders["3"]
+		d.mu.Unlock()
+		if b == nil || !b.ready {
+			t.Fatalf("builder not ready: %+v", b)
+		}
+	})
+}
+
+// A new builder's port is mapped before jobs are told it is ready, and not
+// under the daemon lock.
+func TestBuilderPortMappedBeforeReady(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	stubBoot(t, nil)
+	d, _ := newTestDaemon(t)
+	mapped, locked, readyAtMap := false, false, false
+	old := nftRun
+	nftRun = func(script string, args ...string) (string, error) {
+		if script != "" && !mapped {
+			mapped = true
+			if !d.mu.TryLock() { // nothing else runs: held by bootBuilder
+				locked = true
+			} else {
+				readyAtMap = d.builders["3"] != nil && d.builders["3"].ready
+				d.mu.Unlock()
+			}
+		}
+		return old(script, args...)
+	}
+	d.Builder("3", true)
+	d.bootBuilder(context.Background(), d.cfg, "3")
+	if !mapped || locked || readyAtMap {
+		t.Fatalf("port mapped %v, under the lock %v, after the builder was ready %v", mapped, locked, readyAtMap)
+	}
 }
 
 func TestBuilderPersistsLastUsedAtMostOncePerMinute(t *testing.T) {
@@ -920,5 +966,30 @@ func TestParseBuilderMap(t *testing.T) {
 		if !maps.Equal(got, tc.want) {
 			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// A builder whose boot ends with the daemon stopping is deleted, and the port
+// mapping made for it does not stay behind.
+func TestBuilderBootCutByShutdownUnmapsPort(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	nft := stubNft(t)
+	boots := stubBoot(t, nil)
+	ctx, stop := context.WithCancel(context.Background())
+	builderSetup = func(context.Context, config.Config, *vm.Instance, *builderCreds) error { stop(); return nil }
+	d, srv := newTestDaemon(t)
+	d.Builder("3", true)
+	port := d.builders["3"].Port
+	d.bootBuilder(ctx, d.cfg, "3")
+	srv.WaitDeleted(t, "uid-"+boots.last(), 2*time.Second)
+	d.bg.Wait()
+	if !strings.Contains(nft.String(), fmt.Sprintf("{ %d : 10.200.0.77 . 1234 }", port)) {
+		t.Fatalf("port never mapped: %s", nft.String())
+	}
+	if to, ok := nft.elems[port]; ok {
+		t.Fatalf("port %d still maps to %s after the builder was dropped", port, to)
+	}
+	if d.builders["3"].ready {
+		t.Fatal("builder marked ready while shutting down")
 	}
 }
