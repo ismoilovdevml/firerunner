@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -509,14 +508,38 @@ func TestRestoreFailures(t *testing.T) {
 	}
 }
 
+// bootStub records the builder VMs bootBuilder booted through stubBoot.
+type bootStub struct {
+	mu  sync.Mutex
+	ids []string
+}
+
+func (s *bootStub) Load() int32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return int32(len(s.ids))
+}
+
+// last is the id of the last VM booted; its uid is "uid-" + id.
+func (s *bootStub) last() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.ids) == 0 {
+		return ""
+	}
+	return s.ids[len(s.ids)-1]
+}
+
 // stubBoot runs bootBuilder without VMs: boot, admission and buildkitd setup
 // are replaced; setup returns setupErr.
-func stubBoot(t *testing.T, setupErr error) *atomic.Int32 {
+func stubBoot(t *testing.T, setupErr error) *bootStub {
 	t.Helper()
-	var boots atomic.Int32
+	boots := &bootStub{}
 	oldBoot, oldFits, oldSetup := builderVMBoot, builderFits, builderSetup
 	builderVMBoot = func(_ context.Context, _ config.Config, _ *flintlock.Client, id string, _ map[string]string) (*vm.Instance, error) {
-		boots.Add(1)
+		boots.mu.Lock()
+		boots.ids = append(boots.ids, id)
+		boots.mu.Unlock()
 		return &vm.Instance{ID: id, UID: "uid-" + id, IP: "10.200.0.77"}, nil
 	}
 	builderFits = func(context.Context, config.Config, *flintlock.Client, int) (bool, string, error) {
@@ -524,7 +547,7 @@ func stubBoot(t *testing.T, setupErr error) *atomic.Int32 {
 	}
 	builderSetup = func(context.Context, config.Config, *vm.Instance, *builderCreds) error { return setupErr }
 	t.Cleanup(func() { builderVMBoot, builderFits, builderSetup = oldBoot, oldFits, oldSetup })
-	return &boots
+	return boots
 }
 
 // The next builder of a project waits for its previous builder's copy, then
@@ -562,10 +585,11 @@ func TestBootBuilderWaitsForSaveAndRestores(t *testing.T) {
 	d.mu.Lock()
 	b := d.builders["7"]
 	d.mu.Unlock()
-	if b == nil || !b.ready || b.Instance.UID != "uid-bld-7" || loaded != "warm" {
+	uid := "uid-" + boots.last()
+	if b == nil || !b.ready || b.Instance.UID != uid || loaded != "warm" {
 		t.Fatalf("builder %+v, loaded %q", b, loaded)
 	}
-	if uidDuringRestore != "uid-bld-7" {
+	if uidDuringRestore != uid {
 		t.Fatalf("while its cache loaded, reconcile saw builder VM %q (would delete it as an orphan)", uidDuringRestore)
 	}
 }
@@ -587,12 +611,12 @@ func TestBootBuilderDropsCacheOnlyWhenBuildkitRefusesIt(t *testing.T) {
 				_, err := io.ReadAll(r)
 				return err
 			})
-			stubBoot(t, tc.setupErr)
+			boots := stubBoot(t, tc.setupErr)
 			d, srv := newTestDaemon(t)
 			writeFile(t, filepath.Join(dir, "7.tar"), "warm", time.Minute)
 			d.Builder("7", true)
 			d.bootBuilder(context.Background(), d.cfg, "7")
-			srv.WaitDeleted(t, "uid-bld-7", 2*time.Second)
+			srv.WaitDeleted(t, "uid-"+boots.last(), 2*time.Second)
 			_, err := os.Stat(filepath.Join(dir, "7.tar"))
 			if kept := err == nil; kept != tc.keep {
 				t.Fatalf("cache kept = %v, want %v", kept, tc.keep)
@@ -672,9 +696,11 @@ func TestStartupReconcileSparesBootingBuilder(t *testing.T) {
 	stubBoot(t, nil)
 	d, srv := newTestDaemon(t)
 	uid := "uid-new"
-	srv.SetVMs(&types.MicroVM{Spec: &types.MicroVMSpec{Id: "bld-7", Uid: &uid},
-		Status: &types.MicroVMStatus{State: types.MicroVMStatus_CREATED}})
+	var booted string
 	builderVMBoot = func(ctx context.Context, _ config.Config, _ *flintlock.Client, id string, _ map[string]string) (*vm.Instance, error) {
+		booted = id
+		srv.SetVMs(&types.MicroVM{Spec: &types.MicroVMSpec{Id: id, Uid: &uid},
+			Status: &types.MicroVMStatus{State: types.MicroVMStatus_CREATED}})
 		d.reconcile(ctx, true) // the startup reconcile runs while this VM boots
 		return &vm.Instance{ID: id, UID: uid, IP: "10.200.0.77"}, nil
 	}
@@ -684,7 +710,7 @@ func TestStartupReconcileSparesBootingBuilder(t *testing.T) {
 	if deleted(srv.Deleted(), uid) {
 		t.Fatal("startup reconcile deleted the builder VM that was booting")
 	}
-	if d.bootingIDs["bld-7"] {
-		t.Fatal("booting mark left after the boot")
+	if booted == "" || d.bootingIDs[booted] {
+		t.Fatalf("booting mark of %q left after the boot", booted)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -323,7 +324,9 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		case <-ctx.Done():
 		}
 	}
-	release, err := d.admitBuilder(ctx, bcfg, "bld-"+project)
+	// Host memory is reserved under the VM's own id until flintlock lists it.
+	id := builderVMID(project)
+	release, err := d.admitBuilder(ctx, bcfg, id)
 	if err != nil {
 		fail(nil, err)
 		return
@@ -331,7 +334,6 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	defer release()
 	// A daemon that just started reconciles builder VMs it did not adopt as
 	// left over: this one is ours, though its uid is not known until Boot returns.
-	id := "bld-" + project
 	d.mu.Lock()
 	d.bootingIDs[id] = true
 	d.mu.Unlock()
@@ -392,6 +394,17 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	d.metrics.bootSeconds.WithLabelValues("builder").Observe(time.Since(start).Seconds())
 	d.log.Info("builder ready", "project", project, "id", inst.ID, "ip", inst.IP, "port", b.Port,
 		"took", time.Since(start).Round(100*time.Millisecond).String())
+}
+
+// builderVMID is a new VM id for one boot of project's builder. The id alone
+// sets the VM's MAC, DHCP lease and pinned key file, so every boot gets its
+// own: the project's previous builder may still exist (copying its cache out,
+// a failed delete, not adopted after a restart), and a MAC derived from the
+// public project id alone could be taken by any guest.
+func builderVMID(project string) string {
+	suffix := make([]byte, 4)
+	_, _ = rand.Read(suffix)
+	return "bld-" + project + "-" + hex.EncodeToString(suffix)
 }
 
 // VM boot, admission and buildkitd setup are variables so tests can run

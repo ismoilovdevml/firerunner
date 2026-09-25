@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
+	"github.com/ismoilovdevml/firerunner/internal/flintlock"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
@@ -688,5 +689,79 @@ func TestFingerprintFollowsCAContent(t *testing.T) {
 	plain := config.Default()
 	if strings.Contains(fingerprint(plain), "|") || strings.Contains(builderSpec(plain), "|ca:") {
 		t.Fatalf("defaults changed the fingerprint: %s / %s", fingerprint(plain), builderSpec(plain))
+	}
+}
+
+// Every builder boot gets its own VM id, so its MAC, lease and pinned key are
+// its own: the project's previous builder may still exist (saving its cache, a
+// failed delete, not adopted after a restart), and a MAC derived from the
+// public project id alone could be taken by any guest.
+func TestBuilderVMIDIsUniquePerBoot(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	stubBuilderCache(t, nil, nil, nil)
+	boots := stubBoot(t, nil)
+	var unreserved []string // booted VMs without a host memory reservation under their id
+	stubbed := builderVMBoot
+	builderVMBoot = func(ctx context.Context, cfg config.Config, fl *flintlock.Client, id string, labels map[string]string) (*vm.Instance, error) {
+		if data, _ := os.ReadFile(vm.AdmissionFile); !strings.Contains(string(data), `"id":"`+id+`"`) {
+			unreserved = append(unreserved, id)
+		}
+		return stubbed(ctx, cfg, fl, id, labels)
+	}
+	d, _ := newTestDaemon(t)
+	var ids []string
+	for i := 0; i < 2; i++ {
+		d.Builder("7", true)
+		d.bootBuilder(context.Background(), d.cfg, "7")
+		d.mu.Lock()
+		b := d.builders["7"]
+		delete(d.builders, "7") // gone, as after its removal
+		d.mu.Unlock()
+		if b == nil || !b.ready || b.Instance.ID != boots.last() {
+			t.Fatalf("boot %d: builder %+v, booted %q", i, b, boots.last())
+		}
+		ids = append(ids, b.Instance.ID)
+	}
+	if ids[0] == ids[1] {
+		t.Fatalf("two boots of project 7 used the same VM id %q", ids[0])
+	}
+	if len(unreserved) > 0 {
+		t.Fatalf("booted %v without host memory reserved under that id", unreserved)
+	}
+	for _, id := range ids {
+		suffix, ok := strings.CutPrefix(id, "bld-7-")
+		if !ok || len(suffix) != 8 || strings.Trim(suffix, "0123456789abcdef") != "" {
+			t.Fatalf("id %q, want bld-7-<8 hex digits>", id)
+		}
+		if role, _ := RoleOf(id); role != "builder" {
+			t.Fatalf("RoleOf(%q) = %q: reconcile would not know it as a builder", id, role)
+		}
+		if vm.MAC(id) == vm.MAC("bld-7") {
+			t.Fatalf("MAC of %q is the one derived from the project id", id)
+		}
+	}
+}
+
+// builders.json written before per-boot ids (bld-<project>) and after
+// (bld-<project>-<hex>) is adopted; the project comes from the record.
+func TestAdoptBuildersOfBothIDForms(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	d, _ := newTestDaemon(t)
+	old := readyBuilder("7", 20001, 0, builderSpec(d.cfg)) // id bld-7
+	cur := readyBuilder("8", 20002, 0, builderSpec(d.cfg))
+	cur.Instance.ID = "bld-8-0a1b2c3d"
+	d.builders = map[string]*builder{"7": old, "8": cur}
+	d.mu.Lock()
+	d.saveBuildersLocked()
+	d.mu.Unlock()
+
+	d2, _ := newTestDaemon(t)
+	d2.cfg.Daemon.Socket = d.cfg.Daemon.Socket
+	d2.adoptBuilders(map[string]bool{"uid-7": true, "uid-8": true})
+	if b := d2.builders["7"]; b == nil || b.Instance.ID != "bld-7" || !b.ready {
+		t.Fatalf("old-form builder not adopted: %+v", b)
+	}
+	if b := d2.builders["8"]; b == nil || b.Instance.ID != "bld-8-0a1b2c3d" || !b.ready {
+		t.Fatalf("per-boot id builder not adopted: %+v", b)
 	}
 }
