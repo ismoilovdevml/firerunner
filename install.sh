@@ -220,7 +220,8 @@ state = "${CONTAINERD_STATE}"
   base_image_size = "${FR_VM_DISK}"
   # Discarding a deleted VM's blocks runs inside the snapshotter's write
   # transaction and stalls the next VM's snapshot; the thin pool frees the
-  # blocks of a deleted thin device anyway.
+  # blocks of a deleted thin device anyway, and zeroes every chunk it hands
+  # out again (setup_thinpool), so no VM reads what an earlier one wrote.
   discard_blocks = false
 EOF
 
@@ -286,7 +287,14 @@ setup_thinpool() {
         vgcreate -q "$VG" "$FR_DISK"
         lvcreate -q --wipesignatures y -n thinpool "$VG" -l 95%VG
         lvcreate -q --wipesignatures y -n thinpoolmeta "$VG" -l 1%VG
-        lvconvert -qy --zero n -c 512K --thinpool "$VG/thinpool" --poolmetadata "$VG/thinpoolmeta"
+        # --zero y: a chunk freed by a deleted VM may be handed to a VM of
+        # another project; zeroing on first use means it never reads the old
+        # data (discards do not guarantee zeros on every disk).
+        lvconvert -qy --zero y -c 512K --thinpool "$VG/thinpool" --poolmetadata "$VG/thinpoolmeta"
+    fi
+    if [[ $(lvs --noheadings -o zero "$VG/thinpool" 2>/dev/null | tr -d ' ') != zero ]]; then
+        warn "thin pool $VG/thinpool does not zero new chunks: a microVM may read data a deleted
+  microVM left on disk. Turn it on (online, no restart): lvchange --zero y $VG/thinpool"
     fi
 
     mkdir -p /etc/lvm/profile
