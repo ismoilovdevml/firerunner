@@ -40,7 +40,9 @@ func prepareReason(err error) string {
 	switch {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return "canceled"
-	case errors.Is(err, errNoMemory):
+	case errors.Is(err, errNoMemory), errors.Is(err, vm.ErrAdmissionBusy):
+		// No room, or other admissions held the lock, until the deadline:
+		// the host is busy admitting microVMs, flintlock did not fail.
 		return "admission_timeout"
 	case errors.Is(err, vm.ErrNotReady):
 		return "vm_boot"

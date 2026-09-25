@@ -100,6 +100,12 @@ var admissionTimeout = 30 * time.Second
 // interruptible, so waiting is polling: the wait must end with the context.
 const lockPoll = 10 * time.Millisecond
 
+// ErrAdmissionBusy is the error of an admission that waited for the host-wide
+// admission lock until its deadline: other admissions held it all along, and
+// flintlock was never asked. It deliberately does not wrap
+// context.DeadlineExceeded, which callers read as a flintlock call cut off.
+var ErrAdmissionBusy = errors.New("other microVM admissions held the admission lock")
+
 // reservation is memory admitted to one microVM that flintlock may not list
 // yet. It lasts until flintlock lists the VM, the process that admitted it
 // says its boot returned (Unreserve) or exits, or Until passes.
@@ -126,9 +132,9 @@ type FitsFunc func(ctx context.Context, cfg config.Config, fl *flintlock.Client,
 // created now, with a single flintlock listing, and reserves memory for them:
 // the first n of ids may be created. Call Unreserve(id) for each once its boot
 // returned. Errors admit nothing: flintlock down, the lock busy for
-// admissionTimeout, and a transient listing error, which is not retried under
-// the lock (the caller asks again, as when there is no room). Unknown host
-// memory admits everything, like Fits.
+// admissionTimeout (ErrAdmissionBusy), and a transient listing error, which
+// is not retried under the lock (the caller asks again, as when there is no
+// room). Unknown host memory admits everything, like Fits.
 func Admit(ctx context.Context, cfg config.Config, fl *flintlock.Client, ids ...string) (int, string, error) {
 	return admit(ctx, cfg, fl, ids, nil)
 }
@@ -215,7 +221,8 @@ func Unreserve(id string) error {
 }
 
 // lockAdmission takes the host-wide admission lock, waiting at most until ctx
-// ends. The returned function releases it.
+// ends: ErrAdmissionBusy at its deadline, the cancellation if the caller gave
+// up. The returned function releases it.
 func lockAdmission(ctx context.Context) (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(AdmissionFile), 0o700); err != nil {
 		return nil, err
@@ -237,6 +244,9 @@ func lockAdmission(ctx context.Context) (func(), error) {
 		select {
 		case <-ctx.Done():
 			_ = f.Close()
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, fmt.Errorf("%w (%s)", ErrAdmissionBusy, f.Name())
+			}
 			return nil, fmt.Errorf("waiting for another microVM admission (%s): %w", f.Name(), ctx.Err())
 		case <-time.After(lockPoll):
 		}

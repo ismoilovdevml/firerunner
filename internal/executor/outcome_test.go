@@ -57,6 +57,7 @@ func TestPrepareReason(t *testing.T) {
 		{context.Canceled, "canceled"},
 		{fmt.Errorf("waiting: %w", context.DeadlineExceeded), "canceled"},
 		{fmt.Errorf("%w for another microVM within 3m0s", errNoMemory), "admission_timeout"},
+		{fmt.Errorf("checking host memory failed for 3m0s: %w", vm.ErrAdmissionBusy), "admission_timeout"},
 		{fmt.Errorf("creating microVM job-1: %w", status.Error(codes.Unavailable, "connection refused")), "flintlock_error"},
 		{status.Error(codes.Unknown, "failed reading from content store"), "flintlock_error"},
 		{errors.New("something else"), "other"},

@@ -738,6 +738,31 @@ func TestColdBootBoundsEachFlintlockCall(t *testing.T) {
 	}
 }
 
+// Other admissions holding the host-wide admission lock until the deadline
+// fail the job as an admission timeout, not as a flintlock error: flintlock
+// was never asked.
+func TestColdBootAdmissionLockBusyUntilDeadline(t *testing.T) {
+	cfg, srv, boots := coldBootFixture(t, 300*time.Millisecond)
+	old := flintlockCallTimeout
+	flintlockCallTimeout = 50 * time.Millisecond // each admission's wait for the lock
+	t.Cleanup(func() { flintlockCallTimeout = old })
+	lock, err := os.OpenFile(vm.AdmissionFile+".lock", os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = coldBoot(context.Background(), cfg, "job-7", noPoolVM)
+	if !errors.Is(err, vm.ErrAdmissionBusy) || prepareReason(err) != "admission_timeout" {
+		t.Fatalf("coldBoot = %v (reason %s); want an admission_timeout", err, prepareReason(err))
+	}
+	if boots.Load() != 0 || srv.ListCalls() != 0 {
+		t.Fatalf("%d boots, %d listings without the lock; want none", boots.Load(), srv.ListCalls())
+	}
+}
+
 // A boot cut off by the cold boot's own bound is a VM that did not come up
 // (vm_boot); a boot cut off because the job was cancelled stays "canceled".
 func TestColdBootBoundedBootReason(t *testing.T) {

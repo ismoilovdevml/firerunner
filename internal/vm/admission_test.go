@@ -332,35 +332,57 @@ func TestAdmitFailurePaths(t *testing.T) {
 		}
 	})
 
-	t.Run("a held lock is waited for, not forever", func(t *testing.T) {
-		file := tempAdmission(t)
-		pinMemTotal(t, 1050, nil)
-		fl := dialFake(t, flintlocktest.NewServer(""))
-		if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		lock, err := os.OpenFile(file+".lock", os.O_RDWR|os.O_CREATE, 0o600)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer lock.Close()
-		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
-			t.Fatal(err)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-		start := time.Now()
-		if n, _, err := Admit(ctx, cfg, fl, "job-a"); n != 0 || !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("Admit under a held lock = %d, %v; want 0 with a deadline error", n, err)
-		}
-		if took := time.Since(start); took > time.Second {
-			t.Fatalf("Admit waited %s for the lock", took)
-		}
-		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-		if n, _, err := Admit(context.Background(), cfg, fl, "job-a"); n != 1 || err != nil {
-			t.Fatalf("Admit after the lock was released = %d, %v", n, err)
-		}
-	})
+	// Waiting out other admissions until the deadline is ErrAdmissionBusy,
+	// which says flintlock never failed (a deadline error would read as a
+	// flintlock call cut off); a caller that gives up gets its cancellation.
+	for _, c := range []struct {
+		name     string
+		ctx      func() (context.Context, context.CancelFunc)
+		want     error
+		wantNot  error
+		wantSays string
+	}{
+		{"a held lock is waited for until the deadline, then it is busy", func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), 100*time.Millisecond)
+		}, ErrAdmissionBusy, context.DeadlineExceeded, "admission.json.lock"},
+		{"a caller that gives up while waiting gets its cancellation", func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			time.AfterFunc(100*time.Millisecond, cancel)
+			return ctx, cancel
+		}, context.Canceled, ErrAdmissionBusy, "admission.json.lock"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			file := tempAdmission(t)
+			pinMemTotal(t, 1050, nil)
+			srv := flintlocktest.NewServer("")
+			fl := dialFake(t, srv)
+			if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			lock, err := os.OpenFile(file+".lock", os.O_RDWR|os.O_CREATE, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Close()
+			if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := c.ctx()
+			defer cancel()
+			start := time.Now()
+			n, _, err := Admit(ctx, cfg, fl, "job-a")
+			if n != 0 || !errors.Is(err, c.want) || errors.Is(err, c.wantNot) || !strings.Contains(fmt.Sprint(err), c.wantSays) {
+				t.Fatalf("Admit under a held lock = %d, %v; want 0 with %v (naming the lock), not %v", n, err, c.want, c.wantNot)
+			}
+			if took := time.Since(start); took > time.Second || srv.ListCalls() != 0 {
+				t.Fatalf("Admit waited %s for the lock and listed %d times; want about 100ms, none", took, srv.ListCalls())
+			}
+			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+			if n, _, err := Admit(context.Background(), cfg, fl, "job-a"); n != 1 || err != nil {
+				t.Fatalf("Admit after the lock was released = %d, %v", n, err)
+			}
+		})
+	}
 
 	t.Run("a reservation that cannot be recorded is not admitted", func(t *testing.T) {
 		file := tempAdmission(t)
