@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -507,5 +509,186 @@ func TestJobMaxAgeCountsFromTheJobStart(t *testing.T) {
 				t.Fatalf("deleted = %v (%v), want %v", got, srv.Deleted(), c.deleted)
 			}
 		})
+	}
+}
+
+// logBuffer collects a daemon's log lines (Debug and up) for a test.
+type logBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *logBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *logBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// captureLog sends d's log to a buffer; call it before d starts any work.
+func captureLog(d *Daemon) *logBuffer {
+	buf := &logBuffer{}
+	d.log = slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return buf
+}
+
+func writePoolFile(t *testing.T, d *Daemon, recs ...poolRecord) {
+	t.Helper()
+	data, err := json.Marshal(recs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(d.poolFile(), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readPoolFile(t *testing.T, d *Daemon) []string {
+	t.Helper()
+	data, err := os.ReadFile(d.poolFile())
+	if err != nil {
+		return nil
+	}
+	var recs []poolRecord
+	if err := json.Unmarshal(data, &recs); err != nil {
+		t.Fatal(err)
+	}
+	var uids []string
+	for _, r := range recs {
+		uids = append(uids, r.Instance.UID)
+	}
+	return uids
+}
+
+func createdVM(id, uid string) *types.MicroVM {
+	return &types.MicroVM{Spec: &types.MicroVMSpec{Id: id, Uid: &uid},
+		Status: &types.MicroVMStatus{State: types.MicroVMStatus_CREATED}}
+}
+
+// A pool VM a job runs on is never adopted back into the pool, even when
+// pool.json still lists it (a failed write, then a restart): it would be
+// handed to a second job, maybe of another project.
+func TestAdoptPoolSkipsVMsOfRunningJobs(t *testing.T) {
+	dir := tempJobStates(t)
+	d, srv := newTestDaemon(t)
+	fp := fingerprint(d.cfg)
+	rec := func(uid string) poolRecord {
+		return poolRecord{Instance: vm.Instance{ID: "pool-" + uid, UID: uid}, BornAt: time.Now(), SpecID: fp}
+	}
+	writePoolFile(t, d, rec("idle"), rec("byuid"), rec("byid"))
+	srv.SetVMs(createdVM("pool-idle", "idle"), createdVM("pool-byuid", "byuid"), createdVM("pool-byid", "byid"))
+	for name, st := range map[string]*vm.JobState{
+		"job-1.json": {Instance: vm.Instance{ID: "pool-byuid", UID: "byuid"}},
+		"job-2.json": {Instance: vm.Instance{ID: "pool-byid", UID: "other"}},
+	} {
+		if err := vm.SaveJobState(filepath.Join(dir, name), st); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orig := alive
+	alive = func(config.Config, *vm.Instance) bool { return true }
+	t.Cleanup(func() { alive = orig })
+
+	vms, err := d.fl.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.adoptPool(vms)
+	if len(d.ready) != 1 || d.ready[0].inst.UID != "idle" {
+		var got []string
+		for _, p := range d.ready {
+			got = append(got, p.inst.UID)
+		}
+		t.Fatalf("adopted %v, want only [idle]", got)
+	}
+}
+
+// A pool.json that cannot be replaced is removed: at the next start adopting
+// nothing beats adopting a VM a job took meanwhile.
+func TestPoolSaveFailureRemovesStaleRecord(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	logs := captureLog(d)
+	d.adoptPool(nil) // no pool.json: adoption ran, saves may write
+	fp := fingerprint(d.cfg)
+	writePoolFile(t, d, poolRecord{Instance: vm.Instance{ID: "pool-taken", UID: "taken"}, BornAt: time.Now(), SpecID: fp})
+	if err := os.Mkdir(d.poolFile()+".tmp", 0o700); err != nil { // the next write fails
+		t.Fatal(err)
+	}
+	d.ready = []*pooled{pooledVM("taken", fp, 0)}
+	if d.Claim() == nil {
+		t.Fatal("claim missed")
+	}
+	if _, err := os.Stat(d.poolFile()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale pool.json kept after a failed save (%v): a restart would adopt the claimed VM", err)
+	}
+	if !strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("failed save not logged:\n%s", logs)
+	}
+	// Once writes work again, the pool is recorded again.
+	if err := os.Remove(d.poolFile() + ".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	d.ready = []*pooled{pooledVM("fresh", fp, 0)}
+	d.mu.Lock()
+	d.savePoolLocked()
+	d.mu.Unlock()
+	if got := readPoolFile(t, d); len(got) != 1 || got[0] != "fresh" {
+		t.Fatalf("pool.json = %v, want [fresh]", got)
+	}
+}
+
+// When flintlockd does not answer at startup, the previous run's pool.json is
+// neither overwritten nor forgotten: the first listing that works adopts it.
+func TestStartupListFailureRetriesAdoption(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	oldFor, oldRetry := startupListFor, startupRetry
+	startupListFor, startupRetry = 0, 10*time.Millisecond
+	t.Cleanup(func() { startupListFor, startupRetry = oldFor, oldRetry })
+	orig := alive
+	alive = func(config.Config, *vm.Instance) bool { return true }
+	t.Cleanup(func() { alive = orig })
+
+	d, srv := newTestDaemon(t)
+	fp := fingerprint(d.cfg)
+	writePoolFile(t, d, poolRecord{Instance: vm.Instance{ID: "pool-warm", UID: "warm"}, BornAt: time.Now(), SpecID: fp})
+	d.expireIdle(context.Background()) // saves the (empty) pool before any adoption
+	if got := readPoolFile(t, d); len(got) != 1 {
+		t.Fatalf("pool.json overwritten before adoption: %v", got)
+	}
+	srv.SetVMs(createdVM("pool-warm", "warm"))
+	srv.FailList(status.Error(codes.Unavailable, "flintlockd starting")) // the startup listing
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		d.mu.Lock()
+		n := len(d.ready)
+		d.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("pool VM from the previous run never adopted after the startup listing failed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	if got := srv.Deleted(); len(got) != 0 {
+		t.Fatalf("deleted %v", got)
+	}
+	if got := readPoolFile(t, d); len(got) != 1 || got[0] != "warm" {
+		t.Fatalf("pool.json after shutdown = %v, want [warm]", got)
 	}
 }

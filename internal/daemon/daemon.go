@@ -90,31 +90,73 @@ func (d *Daemon) poolFile() string {
 	return filepath.Join(filepath.Dir(d.cfg.Daemon.Socket), "pool.json")
 }
 
-// savePoolLocked persists the ready pool; the caller holds d.mu.
+// savePoolLocked persists the ready pool; the caller holds d.mu. Until
+// adoptPool read the previous run's pool.json nothing is written, or that
+// record would be lost. A pool.json that cannot be replaced is removed: at
+// the next start a stale record could adopt a VM a job took since, and
+// adopting nothing only costs warm VMs.
 func (d *Daemon) savePoolLocked() {
+	if !d.poolAdopted {
+		return
+	}
 	recs := make([]poolRecord, 0, len(d.ready))
 	for _, p := range d.ready {
 		recs = append(recs, poolRecord{Instance: *p.inst, BornAt: p.bornAt, SpecID: p.specID})
 	}
-	data, _ := json.Marshal(recs)
-	tmp := d.poolFile() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err == nil {
-		_ = os.Rename(tmp, d.poolFile())
+	data, err := json.Marshal(recs)
+	if err == nil {
+		err = writeFileSync(d.poolFile(), data)
 	}
+	if err != nil {
+		rmErr := os.Remove(d.poolFile())
+		if rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			d.log.Error("cannot record the idle pool nor remove the old record: a restart may adopt a VM a job uses",
+				"file", d.poolFile(), "err", err, "remove_err", rmErr)
+			return
+		}
+		d.warnLimited("pool-save", "cannot record the idle pool; a restart adopts none of it", "file", d.poolFile(), "err", err)
+	}
+}
+
+// writeFileSync replaces path with data through a synced temporary file, so
+// a crash leaves the old content or the new one, never a torn file.
+func writeFileSync(path string, data []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+	}
+	return err
 }
 
 // adoptPool takes back idle pool VMs a previous daemon run left ready, so a
 // restart or upgrade does not throw the warm pool away. Anything that does not
-// match (gone, other config, too old, not answering) is left for reconcile.
-// vms is the flintlock listing taken at startup.
+// match (gone, other config, too old, not answering) is left for reconcile, and
+// so is a VM a job state file names: a job took it after pool.json was last
+// written. vms is a flintlock listing: the one taken at startup, or the first
+// one that worked after that failed.
 func (d *Daemon) adoptPool(vms []*types.MicroVM) {
-	data, err := os.ReadFile(d.poolFile())
-	if err != nil {
-		return
-	}
+	data, readErr := os.ReadFile(d.poolFile())
+	d.mu.Lock()
+	d.poolAdopted = true // read: saving may replace it now
+	cfg, fp := d.cfg, fingerprint(d.cfg)
+	d.mu.Unlock()
 	var recs []poolRecord
-	if json.Unmarshal(data, &recs) != nil {
-		return
+	if readErr != nil || json.Unmarshal(data, &recs) != nil {
+		recs = nil
 	}
 	live := map[string]bool{}
 	for _, v := range vms {
@@ -122,11 +164,16 @@ func (d *Daemon) adoptPool(vms []*types.MicroVM) {
 			live[v.GetSpec().GetUid()] = true
 		}
 	}
-	d.mu.Lock()
-	cfg, fp := d.cfg, fingerprint(d.cfg)
-	d.mu.Unlock()
+	jobUIDs, jobIDs := map[string]bool{}, map[string]bool{}
+	for _, j := range runningJobs() {
+		jobUIDs[j.uid], jobIDs[j.id] = true, true
+	}
 	for _, r := range recs {
 		inst := r.Instance
+		if jobUIDs[inst.UID] || jobIDs[inst.ID] {
+			d.log.Warn("pool VM from previous run not adopted: a job runs on it", "vm", inst.ID)
+			continue
+		}
 		if !live[inst.UID] || r.SpecID != fp || time.Since(r.BornAt) > cfg.Pool.MaxIdle || !alive(cfg, &inst) {
 			continue
 		}
@@ -168,6 +215,12 @@ type Daemon struct {
 	// busy is the projects whose builder a running job uses, as expireBuilders
 	// last saw them (every 2 s), so Builder can evict without a scan under mu.
 	busy map[string]bool
+	// poolAdopted: adoptPool read the previous run's pool.json (at startup,
+	// or at the first reconcile that could list); savePoolLocked waits for it.
+	poolAdopted bool
+	// warned: when warnLimited last logged each problem at Warn.
+	warnMu sync.Mutex
+	warned map[string]time.Time
 
 	lastTick atomic.Int64 // unix time of the main loop's last pass (/healthz)
 	oomKills int64        // host oom_kill count at the last collectHost, -1 before the first
@@ -182,6 +235,29 @@ type Daemon struct {
 	// the same free space.
 	cacheMu       sync.Mutex
 	cacheReserved int64
+}
+
+// warnEvery is how often a problem that repeats every pass of the main loop
+// is logged at Warn; the repeats in between go to Debug.
+const warnEvery = 5 * time.Minute
+
+// warnLimited logs msg at Warn at most once per warnEvery for key.
+func (d *Daemon) warnLimited(key, msg string, args ...any) {
+	d.warnMu.Lock()
+	if d.warned == nil {
+		d.warned = map[string]time.Time{}
+	}
+	last, seen := d.warned[key]
+	loud := !seen || time.Since(last) >= warnEvery
+	if loud {
+		d.warned[key] = time.Now()
+	}
+	d.warnMu.Unlock()
+	if loud {
+		d.log.Warn(msg, args...)
+	} else {
+		d.log.Debug(msg, args...)
+	}
 }
 
 // spawn runs fn in the background and lets Run wait for it at shutdown, so
@@ -732,6 +808,14 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 		return
 	}
 	d.metrics.flintlockUp.Set(1)
+	d.mu.Lock()
+	adopted := d.poolAdopted
+	d.mu.Unlock()
+	if !adopted {
+		// The startup listing failed: adopt the previous run's pool now,
+		// before its VMs are judged.
+		d.adoptPool(vms)
+	}
 
 	d.mu.Lock()
 	cfg := d.cfg
