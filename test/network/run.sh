@@ -115,6 +115,25 @@ check "LAN->bridge address DNS tcp .1:53"           blocked $L nc -z -w2 10.200.
 check "host itself->bridge address .1:5000"         ok      nc -z -w2 10.200.0.1 5000
 check "host->VM (how the executor reaches sshd)"   ok      nc -z -w2 10.200.0.12 1234
 check "VM egress still gets replies"                ok      $A nc -z -w2 192.0.2.50 80
+
+# flintlock gives every microVM a second tap for the metadata service (eth0 in the
+# guest, 169.254.0.1/16). It is up on the host but not on the bridge; Firecracker
+# answers the metadata address itself, so nothing sent on it may reach the host.
+sysctl -qw net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 2>/dev/null
+ip link add fltapM type veth peer name mds0 netns vmA
+ip link set fltapM up
+ip -n vmA addr add 169.254.0.1/16 dev mds0; ip -n vmA link set mds0 up
+listen nc -6 :: 2222
+listen nc 0.0.0.0 2223
+sleep 3   # IPv6 link-local addresses finish DAD
+HLL=$(ip -6 addr show dev fltapM scope link | awk '/inet6/{sub("/.*","",$2); print $2; exit}')
+# IPv4 through the metadata tap, sourced from the VM's own bridge address so the
+# host's reply comes back over the bridge (loose rp_filter, the Ubuntu default).
+sysctl -qw net.ipv4.conf.all.rp_filter=2 net.ipv4.conf.fltapM.rp_filter=2
+ip -n vmA route add 192.0.2.1/32 dev mds0 src 10.200.0.11
+check "metadata tap->host over IPv6 link-local"     blocked $A nc -6 -z -w2 "$HLL%mds0" 2222
+check "metadata tap->host uplink address (IPv4)"    blocked $A nc -z -w2 -s 10.200.0.11 192.0.2.1 2223
+check "metadata tap->other VM"                      blocked $A nc -z -w2 -s 169.254.0.1 10.200.0.12 1234
 echo "---- rendered rules"; nft list table inet firerunner | sed -n '/chain input/,/^}/p'
 echo "RESULT pass=$pass fail=$fail"
 [[ $fail -eq 0 ]]
