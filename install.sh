@@ -749,6 +749,12 @@ log-format: json
 verbosity: 1
 EOF
 
+    # flintlockd writes each VM's user-data, which holds the VM's SSH host
+    # private key, to metadata.json with mode 0644: keep its state root-only.
+    if [[ -d /var/lib/flintlock ]]; then
+        chmod -R go-rwx /var/lib/flintlock
+    fi
+
     put /etc/systemd/system/flintlockd.service <<EOF
 [Unit]
 Description=flintlock microVM service
@@ -758,6 +764,8 @@ After=containerd-flintlock.service firerunner-net.service
 [Service]
 # All settings, including the API token, come from /etc/opt/flintlockd/config.yaml (0600).
 ExecStart=${BIN_DIR}/flintlockd run
+# VM state (metadata.json with the SSH host keys, console logs) for root only.
+UMask=0077
 Restart=always
 RestartSec=5
 KillMode=process
