@@ -137,6 +137,11 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 			}
 		}
 	}
+	// SSH refuses to connect when the key cannot be pinned: say so now rather
+	// than after vm.boot_timeout of failed attempts.
+	if _, err := knownHosts(inst); err != nil {
+		return fail(fmt.Errorf("pinning the host key of %s: %w", id, err))
+	}
 	// Wait for sshd's port before spawning ssh: a TCP dial costs no process, so
 	// it can poll every bootPoll, and the first ssh then almost always succeeds.
 	if err := waitTCP(ctx, net.JoinHostPort(inst.IP, "22"), deadline); err != nil {
@@ -378,15 +383,19 @@ var routeDev = func(ip string) string {
 
 // SSH returns a command that runs args in the microVM as root. The VM's
 // host key is pinned under its id (HostKeyAlias), so the connection fails
-// if anything else answers on the VM's IP.
+// if anything else answers on the VM's IP. When a recorded key cannot be
+// pinned (its known_hosts file cannot be written), the command's Run and
+// Start fail without connecting.
 func SSH(cfg config.Config, inst *Instance, args ...string) *exec.Cmd {
 	base := []string{"-q", "-i", cfg.Network.SSHKey, "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=3", "-o", "ServerAliveInterval=15"}
-	if file, err := knownHosts(inst); err == nil {
+	file, pinErr := knownHosts(inst)
+	if inst.HostKey != "" {
 		base = append(base, "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile="+file, "-o", "HostKeyAlias="+inst.ID)
 	} else {
 		// Only VMs created before host-key pinning existed (no HostKey recorded).
-		fmt.Fprintf(os.Stderr, "warning: %v; connecting to %s without host key verification\n", err, inst.ID)
+		fmt.Fprintf(os.Stderr, "warning: %v; connecting to %s without host key verification\n", pinErr, inst.ID)
 		base = append(base, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null")
+		pinErr = nil
 	}
 	if Multiplex && inst.HostKey != "" {
 		// Client only: never become a master here. A master started by a stage
@@ -395,7 +404,13 @@ func SSH(cfg config.Config, inst *Instance, args ...string) *exec.Cmd {
 		base = append(base, "-o", "ControlMaster=no", "-o", "ControlPath="+muxPath(inst.ID))
 	}
 	base = append(base, "root@"+inst.IP)
-	return exec.Command("ssh", append(base, args...)...)
+	cmd := exec.Command("ssh", append(base, args...)...)
+	if pinErr != nil {
+		// Never fall back to an unverified connection: a stage script carries
+		// the job's secrets to whoever answers on the IP.
+		cmd.Err = fmt.Errorf("pinning the host key of %s: %w", inst.ID, pinErr)
+	}
+	return cmd
 }
 
 // StartMux opens the shared connection for a pinned microVM: ssh
@@ -438,14 +453,16 @@ func StopMux(inst *Instance) {
 	_ = os.Remove(path)
 }
 
+// knownHosts writes the pinned key file of inst and returns its path (also
+// when writing it failed).
 func knownHosts(inst *Instance) (string, error) {
+	file := filepath.Join(KnownHostsDir, filepath.Base(inst.ID))
 	if inst.HostKey == "" {
-		return "", fmt.Errorf("no host key recorded for %s", inst.ID)
+		return file, fmt.Errorf("no host key recorded for %s", inst.ID)
 	}
 	if err := os.MkdirAll(KnownHostsDir, 0o700); err != nil {
-		return "", err
+		return file, err
 	}
-	file := filepath.Join(KnownHostsDir, filepath.Base(inst.ID))
 	return file, os.WriteFile(file, []byte(inst.ID+" "+inst.HostKey+"\n"), 0o600)
 }
 

@@ -152,6 +152,43 @@ func TestSSHPinsHostKey(t *testing.T) {
 	}
 }
 
+// A VM with a recorded host key is never reached unverified: when its key
+// cannot be pinned, the command fails instead of connecting to whoever answers
+// on the IP (the session may carry the job's secrets). Only a VM without a
+// recorded key, from before host keys were pinned, connects unverified.
+func TestSSHFailsClosedWhenTheKeyCannotBePinned(t *testing.T) {
+	old := KnownHostsDir
+	t.Cleanup(func() { KnownHostsDir = old })
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	KnownHostsDir = filepath.Join(file, "known_hosts") // cannot be created
+	cfg := config.Default()
+
+	pinned := &Instance{ID: "job-5", IP: "10.200.0.9", HostKey: "ssh-ed25519 AAAAHOST"}
+	cmd := SSH(cfg, pinned, "true")
+	if args := strings.Join(cmd.Args, " "); strings.Contains(args, "StrictHostKeyChecking=no") ||
+		!strings.Contains(args, "StrictHostKeyChecking=yes") {
+		t.Fatalf("known key not pinned, connecting unverified: %s", args)
+	}
+	err := cmd.Run()
+	if err == nil || !strings.Contains(err.Error(), "host key of job-5") {
+		t.Fatalf("Run = %v; want it to fail on the host key before connecting", err)
+	}
+	if cmd.Process != nil {
+		t.Fatal("ssh was started")
+	}
+	if code, err := RunScript(cfg, pinned, strings.NewReader("echo secret"), nil, nil); code != -1 || err == nil {
+		t.Fatalf("RunScript = %d, %v; want -1 with the error", code, err)
+	}
+
+	legacy := &Instance{ID: "job-6", IP: "10.200.0.10"}
+	if args := strings.Join(SSH(cfg, legacy, "true").Args, " "); !strings.Contains(args, "StrictHostKeyChecking=no") {
+		t.Fatalf("a VM without a recorded key must still be reachable: %s", args)
+	}
+}
+
 func TestForgetReleasesLease(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.Default()
