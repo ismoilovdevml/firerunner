@@ -230,7 +230,7 @@ func (d *Daemon) removeBuilderLocked(b *builder, reason string) {
 		d.saving[project] = saved
 	}
 	d.spawn(func() {
-		_ = nft("delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", port))
+		_, _ = nft("", "delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", port))
 		if saved != nil {
 			if ctx.Err() == nil {
 				d.saveBuilderCache(ctx, cfg, project, &inst, saved.start)
@@ -386,7 +386,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	}
 	b.Instance, b.creds = *inst, nil
 	b.SpecID, b.BornAt, b.ready = builderSpec(cfg), time.Now(), true
-	if err := mapBuilderPort(b); err != nil {
+	if err := mapBuilderPorts(*b); err != nil {
 		d.log.Error("builder port mapping failed", "project", project, "err", err)
 	}
 	d.saveBuildersLocked()
@@ -536,24 +536,77 @@ func ensureNL(s string) string {
 	return s + "\n"
 }
 
-// nftRun is a variable so tests can record nft calls.
-var nftRun = func(args ...string) error {
-	out, err := exec.Command("nft", args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("nft %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+// nftRun runs nft with args and script on its standard input ("" for none)
+// and returns what it printed; a variable so tests can emulate nft.
+var nftRun = func(script string, args ...string) (string, error) {
+	cmd := exec.Command("nft", args...)
+	if script != "" {
+		cmd.Stdin = strings.NewReader(script)
 	}
-	return nil
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("nft %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
 }
 
-// mapBuilderPort points <bridge address>:port at the builder (install.sh
-// creates the map and the DNAT rule). Re-adding an existing mapping is a no-op.
-func mapBuilderPort(b *builder) error {
-	if net.ParseIP(b.Instance.IP).To4() == nil {
-		return fmt.Errorf("builder %s has no IPv4 address", b.Instance.ID)
+// mapBuilderPorts points <bridge address>:port at each builder's buildkitd
+// (install.sh creates the map and the DNAT rule; restarting firerunner-net
+// empties it). It lists the map once and leaves mappings in place alone; the
+// missing and wrong ones change in one nft transaction, so a wrong mapping is
+// replaced without a moment in which the port maps to nothing.
+func mapBuilderPorts(bs ...builder) error {
+	out, err := nftRun("", "list", "map", "inet", "firerunner", "builders")
+	if err != nil {
+		return err
 	}
-	_ = nftRun("delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", b.Port))
-	return nftRun("add", "element", "inet", "firerunner", "builders",
-		fmt.Sprintf("{ %d : %s . 1234 }", b.Port, b.Instance.IP))
+	have := parseBuilderMap(out)
+	var errs []error
+	var script strings.Builder
+	for _, b := range bs {
+		ip := net.ParseIP(b.Instance.IP).To4()
+		if ip == nil {
+			errs = append(errs, fmt.Errorf("builder %s has no IPv4 address", b.Instance.ID))
+			continue
+		}
+		to, mapped := have[b.Port]
+		if to == ip.String()+" . 1234" {
+			continue
+		}
+		if mapped {
+			// nft refuses to add a key that maps elsewhere.
+			fmt.Fprintf(&script, "delete element inet firerunner builders { %d }\n", b.Port)
+		}
+		fmt.Fprintf(&script, "add element inet firerunner builders { %d : %s . 1234 }\n", b.Port, ip)
+	}
+	if script.Len() > 0 {
+		if _, err := nftRun(script.String(), "-f", "-"); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// parseBuilderMap reads `nft list map inet firerunner builders`: port ->
+// target ("10.200.0.13 . 1234"). Elements it cannot read are left out, so
+// they count as missing.
+func parseBuilderMap(out string) map[int]string {
+	m := map[int]string{}
+	_, rest, ok := strings.Cut(strings.Join(strings.Fields(out), " "), "elements = {")
+	if !ok {
+		return m
+	}
+	body, _, _ := strings.Cut(rest, "}")
+	for _, e := range strings.Split(body, ",") {
+		key, to, ok := strings.Cut(e, ":")
+		port, err := strconv.Atoi(strings.TrimSpace(key))
+		if !ok || err != nil {
+			continue
+		}
+		m[port] = strings.Join(strings.Fields(to), " ")
+	}
+	return m
 }
 
 // expireBuilders deletes builders idle longer than builder.idle_ttl, older
@@ -589,7 +642,7 @@ func (d *Daemon) expireBuilders() {
 	}
 }
 
-// checkBuilders re-adds port mappings (restarting firerunner-net clears them)
+// checkBuilders restores port mappings (restarting firerunner-net clears them)
 // and drops builders whose VM is gone, or whose buildkitd missed builderStrikes
 // probes in a row while no job uses it. present is the flintlock listing taken
 // at listedAt; a builder that became ready after that is not in it yet.
@@ -653,11 +706,9 @@ func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
 		remap = append(remap, *b)
 	}
 	d.mu.Unlock()
-	// Two nft execs per builder: outside the lock, so job claims never wait.
-	for i := range remap {
-		if err := mapBuilderPort(&remap[i]); err != nil {
-			d.log.Error("builder port mapping failed", "project", remap[i].Project, "err", err)
-		}
+	// nft runs outside the lock, so job claims never wait for it.
+	if err := mapBuilderPorts(remap...); err != nil {
+		d.log.Error("builder port mapping failed", "err", err)
 	}
 }
 
@@ -731,7 +782,7 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 	// with a new builder keeps it (reconcile removes the old VM), and an old
 	// builder whose port a new one took gets another port.
 	d.mu.Lock()
-	var adopted []*builder
+	var adopted []builder
 	for _, b := range keep {
 		if _, taken := d.builders[b.Project]; taken {
 			d.log.Warn("builder from previous run not adopted: the project has a new one", "project", b.Project, "id", b.Instance.ID)
@@ -750,16 +801,14 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 			b.SpecID = builderSpec(d.cfg)
 		}
 		d.builders[b.Project] = b
-		adopted = append(adopted, b)
+		adopted = append(adopted, *b)
 		d.log.Info("adopted builder from previous run", "project", b.Project, "id", b.Instance.ID)
 	}
 	d.saveBuildersLocked()
 	d.metrics.builders.Set(float64(len(d.builders)))
 	d.mu.Unlock()
-	for _, b := range adopted {
-		if err := mapBuilderPort(b); err != nil {
-			d.log.Error("builder port mapping failed", "project", b.Project, "err", err)
-		}
+	if err := mapBuilderPorts(adopted...); err != nil {
+		d.log.Error("builder port mapping failed", "err", err)
 	}
 }
 

@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,31 +28,120 @@ import (
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
-// stubBuilders records nft calls and answers builder probes without VMs. The
-// returned function lists the calls so far, one per line.
-func stubBuilders(t *testing.T, alive func(ip string) bool) func() string {
-	t.Helper()
-	var mu sync.Mutex
-	var calls []string
-	oldNft, oldTCP, oldBoot := nftRun, tcpOpen, builderBoot
-	nftRun = func(args ...string) error {
-		mu.Lock()
-		defer mu.Unlock()
-		calls = append(calls, strings.Join(args, " "))
+// fakeNft emulates nft for the builders map: it records every call (the
+// arguments, then the script, if any) and keeps the map's elements, port ->
+// "ip . port". A script is applied all or nothing, like nft -f.
+type fakeNft struct {
+	mu      sync.Mutex
+	calls   []string
+	elems   map[int]string
+	listErr error
+}
+
+func (f *fakeNft) run(script string, args ...string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	call := strings.Join(args, " ")
+	if script != "" {
+		call += "\n" + strings.TrimSpace(script)
+	}
+	f.calls = append(f.calls, call)
+	if f.elems == nil {
+		f.elems = map[int]string{}
+	}
+	switch strings.Join(args, " ") {
+	case "list map inet firerunner builders":
+		if f.listErr != nil {
+			return "", f.listErr
+		}
+		var e []string
+		for port, to := range f.elems {
+			e = append(e, fmt.Sprintf("%d : %s", port, to))
+		}
+		out := "table inet firerunner {\n\tmap builders {\n\t\ttype inet_service : ipv4_addr . inet_service\n"
+		if len(e) > 0 {
+			sort.Strings(e)
+			out += "\t\telements = { " + strings.Join(e, ",\n\t\t\t     ") + " }\n"
+		}
+		return out + "\t}\n}\n", nil
+	case "-f -":
+		next := maps.Clone(f.elems)
+		for _, line := range strings.Split(strings.TrimSpace(script), "\n") {
+			if err := applyNft(next, line); err != nil {
+				return "", err
+			}
+		}
+		f.elems = next
+		return "", nil
+	}
+	return "", applyNft(f.elems, strings.Join(args, " "))
+}
+
+// applyNft applies one add or delete of a builders map element like nft does:
+// deleting a missing element or re-adding a port with another target fails.
+func applyNft(elems map[int]string, cmd string) error {
+	var port int
+	var ip string
+	if n, _ := fmt.Sscanf(cmd, "add element inet firerunner builders { %d : %s . 1234 }", &port, &ip); n == 2 {
+		if have, ok := elems[port]; ok && have != ip+" . 1234" {
+			return fmt.Errorf("nft: %s: Device or resource busy", cmd)
+		}
+		elems[port] = ip + " . 1234"
 		return nil
 	}
+	if n, _ := fmt.Sscanf(cmd, "delete element inet firerunner builders { %d }", &port); n == 1 {
+		if _, ok := elems[port]; !ok {
+			return fmt.Errorf("nft: %s: No such file or directory", cmd)
+		}
+		delete(elems, port)
+		return nil
+	}
+	return fmt.Errorf("fake nft does not know %q", cmd)
+}
+
+func (f *fakeNft) String() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return strings.Join(f.calls, "\n")
+}
+
+// writes are the calls that changed or tried to change the map.
+func (f *fakeNft) writes() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, c := range f.calls {
+		if !strings.HasPrefix(c, "list ") {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// stubBuilders emulates nft (see fakeNft) and answers builder probes without
+// VMs. The returned function lists the nft calls so far, one per line.
+func stubBuilders(t *testing.T, alive func(ip string) bool) func() string {
+	t.Helper()
+	nft := stubNft(t)
+	oldTCP, oldBoot := tcpOpen, builderBoot
 	tcpOpen = func(ip string, _ int) bool { return alive(ip) }
 	builderBoot = func(*Daemon, context.Context, config.Config, string) {}
-	t.Cleanup(func() { nftRun, tcpOpen, builderBoot = oldNft, oldTCP, oldBoot })
+	t.Cleanup(func() { tcpOpen, builderBoot = oldTCP, oldBoot })
 	// No builder VMs to copy caches from: saves fail fast unless a test stubs them.
 	stubBuilderCache(t, func(context.Context, config.Config, *vm.Instance) (int64, error) {
 		return 0, errors.New("stub: no VM")
 	}, nil, nil)
-	return func() string {
-		mu.Lock()
-		defer mu.Unlock()
-		return strings.Join(calls, "\n")
-	}
+	return nft.String
+}
+
+// stubNft replaces nft with a fakeNft for one test.
+func stubNft(t *testing.T) *fakeNft {
+	t.Helper()
+	f := &fakeNft{}
+	old := nftRun
+	nftRun = f.run
+	t.Cleanup(func() { nftRun = old })
+	return f
 }
 
 func readyBuilder(project string, port int, lastUsed time.Duration, spec string) *builder {
@@ -411,10 +502,10 @@ func blockNft(t *testing.T) (entered chan string, release func()) {
 	t.Helper()
 	entered, gate := make(chan string, 64), make(chan struct{})
 	old := nftRun
-	nftRun = func(args ...string) error {
+	nftRun = func(_ string, args ...string) (string, error) {
 		entered <- strings.Join(args, " ")
 		<-gate
-		return nil
+		return "", nil
 	}
 	var once sync.Once
 	release = func() { once.Do(func() { close(gate) }) }
@@ -763,5 +854,71 @@ func TestAdoptBuildersOfBothIDForms(t *testing.T) {
 	}
 	if b := d2.builders["8"]; b == nil || b.Instance.ID != "bld-8-0a1b2c3d" || !b.ready {
 		t.Fatalf("per-boot id builder not adopted: %+v", b)
+	}
+}
+
+// Every reconcile checks the port mappings. One already in place is left
+// alone, a missing one is added, and one pointing elsewhere is replaced in a
+// single nft transaction: between a separate delete and add, connections to
+// the port would be dropped.
+func TestBuilderPortsRemappedOnlyWhenNeeded(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	nft := stubNft(t)
+	d, _ := newTestDaemon(t)
+	spec := builderSpec(d.cfg)
+	d.builders = map[string]*builder{"1": readyBuilder("1", 20001, 0, spec), "2": readyBuilder("2", 20002, 0, spec)}
+	present := map[string]bool{"uid-1": true, "uid-2": true}
+	nft.elems = map[int]string{20002: "10.200.0.2 . 1234"}
+
+	d.checkBuilders(present, time.Now()) // 20001 missing
+	want := []string{"-f -\nadd element inet firerunner builders { 20001 : 10.200.0.1 . 1234 }"}
+	if got := nft.writes(); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("missing mapping: nft writes %q, want %q", got, want)
+	}
+
+	nft.calls = nil
+	d.checkBuilders(present, time.Now()) // all in place
+	if got := nft.writes(); len(got) != 0 {
+		t.Fatalf("mappings in place, but nft ran %q", got)
+	}
+
+	nft.calls = nil
+	nft.elems[20001] = "10.200.0.99 . 1234" // firerunner-net reloaded with an old address
+	d.checkBuilders(present, time.Now())
+	want = []string{"-f -\ndelete element inet firerunner builders { 20001 }\nadd element inet firerunner builders { 20001 : 10.200.0.1 . 1234 }"}
+	if got := nft.writes(); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("wrong mapping: nft writes %q, want one transaction %q", got, want)
+	}
+	if nft.elems[20001] != "10.200.0.1 . 1234" || nft.elems[20002] != "10.200.0.2 . 1234" {
+		t.Fatalf("map after remap: %v", nft.elems)
+	}
+
+	// nft cannot list the map (firerunner-net stopped): nothing is written blind.
+	nft.calls = nil
+	nft.listErr = errors.New("nft: No such file or directory")
+	delete(nft.elems, 20001)
+	d.checkBuilders(present, time.Now())
+	if got := nft.writes(); len(got) != 0 {
+		t.Fatalf("listing failed, but nft ran %q", got)
+	}
+}
+
+// parseBuilderMap reads nft's listing of the builders map, one or many lines.
+func TestParseBuilderMap(t *testing.T) {
+	for _, tc := range []struct {
+		name, out string
+		want      map[int]string
+	}{
+		{"empty map", "table inet firerunner {\n\tmap builders {\n\t\ttype inet_service : ipv4_addr . inet_service\n\t}\n}\n", map[int]string{}},
+		{"one element", "table inet firerunner {\n\tmap builders {\n\t\ttype inet_service : ipv4_addr . inet_service\n\t\telements = { 20001 : 10.200.0.13 . 1234 }\n\t}\n}\n",
+			map[int]string{20001: "10.200.0.13 . 1234"}},
+		{"wrapped elements", "table inet firerunner {\n\tmap builders {\n\t\ttype inet_service : ipv4_addr . inet_service\n\t\telements = { 20001 : 10.200.0.13 . 1234,\n\t\t\t     20002 : 10.200.0.14 . 1234 }\n\t}\n}\n",
+			map[int]string{20001: "10.200.0.13 . 1234", 20002: "10.200.0.14 . 1234"}},
+		{"unexpected text", "garbage", map[int]string{}},
+	} {
+		got := parseBuilderMap(tc.out)
+		if !maps.Equal(got, tc.want) {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

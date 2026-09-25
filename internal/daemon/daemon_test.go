@@ -36,7 +36,7 @@ func TestMain(m *testing.M) {
 	poolBoot = func(context.Context, config.Config, *flintlock.Client, string, map[string]string) (*vm.Instance, error) {
 		return nil, errors.New("no microVMs in tests")
 	}
-	nftRun = func(...string) error { return errors.New("nft is not run in tests") }
+	nftRun = func(string, ...string) (string, error) { return "", errors.New("nft is not run in tests") }
 	alive = func(config.Config, *vm.Instance) bool { return false }
 	warmDocker = func(config.Config, *vm.Instance) error { return nil }
 	serviceActive = func(context.Context, string) bool { return false }
@@ -198,7 +198,7 @@ func TestHostPathsAreIsolated(t *testing.T) {
 			t.Errorf("%s = %s: a host path outside %s", name, p, tmp)
 		}
 	}
-	if err := nftRun("list", "ruleset"); err == nil {
+	if _, err := nftRun("", "list", "ruleset"); err == nil {
 		t.Error("nft ran: tests must never touch the host firewall")
 	}
 }
