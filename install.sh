@@ -400,6 +400,11 @@ table inet firerunner {
     # The services on the bridge address are for microVMs and the host only,
     # never for the uplink (a LAN host routing the microVM subnet here).
     ip daddr ${FR_SUBNET}.1 iifname != { "${FR_BRIDGE}", "lo" } drop
+    # flintlock also gives every microVM a metadata tap (eth0 in the guest). It is
+    # up on the host but not on the bridge, and Firecracker answers the metadata
+    # address itself, so nothing that arrives on it is for the host (IPv6 link-local
+    # would otherwise reach every host service listening on ::).
+    iifname "fltap*" drop
     iifname "${FR_BRIDGE}" udp dport 67 accept
     iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 udp dport 53 accept
     iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport { 53, 5000, 9000 } accept
@@ -409,6 +414,8 @@ $(metrics_input_rules)
   }
   chain forward {
     type filter hook forward priority filter; policy accept;
+    # Nothing is routed from a microVM's metadata tap (see the input chain).
+    iifname "fltap*" drop
     # A job VM reaches its project's builder through the bridge address (DNAT
     # below); any other traffic routed from one microVM to another is dropped.
     iifname "${FR_BRIDGE}" oifname "${FR_BRIDGE}" ct status dnat accept
