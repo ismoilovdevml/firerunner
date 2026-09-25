@@ -3,7 +3,10 @@ package flintlock
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -12,6 +15,7 @@ import (
 	mvmv1 "github.com/liquidmetal-dev/flintlock/api/services/microvm/v1alpha1"
 	"github.com/liquidmetal-dev/flintlock/api/types"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
@@ -46,7 +50,8 @@ func (t basicAuth) GetRequestMetadata(context.Context, ...string) (map[string]st
 	return map[string]string{"authorization": "basic " + base64.StdEncoding.EncodeToString([]byte(t))}, nil
 }
 
-// flintlockd listens on localhost only, so plaintext is acceptable.
+// Plaintext stays possible for flintlockd's `insecure: true` on localhost;
+// with flintlock.tls_ca_file the token only goes to a verified flintlockd.
 func (basicAuth) RequireTransportSecurity() bool { return false }
 
 func Dial(cfg config.Flintlock) (*Client, error) {
@@ -54,14 +59,44 @@ func Dial(cfg config.Flintlock) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading flintlock token: %w", err)
 	}
+	creds := insecure.NewCredentials()
+	if cfg.TLSCAFile != "" {
+		tc, err := tlsConfig(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("flintlock TLS: %w", err)
+		}
+		creds = credentials.NewTLS(tc)
+	}
 	conn, err := grpc.NewClient(cfg.Endpoint,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(creds),
 		grpc.WithPerRPCCredentials(basicAuth(strings.TrimSpace(string(token)))),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to flintlock at %s: %w", cfg.Endpoint, err)
 	}
 	return newClient(conn, cfg.Namespace), nil
+}
+
+// tlsConfig trusts only flintlock.tls_ca_file for flintlockd's certificate
+// and presents the client certificate, if any.
+func tlsConfig(cfg config.Flintlock) (*tls.Config, error) {
+	ca, err := os.ReadFile(cfg.TLSCAFile)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(ca) {
+		return nil, errors.New("no certificate in " + cfg.TLSCAFile)
+	}
+	tc := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	if cfg.TLSCertFile != "" {
+		pair, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		tc.Certificates = []tls.Certificate{pair}
+	}
+	return tc, nil
 }
 
 // newClient wraps an established connection; split from Dial so tests can

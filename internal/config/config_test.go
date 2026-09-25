@@ -261,3 +261,42 @@ func TestJobMaxSizeKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestFlintlockTLSKeys(t *testing.T) {
+	for name, mutate := range map[string]func(c *Config){
+		"cert without key": func(c *Config) { c.Flintlock.TLSCAFile, c.Flintlock.TLSCertFile = "/ca.pem", "/c.pem" },
+		"key without cert": func(c *Config) { c.Flintlock.TLSCAFile, c.Flintlock.TLSKeyFile = "/ca.pem", "/c.key" },
+		"cert without CA":  func(c *Config) { c.Flintlock.TLSCertFile, c.Flintlock.TLSKeyFile = "/c.pem", "/c.key" },
+	} {
+		c := Default()
+		mutate(&c)
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	ok := Default()
+	ok.Flintlock.TLSCAFile = "/etc/firerunner/flintlock-tls/ca.pem"
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("server-only TLS refused: %v", err)
+	}
+	ok.Flintlock.TLSCertFile, ok.Flintlock.TLSKeyFile = "/c.pem", "/c.key"
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("mutual TLS refused: %v", err)
+	}
+
+	// Unused, the keys stay out of the saved config (v0.1.0 refuses them).
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := Save(path, Default()); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(path); strings.Contains(string(data), "tls_") {
+		t.Fatalf("unused TLS keys written:\n%s", data)
+	}
+	if err := Save(path, ok); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil || got.Flintlock.TLSCAFile != ok.Flintlock.TLSCAFile || got.Flintlock.TLSKeyFile != "/c.key" {
+		t.Fatalf("reload: %+v %v", got.Flintlock, err)
+	}
+}

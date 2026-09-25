@@ -106,6 +106,15 @@ type Flintlock struct {
 	Endpoint  string `yaml:"endpoint"`
 	TokenFile string `yaml:"token_file"`
 	Namespace string `yaml:"namespace"`
+
+	// TLSCAFile makes the client talk to flintlockd over TLS and accept only a
+	// server certificate from this CA, so a process that took flintlockd's
+	// port never gets the token. TLSCertFile and TLSKeyFile are the client
+	// certificate flintlockd asks for with tls-client-validate. Empty:
+	// plaintext, for flintlockd's `insecure: true`.
+	TLSCAFile   string `yaml:"tls_ca_file"`
+	TLSCertFile string `yaml:"tls_cert_file"`
+	TLSKeyFile  string `yaml:"tls_key_file"`
 }
 
 type VM struct {
@@ -247,6 +256,12 @@ func (c Config) Validate() error {
 	}
 	if c.Flintlock.Namespace == "" {
 		errs = append(errs, "flintlock.namespace is required")
+	}
+	if (c.Flintlock.TLSCertFile == "") != (c.Flintlock.TLSKeyFile == "") {
+		errs = append(errs, "flintlock.tls_cert_file and flintlock.tls_key_file go together")
+	}
+	if c.Flintlock.TLSCertFile != "" && c.Flintlock.TLSCAFile == "" {
+		errs = append(errs, "flintlock.tls_cert_file needs flintlock.tls_ca_file (the client must check flintlockd too)")
 	}
 	if c.VM.VCPU < 1 || c.VM.VCPU > 32 {
 		errs = append(errs, "vm.vcpu must be between 1 and 32")
@@ -419,6 +434,14 @@ func pruneUnused(m map[string]any, cfg Config) {
 		}
 		if cfg.VM.JobMaxMemoryMB == 0 {
 			delete(vm, "job_max_memory_mb")
+		}
+	}
+	if fl, ok := m["flintlock"].(map[string]any); ok {
+		for key, v := range map[string]string{"tls_ca_file": cfg.Flintlock.TLSCAFile,
+			"tls_cert_file": cfg.Flintlock.TLSCertFile, "tls_key_file": cfg.Flintlock.TLSKeyFile} {
+			if v == "" {
+				delete(fl, key)
+			}
 		}
 	}
 	if nw, ok := m["network"].(map[string]any); ok && len(cfg.Network.EgressDeny) == 0 {
