@@ -34,9 +34,10 @@ func newTestDaemon(t *testing.T) (*Daemon, *flintlocktest.Server) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	cfgPath := filepath.Join(dir, "config.yaml")
+	// Host paths of the config are temporary too (see TestMain).
 	yaml := fmt.Sprintf("flintlock:\n  endpoint: %q\n  token_file: %q\n  namespace: %q\n"+
-		"daemon:\n  socket: %q\n  metrics_listen: \"127.0.0.1:0\"\n",
-		fl.Endpoint, fl.TokenFile, fl.Namespace, filepath.Join(dir, "d.sock"))
+		"daemon:\n  socket: %q\n  metrics_listen: \"127.0.0.1:0\"\nnetwork:\n  leases_file: %q\n",
+		fl.Endpoint, fl.TokenFile, fl.Namespace, filepath.Join(dir, "d.sock"), filepath.Join(dir, "leases"))
 	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
 		t.Fatal(err)
 	}

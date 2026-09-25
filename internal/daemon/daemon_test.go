@@ -2,14 +2,42 @@ package daemon
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/flintlock"
+	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
+
+// TestMain points every host path the daemon touches at a temporary directory
+// and replaces nft and the SSH and TCP probes of microVMs before any test runs.
+// Tests run as root on runner hosts: one that forgets a stub must not remove
+// the host's job state files (reconcile), pinned host keys and DHCP leases
+// (vm.Forget), saved builder caches or firewall entries. Tests that stub one of
+// these themselves restore it to the value set here.
+func TestMain(m *testing.M) {
+	root, err := os.MkdirTemp("", "frd-host")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	jobStateGlob = filepath.Join(root, "jobs", "*.json")
+	flintlockVMDir = filepath.Join(root, "flintlock-vm")
+	builderCacheDir = filepath.Join(root, "builder-cache")
+	vm.KnownHostsDir = filepath.Join(root, "known_hosts")
+	vm.MuxDir = filepath.Join(root, "ssh-mux")
+	nftRun = func(...string) error { return errors.New("nft is not run in tests") }
+	alive = func(config.Config, *vm.Instance) bool { return false }
+	tcpOpen = func(string, int) bool { return false }
+	code := m.Run()
+	_ = os.RemoveAll(root)
+	os.Exit(code)
+}
 
 func TestDecide(t *testing.T) {
 	cfg := config.Default() // boot_timeout 3m, job_max_age 3h
@@ -127,5 +155,40 @@ func TestTidyVMDirs(t *testing.T) {
 		if err := tidyVMDirs(ro, nil); err == nil {
 			t.Fatal("a failed removal must be reported")
 		}
+	}
+}
+
+// Every host path a daemon test can reach is a temporary one (see TestMain):
+// `go test` as root on a runner host must not delete its job state files,
+// pinned host keys, DHCP leases or saved caches.
+func TestHostPathsAreIsolated(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	tmp, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, p := range map[string]string{
+		"jobStateGlob":        jobStateGlob,
+		"flintlockVMDir":      flintlockVMDir,
+		"builderCacheDir":     builderCacheDir,
+		"vm.KnownHostsDir":    vm.KnownHostsDir,
+		"vm.MuxDir":           vm.MuxDir,
+		"network.leases_file": d.cfgSnapshot().Network.LeasesFile,
+		"daemon.socket":       d.cfgSnapshot().Daemon.Socket,
+	} {
+		dir := filepath.Dir(p)
+		for {
+			if real, err := filepath.EvalSymlinks(dir); err == nil {
+				dir = real
+				break
+			}
+			dir = filepath.Dir(dir)
+		}
+		if !strings.HasPrefix(dir+string(filepath.Separator), tmp+string(filepath.Separator)) {
+			t.Errorf("%s = %s: a host path outside %s", name, p, tmp)
+		}
+	}
+	if err := nftRun("list", "ruleset"); err == nil {
+		t.Error("nft ran: tests must never touch the host firewall")
 	}
 }
