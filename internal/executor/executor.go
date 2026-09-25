@@ -372,21 +372,24 @@ func Run(cfg config.Config, script, stage string) error {
 		var script io.Reader = f
 		if st.BuilderProject == "" && isUserStage(stage) {
 			// The stage builds images: give the project a builder now (its
-			// docker wrapper waits while the builder starts).
-			if body, rerr := io.ReadAll(f); rerr == nil {
-				script = bytes.NewReader(body)
-				if BuildsImages(body) {
-					if j, jerr := currentJob(); jerr == nil && j.Project != "" &&
-						useBuilder(cfg, daemon.NewClient(cfg.Daemon.Socket), &st.Instance, j.Project, true) {
-						st.BuilderProject = j.Project
-						_ = vm.SaveJobState(statePath(id), st)
-					}
+			// docker wrapper waits while the builder starts). Reading drains f,
+			// so from here on the script is body.
+			body, rerr := io.ReadAll(f)
+			if rerr != nil {
+				return systemFailure(fmt.Errorf("reading stage script: %w", rerr))
+			}
+			script = bytes.NewReader(body)
+			if BuildsImages(body) {
+				if j, jerr := currentJob(); jerr == nil && j.Project != "" &&
+					useBuilder(cfg, daemon.NewClient(cfg.Daemon.Socket), &st.Instance, j.Project, true) {
+					st.BuilderProject = j.Project
+					_ = vm.SaveJobState(statePath(id), st)
 				}
 			}
 		}
 		if st.BuilderProject != "" && isUserStage(stage) {
 			// `docker build` only uses a buildx builder named in the environment.
-			script = io.MultiReader(strings.NewReader("export BUILDX_BUILDER="+BuilderName+"\n"), f)
+			script = io.MultiReader(strings.NewReader("export BUILDX_BUILDER="+BuilderName+"\n"), script)
 		}
 		code, err = vm.RunScript(cfg, &st.Instance, script, os.Stdout, os.Stderr)
 	}

@@ -1,7 +1,10 @@
 package executor
 
 import (
+	"encoding/json"
 	"errors"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -194,6 +197,66 @@ func TestBuildsImages(t *testing.T) {
 		if got := BuildsImages([]byte(script)); got != want {
 			t.Errorf("BuildsImages(%q) = %v, want %v", script, got, want)
 		}
+	}
+}
+
+// A stage that builds in a project whose builder prepare did not attach (first
+// build, or the builder was idle-expired, evicted or removed): Run starts the
+// builder after reading the script to spot the build, and must still send the
+// whole script, not only the BUILDX_BUILDER line.
+func TestRunSendsTheWholeScriptAfterStartingABuilder(t *testing.T) {
+	cfg, _ := cleanupFixture(t)
+	st := &vm.JobState{Instance: vm.Instance{ID: "job-555", UID: "u1", IP: "10.200.0.55", HostKey: "ssh-ed25519 AAAA"}}
+	if err := vm.SaveJobState(statePath("job-555"), st); err != nil {
+		t.Fatal(err)
+	}
+	oldMux := vm.MuxDir
+	vm.MuxDir = t.TempDir()
+	t.Cleanup(func() { vm.MuxDir = oldMux })
+	t.Setenv("CUSTOM_ENV_CI_JOB_IMAGE", "")
+
+	dir, err := os.MkdirTemp("", "fre") // short: unix socket paths are limited
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	cfg.Daemon.Socket = filepath.Join(dir, "d.sock")
+	l, err := net.Listen("unix", cfg.Daemon.Socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/builder" && r.URL.Query().Get("start") == "1" {
+			_ = json.NewEncoder(w).Encode(daemon.BuilderInfo{State: daemon.BuilderBooting, Port: 20001, CA: "CA", Cert: "CERT", Key: "KEY"})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	// Fake ssh: record what each session gets on stdin.
+	bin, sent := t.TempDir(), filepath.Join(t.TempDir(), "sent")
+	fake := "#!/bin/sh\n{ echo \"--- ssh $*\"; cat; } >> " + sent + "\n"
+	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	body := "docker build -t app .\necho pushed\n"
+	script := filepath.Join(t.TempDir(), "build_script")
+	if err := os.WriteFile(script, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(cfg, script, "build_script"); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	got, _ := os.ReadFile(sent)
+	if !strings.HasSuffix(string(got), "/bin/bash\nexport BUILDX_BUILDER="+BuilderName+"\n"+body) {
+		t.Fatalf("the stage session did not get the whole script:\n%s", got)
+	}
+	if st, err := vm.LoadJobState(statePath("job-555")); err != nil || st.BuilderProject != "1" {
+		t.Fatalf("job state after Run: %+v, %v; want BuilderProject 1", st, err)
 	}
 }
 
