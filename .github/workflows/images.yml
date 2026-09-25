@@ -21,7 +21,11 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      # :latest is the image every new microVM boots (the vm.rootfs_image
+      # default), so only main publishes. A manual run on any other ref
+      # builds the image without pushing it.
       - name: Log in to ghcr.io
+        if: github.ref == 'refs/heads/main'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -33,7 +37,7 @@ jobs:
         with:
           context: images/rootfs
           platforms: linux/amd64
-          push: true
+          push: ${{ github.ref == 'refs/heads/main' }}
           provenance: false
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
           tags: |
