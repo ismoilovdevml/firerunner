@@ -39,6 +39,13 @@ COPY firerunner-netfilter /usr/local/sbin/firerunner-netfilter
 RUN printf 'L+ /etc/resolv.conf - - - - /run/systemd/resolve/stub-resolv.conf\n' >/etc/tmpfiles.d/resolv.conf \
     # Flintlock serves meta-data/user-data over MMDS (ds=nocloud-net on the kernel cmdline).
     && printf 'datasource_list: [ NoCloud, None ]\n' >/etc/cloud/cloud.cfg.d/90-firerunner.cfg \
+    # eth0 carries only MMDS, at 169.254.0.1/16 (flintlock's network-config). networkd
+    # probes IPv4 link-local addresses for conflicts (ACD) before using them, about 6 s
+    # every time the link is configured, and cloud-init's first metadata request waits
+    # for it. Nothing else is on that link: no probing.
+    && mkdir -p /etc/systemd/network/10-netplan-eth0.network.d \
+    && printf '[Address]\nAddress=169.254.0.1/16\nDuplicateAddressDetection=none\n' \
+        >/etc/systemd/network/10-netplan-eth0.network.d/10-firerunner-no-acd.conf \
     # Jobs are short-lived: skip timers and units that only slow boot down.
     && systemctl mask apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service \
         motd-news.timer e2scrub_all.timer fstrim.timer man-db.timer systemd-networkd-wait-online.service \
