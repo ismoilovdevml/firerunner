@@ -155,8 +155,12 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	ready := time.Since(start) // what the job waited for its VM
 
 	// One SSH connection for the rest of the job (every later stage reuses it).
-	if err := vm.StartMux(cfg, inst); err != nil {
-		fmt.Fprintf(os.Stderr, "ssh multiplexing unavailable (%v); stages connect one by one\n", err)
+	// claim opened it for a pool VM: a second master would find the control
+	// socket taken and stay in the background as a plain connection.
+	if source == "cold" {
+		if err := vm.StartMux(cfg, inst); err != nil {
+			fmt.Fprintf(os.Stderr, "ssh multiplexing unavailable (%v); stages connect one by one\n", err)
+		}
 	}
 
 	services, err := ParseServices(os.Getenv("CUSTOM_ENV_CI_JOB_SERVICES"))
@@ -220,16 +224,24 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 }
 
 // claim takes a pre-booted VM from the daemon and checks it still answers.
+// It opens the job's shared SSH connection first and renames the VM over it:
+// one SSH handshake per claim instead of two, and `hostname` instead of
+// hostnamectl, which first has D-Bus start systemd-hostnamed.
 func claim(cfg config.Config, dc *daemon.Client, id string) *vm.Instance {
 	inst, err := dc.Claim(id)
 	if err != nil || inst == nil {
 		return nil
 	}
-	if err := vm.SSH(cfg, inst, "hostnamectl", "set-hostname", id).Run(); err != nil {
+	muxErr := vm.StartMux(cfg, inst)
+	// id is "job-<number>" (currentJob), safe in a shell command.
+	if err := vm.SSH(cfg, inst, "hostname "+id+" && echo "+id+" >/etc/hostname").Run(); err != nil {
 		fmt.Printf("pool VM %s did not answer (%v), booting a new one\n", inst.ID, err)
 		_ = dc.Send(daemon.Event{Kind: "pool_vm_dead", VM: inst.ID, Job: jobNumber(id), Err: errText(err)})
 		deleteVM(cfg, inst)
 		return nil
+	}
+	if muxErr != nil {
+		fmt.Fprintf(os.Stderr, "ssh multiplexing unavailable (%v); stages connect one by one\n", muxErr)
 	}
 	return inst
 }

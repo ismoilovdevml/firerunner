@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -237,6 +238,100 @@ func TestBuildsImages(t *testing.T) {
 		if got := BuildsImages([]byte(script)); got != want {
 			t.Errorf("BuildsImages(%q) = %v, want %v", script, got, want)
 		}
+	}
+}
+
+// claimFixture serves one pool VM from a fake daemon and puts a fake ssh on
+// PATH that records each call (arguments, then stdin) and exits with code.
+func claimFixture(t *testing.T, code int) (config.Config, *daemon.Client, *flintlocktest.Server, func() string, func() []daemon.Event) {
+	t.Helper()
+	cfg, fl := cleanupFixture(t)
+	oldMux, oldOn := vm.MuxDir, vm.Multiplex
+	vm.MuxDir, vm.Multiplex = t.TempDir(), true
+	t.Cleanup(func() { vm.MuxDir, vm.Multiplex = oldMux, oldOn })
+
+	dir, err := os.MkdirTemp("", "fre") // short: unix socket paths are limited
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	cfg.Daemon.Socket = filepath.Join(dir, "d.sock")
+	var mu sync.Mutex
+	var events []daemon.Event
+	l, err := net.Listen("unix", cfg.Daemon.Socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/claim":
+			_ = json.NewEncoder(w).Encode(vm.Instance{ID: "pool-abc", UID: "u9", IP: "10.200.0.9", HostKey: "ssh-ed25519 AAAA"})
+		case "/event":
+			var e daemon.Event
+			if json.NewDecoder(r.Body).Decode(&e) == nil {
+				mu.Lock()
+				events = append(events, e)
+				mu.Unlock()
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})}
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	bin, calls := t.TempDir(), filepath.Join(t.TempDir(), "calls")
+	fake := fmt.Sprintf("#!/bin/sh\necho \"--- ssh $*\" >> %s\nexit %d\n", calls, code)
+	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	read := func() string { b, _ := os.ReadFile(calls); return string(b) }
+	got := func() []daemon.Event { mu.Lock(); defer mu.Unlock(); return append([]daemon.Event(nil), events...) }
+	return cfg, daemon.NewClient(cfg.Daemon.Socket), fl, read, got
+}
+
+// A pool hit opens the job's shared connection once and renames the VM over
+// it; the extra handshake and hostnamectl's D-Bus round trip are gone.
+func TestClaimOpensTheSharedConnectionOnce(t *testing.T) {
+	cfg, dc, _, calls, _ := claimFixture(t, 0)
+	inst := claim(cfg, dc, "job-7")
+	if inst == nil || inst.ID != "pool-abc" {
+		t.Fatalf("claim = %+v, want pool-abc", inst)
+	}
+	log := calls()
+	if n := strings.Count(log, "ControlMaster=yes"); n != 1 {
+		t.Errorf("%d masters started, want 1:\n%s", n, log)
+	}
+	if strings.Contains(log, "hostnamectl") {
+		t.Errorf("hostnamectl used:\n%s", log)
+	}
+	lines := strings.Split(strings.TrimSpace(log), "\n")
+	last := lines[len(lines)-1]
+	if !strings.Contains(last, "ControlMaster=no") || !strings.HasSuffix(last, "hostname job-7 && echo job-7 >/etc/hostname") {
+		t.Errorf("rename not sent over the shared connection: %s", last)
+	}
+	if strings.Index(log, "ControlMaster=yes") > strings.Index(log, "hostname job-7") {
+		t.Errorf("rename before the master was opened:\n%s", log)
+	}
+}
+
+// A pool VM that does not answer is reported, deleted and not handed out.
+func TestClaimDropsAPoolVMThatDoesNotAnswer(t *testing.T) {
+	cfg, dc, fl, _, events := claimFixture(t, 255)
+	if inst := claim(cfg, dc, "job-7"); inst != nil {
+		t.Fatalf("claim = %+v, want nil for a dead pool VM", inst)
+	}
+	if got := fl.Deleted(); len(got) != 1 || got[0] != "u9" {
+		t.Errorf("deleted %v, want [u9]", got)
+	}
+	var dead bool
+	for _, e := range events() {
+		dead = dead || (e.Kind == "pool_vm_dead" && e.VM == "pool-abc")
+	}
+	if !dead {
+		t.Fatalf("no pool_vm_dead event: %+v", events())
 	}
 }
 
