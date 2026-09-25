@@ -14,12 +14,25 @@ sudo firerunner config set vm.memory_mb 3072
 |---|---|---|
 | `vm.vcpu` | `2` | per job VM |
 | `vm.memory_mb` | `2048` | per job VM |
+| `vm.job_max_vcpu`, `vm.job_max_memory_mb` | `0` | the largest VM a job may ask for (see below); `0` = `vm.vcpu` and `vm.memory_mb`, so jobs cannot ask for more |
 | `pool.size` | `2` | pre-booted VMs; a job takes one in 0.3 s instead of a 15 s boot |
 | `pool.max_idle` | `30m` | idle pool VMs are replaced after this |
 | `pool.preload_images` | none | images pulled into pool VMs in advance, e.g. a large SDK |
 | `vm.host_reserve_mb` | `1024` | host memory never given to VMs |
 
 Set `pool.size` to the number of jobs that usually start at once.
+
+Keep `vm.vcpu` and `vm.memory_mb` at what most jobs need and let the few heavy jobs (static analysis,
+large test suites) ask for more with job variables, up to `vm.job_max_vcpu` and
+`vm.job_max_memory_mb`:
+
+```bash
+sudo firerunner config set vm.job_max_memory_mb 4096
+sudo firerunner config set vm.job_max_vcpu 4
+```
+
+Such a job boots its own VM (pool VMs have the default size), so it waits for memory like any cold
+boot and counts its own size.
 
 ## Builders (Docker layer cache)
 

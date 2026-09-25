@@ -518,3 +518,21 @@ func TestAdmitFits(t *testing.T) {
 		t.Fatalf("AdmitFits with a failing check = %v, %v; want refused with its error", ok, err)
 	}
 }
+
+// A job that asks for a bigger microVM is admitted for its own size: it waits
+// while a VM of the configured size would still fit.
+func TestAdmitCountsTheSizeAJobAskedFor(t *testing.T) {
+	tempAdmission(t)
+	pinMemTotal(t, 3200, nil)
+	srv := flintlocktest.NewServer("")
+	srv.SetVMs(listedVM("pool-x", "ux", 2000)) // 2100 with overhead: 1100 left
+	fl := dialFake(t, srv)
+	big := admitCfg()
+	big.VM.MemoryMB = 2000 // 2100 with overhead
+	if n, why, err := Admit(context.Background(), big, fl, "job-8"); err != nil || n != 0 || why == "" {
+		t.Fatalf("Admit(2000 MB) = %d, %q, %v; want no room", n, why, err)
+	}
+	if n, _, err := Admit(context.Background(), admitCfg(), fl, "job-9"); err != nil || n != 1 {
+		t.Fatalf("Admit(1000 MB) = %d, %v; want room for the configured size", n, err)
+	}
+}

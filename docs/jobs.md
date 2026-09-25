@@ -82,9 +82,24 @@ without TLS are set up on the host: see [Corporate networks](corporate-network.m
 | | |
 |---|---|
 | Size | 2 vCPU, 2 GB RAM, 40 GB disk (the operator may change it) |
+| Bigger size | set `FIRERUNNER_VM_MEMORY_MB` and `FIRERUNNER_VM_VCPU` in the job's `variables:` |
 | User | `root` |
 | Network | internet and your LAN through NAT; no access to other jobs' VMs |
 | Hostname | `job-<CI_JOB_ID>` |
+
+A job that needs more memory or CPUs, such as a SonarQube scan, asks for it:
+
+```yaml
+sonar:
+  variables:
+    FIRERUNNER_VM_MEMORY_MB: "3072"
+    FIRERUNNER_VM_VCPU: "4"
+```
+
+The job log shows what it asked for and what it got. It gets at most what the operator allows
+(`vm.job_max_memory_mb`, `vm.job_max_vcpu`); without such a limit it gets the default size. A job
+with its own size does not use the pre-booted VMs, so it starts in a cold boot (about 15 s). A value
+that is not a number fails the job.
 
 ## When a job fails
 

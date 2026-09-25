@@ -131,6 +131,12 @@ type VM struct {
 	// ("host:port") or that speak plain HTTP ("http://host:port"), for the
 	// VM's Docker and for builders. Prefer vm.ca_file for a company CA.
 	InsecureRegistries []string `yaml:"insecure_registries"`
+
+	// JobMaxVCPU and JobMaxMemoryMB are the largest microVM a job may ask for
+	// with the job variables FIRERUNNER_VM_VCPU and FIRERUNNER_VM_MEMORY_MB.
+	// Unset or lower, they are vcpu and memory_mb: no job gets more.
+	JobMaxVCPU     int `yaml:"job_max_vcpu"`
+	JobMaxMemoryMB int `yaml:"job_max_memory_mb"`
 }
 
 type Network struct {
@@ -247,6 +253,12 @@ func (c Config) Validate() error {
 	}
 	if c.VM.MemoryMB < 256 || c.VM.MemoryMB > 65536 {
 		errs = append(errs, "vm.memory_mb must be between 256 and 65536")
+	}
+	if c.VM.JobMaxVCPU < 0 || c.VM.JobMaxVCPU > 32 {
+		errs = append(errs, "vm.job_max_vcpu must be between 0 (= vm.vcpu) and 32")
+	}
+	if c.VM.JobMaxMemoryMB < 0 || c.VM.JobMaxMemoryMB > 65536 {
+		errs = append(errs, "vm.job_max_memory_mb must be between 0 (= vm.memory_mb) and 65536")
 	}
 	if c.VM.KernelImage == "" || c.VM.RootFSImage == "" {
 		errs = append(errs, "vm.kernel_image and vm.rootfs_image are required")
@@ -401,6 +413,12 @@ func pruneUnused(m map[string]any, cfg Config) {
 		}
 		if len(cfg.VM.InsecureRegistries) == 0 {
 			delete(vm, "insecure_registries")
+		}
+		if cfg.VM.JobMaxVCPU == 0 {
+			delete(vm, "job_max_vcpu")
+		}
+		if cfg.VM.JobMaxMemoryMB == 0 {
+			delete(vm, "job_max_memory_mb")
 		}
 	}
 	if nw, ok := m["network"].(map[string]any); ok && len(cfg.Network.EgressDeny) == 0 {

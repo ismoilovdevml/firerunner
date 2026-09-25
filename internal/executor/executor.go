@@ -125,6 +125,52 @@ func jobLabels(id string) map[string]string {
 
 func statePath(id string) string { return filepath.Join(StateDir, id+".json") }
 
+// jobVMSize applies the job variables FIRERUNNER_VM_VCPU and
+// FIRERUNNER_VM_MEMORY_MB to cfg's microVM size, up to vm.job_max_vcpu and
+// vm.job_max_memory_mb (unset: the configured size, so a job cannot ask for
+// more). note says what the job asked for and got; it is empty when the job
+// asked for nothing. A value that is not a size is the job's error.
+func jobVMSize(cfg config.Config) (sized config.Config, note string, err error) {
+	vcpu, askedVCPU, err := sizeVar("FIRERUNNER_VM_VCPU", cfg.VM.VCPU, 1, max(cfg.VM.JobMaxVCPU, cfg.VM.VCPU), "vm.job_max_vcpu")
+	if err != nil {
+		return cfg, "", err
+	}
+	mem, askedMem, err := sizeVar("FIRERUNNER_VM_MEMORY_MB", cfg.VM.MemoryMB, 256, max(cfg.VM.JobMaxMemoryMB, cfg.VM.MemoryMB), "vm.job_max_memory_mb")
+	if err != nil {
+		return cfg, "", err
+	}
+	if askedVCPU == "" && askedMem == "" {
+		return cfg, "", nil
+	}
+	note = fmt.Sprintf("microVM size: the job asked for %s and %s, gets %d vCPU and %d MB", or(askedVCPU, "the default vCPUs"), or(askedMem, "the default memory"), vcpu, mem)
+	cfg.VM.VCPU, cfg.VM.MemoryMB = vcpu, mem
+	return cfg, note, nil
+}
+
+// sizeVar reads one size job variable: def when unset, at most limit (named
+// by limitKey in the returned note), an error below lowest or not a number.
+func sizeVar(name string, def, lowest, limit int, limitKey string) (int, string, error) {
+	raw := strings.TrimSpace(os.Getenv("CUSTOM_ENV_" + name))
+	if raw == "" {
+		return def, "", nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < lowest {
+		return 0, "", fmt.Errorf("%s must be a whole number of at least %d, not %q", name, lowest, raw)
+	}
+	if n > limit {
+		return limit, fmt.Sprintf("%s=%d (above %s, %d)", name, n, limitKey, limit), nil
+	}
+	return n, fmt.Sprintf("%s=%d", name, n), nil
+}
+
+func or(s, otherwise string) string {
+	if s == "" {
+		return otherwise
+	}
+	return s
+}
+
 func Prepare(ctx context.Context, cfg config.Config) error {
 	j, err := currentJob()
 	if err != nil {
@@ -139,11 +185,27 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 			Job: jobNumber(id), Project: j.Project, Err: errText(err)})
 	}
 
+	// A job may ask for another microVM size; pool VMs have the configured
+	// one, so such a job boots its own VM (with the same host-wide admission).
+	pooledSize := cfg.VM
+	cfg, note, err := jobVMSize(cfg)
+	if err != nil {
+		finish(daemon.ResultScriptFailure, "", err)
+		return buildFailure(err)
+	}
+	if note != "" {
+		fmt.Println(note)
+	}
+	fromPool := func() *vm.Instance { return claim(cfg, dc, id) }
+	if cfg.VM.VCPU != pooledSize.VCPU || cfg.VM.MemoryMB != pooledSize.MemoryMB {
+		fromPool = func() *vm.Instance { return nil }
+	}
+
 	source := "pool"
 	var times bootTimes
-	inst := claim(cfg, dc, id)
+	inst := fromPool()
 	if inst == nil {
-		inst, source, times, err = coldBoot(ctx, cfg, id, func() *vm.Instance { return claim(cfg, dc, id) })
+		inst, source, times, err = coldBoot(ctx, cfg, id, fromPool)
 		if err != nil {
 			reason := prepareReason(err)
 			_ = dc.Send(daemon.Event{Kind: "prepare", Source: source, Reason: reason, WaitSeconds: times.wait.Seconds(),

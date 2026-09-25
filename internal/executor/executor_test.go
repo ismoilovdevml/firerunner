@@ -929,3 +929,129 @@ func TestColdBootBoundedBootReason(t *testing.T) {
 		})
 	}
 }
+
+func TestJobVMSize(t *testing.T) {
+	for _, c := range []struct {
+		name              string
+		vcpu, mem         string // job variables, "" = unset
+		maxVCPU, maxMem   int    // vm.job_max_*
+		wantVCPU, wantMem int
+		wantNote, wantErr string
+	}{
+		{name: "nothing asked", wantVCPU: 2, wantMem: 2048},
+		{name: "within the limit", mem: "4096", vcpu: "4", maxVCPU: 8, maxMem: 8192, wantVCPU: 4, wantMem: 4096,
+			wantNote: "FIRERUNNER_VM_VCPU=4 and FIRERUNNER_VM_MEMORY_MB=4096, gets 4 vCPU and 4096 MB"},
+		{name: "above the limit", mem: "16384", maxMem: 8192, wantVCPU: 2, wantMem: 8192,
+			wantNote: "FIRERUNNER_VM_MEMORY_MB=16384 (above vm.job_max_memory_mb, 8192)"},
+		{name: "no limit set", mem: "4096", vcpu: "8", wantVCPU: 2, wantMem: 2048,
+			wantNote: "(above vm.job_max_vcpu, 2) and FIRERUNNER_VM_MEMORY_MB=4096 (above vm.job_max_memory_mb, 2048)"},
+		{name: "smaller", mem: "1024", wantVCPU: 2, wantMem: 1024, wantNote: "gets 2 vCPU and 1024 MB"},
+		{name: "not a number", mem: "4G", maxMem: 8192, wantErr: `FIRERUNNER_VM_MEMORY_MB must be a whole number of at least 256, not "4G"`},
+		{name: "too small", mem: "100", wantErr: "at least 256"},
+		{name: "no vCPU", vcpu: "0", wantErr: "FIRERUNNER_VM_VCPU must be a whole number of at least 1"},
+		{name: "negative", vcpu: "-2", wantErr: "at least 1"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("CUSTOM_ENV_FIRERUNNER_VM_VCPU", c.vcpu)
+			t.Setenv("CUSTOM_ENV_FIRERUNNER_VM_MEMORY_MB", c.mem)
+			cfg := config.Default()
+			cfg.VM.JobMaxVCPU, cfg.VM.JobMaxMemoryMB = c.maxVCPU, c.maxMem
+			got, note, err := jobVMSize(cfg)
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("err = %v, want %q", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil || got.VM.VCPU != c.wantVCPU || got.VM.MemoryMB != c.wantMem {
+				t.Fatalf("jobVMSize = %d vCPU, %d MB, %v; want %d, %d", got.VM.VCPU, got.VM.MemoryMB, err, c.wantVCPU, c.wantMem)
+			}
+			if (c.wantNote == "") != (note == "") || !strings.Contains(note, c.wantNote) {
+				t.Fatalf("note = %q, want %q", note, c.wantNote)
+			}
+		})
+	}
+}
+
+// A job that asks for another size never takes a pool VM (they have the
+// configured size): it boots its own VM of that size. A job that asks for
+// nothing takes the pool VM. A size that is not a number fails the job, as its
+// own error, before any VM is claimed.
+func TestPrepareBootsTheSizeTheJobAskedFor(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		mem        string
+		wantClaims int
+		wantBootMB int
+		wantErr    bool
+	}{
+		{"asked for more", "4096", 0, 4096, false},
+		{"asked for nothing", "", 1, 0, false},
+		{"not a size", "lots", 0, 0, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, _, _ := coldBootFixture(t, 5*time.Second)
+			cfg.VM.JobMaxMemoryMB = 8192
+			cfg.Network.LeasesFile = filepath.Join(t.TempDir(), "leases")
+			oldDir, oldKnown, oldMux := StateDir, vm.KnownHostsDir, vm.MuxDir
+			StateDir, vm.KnownHostsDir, vm.MuxDir = t.TempDir(), t.TempDir(), t.TempDir()
+			t.Cleanup(func() { StateDir, vm.KnownHostsDir, vm.MuxDir = oldDir, oldKnown, oldMux })
+			writePayload(t, `{"id":31,"job_info":{"project_id":5}}`)
+			t.Setenv("CUSTOM_ENV_FIRERUNNER_VM_MEMORY_MB", c.mem)
+			t.Setenv("CUSTOM_ENV_CI_JOB_IMAGE", "")
+			t.Setenv("CUSTOM_ENV_CI_JOB_SERVICES", "")
+			t.Setenv("CUSTOM_ENV_DOCKER_AUTH_CONFIG", "")
+
+			var bootMB atomic.Int32
+			oldBoot := bootVM
+			bootVM = func(_ context.Context, bcfg config.Config, _ *flintlock.Client, id string, _ map[string]string) (*vm.Instance, error) {
+				bootMB.Store(int32(bcfg.VM.MemoryMB))
+				return &vm.Instance{ID: id, UID: "u1", IP: "10.200.0.31"}, nil
+			}
+			t.Cleanup(func() { bootVM = oldBoot })
+
+			dir, err := os.MkdirTemp("", "fre") // short: unix socket paths are limited
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(dir) })
+			cfg.Daemon.Socket = filepath.Join(dir, "d.sock")
+			var claims atomic.Int32
+			l, err := net.Listen("unix", cfg.Daemon.Socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/claim" {
+					claims.Add(1)
+					_ = json.NewEncoder(w).Encode(vm.Instance{ID: "pool-abc", UID: "u9", IP: "10.200.0.9"})
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})}
+			go func() { _ = srv.Serve(l) }()
+			t.Cleanup(func() { _ = srv.Close() })
+			bin := t.TempDir()
+			if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			err = Prepare(context.Background(), cfg)
+			var e *ExitError
+			if c.wantErr {
+				if !errors.As(err, &e) || e.Code != 1 {
+					t.Fatalf("Prepare = %v, want the job's own failure", err)
+				}
+			} else if err != nil {
+				t.Fatalf("Prepare = %v", err)
+			}
+			if got := claims.Load(); got != int32(c.wantClaims) {
+				t.Errorf("pool claims = %d, want %d", got, c.wantClaims)
+			}
+			if got := bootMB.Load(); got != int32(c.wantBootMB) {
+				t.Errorf("booted a %d MB microVM, want %d (0 = none)", got, c.wantBootMB)
+			}
+		})
+	}
+}

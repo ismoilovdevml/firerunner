@@ -176,7 +176,7 @@ func TestSaveLeavesOutUnusedNewKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(path)
-	for _, key := range []string{"proxy:", "ca_file:", "insecure_registries:", "egress_deny:"} {
+	for _, key := range []string{"proxy:", "ca_file:", "insecure_registries:", "egress_deny:", "job_max_vcpu:", "job_max_memory_mb:"} {
 		if strings.Contains(string(data), key) {
 			t.Errorf("unused %s written:\n%s", key, data)
 		}
@@ -195,11 +195,12 @@ func TestSaveLeavesOutUnusedNewKeys(t *testing.T) {
 	cfg.Proxy.Enabled = true
 	cfg.VM.CAFile = "/etc/firerunner/ca.pem"
 	cfg.Network.EgressDeny = []string{"192.168.0.0/16"}
+	cfg.VM.JobMaxVCPU, cfg.VM.JobMaxMemoryMB = 4, 4096
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
 	}
 	data, _ = os.ReadFile(path)
-	for _, key := range []string{"proxy:", "ca_file:", "egress_deny:"} {
+	for _, key := range []string{"proxy:", "ca_file:", "egress_deny:", "job_max_vcpu:", "job_max_memory_mb:"} {
 		if !strings.Contains(string(data), key) {
 			t.Errorf("used %s not written", key)
 		}
@@ -237,5 +238,26 @@ func TestCorporateValuesAllowList(t *testing.T) {
 	ok.Network.EgressDeny = []string{"192.168.0.0/16", "10.1.2.3"}
 	if err := ok.Validate(); err != nil {
 		t.Fatalf("valid values refused: %v", err)
+	}
+}
+
+func TestJobMaxSizeKeys(t *testing.T) {
+	cfg, err := Set(Default(), "vm.job_max_memory_mb", "4096")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = Set(cfg, "vm.job_max_vcpu", "4"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := Get(cfg, "vm.job_max_memory_mb"); v != "4096" {
+		t.Fatalf("vm.job_max_memory_mb = %q", v)
+	}
+	for _, c := range []struct{ key, value string }{
+		{"vm.job_max_memory_mb", "-1"}, {"vm.job_max_memory_mb", "70000"}, {"vm.job_max_memory_mb", "4G"},
+		{"vm.job_max_vcpu", "-1"}, {"vm.job_max_vcpu", "33"},
+	} {
+		if _, err := Set(Default(), c.key, c.value); err == nil {
+			t.Errorf("Set(%s, %s) accepted", c.key, c.value)
+		}
 	}
 }
