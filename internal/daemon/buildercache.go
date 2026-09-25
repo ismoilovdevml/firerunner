@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -172,6 +173,27 @@ func (w *cacheWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// A saved cache starts with one line naming the builder image that wrote it,
+// then the archive. It is only restored into a builder of the same image: a
+// new builder.image may fix a BuildKit flaw the old state carries.
+const builderCacheMagic = "firerunner-builder-cache/1 "
+
+func cacheHeader(image string) string { return builderCacheMagic + strconv.Quote(image) + "\n" }
+
+// readCacheHeader reads the header of a saved cache and returns its image;
+// ok is false for a file without one (saved before images were recorded).
+func readCacheHeader(r *bufio.Reader) (image string, ok bool) {
+	if magic, err := r.Peek(len(builderCacheMagic)); err != nil || string(magic) != builderCacheMagic {
+		return "", false
+	}
+	line, err := r.ReadSlice('\n') // at most the reader's buffer: a header is short
+	if err != nil {
+		return "", false
+	}
+	image, err = strconv.Unquote(strings.TrimSpace(strings.TrimPrefix(string(line), builderCacheMagic)))
+	return image, err == nil
+}
+
 func builderCacheFile(project string) string {
 	return filepath.Join(builderCacheDir, project+".tar")
 }
@@ -188,11 +210,12 @@ func keepsCache(reason string) bool {
 	return false
 }
 
-// saveBuilderCache copies the builder's BuildKit state to the host. Any failure
-// leaves the previous saved copy (if any) in place. Saves copy side by side,
-// but each reserves its size first (see makeRoomForCache); started is when the
-// builder was removed (see cacheDropped).
-func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, project string, inst *vm.Instance, started time.Time) {
+// saveBuilderCache copies the builder's BuildKit state to the host, under a
+// header naming the builder's image. Any failure leaves the previous saved
+// copy (if any) in place. Saves copy side by side, but each reserves its size
+// first (see makeRoomForCache); started is when the builder was removed (see
+// cacheDropped).
+func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, project string, inst *vm.Instance, image string, started time.Time) {
 	result := "failed"
 	defer func() { d.metrics.builderCache.WithLabelValues("save", result).Inc() }()
 	ctx, cancel := context.WithTimeout(ctx, builderCacheTimeout)
@@ -208,7 +231,8 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 		d.log.Warn("builder cache not saved: size unknown", "project", project, "err", err)
 		return
 	}
-	reserve := size + builderCacheSlack
+	header := cacheHeader(image)
+	reserve := size + int64(len(header)) + builderCacheSlack
 	if reserve > limit {
 		result = "skipped"
 		d.log.Warn("builder cache not saved: larger than builder.saved_cache_gb", "project", project, "bytes", size)
@@ -241,7 +265,9 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 		return
 	}
 	w.f = tmp
-	err = builderCacheSave(ctx, cfg, inst, w)
+	if _, err = io.WriteString(w, header); err == nil {
+		err = builderCacheSave(ctx, cfg, inst, w)
+	}
 	if w.over {
 		// The copy is cut off at the reservation, whatever the stream says.
 		err = fmt.Errorf("%w of %d bytes", errCacheOverrun, reserve)
@@ -359,7 +385,8 @@ func (d *Daemon) makeRoomForCache(project string, size, limit, reserved int64) e
 }
 
 // restoreBuilderCache loads the project's saved cache into a new builder VM
-// before buildkitd starts, and reports whether it did. A copy that tar or the
+// before buildkitd starts, and reports whether it did. A copy written by
+// another builder image than cfg's is deleted unread. A copy that tar or the
 // completeness check refuses is deleted, so it is not tried again, and the
 // volume is removed so buildkitd starts empty. A load that failed on the way
 // (the SSH connection, a timeout) keeps the copy and returns an error: the VM
@@ -378,10 +405,18 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 	if info, err := f.Stat(); err == nil {
 		size = info.Size()
 	}
+	r := bufio.NewReader(f)
+	if image, ok := readCacheHeader(r); !ok || image != cfg.Builder.Image {
+		_ = os.Remove(file)
+		d.metrics.builderCache.WithLabelValues("restore", "stale").Inc()
+		d.log.Info("saved builder cache dropped: written by another builder image, starting empty",
+			"project", project, "cache_image", image, "image", cfg.Builder.Image)
+		return false, nil
+	}
 	lctx, cancel := context.WithTimeout(ctx, builderCacheTimeout)
 	defer cancel()
 	start := time.Now()
-	if err := builderCacheLoad(lctx, cfg, inst, f); err != nil {
+	if err := builderCacheLoad(lctx, cfg, inst, r); err != nil {
 		d.metrics.builderCache.WithLabelValues("restore", "failed").Inc()
 		// Only the VM's own verdict (tar or the marker check: exit 1..254) says the
 		// copy is bad. 255 is ssh failing, -1 ssh killed (e.g. by the OOM killer).

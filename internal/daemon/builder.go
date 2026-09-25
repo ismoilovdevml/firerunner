@@ -93,6 +93,17 @@ func builderSpec(c config.Config) string {
 		c.VM.KernelImage, c.VM.RootFSImage, c.VM.RegistryMirror, c.Builder.CacheMB) + proxySpec(c)
 }
 
+// specImage is the builder image in a builderSpec fingerprint, "" for a
+// fingerprint of another form (legacyBuilderSpec).
+func specImage(spec string) string {
+	rest, ok := strings.CutPrefix(spec, "v2|")
+	if !ok {
+		return ""
+	}
+	image, _, _ := strings.Cut(rest, "|")
+	return image
+}
+
 // legacyBuilderSpec is builderSpec before v2 (it included the size), so
 // builders recorded by an older daemon are not replaced after an upgrade.
 func legacyBuilderSpec(c config.Config) string {
@@ -224,8 +235,11 @@ func (d *Daemon) removeBuilderLocked(b *builder, reason string) {
 	d.metrics.builders.Set(float64(len(d.builders)))
 	project, port, inst, nft := b.Project, b.Port, b.Instance, nftRun
 	cfg, ctx := d.cfg, d.runCtx
+	// Only a builder.image builder's cache is worth copying: a new image's
+	// builder would not take it (see restoreBuilderCache).
+	image := specImage(b.SpecID)
 	var saved *cacheSave
-	if keepsCache(reason) && cfg.Builder.SavedCacheGB > 0 && inst.UID != "" && d.saving[project] == nil {
+	if keepsCache(reason) && cfg.Builder.SavedCacheGB > 0 && inst.UID != "" && d.saving[project] == nil && image == cfg.Builder.Image {
 		saved = &cacheSave{done: make(chan struct{}), uid: inst.UID, start: time.Now()}
 		d.saving[project] = saved
 	}
@@ -233,7 +247,7 @@ func (d *Daemon) removeBuilderLocked(b *builder, reason string) {
 		_, _ = nft("", "delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", port))
 		if saved != nil {
 			if ctx.Err() == nil {
-				d.saveBuilderCache(ctx, cfg, project, &inst, saved.start)
+				d.saveBuilderCache(ctx, cfg, project, &inst, image, saved.start)
 			}
 			defer func() {
 				d.mu.Lock()

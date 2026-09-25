@@ -70,6 +70,9 @@ func writeFile(t *testing.T, path, data string, age time.Duration) {
 	}
 }
 
+// saved is a saved cache file of the default builder image holding data.
+func saved(data string) string { return cacheHeader(config.Default().Builder.Image) + data }
+
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -108,7 +111,7 @@ func TestBuilderCacheSavedOnExpiryAndRestored(t *testing.T) {
 	srv.WaitDeleted(t, "uid-7", 2*time.Second)
 	d.bg.Wait()
 
-	if got := readFile(t, filepath.Join(dir, "7.tar")); got != "data-7" {
+	if got := readFile(t, filepath.Join(dir, "7.tar")); got != saved("data-7") {
 		t.Fatalf("saved cache = %q", got)
 	}
 	if n := cacheCount(d, "save", "ok"); n != 1 {
@@ -233,7 +236,7 @@ func TestBuilderCacheFailedRestoreDropsCopy(t *testing.T) {
 		func(context.Context, config.Config, *vm.Instance, io.Reader) error {
 			return fmt.Errorf("tar: unexpected EOF: %w", exec.Command("sh", "-c", "exit 1").Run())
 		})
-	writeFile(t, filepath.Join(dir, "7.tar"), "broken", time.Hour)
+	writeFile(t, filepath.Join(dir, "7.tar"), saved("broken"), time.Hour)
 	d, _ := newTestDaemon(t)
 	if ok, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", &vm.Instance{ID: "bld-7"}); ok || err != nil {
 		t.Fatalf("restore of a refused copy = %v, %v; want false, nil (start empty)", ok, err)
@@ -417,8 +420,10 @@ func TestConcurrentSavesStayWithinBudget(t *testing.T) {
 		_, err := io.WriteString(w, strings.Repeat("x", size))
 		return err
 	}, nil)
+	// Room for two saved caches (header and archive), not three.
+	limit := 2*(size+int64(len(saved("")))) + 10
 	oldLimit := builderCacheLimit
-	builderCacheLimit = func(config.Config) int64 { return 100 }
+	builderCacheLimit = func(config.Config) int64 { return limit }
 	t.Cleanup(func() { builderCacheLimit = oldLimit })
 	d, _ := newTestDaemon(t)
 	d.builders = map[string]*builder{}
@@ -433,8 +438,8 @@ func TestConcurrentSavesStayWithinBudget(t *testing.T) {
 			total += info.Size()
 		}
 	}
-	if total > 100 {
-		t.Fatalf("saved %d bytes under a 100-byte budget: %v", total, listDir(dir))
+	if total > limit {
+		t.Fatalf("saved %d bytes under a %d-byte budget: %v", total, limit, listDir(dir))
 	}
 	ok, skipped := cacheCount(d, "save", "ok"), cacheCount(d, "save", "skipped")
 	if ok < 2 || ok+skipped != 4 {
@@ -497,12 +502,12 @@ func TestRestoreFailures(t *testing.T) {
 	file := filepath.Join(dir, "7.tar")
 	inst := &vm.Instance{ID: "bld-7"}
 
-	writeFile(t, file, "copy", time.Hour)
+	writeFile(t, file, saved("copy"), time.Hour)
 	loadErr = fmt.Errorf("stream: %w", exitErr(t, 255))
 	if ok, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", inst); ok || err == nil {
 		t.Fatalf("ssh drop: %v, %v; want an error, so the boot fails and the next one retries", ok, err)
 	}
-	if readFile(t, file) != "copy" {
+	if readFile(t, file) != saved("copy") {
 		t.Fatalf("ssh drop: copy %q, want it kept", readFile(t, file))
 	}
 
@@ -512,7 +517,7 @@ func TestRestoreFailures(t *testing.T) {
 	if _, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", inst); err == nil {
 		t.Fatal("volume could not be wiped, but the builder was declared usable")
 	}
-	writeFile(t, file, "copy", time.Hour)
+	writeFile(t, file, saved("copy"), time.Hour)
 	wipeErr = nil
 	if ok, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", inst); ok || err != nil {
 		t.Fatalf("refused copy: %v, %v; want false, nil (start empty)", ok, err)
@@ -590,7 +595,7 @@ func TestBootBuilderWaitsForSaveAndRestores(t *testing.T) {
 	if boots.Load() != 0 {
 		t.Fatal("booted before the previous builder's cache was saved")
 	}
-	writeFile(t, filepath.Join(dir, "7.tar"), "warm", time.Minute)
+	writeFile(t, filepath.Join(dir, "7.tar"), saved("warm"), time.Minute)
 	d.mu.Lock()
 	delete(d.saving, "7")
 	d.mu.Unlock()
@@ -627,7 +632,7 @@ func TestBootBuilderDropsCacheOnlyWhenBuildkitRefusesIt(t *testing.T) {
 			})
 			boots := stubBoot(t, tc.setupErr)
 			d, srv := newTestDaemon(t)
-			writeFile(t, filepath.Join(dir, "7.tar"), "warm", time.Minute)
+			writeFile(t, filepath.Join(dir, "7.tar"), saved("warm"), time.Minute)
 			d.Builder("7", true)
 			d.bootBuilder(context.Background(), d.cfg, "7")
 			srv.WaitDeleted(t, "uid-"+boots.last(), 2*time.Second)
@@ -675,7 +680,7 @@ func TestSlowSaveDoesNotStallOthers(t *testing.T) {
 	d.builders = map[string]*builder{"2": readyBuilder("2", 20002, d.cfg.Builder.IdleTTL+time.Hour, builderSpec(d.cfg))}
 	d.expireBuilders()
 	deadline := time.Now().Add(2 * time.Second)
-	for readFile(t, filepath.Join(dir, "2.tar")) != "x" {
+	for readFile(t, filepath.Join(dir, "2.tar")) != saved("x") {
 		if time.Now().After(deadline) {
 			t.Fatal("project 2's save waited for project 1's hung save")
 		}
@@ -885,8 +890,11 @@ func TestParallelSavesCountWrittenBytesOnce(t *testing.T) {
 			<-release // still streaming (e.g. waiting for tar to exit)
 			return nil
 		}, nil)
-	// A 1000-byte disk that must keep 100 free, whose free space is what the
-	// files in the cache directory leave.
+	// A disk whose free space is what the files in the cache directory leave,
+	// and that must keep 10% free: after the first save wrote its 500 bytes
+	// (and header h), 300+h more fit, but not if the 500+h were counted twice.
+	h := uint64(len(saved("")))
+	disk := 1200 + 2*h
 	diskSpace = func(string) (uint64, uint64, error) {
 		used := uint64(0)
 		for _, n := range listDir(dir) {
@@ -894,14 +902,14 @@ func TestParallelSavesCountWrittenBytesOnce(t *testing.T) {
 				used += uint64(info.Size())
 			}
 		}
-		return 1000 - used, 1000, nil
+		return disk - used, disk, nil
 	}
 	d, _ := newTestDaemon(t)
 	t.Cleanup(free) // before bg.Wait: a failing test must not hang on the blocked save
 	spec := builderSpec(d.cfg)
 	d.builders = map[string]*builder{"1": readyBuilder("1", 20001, d.cfg.Builder.IdleTTL+time.Hour, spec)}
 	d.expireBuilders()
-	<-wrote // 500 bytes on disk, 500 free
+	<-wrote // 500+h bytes on disk
 	d.mu.Lock()
 	d.builders = map[string]*builder{"2": readyBuilder("2", 20002, d.cfg.Builder.IdleTTL+time.Hour, spec)}
 	d.mu.Unlock()
@@ -914,7 +922,7 @@ func TestParallelSavesCountWrittenBytesOnce(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if n := cacheCount(d, "save", "ok"); n != 1 {
-		t.Fatalf("second save: ok %v, skipped %v; 300 bytes fit into 500 free with 100 kept", n, cacheCount(d, "save", "skipped"))
+		t.Fatalf("second save: ok %v, skipped %v; it fits the free space left", n, cacheCount(d, "save", "skipped"))
 	}
 	free()
 	d.bg.Wait()
@@ -949,5 +957,87 @@ func TestParseTarTotal(t *testing.T) {
 		if !strings.Contains(builderSizeScript, want) {
 			t.Errorf("size script lacks %q: %s", want, builderSizeScript)
 		}
+	}
+}
+
+// A saved cache goes back only into a builder running the image that wrote
+// it: a new builder.image may fix a BuildKit flaw its old state carries. A
+// cache of another image, or one saved before images were recorded, is
+// deleted and the builder starts empty.
+func TestSavedCacheIsTiedToTheBuilderImage(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	var loaded []string
+	dir := stubBuilderCache(t, sizeOf(4), func(_ context.Context, _ config.Config, _ *vm.Instance, w io.Writer) error {
+		_, err := io.WriteString(w, "warm")
+		return err
+	}, func(_ context.Context, _ config.Config, _ *vm.Instance, r io.Reader) error {
+		b, err := io.ReadAll(r)
+		loaded = append(loaded, string(b))
+		return err
+	})
+	d, srv := newTestDaemon(t)
+	d.builders = map[string]*builder{"7": readyBuilder("7", 20001, d.cfg.Builder.IdleTTL+time.Hour, builderSpec(d.cfg))}
+	d.expireBuilders()
+	srv.WaitDeleted(t, "uid-7", 2*time.Second)
+	d.bg.Wait()
+	file := filepath.Join(dir, "7.tar")
+	inst := &vm.Instance{ID: "bld-7-00000001"}
+
+	same := d.cfg
+	if ok, err := d.restoreBuilderCache(context.Background(), same, "7", inst); !ok || err != nil || strings.Join(loaded, ",") != "warm" {
+		t.Fatalf("same image: restored %v, %v, loaded %q (want exactly the archive)", ok, err, loaded)
+	}
+
+	bumped := d.cfg
+	bumped.Builder.Image = "moby/buildkit:v0.99.0"
+	if ok, err := d.restoreBuilderCache(context.Background(), bumped, "7", inst); ok || err != nil {
+		t.Fatalf("new image: restored %v, %v; want an empty start", ok, err)
+	}
+	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) || len(loaded) != 1 {
+		t.Fatalf("cache of the old image kept (%v) or loaded (%q)", err, loaded)
+	}
+
+	writeFile(t, file, "tar data saved before images were recorded", time.Hour)
+	if ok, err := d.restoreBuilderCache(context.Background(), same, "7", inst); ok || err != nil {
+		t.Fatalf("cache without an image: restored %v, %v; want an empty start", ok, err)
+	}
+	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) || len(loaded) != 1 {
+		t.Fatalf("cache without an image kept (%v) or loaded (%q)", err, loaded)
+	}
+	if n := cacheCount(d, "restore", "stale"); n != 2 {
+		t.Fatalf("restore stale = %v, want 2", n)
+	}
+}
+
+// A builder removed because builder.image changed is not copied out at all:
+// no builder of the new image would take its cache.
+func TestBuilderOfAnOldImageIsNotSaved(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	saves := 0
+	dir := stubBuilderCache(t, sizeOf(1), func(_ context.Context, _ config.Config, _ *vm.Instance, w io.Writer) error {
+		saves++
+		_, err := io.WriteString(w, "x")
+		return err
+	}, nil)
+	d, srv := newTestDaemon(t)
+	old := d.cfg
+	old.Builder.Image = "moby/buildkit:v0.1.0"
+	d.builders = map[string]*builder{"7": readyBuilder("7", 20001, time.Hour, builderSpec(old))}
+	d.expireBuilders() // config changed, idle for an hour
+	srv.WaitDeleted(t, "uid-7", 2*time.Second)
+	d.bg.Wait()
+	if saves != 0 || len(listDir(dir)) != 0 {
+		t.Fatalf("saved %d times, files %v", saves, listDir(dir))
+	}
+}
+
+func TestSpecImage(t *testing.T) {
+	cfg := config.Default()
+	cfg.Builder.Image = "registry.example:5000/buildkit:v1"
+	if got := specImage(builderSpec(cfg)); got != cfg.Builder.Image {
+		t.Fatalf("specImage = %q", got)
+	}
+	if got := specImage(legacyBuilderSpec(cfg)); got != "" {
+		t.Fatalf("legacy spec: %q, want unknown", got)
 	}
 }
