@@ -74,7 +74,7 @@ func NewMetrics() *Metrics {
 			Help:    "Job duration from prepare to cleanup.",
 			Buckets: []float64{10, 20, 30, 45, 60, 90, 120, 180, 300, 450, 600, 900, 1200, 1800, 3600}}),
 		admissionWait: prometheus.NewHistogram(prometheus.HistogramOpts{Name: "firerunner_job_admission_wait_seconds",
-			Help:    "Time a job without a pool VM waited for host memory before its microVM was created.",
+			Help:    "Time a job that found no ready pool VM waited for host memory: cold boots, and jobs that took a pool VM that became ready while they waited. Jobs that got a ready pool VM at once are not counted.",
 			Buckets: []float64{0.5, 1, 5, 10, 30, 60, 120, 180, 300}}),
 		memCommitted: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "firerunner_memory_committed_bytes",
 			Help: "Guest memory (plus Firecracker overhead) promised to microVMs, by role (pool, job, builder, run, other)."}, []string{"role"}),

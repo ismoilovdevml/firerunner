@@ -58,7 +58,8 @@ func TestPrepareEvents(t *testing.T) {
 	d.record(Event{Kind: "prepare", Source: "cold", Reason: "canceled"})
 	d.record(Event{Kind: "prepare", Source: "cold", Reason: "admission_timeout", WaitSeconds: 180})
 	d.record(Event{Kind: "prepare", Source: "cold", Reason: "vm_boot"})
-	d.record(Event{Kind: "prepare", Source: "cold"}) // older executor: failure without reason
+	d.record(Event{Kind: "prepare", Source: "cold"})                                       // older executor: failure without reason
+	d.record(Event{Kind: "prepare", Source: "pool", OK: true, Seconds: 5, WaitSeconds: 4}) // took a pool VM while waiting
 	d.record(Event{Kind: "pool_vm_dead", VM: "pool-abc"})
 
 	boot := sampleSum(t, d, "firerunner_vm_boot_seconds", "cold")
@@ -71,9 +72,29 @@ func TestPrepareEvents(t *testing.T) {
 	if got := value(t, d.metrics.bootFailures.WithLabelValues("pool_dead")); got != 1 {
 		t.Errorf("pool_dead = %v, want 1", got)
 	}
+	// Only jobs without a ready pool VM waited for memory: a pool hit is not a 0 s wait.
 	wait := sampleSum(t, d, "firerunner_job_admission_wait_seconds", "")
-	if wait.count != 7 || wait.sum != 183 {
-		t.Errorf("admission wait count=%v sum=%v, want 7 and 183", wait.count, wait.sum)
+	if wait.count != 7 || wait.sum != 187 {
+		t.Errorf("admission wait count=%v sum=%v, want 7 and 187 (cold prepares and the pool VM taken while waiting)", wait.count, wait.sum)
+	}
+}
+
+// Only prepare events carry a source: finish and pool_vm_dead lines must not
+// claim "cold", and a prepare from an executor that sent none counts as cold.
+func TestEventSourceOnlyForPrepare(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	logs := captureLog(d)
+	d.record(Event{Kind: "finish", Result: ResultSuccess, Job: "11", VM: "pool-abc"})
+	d.record(Event{Kind: "pool_vm_dead", Job: "12", VM: "pool-def"})
+	d.record(Event{Kind: "prepare", OK: true, Seconds: 9, Job: "13"})
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		isPrepare := strings.Contains(line, "kind=prepare")
+		if strings.Contains(line, "source=cold") != isPrepare {
+			t.Errorf("source in %q", line)
+		}
+	}
+	if got := sampleSum(t, d, "firerunner_job_prepare_seconds", "cold"); got.count != 1 {
+		t.Errorf("prepare without a source counted as cold %v times, want 1", got.count)
 	}
 }
 

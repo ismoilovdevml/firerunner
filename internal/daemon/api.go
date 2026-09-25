@@ -141,13 +141,17 @@ func (d *Daemon) apiHandler() http.Handler {
 }
 
 func (d *Daemon) record(e Event) {
-	// Event fields become metric labels: only accept known values.
-	if e.Source != "pool" && e.Source != "cold" {
-		e.Source = "cold"
-	}
 	switch e.Kind {
 	case "prepare":
-		d.metrics.admissionWait.Observe(e.WaitSeconds)
+		// Event fields become metric labels: only accept known values. Only
+		// prepare events have a source.
+		if e.Source != "pool" && e.Source != "cold" {
+			e.Source = "cold"
+		}
+		// Jobs that found a ready pool VM never waited for memory.
+		if e.Source == "cold" || e.WaitSeconds > 0 {
+			d.metrics.admissionWait.Observe(e.WaitSeconds)
+		}
 		if e.OK {
 			d.metrics.prepareSeconds.WithLabelValues(e.Source).Observe(e.Seconds)
 			switch {
