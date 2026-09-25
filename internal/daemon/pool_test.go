@@ -412,7 +412,10 @@ func TestReconcileReclaimsOrphanWhileBooting(t *testing.T) {
 func TestPoolAndBuilderAdmissionsShareTheHost(t *testing.T) {
 	d, _ := newTestDaemon(t)
 	d.cfg.VM.MemoryMB, d.cfg.Pool.Size = 256, 2
-	release := make(chan struct{})
+	release := make(chan struct{}) // the stubbed pool boots block until it closes
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(free) // before bg.Wait: a failing check must not hang on the blocked boots
 	var booting sync.WaitGroup
 	booting.Add(2)
 	var mu sync.Mutex
@@ -446,7 +449,7 @@ func TestPoolAndBuilderAdmissionsShareTheHost(t *testing.T) {
 	if got, want := lastReserved(), 2*vm.WithOverhead(256); got != want {
 		t.Fatalf("builder admitted next to %d MB reserved, want the booting pool VMs' %d", got, want)
 	}
-	close(release)
+	free()
 	d.bg.Wait() // the pool boots returned (and failed)
 	drop8, err := d.admitBuilder(context.Background(), bcfg, "bld-8")
 	if err != nil {
