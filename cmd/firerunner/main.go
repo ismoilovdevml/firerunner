@@ -718,7 +718,11 @@ func cmdExecutor(cfg config.Config, args []string) error {
 		if len(args) != 3 {
 			return errors.New("usage: firerunner executor run <script> <stage>")
 		}
-		return executor.Run(cfg, args[1], args[2])
+		// gitlab-runner stops a cancelled or timed-out job with SIGTERM; Run
+		// then ends the stage and records the job as cancelled.
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return executor.Run(ctx, cfg, args[1], args[2])
 	case "cleanup":
 		return executor.Cleanup(cfg)
 	}

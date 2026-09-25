@@ -13,10 +13,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
@@ -347,7 +349,8 @@ func writeDockerAuth(cfg config.Config, inst *vm.Instance, auth string) error {
 // Run executes one stage script. gitlab-runner passes the script path and stage name.
 // With `image:` in the job, the user's scripts run inside that container in the
 // microVM (like the docker executor); git and artifact stages run on the VM itself.
-func Run(cfg config.Config, script, stage string) error {
+// ctx ends when gitlab-runner stops the job (cancelled or timed out).
+func Run(ctx context.Context, cfg config.Config, script, stage string) error {
 	id, err := jobID()
 	if err != nil {
 		return systemFailure(err)
@@ -367,7 +370,7 @@ func Run(cfg config.Config, script, stage string) error {
 		if strings.HasPrefix(image, "-") {
 			return buildFailure(fmt.Errorf("invalid image %q", image))
 		}
-		code, err = runInContainer(cfg, &st.Instance, image, st.Network, f, vm.ContainerArgs(cfg, st.ServiceAliases)...)
+		code, err = runInContainer(ctx, cfg, &st.Instance, image, st.Network, f, vm.ContainerArgs(cfg, st.ServiceAliases)...)
 	} else {
 		var script io.Reader = f
 		if st.BuilderProject == "" && isUserStage(stage) {
@@ -391,7 +394,16 @@ func Run(cfg config.Config, script, stage string) error {
 			// `docker build` only uses a buildx builder named in the environment.
 			script = io.MultiReader(strings.NewReader("export BUILDX_BUILDER="+BuilderName+"\n"), script)
 		}
-		code, err = vm.RunScript(cfg, &st.Instance, script, os.Stdout, os.Stderr)
+		cmd := vm.SSH(cfg, &st.Instance, "/bin/bash")
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = script, os.Stdout, os.Stderr
+		code, err = runSSH(ctx, cmd)
+	}
+	if ctx.Err() != nil {
+		// Neither the script's failure nor FireRunner's: the alerts leave
+		// "canceled" out. Without it cleanup would report a success.
+		recordFailure(st, daemon.ResultSystemFailure, "canceled")
+		_ = vm.SaveJobState(statePath(id), st)
+		return systemFailure(fmt.Errorf("stage %s stopped: the job was cancelled or timed out", stage))
 	}
 	if result, reason := stageOutcome(stage, code, err); result != daemon.ResultSuccess && st.Result == "" {
 		recordFailure(st, result, reason)
@@ -430,10 +442,43 @@ func ContainerCommand(image, network string, extra ...string) string {
 		`sh -c 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi'`
 }
 
-func runInContainer(cfg config.Config, inst *vm.Instance, image, network string, script io.Reader, extra ...string) (int, error) {
+func runInContainer(ctx context.Context, cfg config.Config, inst *vm.Instance, image, network string, script io.Reader, extra ...string) (int, error) {
 	cmd := vm.SSH(cfg, inst, ContainerCommand(image, network, extra...))
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = script, os.Stdout, os.Stderr
-	return vm.ExitCode(cmd.Run())
+	return runSSH(ctx, cmd)
+}
+
+// sshStopGrace is how long a stopped session's ssh may take to exit before it
+// is killed (a variable for tests).
+var sshStopGrace = 5 * time.Second
+
+// runSSH runs an ssh command until it exits or ctx ends, and returns its exit
+// code like vm.ExitCode. gitlab-runner stops a job with SIGTERM to the whole
+// process group, so ssh normally exits by itself; it is stopped here as well
+// for a signal that reached only this process, so the stage never outlives
+// the job.
+func runSSH(ctx context.Context, cmd *exec.Cmd) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
+	if err := cmd.Start(); err != nil {
+		return -1, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return vm.ExitCode(err)
+	case <-ctx.Done():
+	}
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case err := <-done:
+		return vm.ExitCode(err)
+	case <-time.After(sshStopGrace):
+		_ = cmd.Process.Kill()
+		return vm.ExitCode(<-done)
+	}
 }
 
 func Cleanup(cfg config.Config) error {

@@ -1,13 +1,16 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -47,7 +50,7 @@ func TestExitCodesFromEnvironment(t *testing.T) {
 func TestStagesRequireJobID(t *testing.T) {
 	t.Setenv("CUSTOM_ENV_CI_JOB_ID", "")
 	var e *ExitError
-	if err := Run(config.Default(), "/nonexistent", "build_script"); !errors.As(err, &e) || e.Code != 2 {
+	if err := Run(context.Background(), config.Default(), "/nonexistent", "build_script"); !errors.As(err, &e) || e.Code != 2 {
 		t.Fatalf("want system failure, got %v", err)
 	}
 }
@@ -55,7 +58,7 @@ func TestStagesRequireJobID(t *testing.T) {
 func TestRunWithoutPrepareIsSystemFailure(t *testing.T) {
 	t.Setenv("CUSTOM_ENV_CI_JOB_ID", "does-not-exist-123")
 	var e *ExitError
-	if err := Run(config.Default(), "/nonexistent", "build_script"); !errors.As(err, &e) || e.Code != 2 {
+	if err := Run(context.Background(), config.Default(), "/nonexistent", "build_script"); !errors.As(err, &e) || e.Code != 2 {
 		t.Fatalf("want system failure, got %v", err)
 	}
 }
@@ -111,7 +114,7 @@ func TestLeadingDashImageIsRejected(t *testing.T) {
 	// No state file exists, so a system failure is expected before the image check;
 	// the image check itself is covered by ContainerCommand never seeing it.
 	var e *ExitError
-	if err := Run(config.Default(), "/nonexistent", "build_script"); !errors.As(err, &e) {
+	if err := Run(context.Background(), config.Default(), "/nonexistent", "build_script"); !errors.As(err, &e) {
 		t.Fatalf("want ExitError, got %v", err)
 	}
 }
@@ -248,7 +251,7 @@ func TestRunSendsTheWholeScriptAfterStartingABuilder(t *testing.T) {
 	if err := os.WriteFile(script, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := Run(cfg, script, "build_script"); err != nil {
+	if err := Run(context.Background(), cfg, script, "build_script"); err != nil {
 		t.Fatalf("Run = %v", err)
 	}
 	got, _ := os.ReadFile(sent)
@@ -257,6 +260,109 @@ func TestRunSendsTheWholeScriptAfterStartingABuilder(t *testing.T) {
 	}
 	if st, err := vm.LoadJobState(statePath("job-555")); err != nil || st.BuilderProject != "1" {
 		t.Fatalf("job state after Run: %+v, %v; want BuilderProject 1", st, err)
+	}
+}
+
+// runFixture is the cleanup fixture with job 555's VM pinned (as prepare
+// leaves it), no image and ssh replaced by fakeSSH: Run talks to no real VM.
+func runFixture(t *testing.T, fakeSSH string) (config.Config, string) {
+	t.Helper()
+	cfg, _ := cleanupFixture(t)
+	st := &vm.JobState{Instance: vm.Instance{ID: "job-555", UID: "u1", IP: "10.200.0.55", HostKey: "ssh-ed25519 AAAA"}}
+	if err := vm.SaveJobState(statePath("job-555"), st); err != nil {
+		t.Fatal(err)
+	}
+	oldMux := vm.MuxDir
+	vm.MuxDir = t.TempDir()
+	t.Cleanup(func() { vm.MuxDir = oldMux })
+	t.Setenv("CUSTOM_ENV_CI_JOB_IMAGE", "")
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte("#!/bin/sh\n"+fakeSSH), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	script := filepath.Join(t.TempDir(), "step_script")
+	if err := os.WriteFile(script, []byte("make test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return cfg, script
+}
+
+// jobResult is the result cleanup will report for job 555.
+func jobResult(t *testing.T) (result, reason string) {
+	t.Helper()
+	st, err := vm.LoadJobState(statePath("job-555"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return finishResult(st)
+}
+
+// gitlab-runner stops a cancelled or timed-out job with SIGTERM (main turns
+// it into a cancelled context). The stage's ssh must end, even one that
+// ignores SIGTERM, and the job must not be reported as a success.
+func TestRunStoppedByCancelIsRecordedAsCanceled(t *testing.T) {
+	oldGrace := sshStopGrace
+	sshStopGrace = 200 * time.Millisecond
+	t.Cleanup(func() { sshStopGrace = oldGrace })
+	for name, trap := range map[string]string{
+		"ssh exits on SIGTERM": "",
+		"ssh ignores SIGTERM":  "trap '' TERM\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			pidFile := filepath.Join(t.TempDir(), "pid")
+			cfg, script := runFixture(t, trap+"echo $$ > "+pidFile+".tmp && mv "+pidFile+".tmp "+pidFile+"\nexec sleep 30\n")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- Run(ctx, cfg, script, "step_script") }()
+
+			var pid int
+			for deadline := time.Now().Add(10 * time.Second); pid == 0; {
+				if b, err := os.ReadFile(pidFile); err == nil {
+					pid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+				} else if time.Now().After(deadline) {
+					t.Fatal("the stage's ssh never started")
+				} else {
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			cancel()
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("Run still waits for the stage after the job was cancelled")
+			}
+			var e *ExitError
+			if !errors.As(err, &e) || e.Code != 2 {
+				t.Fatalf("Run = %v, want a system failure exit", err)
+			}
+			if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+				t.Fatalf("the stage's ssh (pid %d) outlived the cancelled stage: %v", pid, err)
+			}
+			if r, why := jobResult(t); r != daemon.ResultSystemFailure || why != "canceled" {
+				t.Fatalf("recorded %s/%s, want system_failure/canceled", r, why)
+			}
+		})
+	}
+}
+
+// A job cancelled before its stage started runs nothing in the VM.
+func TestRunAfterCancelStartsNoSession(t *testing.T) {
+	ran := filepath.Join(t.TempDir(), "ran")
+	cfg, script := runFixture(t, "touch "+ran+"\n")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var e *ExitError
+	if err := Run(ctx, cfg, script, "get_sources"); !errors.As(err, &e) || e.Code != 2 {
+		t.Fatalf("Run = %v, want a system failure exit", err)
+	}
+	if _, err := os.Stat(ran); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("ssh ran for a cancelled job")
+	}
+	if r, why := jobResult(t); r != daemon.ResultSystemFailure || why != "canceled" {
+		t.Fatalf("recorded %s/%s, want system_failure/canceled", r, why)
 	}
 }
 
