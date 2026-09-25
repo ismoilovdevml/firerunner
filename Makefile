@@ -1,4 +1,5 @@
-.PHONY: build test clean run dev help
+.PHONY: all help build build-linux test test-coverage clean deps rootfs-image run dev \
+	fmt fmt-check vet tidy-check lint shellcheck vulncheck check
 
 # Build variables
 BINARY_NAME=firerunner
@@ -9,6 +10,9 @@ LDFLAGS=-ldflags "-X main.version=$(VERSION)"
 # Pinned to the versions CI runs (.github/workflows/ci.yml).
 GOLANGCI_LINT_VERSION=v2.13.2
 GOVULNCHECK_VERSION=v1.8.0
+
+# The shell scripts CI runs shellcheck on (.github/workflows/ci.yml).
+SHELL_SCRIPTS=install.sh images/rootfs/firerunner-netfilter test/network/run.sh test/installer/proxy.sh
 
 # Local tag for the microVM rootfs image; CI publishes to ghcr.io (images.yml).
 ROOTFS_IMAGE?=firerunner-rootfs:local
@@ -79,9 +83,9 @@ run: build ## Build and run a command (ARGS="status"; config from FIRERUNNER_CON
 dev: ## go run a command (ARGS="status"; config from FIRERUNNER_CONFIG)
 	$(GOCMD) run ./$(CMD_DIR) $(ARGS)
 
-fmt: ## Format Go code
+fmt: ## Format Go code with gofmt -s (what fmt-check and golangci-lint expect)
 	@echo "Formatting code..."
-	$(GOCMD) fmt ./...
+	gofmt -s -w .
 	@echo "Format complete"
 
 lint: ## Run golangci-lint (pinned version)
@@ -97,10 +101,16 @@ vet: ## Run go vet
 	$(GOCMD) vet ./...
 	@echo "Vet complete"
 
-fmt-check: ## Fail if any Go file is not gofmt -s formatted (as CI does)
+fmt-check: ## Fail if any Go file is not gofmt -s formatted (CI checks it in golangci-lint)
 	@test -z "$$(gofmt -s -l .)" || { gofmt -s -l .; exit 1; }
 
-check: fmt-check vet lint vulncheck test ## Run all checks CI runs (without changing files)
+tidy-check: ## Fail if the module cache does not verify or go.mod/go.sum are not tidy (as CI does)
+	$(GOMOD) verify
+	$(GOMOD) tidy -diff
 
-.PHONY: all build-linux test-coverage deps fmt fmt-check lint vulncheck vet check rootfs-image
+shellcheck: ## Run shellcheck on the shell scripts CI checks
+	shellcheck -S warning $(SHELL_SCRIPTS)
+
+check: fmt-check vet tidy-check lint shellcheck vulncheck test ## Run CI's Go and shellcheck checks (without changing files); see CONTRIBUTING.md for the rest
+
 all: clean deps check build ## Run clean, deps, check, and build

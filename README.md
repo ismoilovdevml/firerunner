@@ -82,13 +82,13 @@ times, boots and host health:
 
 ## Development
 
-You need Go, at the version in `go.mod`.
+You need Go, at the version in `go.mod`, and shellcheck for `make check`.
 
 ```bash
 git clone https://github.com/ismoilovdevml/firerunner
 cd firerunner
 make build        # build/firerunner
-make check        # fmt, vet, golangci-lint, govulncheck, tests
+make check        # fmt, vet, go.mod tidy, golangci-lint, shellcheck, govulncheck, tests
 ```
 
 | Directory | |
