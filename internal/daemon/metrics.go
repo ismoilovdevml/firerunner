@@ -51,8 +51,9 @@ type Metrics struct {
 }
 
 func NewMetrics() *Metrics {
-	// Cold boots take 10-20 s; boot_timeout is 180 s.
-	bootBuckets := []float64{2, 5, 8, 10, 12, 14, 16, 18, 20, 25, 30, 45, 60, 90, 120, 180}
+	// Cold boots take 10-20 s; boot_timeout is 180 s. A builder boot also
+	// waits for its previous cache copy, host memory and the cache restore.
+	bootBuckets := []float64{2, 5, 8, 10, 12, 14, 16, 18, 20, 25, 30, 45, 60, 90, 120, 180, 240, 300, 600}
 	m := &Metrics{
 		builderRequests: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_builder_requests_total",
 			Help: "Jobs asking for their project's builder, by answer: ready (warm cache), booting, busy, disabled."}, []string{"state"}),
@@ -72,7 +73,7 @@ func NewMetrics() *Metrics {
 			Help: "microVMs that did not become ready, by kind (pool, cold, builder, preload, pool_dead: a pool VM that no longer answered when a job claimed it)."}, []string{"kind"}),
 		prepareSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "firerunner_job_prepare_seconds",
 			Help:    "Time a job waited until its microVM was ready, by source (pool, cold).",
-			Buckets: []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300}}, []string{"source"}),
+			Buckets: []float64{0.5, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 18, 20, 25, 30, 45, 60, 90, 120, 180, 300}}, []string{"source"}),
 		jobs: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_jobs_total",
 			Help: "Finished jobs by result (success, script_failure: the job's own commands failed, system_failure: FireRunner or the host failed it) and reason (for system failures)."}, []string{"result", "reason"}),
 		jobSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{Name: "firerunner_job_duration_seconds",
