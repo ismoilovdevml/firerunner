@@ -558,8 +558,9 @@ func (f *Forwarder) forward(w http.ResponseWriter, r *http.Request, up Upstream)
 }
 
 // passThrough sends an absolute-form request to the upstream as it came,
-// with the upstream's credentials, over a connection of its own. The
-// connection closes when the client goes away.
+// with the upstream's credentials, over a connection of its own. A stalled
+// upstream is given up after HeaderWait. The request's context is not used:
+// clients like busybox wget half-close after the request, which cancels it.
 func (f *Forwarder) passThrough(w http.ResponseWriter, r *http.Request, up Upstream) (int, int64) {
 	conn, err := net.DialTimeout("tcp", up.Addr, f.DialTimeout)
 	if err != nil {
@@ -568,9 +569,7 @@ func (f *Forwarder) passThrough(w http.ResponseWriter, r *http.Request, up Upstr
 		return http.StatusBadGateway, 0
 	}
 	defer conn.Close()
-	stop := context.AfterFunc(r.Context(), func() { _ = conn.Close() })
-	defer stop()
-	out := r.Clone(r.Context())
+	out := r.Clone(context.Background())
 	removeHopHeaders(out.Header)
 	if up.Auth != "" {
 		out.Header.Set("Proxy-Authorization", up.Auth)

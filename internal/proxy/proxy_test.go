@@ -594,9 +594,10 @@ func TestTunnelIdleTimeout(t *testing.T) {
 	}
 }
 
-// busybox-style https requests: a client that goes away closes the upstream
-// connection even when the upstream never answers.
-func TestPassThroughClosesWithClient(t *testing.T) {
+// busybox-style https requests: a stalled upstream is given up after
+// HeaderWait, and a client that half-closes after its request (busybox wget
+// does) still gets the answer.
+func TestPassThroughStalledUpstreamAndHalfClose(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -611,18 +612,45 @@ func TestPassThroughClosesWithClient(t *testing.T) {
 		_, _ = io.Copy(io.Discard, c) // never answers; returns when the forwarder closes
 		close(closed)
 	}()
-	fwd, _ := startForwarderWith(t, "http://"+l.Addr().String(), nil, Limits{HeaderWait: time.Minute})
+	fwd, _ := startForwarderWith(t, "http://"+l.Addr().String(), nil, Limits{HeaderWait: 500 * time.Millisecond})
 	c, err := net.Dial("tcp", fwd)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer c.Close()
 	fmt.Fprint(c, "GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
-	time.Sleep(300 * time.Millisecond)
-	c.Close()
 	select {
 	case <-closed:
 	case <-time.After(3 * time.Second):
-		t.Fatal("upstream connection left open after the client went away")
+		t.Fatal("stalled upstream connection kept past HeaderWait")
+	}
+
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("bob:pw"))
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Proxy-Authorization") != want {
+			w.WriteHeader(http.StatusProxyAuthRequired)
+			return
+		}
+		time.Sleep(200 * time.Millisecond) // the half-close reaches the forwarder first
+		_, _ = io.WriteString(w, "fetched")
+	}))
+	defer up.Close()
+	fwd2, _ := startForwarderWith(t, "http://bob:pw@"+up.Listener.Addr().String(), nil, Limits{HeaderWait: time.Minute})
+	c2, err := net.Dial("tcp", fwd2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	fmt.Fprint(c2, "GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+	_ = c2.(*net.TCPConn).CloseWrite()
+	_ = c2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c2), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || string(body) != "fetched" {
+		t.Fatalf("half-closed client got %d %q", resp.StatusCode, body)
 	}
 }
 
