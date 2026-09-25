@@ -87,6 +87,32 @@ type builder struct {
 	dropped bool
 }
 
+// builderRemoval is why a builder is removed: the reason in the log, its
+// label in firerunner_builder_removals_total, and whether the builder's
+// cache is copied out for the project's next builder.
+type builderRemoval struct {
+	text, label string
+	keepCache   bool
+}
+
+// The reasons a builder is removed. An operator's removal and disabling
+// builders mean "throw it away"; a builder whose VM is gone or not answering
+// has nothing to copy.
+var (
+	removedLRU      = builderRemoval{"least recently used", "lru", true}
+	removedIdle     = builderRemoval{"idle", "idle", true}
+	removedMaxAge   = builderRemoval{"max age", "max_age", true}
+	removedConfig   = builderRemoval{"config changed", "config_changed", true}
+	removedVMGone   = builderRemoval{"VM gone", "vm_gone", false}
+	removedSilent   = builderRemoval{"not answering", "not_answering", false}
+	removedOperator = builderRemoval{"removed by operator", "operator", false}
+	removedDisabled = builderRemoval{"builders disabled", "disabled", false}
+)
+
+// builderRemovals is every removal reason (the pre-created metric labels).
+var builderRemovals = []builderRemoval{removedLRU, removedIdle, removedMaxAge, removedConfig,
+	removedVMGone, removedSilent, removedOperator, removedDisabled}
+
 // builderStrikes consecutive failed probes drop a builder. One missed 3 s dial
 // (a builder VM busy with a heavy build) must not throw its cache away.
 const builderStrikes = 2
@@ -177,6 +203,7 @@ func (d *Daemon) Builder(project string, start bool) BuilderInfo {
 	b := &builder{Project: project, Port: port, LastUsed: time.Now(),
 		CA: creds.caPEM, Cert: creds.clientCert, Key: creds.clientKey, creds: creds}
 	d.builders[project] = b
+	d.builderGaugesLocked()
 	d.metrics.builderRequests.WithLabelValues(BuilderBooting).Inc()
 	ctx, boot := d.runCtx, builderBoot
 	d.spawn(func() { boot(d, ctx, cfg, project) })
@@ -206,7 +233,7 @@ func (d *Daemon) evictLRULocked() bool {
 	if lru == nil {
 		return false
 	}
-	d.removeBuilderLocked(lru, "least recently used")
+	d.removeBuilderLocked(lru, removedLRU)
 	return true
 }
 
@@ -237,11 +264,32 @@ func (d *Daemon) freePortLocked(cfg config.Config) int {
 // (and with it POST /claim) never waits for nft or flintlock. For reasons that
 // keep the cache, its state is copied to the host before the VM is deleted; the
 // project's next builder waits for that copy (see bootBuilder).
-func (d *Daemon) removeBuilderLocked(b *builder, reason string) {
+func (d *Daemon) removeBuilderLocked(b *builder, why builderRemoval) {
 	delete(d.builders, b.Project)
 	d.saveBuildersLocked()
-	d.metrics.builders.Set(float64(len(d.builders)))
-	d.retireLocked(b.Project, b.Port, b.Instance, b.SpecID, "builder: "+reason, keepsCache(reason), time.Now())
+	d.builderGaugesLocked()
+	d.metrics.builderRemovals.WithLabelValues(why.label).Inc()
+	d.retireLocked(b.Project, b.Port, b.Instance, b.SpecID, "builder: "+why.text, why.keepCache, time.Now())
+}
+
+// builderGaugesLocked sets firerunner_builders by state and
+// firerunner_builder_slots (builder.max; 0 while builders are disabled).
+func (d *Daemon) builderGaugesLocked() {
+	var ready, booting int
+	for _, b := range d.builders {
+		if b.ready {
+			ready++
+		} else {
+			booting++
+		}
+	}
+	d.metrics.builders.WithLabelValues("ready").Set(float64(ready))
+	d.metrics.builders.WithLabelValues("booting").Set(float64(booting))
+	slots := 0
+	if d.cfg.Builder.Enabled {
+		slots = d.cfg.Builder.Max
+	}
+	d.metrics.builderSlots.Set(float64(slots))
 }
 
 // retireLocked unmaps a removed builder's port (0: none), copies its cache
@@ -330,7 +378,7 @@ func (d *Daemon) RemoveBuilders(project string, force bool) Removal {
 			out.Skipped = append(out.Skipped, b.Project)
 			continue
 		}
-		d.removeBuilderLocked(b, "removed by operator")
+		d.removeBuilderLocked(b, removedOperator)
 		out.Removed = append(out.Removed, b.Project)
 	}
 	keep := map[string]bool{}
@@ -362,6 +410,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		d.mu.Lock()
 		if b, ok := d.builders[project]; ok && !b.ready {
 			delete(d.builders, project)
+			d.builderGaugesLocked()
 		}
 		d.builderFailed[project] = time.Now()
 		d.mu.Unlock()
@@ -468,6 +517,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		// `builder rm` came after the wipe check, while buildkitd started on
 		// the removed cache: do not use this builder; the next job starts one.
 		delete(d.builders, project)
+		d.builderGaugesLocked()
 		ok = false
 		d.log.Info("builder dropped: its cache was removed by the operator while it started", "project", project)
 	}
@@ -486,7 +536,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	b.Instance, b.creds = *inst, nil
 	b.SpecID, b.BornAt, b.ready = builderSpec(cfg), time.Now(), true
 	d.saveBuildersLocked()
-	d.metrics.builders.Set(float64(len(d.builders)))
+	d.builderGaugesLocked()
 	d.metrics.bootSeconds.WithLabelValues("builder").Observe(time.Since(start).Seconds())
 	d.log.Info("builder ready", "project", project, "vm", inst.ID, "ip", inst.IP, "port", b.Port,
 		"took", time.Since(start).Round(100*time.Millisecond).String())
@@ -730,15 +780,16 @@ func (d *Daemon) expireBuilders() {
 		idle := time.Since(b.LastUsed)
 		switch {
 		case !cfg.Builder.Enabled:
-			d.removeBuilderLocked(b, "builders disabled")
+			d.removeBuilderLocked(b, removedDisabled)
 		case idle > cfg.Builder.IdleTTL:
-			d.removeBuilderLocked(b, "idle")
+			d.removeBuilderLocked(b, removedIdle)
 		case time.Since(b.BornAt) > builderMaxAge && idle > 10*time.Minute:
-			d.removeBuilderLocked(b, "max age")
+			d.removeBuilderLocked(b, removedMaxAge)
 		case b.SpecID != spec && idle > 10*time.Minute:
-			d.removeBuilderLocked(b, "config changed")
+			d.removeBuilderLocked(b, removedConfig)
 		}
 	}
+	d.builderGaugesLocked() // builder.max and enabled may have been reloaded
 }
 
 // checkBuilders adopts the previous run's builders if that has not happened
@@ -797,7 +848,7 @@ func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
 		answered, probed := answers[b.Project]
 		switch {
 		case gone[b.Project]:
-			d.removeBuilderLocked(b, "VM gone")
+			d.removeBuilderLocked(b, removedVMGone)
 			continue
 		case !probed:
 			continue // became ready after the listing: check it next time
@@ -806,7 +857,7 @@ func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
 		default:
 			b.strikes++
 			if b.strikes >= builderStrikes && !busy[b.Project] {
-				d.removeBuilderLocked(b, "not answering")
+				d.removeBuilderLocked(b, removedSilent)
 				continue
 			}
 			d.log.Warn("builder not answering", "project", b.Project, "vm", b.Instance.ID,
@@ -937,7 +988,7 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 	}
 	d.buildersAdopted = true
 	d.saveBuildersLocked()
-	d.metrics.builders.Set(float64(len(d.builders)))
+	d.builderGaugesLocked()
 	d.mu.Unlock()
 	if err := mapBuilderPorts(adopted...); err != nil {
 		d.log.Error("builder port mapping failed", "err", err)

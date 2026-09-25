@@ -203,18 +203,6 @@ func builderCacheFile(project string) string {
 	return filepath.Join(builderCacheDir, project+".tar")
 }
 
-// keepsCache reports whether a builder removed for reason should leave its
-// cache for the project's next builder. An operator's removal and disabling
-// builders mean "throw it away"; a builder whose VM is gone or not answering
-// has nothing to copy.
-func keepsCache(reason string) bool {
-	switch reason {
-	case "least recently used", "idle", "max age", "config changed":
-		return true
-	}
-	return false
-}
-
 // saveBuilderCache copies the builder's BuildKit state to the host, under a
 // header naming the builder's image. Any failure leaves the previous saved
 // copy (if any) in place. Saves copy side by side, but each reserves its size
@@ -388,6 +376,7 @@ func (d *Daemon) makeRoomForCache(project string, size, limit, reserved int64) e
 		}
 		total -= o.size
 		avail += o.size
+		d.metrics.builderCache.WithLabelValues("evict", "ok").Inc()
 		d.log.Info("saved builder cache dropped to make room", "file", filepath.Base(o.path), "bytes", o.size)
 	}
 	if total+size > limit || avail-size < minFree {
@@ -407,7 +396,9 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 	file := builderCacheFile(project)
 	f, err := os.Open(file)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, os.ErrNotExist) {
+			d.metrics.builderCache.WithLabelValues("restore", "missing").Inc()
+		} else {
 			d.log.Warn("saved builder cache unreadable", "project", project, "err", err)
 		}
 		return false, nil

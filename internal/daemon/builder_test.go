@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1075,4 +1076,113 @@ func TestRunAdoptsBuildersAfterFailedStartupListing(t *testing.T) {
 	if got := srv.Deleted(); len(got) != 0 {
 		t.Fatalf("deleted %v", got)
 	}
+}
+
+// seriesOf lists the label values of every series of the metric name (one
+// label: its value; several: joined with "/").
+func seriesOf(t *testing.T, d *Daemon, name string) []string {
+	t.Helper()
+	mfs, err := d.metrics.reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			var vals []string
+			for _, l := range m.GetLabel() {
+				vals = append(vals, l.GetValue())
+			}
+			out = append(out, strings.Join(vals, "/"))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// firerunner_builders counts booting builders too, and is current whenever a
+// builder is added or goes; firerunner_builder_slots is builder.max (0 when
+// builders are disabled); every removal is counted by a fixed reason; cache
+// restores without a saved copy and evictions are counted.
+func TestBuilderMetrics(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	dir := stubBuilderCache(t, nil, nil, nil)
+	stubBoot(t, errors.New("pull access denied"))
+	d, _ := newTestDaemon(t)
+	d.cfg.Builder.Max = 3
+	gauge := func(state string) float64 { return metricValue(t, d, "firerunner_builders", state) }
+	wantSeries := func(name string, want ...string) {
+		t.Helper()
+		sort.Strings(want)
+		if got := seriesOf(t, d, name); strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("%s series %v, want %v (pre-created)", name, got, want)
+		}
+	}
+	wantSeries("firerunner_builders", "booting", "ready")
+	wantSeries("firerunner_builder_removals_total", "config_changed", "disabled", "idle", "lru", "max_age", "not_answering", "operator", "vm_gone")
+	for _, s := range []string{"evict/ok", "restore/missing", "restore/stale"} {
+		if !slices.Contains(seriesOf(t, d, "firerunner_builder_cache_total"), s) {
+			t.Errorf("firerunner_builder_cache_total{%s} not pre-created", s)
+		}
+	}
+
+	d.expireBuilders()
+	if n := metricValue(t, d, "firerunner_builder_slots", ""); n != 3 {
+		t.Fatalf("slots = %v, want builder.max 3", n)
+	}
+	d.Builder("7", true)
+	if gauge("booting") != 1 || gauge("ready") != 0 {
+		t.Fatalf("after a builder started booting: booting %v ready %v", gauge("booting"), gauge("ready"))
+	}
+	d.bootBuilder(context.Background(), d.cfg, "7") // setup fails
+	d.bg.Wait()
+	if gauge("booting") != 0 {
+		t.Fatalf("after a failed boot: booting %v", gauge("booting"))
+	}
+	if n := cacheCount(d, "restore", "missing"); n != 1 {
+		t.Fatalf("restore without a saved copy = %v", n)
+	}
+
+	spec := builderSpec(d.cfg)
+	d.mu.Lock()
+	d.builders = map[string]*builder{
+		"1": readyBuilder("1", 20001, d.cfg.Builder.IdleTTL+time.Hour, spec), // idle
+		"2": readyBuilder("2", 20002, 0, spec),
+		"3": readyBuilder("3", 20003, 0, spec),
+	}
+	d.mu.Unlock()
+	d.expireBuilders()
+	if gauge("ready") != 2 || metricValue(t, d, "firerunner_builder_removals_total", "idle") != 1 {
+		t.Fatalf("after expiry: ready %v, idle removals %v", gauge("ready"), metricValue(t, d, "firerunner_builder_removals_total", "idle"))
+	}
+	d.RemoveBuilders("2", false)
+	d.checkBuilders(map[string]bool{}, time.Now()) // 3's VM is gone
+	for reason, want := range map[string]float64{"operator": 1, "vm_gone": 1, "idle": 1, "lru": 0} {
+		if got := metricValue(t, d, "firerunner_builder_removals_total", reason); got != want {
+			t.Errorf("removals{%s} = %v, want %v", reason, got, want)
+		}
+	}
+	if gauge("ready") != 0 {
+		t.Fatalf("ready = %v after every builder went", gauge("ready"))
+	}
+
+	writeFile(t, filepath.Join(dir, "8.tar"), "old", time.Hour)
+	d.cacheMu.Lock()
+	err := d.makeRoomForCache("9", 3, 5, 0) // 3 old + 3 new > budget 5: 8.tar must go
+	d.cacheMu.Unlock()
+	if err != nil || cacheCount(d, "evict", "ok") != 1 {
+		t.Fatalf("eviction: %v, evict ok = %v", err, cacheCount(d, "evict", "ok"))
+	}
+
+	d.mu.Lock()
+	d.cfg.Builder.Enabled = false
+	d.mu.Unlock()
+	d.expireBuilders()
+	if n := metricValue(t, d, "firerunner_builder_slots", ""); n != 0 {
+		t.Fatalf("slots with builders disabled = %v", n)
+	}
+	d.bg.Wait()
 }

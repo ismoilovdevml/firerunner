@@ -34,7 +34,6 @@ type Metrics struct {
 	thinPool                           *prometheus.GaugeVec
 	memAvailable                       prometheus.Gauge
 	runnerConcurrent                   prometheus.Gauge
-	builders                           prometheus.Gauge
 	builderRequests                    *prometheus.CounterVec
 	admissionWait                      prometheus.Histogram
 	memCommitted                       *prometheus.GaugeVec
@@ -44,18 +43,21 @@ type Metrics struct {
 	hostOOMKills                       prometheus.Counter
 	loopTick                           prometheus.Gauge
 	builderCache                       *prometheus.CounterVec
+
+	// Builder slots and removals (addBuilderMetrics).
+	builders        *prometheus.GaugeVec
+	builderSlots    prometheus.Gauge
+	builderRemovals *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
 	// Cold boots take 10-20 s; boot_timeout is 180 s.
 	bootBuckets := []float64{2, 5, 8, 10, 12, 14, 16, 18, 20, 25, 30, 45, 60, 90, 120, 180}
 	m := &Metrics{
-		builders: prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_builders",
-			Help: "Per-project BuildKit builder microVMs (booting and ready)."}),
 		builderRequests: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_builder_requests_total",
 			Help: "Jobs asking for their project's builder, by answer: ready (warm cache), booting, busy, disabled."}, []string{"state"}),
 		builderCache: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_builder_cache_total",
-			Help: "Builder caches copied to the host when a builder is deleted (save) and loaded into the project's next builder (restore), by result: ok, failed, skipped (no room)."}, []string{"op", "result"}),
+			Help: "Builder caches copied to the host when a builder is deleted (save), loaded into the project's next builder (restore) and deleted to make room for another (evict), by result: ok, failed, skipped (no room), missing (no saved copy), stale (saved by another builder image, dropped)."}, []string{"op", "result"}),
 		reg:         prometheus.NewRegistry(),
 		poolTarget:  prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_pool_target", Help: "Configured number of pre-booted microVMs."}),
 		poolReady:   prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_pool_ready", Help: "Pre-booted microVMs ready to be claimed."}),
@@ -106,6 +108,7 @@ func NewMetrics() *Metrics {
 		runnerConcurrent: prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_runner_concurrent", Help: "gitlab-runner concurrent limit."}),
 	}
 	m.addHostMetrics()
+	m.addBuilderMetrics()
 	// Pre-create every label combination so dashboards show 0 instead of
 	// "No data" before the first job.
 	for _, r := range []string{"hit", "miss"} {
@@ -148,7 +151,7 @@ func NewMetrics() *Metrics {
 	info.Set(1)
 	m.reg.MustRegister(m.poolTarget, m.poolReady, m.poolBooting, m.claims, m.bootSeconds, m.preloadSeconds, m.bootFailures,
 		m.prepareSeconds, m.jobs, m.jobSeconds, m.microvms, m.orphansDeleted, m.admissionWaits,
-		m.flintlockUp, m.serviceUp, m.thinPool, m.memAvailable, m.runnerConcurrent, m.builders, m.builderRequests, m.builderCache, info,
+		m.flintlockUp, m.serviceUp, m.thinPool, m.memAvailable, m.runnerConcurrent, m.builderRequests, m.builderCache, info,
 		m.admissionWait, m.memCommitted, m.memCapacity, m.dhcpLeases, m.dhcpCapacity, m.hostOOMKills, m.loopTick,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
@@ -166,6 +169,28 @@ func (m *Metrics) addHostMetrics() {
 	m.flintlockErrors = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_flintlock_errors_total",
 		Help: "Failed flintlock calls of the daemon by RPC (CreateMicroVM, DeleteMicroVM, ListMicroVMs) and gRPC code; every failed try of a retried listing counts."}, []string{"op", "code"})
 	m.reg.MustRegister(m.jobsRunning, m.diskFree, m.diskSize, m.flintlockErrors)
+}
+
+// addBuilderMetrics registers the builder slots in use and their removals,
+// and pre-creates the builder cache results added with them. It runs after
+// builderCache is created.
+func (m *Metrics) addBuilderMetrics() {
+	m.builders = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "firerunner_builders",
+		Help: "Per-project BuildKit builder microVMs by state: ready, booting."}, []string{"state"})
+	m.builderSlots = prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_builder_slots",
+		Help: "Builders that may run at once: builder.max, 0 while builders are disabled."})
+	m.builderRemovals = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_builder_removals_total",
+		Help: "Builders removed, by reason: lru (its slot was needed), idle, max_age, config_changed (these four keep their cache), vm_gone, not_answering, operator (builder rm), disabled."}, []string{"reason"})
+	for _, s := range []string{"ready", "booting"} {
+		m.builders.WithLabelValues(s)
+	}
+	for _, r := range builderRemovals {
+		m.builderRemovals.WithLabelValues(r.label)
+	}
+	m.builderCache.WithLabelValues("restore", "missing")
+	m.builderCache.WithLabelValues("restore", "stale")
+	m.builderCache.WithLabelValues("evict", "ok")
+	m.reg.MustRegister(m.builders, m.builderSlots, m.builderRemovals)
 }
 
 // roles are the microVM roles committed memory is reported by.
