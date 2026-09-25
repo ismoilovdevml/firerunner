@@ -16,7 +16,7 @@ All commands need root.
 | `firerunner pool [refresh]` | pre-booted VMs; refresh replaces them |
 | `firerunner builder list` · `rm <project> \| --all [--force]` | builders; a builder in use is kept unless `--force` |
 | `firerunner run [--keep] -- <command>` | run a command in a throwaway VM |
-| `firerunner upgrade [--version V] [--check]` | update the binary |
+| `firerunner upgrade [--version V] [--check] [--allow-unsigned]` | update the binary; the release must be signed and be the version asked for. `--allow-unsigned` only for v0.1.0 and v0.1.1, published before releases were signed |
 | `firerunner proxy` | the corporate proxy forwarder (systemd: `firerunner-proxy`), see [Corporate networks](corporate-network.md) |
 | `firerunner version` | |
 

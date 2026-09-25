@@ -40,6 +40,7 @@ Options go before `bash`, for example `sudo FR_DISK=/dev/sdb bash`:
 | `FR_VM_DISK` | `40GB` | root disk of each microVM, thin-provisioned |
 | `FR_POOL_SIZE` | `2` | pre-booted microVMs |
 | `FR_VERSION` | `edge` | firerunner release to install: `edge` (the latest `main`) or a version tag |
+| `FR_ALLOW_UNSIGNED` | none | `1` installs v0.1.0 or v0.1.1, published before releases were signed. Every other release needs a valid signature |
 | `FR_CACHE_DAYS` | `14` | `cache:` archives not written for this many days are deleted |
 | `FR_METRICS_ALLOW` | none | CIDR that may scrape `:9477`; without it metrics stay local. Kept for later runs |
 | `FR_EGRESS_DENY` | none | comma-separated CIDRs jobs must not reach, e.g. `192.168.0.0/16`. Kept for later runs; `none` clears it |

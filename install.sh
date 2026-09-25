@@ -21,6 +21,8 @@
 #   FLINTLOCK_VERSION       (default: 0.15.2)
 #
 #   FR_VERSION              firerunner release to install (default: edge = latest main)
+#   FR_ALLOW_UNSIGNED=1     install a release without a signature (published before releases were
+#                           signed); a signature that does not verify is never accepted
 #   FR_POOL_SIZE            pre-booted microVMs kept ready (default: 2)
 #   FR_METRICS_ALLOW        source IPv4/CIDR allowed to scrape :9477/metrics (default: none, localhost only;
 #                           remembered for later re-runs)
@@ -65,6 +67,12 @@ FR_CACHE_DAYS="${FR_CACHE_DAYS:-14}"
 GITLAB_RUNNER_VERSION="${GITLAB_RUNNER_VERSION:-19.4.0}"
 FR_VERSION="${FR_VERSION:-edge}"
 FR_BINARY="${FR_BINARY:-}"            # local firerunner binary instead of a release (development)
+FR_ALLOW_UNSIGNED="${FR_ALLOW_UNSIGNED:-}"
+# The key firerunner releases are signed with (internal/upgrade/release-signing.pub):
+# checksums.txt.sig is an Ed25519 signature of checksums.txt.
+RELEASE_KEY='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEApi5crvwgIWd7zeolIaclDHYnEcLcM9xidviuvmeV8PA=
+-----END PUBLIC KEY-----'
 
 FR_DISK="${FR_DISK:-}"
 FR_BRIDGE="${FR_BRIDGE:-br-fc}"
@@ -422,9 +430,9 @@ install_packages() {
     if [[ $PKG == apt ]]; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq curl tar lvm2 thin-provisioning-tools dnsmasq-base dnsmasq-utils nftables iproute2 openssh-client >/dev/null
+        apt-get install -y -qq curl tar openssl lvm2 thin-provisioning-tools dnsmasq-base dnsmasq-utils nftables iproute2 openssh-client >/dev/null
     else
-        dnf install -y -q curl tar lvm2 device-mapper-persistent-data dnsmasq dnsmasq-utils nftables iproute openssh-clients >/dev/null
+        dnf install -y -q curl tar openssl lvm2 device-mapper-persistent-data dnsmasq dnsmasq-utils nftables iproute openssh-clients >/dev/null
     fi
 }
 
@@ -440,6 +448,41 @@ verify() {
     local got
     got=$(sha256sum "$1" | awk '{print $1}')
     [[ "$got" == "$2" ]] || die "checksum mismatch for $(basename "$1"): got $got, want $2"
+}
+
+# verify_release SUMS URL: SUMS (a firerunner release's checksums.txt) carries
+# the release signature, downloaded from URL. Only the releases published
+# before signing may lack one, and only with FR_ALLOW_UNSIGNED=1.
+verify_release() {
+    local sums=$1 url=$2 code out
+    code=$(curl -sSL --retry 3 --retry-delay 2 -o "$sums.sig" -w '%{http_code}' "$url") || die "download failed: $url"
+    case $code in
+        200) ;;
+        404)
+            case $FR_VERSION in
+                v0.1.0|v0.1.1) ;;
+                *) die "firerunner ${FR_VERSION} has no signature (checksums.txt.sig): it is being published (try again in a minute) or was tampered with; not installing it" ;;
+            esac
+            [[ $FR_ALLOW_UNSIGNED == 1 ]] ||
+                die "firerunner ${FR_VERSION} was published before releases were signed; FR_ALLOW_UNSIGNED=1 installs it anyway"
+            warn "firerunner ${FR_VERSION} is not signed; installing it because FR_ALLOW_UNSIGNED=1"
+            return 0 ;;
+        *) die "download failed: $url (HTTP $code)" ;;
+    esac
+    openssl pkeyutl -help 2>&1 | grep -q -- -rawin ||
+        die "checking the release signature needs OpenSSL 3 (openssl pkeyutl -rawin)"
+    printf '%s\n' "$RELEASE_KEY" >"$sums.key"
+    out=$(openssl pkeyutl -verify -pubin -inkey "$sums.key" -rawin -in "$sums" -sigfile "$sums.sig" 2>&1) ||
+        die "checksums.txt of firerunner ${FR_VERSION} does not match its signature, not installing it (${out//$'\n'/ }); while a release is being published this can happen for a minute: try again"
+}
+
+# release_matches VERSION: the downloaded firerunner says it is FR_VERSION, so
+# an older signed release served in its place is not installed.
+release_matches() {
+    case $FR_VERSION in
+        edge) [[ $1 == edge-* ]] ;;
+        *)    [[ $1 == "$FR_VERSION" ]] ;;
+    esac
 }
 
 # Files that changed in this run; a service restarts only if one of its
@@ -1102,7 +1145,14 @@ install_firerunner() {
         local bin="firerunner-linux-${ARCH}"
         fetch "$base/$bin" "$TMP_DIR/$bin"
         fetch "$base/checksums.txt" "$TMP_DIR/fr.sums"
+        verify_release "$TMP_DIR/fr.sums" "$base/checksums.txt.sig"
         verify "$TMP_DIR/$bin" "$(awk -v f="$bin" '$2==f {print $1}' "$TMP_DIR/fr.sums")"
+        # Run next to its destination: /tmp may be mounted noexec.
+        local got
+        install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/.firerunner-new"
+        got=$("$BIN_DIR/.firerunner-new" version 2>/dev/null | awk '{print $2}' || true)
+        rm -f "$BIN_DIR/.firerunner-new"
+        release_matches "$got" || die "firerunner ${FR_VERSION} contains firerunner ${got:-(does not run)}; not installing it"
         put "$BIN_DIR/firerunner" 0755 <"$TMP_DIR/$bin"
     fi
     log "  $($BIN_DIR/firerunner version)"
