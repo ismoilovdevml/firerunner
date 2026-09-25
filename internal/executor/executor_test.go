@@ -108,6 +108,40 @@ func TestJobIdentityFailures(t *testing.T) {
 	}
 }
 
+// The VM's project and pipeline labels come from the payload too: a job sets
+// CI_PROJECT_PATH and CI_PIPELINE_ID as easily as it sets CI_JOB_ID.
+func TestJobLabelsComeFromThePayload(t *testing.T) {
+	t.Setenv("CUSTOM_ENV_CI_PROJECT_PATH", "other-group/other-project")
+	t.Setenv("CUSTOM_ENV_CI_PIPELINE_ID", "999")
+	for _, c := range []struct {
+		name, payload     string
+		project, pipeline string // "" means no label
+	}{
+		{"payload has both", `{"id":7,"job_info":{"project_id":111,"project_full_path":"grp/sub/app","pipeline_id":4242}}`, "grp.sub.app", "4242"},
+		{"payload without them", `{"id":7,"job_info":{"project_id":111}}`, "", ""},
+		{"unreadable payload", `id=7`, "", ""},
+		{"labels of another type", `{"id":7,"job_info":{"project_id":111,"project_full_path":"grp/app","pipeline_id":"x"}}`, "", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			writePayload(t, c.payload)
+			got := jobLabels("job-7")
+			if got[daemon.LabelRole] != "job" || got[daemon.LabelJob] != "job-7" {
+				t.Fatalf("role/job labels %v", got)
+			}
+			for key, want := range map[string]string{"firerunner/project": c.project, "firerunner/pipeline": c.pipeline} {
+				if v, ok := got[key]; v != want || ok != (want != "") {
+					t.Errorf("%s = %q (set %v), want %q", key, v, ok, want)
+				}
+			}
+		})
+	}
+	// A label field of another type drops the labels, never the job.
+	writePayload(t, `{"id":7,"job_info":{"project_id":111,"pipeline_id":"x"}}`)
+	if j, err := currentJob(); err != nil || j.ID != "job-7" {
+		t.Fatalf("currentJob = %+v, %v", j, err)
+	}
+}
+
 func TestLeadingDashImageIsRejected(t *testing.T) {
 	writePayload(t, `{"id":77}`)
 	t.Setenv("CUSTOM_ENV_CI_JOB_IMAGE", "--privileged")

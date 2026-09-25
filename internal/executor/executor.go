@@ -93,6 +93,33 @@ func jobID() (string, error) {
 	return j.ID, err
 }
 
+// jobLabels are the flintlock labels of a job's microVM. Project path and
+// pipeline come from the payload for the same reason as the job id
+// (CUSTOM_ENV_CI_PROJECT_PATH is the job's to set); a payload without them
+// leaves them out. They are parsed apart from currentJob: nothing in FireRunner
+// reads these labels (they describe the VM in flintlock), so they must never
+// fail a job.
+func jobLabels(id string) map[string]string {
+	labels := map[string]string{daemon.LabelRole: "job", daemon.LabelJob: id}
+	var payload struct {
+		JobInfo struct {
+			ProjectFullPath string `json:"project_full_path"`
+			PipelineID      int64  `json:"pipeline_id"`
+		} `json:"job_info"`
+	}
+	data, err := os.ReadFile(os.Getenv("JOB_RESPONSE_FILE"))
+	if err != nil || json.Unmarshal(data, &payload) != nil {
+		return labels
+	}
+	if p := payload.JobInfo.ProjectFullPath; p != "" {
+		labels["firerunner/project"] = strings.ReplaceAll(p, "/", ".")
+	}
+	if payload.JobInfo.PipelineID > 0 {
+		labels["firerunner/pipeline"] = strconv.FormatInt(payload.JobInfo.PipelineID, 10)
+	}
+	return labels
+}
+
 func statePath(id string) string { return filepath.Join(StateDir, id+".json") }
 
 func Prepare(ctx context.Context, cfg config.Config) error {
@@ -245,12 +272,7 @@ func coldBoot(ctx context.Context, cfg config.Config, id string, fromPool func()
 	}
 	fmt.Printf("Creating microVM %s (%s)\n", id, cfg.VM.RootFSImage)
 	bootStart := time.Now()
-	inst, err := vm.Boot(ctx, cfg, fl, id, map[string]string{
-		daemon.LabelRole:      "job",
-		daemon.LabelJob:       id,
-		"firerunner/project":  strings.ReplaceAll(os.Getenv("CUSTOM_ENV_CI_PROJECT_PATH"), "/", "."),
-		"firerunner/pipeline": os.Getenv("CUSTOM_ENV_CI_PIPELINE_ID"),
-	})
+	inst, err := vm.Boot(ctx, cfg, fl, id, jobLabels(id))
 	t.boot = time.Since(bootStart)
 	return inst, "cold", t, err
 }
