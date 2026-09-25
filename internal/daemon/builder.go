@@ -385,11 +385,18 @@ func (d *Daemon) RemoveBuilders(project string, force bool) Removal {
 	for _, p := range out.Skipped {
 		keep[p] = true
 	}
+	now := time.Now()
 	// A save still running would bring a dropped cache back: mark it.
 	for p := range d.saving {
 		if !keep[p] && (project == "all" || p == project) {
-			d.cacheDropped[p] = time.Now()
+			d.cacheDropped[p] = now
 		}
+	}
+	if !d.buildersAdopted && !keep[project] {
+		// builders.json may hold saves the previous run's stop cut off, which
+		// adoption resumes: record the drop ("all" for every project) for
+		// adoptBuilders.
+		d.cacheDropped[project] = now
 	}
 	aside := dropSavedCachesLocked(project, keep)
 	d.mu.Unlock()
@@ -981,10 +988,25 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 		d.log.Info("adopted builder from previous run", "project", b.Project, "vm", b.Instance.ID)
 	}
 	for _, b := range cut {
+		if d.cacheDropped[b.Project].After(b.Unsaved) || d.cacheDropped["all"].After(b.Unsaved) {
+			// `builder rm` came after the removal, before this adoption: a cut
+			// save is no builder a job uses, so "all" drops it too.
+			d.log.Info("builder cache copy cut off by the previous run's stop not resumed: removed by the operator",
+				"project", b.Project, "vm", b.Instance.ID)
+			d.retireLocked(b.Project, 0, b.Instance, b.SpecID, "builder: cache removed by the operator", false, b.Unsaved)
+			continue
+		}
 		// The previous run stopped while it copied this removed builder's
 		// cache: copy it now, then delete the VM.
 		d.log.Info("resuming a builder cache copy cut off by the previous run's stop", "project", b.Project, "vm", b.Instance.ID)
 		d.retireLocked(b.Project, 0, b.Instance, b.SpecID, "builder: cache copied after a restart", true, b.Unsaved)
+	}
+	// Every save that started before now is in d.saving: the other marks
+	// (and "all") have nothing left to stop.
+	for p := range d.cacheDropped {
+		if d.saving[p] == nil {
+			delete(d.cacheDropped, p)
+		}
 	}
 	d.buildersAdopted = true
 	d.saveBuildersLocked()

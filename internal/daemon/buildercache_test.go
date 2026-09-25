@@ -1291,3 +1291,61 @@ func TestSaveCutByShutdownIsResumedByTheNextRun(t *testing.T) {
 		})
 	}
 }
+
+// `builder rm` before the previous run's builders are adopted: a save that
+// run's stop cut off is only in builders.json, not yet among the saves in
+// progress. Adoption must not resume it and write the removed cache back; it
+// deletes the VM instead. A removal of another project leaves it alone.
+func TestBuilderRmBeforeAdoptionDropsCutSave(t *testing.T) {
+	for _, tc := range []struct {
+		name, rm string
+		resumed  bool
+	}{
+		{"rm of the project", "7", false},
+		{"rm all", "all", false},
+		{"rm of another project", "8", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubBuilders(t, func(string) bool { return true })
+			var saves atomic.Int32
+			dir := stubBuilderCache(t, sizeOf(4), func(_ context.Context, _ config.Config, _ *vm.Instance, w io.Writer) error {
+				saves.Add(1)
+				_, err := io.WriteString(w, "warm")
+				return err
+			}, nil)
+			// The previous run's stop cut project 7's save off (see keepCutSave).
+			prev, _ := newTestDaemon(t)
+			prev.mu.Lock()
+			prev.buildersAdopted = true
+			prev.saving["7"] = &cacheSave{done: make(chan struct{}), uid: "uid-7", start: time.Now().Add(-time.Minute),
+				inst: vm.Instance{ID: "bld-7", UID: "uid-7", IP: "10.200.0.7"}, specID: builderSpec(prev.cfg), cut: true}
+			prev.saveBuildersLocked()
+			prev.mu.Unlock()
+			file := filepath.Join(dir, "7.tar")
+			writeFile(t, file, saved("older"), time.Hour)
+
+			d, srv := newTestDaemon(t) // its startup listing failed: nothing adopted yet
+			d.cfg.Daemon.Socket = prev.cfg.Daemon.Socket
+			d.RemoveBuilders(tc.rm, false)
+			d.adoptBuilders(map[string]bool{"uid-7": true})
+			srv.WaitDeleted(t, "uid-7", 2*time.Second)
+			d.bg.Wait()
+			if tc.resumed {
+				if got := readFile(t, file); got != saved("warm") || saves.Load() != 1 {
+					t.Fatalf("saved cache = %q after %d saves, want the resumed copy", got, saves.Load())
+				}
+			} else if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) || saves.Load() != 0 {
+				t.Fatalf("removed cache written back by the resumed save (%d saves): %q", saves.Load(), readFile(t, file))
+			}
+			if recs := builderRecords(t, d); len(recs) != 0 {
+				t.Fatalf("builders.json after adoption = %v", recs)
+			}
+			d.mu.Lock()
+			marks := len(d.cacheDropped)
+			d.mu.Unlock()
+			if marks != 0 {
+				t.Fatalf("%d drop marks left after adoption", marks)
+			}
+		})
+	}
+}
