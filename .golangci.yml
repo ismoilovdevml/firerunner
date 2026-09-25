@@ -1,10 +1,11 @@
 version: "2"
 
 # The "standard" default set (errcheck, govet, ineffassign, staticcheck,
-# unused) plus misspell. Listed explicitly so a golangci-lint upgrade that
-# changes the defaults does not silently change what CI checks.
+# unused) plus misspell. Listed explicitly, with no default set, so a
+# golangci-lint upgrade that changes the defaults does not silently change
+# what CI checks.
 linters:
-  default: standard
+  default: none
   enable:
     - errcheck
     - govet
