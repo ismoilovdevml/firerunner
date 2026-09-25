@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/daemon"
+	"github.com/ismoilovdevml/firerunner/internal/flintlock"
 	"github.com/ismoilovdevml/firerunner/internal/flintlock/flintlocktest"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
@@ -629,5 +632,139 @@ func TestCorporateNetworkContainerFlags(t *testing.T) {
 	}
 	if plain := ServicesScript([]Service{{Name: "redis"}}, ""); strings.Contains(plain, "/etc/environment") {
 		t.Fatal("no proxy, yet /etc/environment is rewritten")
+	}
+}
+
+// coldBootFixture points coldBoot at a fake flintlockd and temporary host
+// paths, with short waits; the returned counter counts microVM boots.
+func coldBootFixture(t *testing.T, bootTimeout time.Duration) (config.Config, *flintlocktest.Server, *atomic.Int32) {
+	t.Helper()
+	srv := flintlocktest.NewServer("u1")
+	cfg := config.Default()
+	cfg.Flintlock = flintlocktest.StartUnix(t, srv)
+	cfg.VM.BootTimeout = bootTimeout
+	oldAdmission, oldPoll, oldBoot := vm.AdmissionFile, admissionPoll, bootVM
+	vm.AdmissionFile, admissionPoll = filepath.Join(t.TempDir(), "admission.json"), 10*time.Millisecond
+	var boots atomic.Int32
+	bootVM = func(ctx context.Context, cfg config.Config, _ *flintlock.Client, id string, _ map[string]string) (*vm.Instance, error) {
+		boots.Add(1)
+		dl, ok := ctx.Deadline()
+		if !ok || time.Until(dl) > cfg.VM.BootTimeout+flintlockCallTimeout {
+			return nil, fmt.Errorf("boot of %s without a deadline (flintlock create unbounded)", id)
+		}
+		return &vm.Instance{ID: id, UID: "u1"}, nil
+	}
+	t.Cleanup(func() { vm.AdmissionFile, admissionPoll, bootVM = oldAdmission, oldPoll, oldBoot })
+	return cfg, srv, &boots
+}
+
+func noPoolVM() *vm.Instance { return nil }
+
+// flintlockd restarting (a few failed calls) costs the job a short wait for
+// host memory, not the job.
+func TestColdBootWaitsOutFlintlockErrors(t *testing.T) {
+	cfg, srv, boots := coldBootFixture(t, 5*time.Second)
+	down := status.Error(codes.Unavailable, "connection refused")
+	srv.FailList(down, down)
+	inst, source, _, err := coldBoot(context.Background(), cfg, "job-7", noPoolVM)
+	if err != nil || inst == nil || source != "cold" {
+		t.Fatalf("coldBoot = %v, %s, %v; want the VM booted after flintlock came back", inst, source, err)
+	}
+	if boots.Load() != 1 || srv.ListCalls() != 3 {
+		t.Fatalf("boots %d after %d listings; want 1 after 3", boots.Load(), srv.ListCalls())
+	}
+}
+
+// flintlockd down for the whole admission wait fails the job as a flintlock
+// error, without booting.
+func TestColdBootFlintlockDownUntilDeadline(t *testing.T) {
+	cfg, srv, boots := coldBootFixture(t, 200*time.Millisecond)
+	for i := 0; i < 1000; i++ {
+		srv.FailList(status.Error(codes.Unavailable, "connection refused"))
+	}
+	start := time.Now()
+	_, _, _, err := coldBoot(context.Background(), cfg, "job-7", noPoolVM)
+	if err == nil || prepareReason(err) != "flintlock_error" {
+		t.Fatalf("coldBoot = %v (reason %s); want a flintlock_error", err, prepareReason(err))
+	}
+	if took := time.Since(start); took > 3*time.Second || srv.ListCalls() < 2 {
+		t.Fatalf("gave up after %s and %d listings; want retries until vm.boot_timeout", took, srv.ListCalls())
+	}
+	if boots.Load() != 0 {
+		t.Fatal("booted without an admission")
+	}
+}
+
+// A hung flintlockd (it accepts and never answers) does not hold the job: every
+// call has its own deadline, and the job fails as a flintlock error.
+func TestColdBootBoundsEachFlintlockCall(t *testing.T) {
+	cfg, _, boots := coldBootFixture(t, 300*time.Millisecond)
+	dir, err := os.MkdirTemp("", "hung") // short: holds a unix socket
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	l, err := net.Listen("unix", filepath.Join(dir, "fl.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = c.Close() }) // never answers
+		}
+	}()
+	cfg.Flintlock.Endpoint = "unix://" + filepath.Join(dir, "fl.sock")
+	old := flintlockCallTimeout
+	flintlockCallTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { flintlockCallTimeout = old })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // the job's own limit
+	defer cancel()
+	start := time.Now()
+	_, _, _, err = coldBoot(ctx, cfg, "job-7", noPoolVM)
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("coldBoot took %s on a hung flintlockd; want about vm.boot_timeout", took)
+	}
+	if err == nil || prepareReason(err) != "flintlock_error" {
+		t.Fatalf("coldBoot = %v (reason %s); want a flintlock_error", err, prepareReason(err))
+	}
+	if boots.Load() != 0 {
+		t.Fatal("booted without an admission")
+	}
+}
+
+// A boot cut off by the cold boot's own bound is a VM that did not come up
+// (vm_boot); a boot cut off because the job was cancelled stays "canceled".
+func TestColdBootBoundedBootReason(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		cancelJob  bool
+		wantReason string
+	}{
+		{"our bound", false, "vm_boot"},
+		{"job cancelled", true, "canceled"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, _, _ := coldBootFixture(t, time.Second)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			bootVM = func(bctx context.Context, _ config.Config, _ *flintlock.Client, _ string, _ map[string]string) (*vm.Instance, error) {
+				if c.cancelJob {
+					cancel()
+					<-bctx.Done()
+					return nil, bctx.Err()
+				}
+				return nil, fmt.Errorf("waiting for SSH: %w", context.DeadlineExceeded)
+			}
+			_, _, _, err := coldBoot(ctx, cfg, "job-7", noPoolVM)
+			if got := prepareReason(err); got != c.wantReason {
+				t.Fatalf("coldBoot = %v, reason %s; want %s", err, got, c.wantReason)
+			}
+		})
 	}
 }

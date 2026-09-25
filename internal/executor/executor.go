@@ -21,6 +21,9 @@ import (
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/daemon"
 	"github.com/ismoilovdevml/firerunner/internal/flintlock"
@@ -237,6 +240,17 @@ type bootTimes struct {
 	boot time.Duration // microVM create to SSH ready
 }
 
+// A cold boot's bounds and its boot (variables for tests).
+var (
+	// flintlockCallTimeout bounds each flintlock call of a cold boot, like the
+	// calls of cleanup: a hung flintlockd must not hold the job for the
+	// custom executor's prepare timeout (an hour).
+	flintlockCallTimeout = 30 * time.Second
+	// admissionPoll is how often a cold boot asks again for host memory.
+	admissionPoll = 5 * time.Second
+	bootVM        = vm.Boot
+)
+
 // coldBoot boots a VM for the job once the host has memory for it. While it
 // waits, pool VMs that finish booting are taken instead (source "pool").
 func coldBoot(ctx context.Context, cfg config.Config, id string, fromPool func() *vm.Instance) (*vm.Instance, string, bootTimes, error) {
@@ -251,35 +265,66 @@ func coldBoot(ctx context.Context, cfg config.Config, id string, fromPool func()
 	for {
 		// Admitted host-wide: the memory stays reserved for this VM, against
 		// every other prepare, pool VM and builder, until the boot returned.
-		n, why, err := vm.Admit(ctx, cfg, fl, id)
+		actx, cancel := context.WithTimeout(ctx, flintlockCallTimeout)
+		n, why, err := vm.Admit(actx, cfg, fl, id)
+		cancel()
 		t.wait = time.Since(waitStart)
-		if err != nil {
-			return nil, "cold", t, err
-		}
 		if n == 1 {
 			break
+		}
+		if ctx.Err() != nil {
+			return nil, "cold", t, ctx.Err()
 		}
 		if inst := fromPool(); inst != nil {
 			return inst, "pool", t, nil
 		}
 		if time.Now().After(deadline) {
+			if err != nil {
+				return nil, "cold", t, fmt.Errorf("checking host memory failed for %s: %w", cfg.VM.BootTimeout, flintlockErr(err))
+			}
 			return nil, "cold", t, fmt.Errorf("%w for another microVM within %s (%s); lower runner concurrent or pool.size", errNoMemory, cfg.VM.BootTimeout, why)
 		}
-		fmt.Printf("waiting for host memory (%s)...\n", why)
+		if err != nil {
+			// flintlockd restarting, or another admission holding the lock:
+			// like no room yet, until the deadline.
+			fmt.Printf("cannot check host memory yet (%v), retrying...\n", err)
+		} else {
+			fmt.Printf("waiting for host memory (%s)...\n", why)
+		}
 		select {
 		case <-ctx.Done():
 			return nil, "cold", t, ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-time.After(admissionPoll):
 		}
 	}
 	fmt.Printf("Creating microVM %s (%s)\n", id, cfg.VM.RootFSImage)
 	bootStart := time.Now()
-	inst, err := vm.Boot(ctx, cfg, fl, id, jobLabels(id))
+	// vm.Boot waits vm.boot_timeout for the VM once its create returned; the
+	// create gets one flintlock call on top. A hung create ends here, not
+	// after the custom executor's prepare timeout.
+	bctx, cancel := context.WithTimeout(ctx, flintlockCallTimeout+cfg.VM.BootTimeout)
+	defer cancel()
+	inst, err := bootVM(bctx, cfg, fl, id, jobLabels(id))
 	t.boot = time.Since(bootStart)
 	// Listed by flintlock now, or never created: the reservation has done its
 	// job (if this fails it expires, or goes with this process).
 	_ = vm.Unreserve(id)
+	if err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		// Our bound, not a cancelled job: the create was slow, then the VM
+		// did not come up in the time left.
+		err = fmt.Errorf("%w: microVM %s not ready within %s of its create request: %v", vm.ErrNotReady, id, flintlockCallTimeout+cfg.VM.BootTimeout, err)
+	}
 	return inst, "cold", t, err
+}
+
+// flintlockErr is an admission error as prepareReason must see it when the
+// job itself was not cancelled: a flintlock call cut off by its own timeout is
+// flintlock failing (a gRPC deadline), not a cancelled job.
+func flintlockErr(err error) error {
+	if _, isStatus := status.FromError(err); !isStatus && errors.Is(err, context.DeadlineExceeded) {
+		return status.Error(codes.DeadlineExceeded, err.Error())
+	}
+	return err
 }
 
 // BuilderName is the buildx builder created in job VMs for the project's builder.
