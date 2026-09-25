@@ -53,8 +53,9 @@ are deleted. `firerunner builder rm` deletes a project's saved cache too.
 
 A saved cache names the builder image it came from and is only loaded into a builder of the same
 image. A builder deleted because `builder.image` changed is not copied out, and a cache of another
-image is dropped when the next builder starts. After an upgrade from a version that did not record
-the image, each project's first build starts with an empty cache.
+image is dropped when the next builder starts. Caches saved by versions that did not record the
+image were all written by `moby/buildkit:v0.33.0`: they are still loaded while `builder.image` is that
+image, and dropped otherwise.
 
 A new builder size applies to builders started later; existing caches are kept.
 

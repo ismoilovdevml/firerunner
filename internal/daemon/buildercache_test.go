@@ -1079,15 +1079,38 @@ func TestSavedCacheIsTiedToTheBuilderImage(t *testing.T) {
 		t.Fatalf("cache of the old image kept (%v) or loaded (%q)", err, loaded)
 	}
 
-	writeFile(t, file, "tar data saved before images were recorded", time.Hour)
-	if ok, err := d.restoreBuilderCache(context.Background(), same, "7", inst); ok || err != nil {
-		t.Fatalf("cache without an image: restored %v, %v; want an empty start", ok, err)
+	// Saved before caches named their image: every one was written by
+	// legacyBuilderImage, so it is restored while builder.image is still that.
+	const legacyTar = "tar data saved before images were recorded"
+	legacyCfg := d.cfg
+	legacyCfg.Builder.Image = legacyBuilderImage
+	writeFile(t, file, legacyTar, time.Hour)
+	if ok, err := d.restoreBuilderCache(context.Background(), legacyCfg, "7", inst); !ok || err != nil || loaded[len(loaded)-1] != legacyTar {
+		t.Fatalf("cache without an image, legacy builder image: restored %v, %v, loaded %q; want the whole file", ok, err, loaded)
 	}
-	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) || len(loaded) != 1 {
-		t.Fatalf("cache without an image kept (%v) or loaded (%q)", err, loaded)
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("restored legacy cache removed: %v", err)
 	}
-	if n := cacheCount(d, "restore", "stale"); n != 2 {
-		t.Fatalf("restore stale = %v, want 2", n)
+	if n := cacheCount(d, "restore", "legacy"); n != 1 {
+		t.Fatalf("restore legacy = %v, want 1", n)
+	}
+	// With another builder image it is dropped like any cache of another image.
+	if ok, err := d.restoreBuilderCache(context.Background(), bumped, "7", inst); ok || err != nil {
+		t.Fatalf("cache without an image, new builder image: restored %v, %v; want an empty start", ok, err)
+	}
+	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) || len(loaded) != 2 {
+		t.Fatalf("cache without an image kept (%v) or loaded again (%q)", err, loaded)
+	}
+	// A header that is there but broken is never taken for a legacy cache.
+	writeFile(t, file, builderCacheMagic+"not quoted\nwarm", time.Hour)
+	if ok, err := d.restoreBuilderCache(context.Background(), legacyCfg, "7", inst); ok || err != nil {
+		t.Fatalf("broken header: restored %v, %v; want an empty start", ok, err)
+	}
+	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) || len(loaded) != 2 {
+		t.Fatalf("cache with a broken header kept (%v) or loaded (%q)", err, loaded)
+	}
+	if n := cacheCount(d, "restore", "stale"); n != 3 {
+		t.Fatalf("restore stale = %v, want 3", n)
 	}
 }
 

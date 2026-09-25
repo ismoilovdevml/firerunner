@@ -186,6 +186,11 @@ func (w *cacheWriter) Write(p []byte) (int, error) {
 // new builder.image may fix a BuildKit flaw the old state carries.
 const builderCacheMagic = "firerunner-builder-cache/1 "
 
+// legacyBuilderImage wrote every cache saved before caches named their image:
+// it was the only builder.image until then. A cache without a header is
+// restored as its cache while builder.image is still this one.
+const legacyBuilderImage = "moby/buildkit:v0.33.0"
+
 func cacheHeader(image string) string { return builderCacheMagic + strconv.Quote(image) + "\n" }
 
 // readCacheHeader reads the header of a saved cache and returns its image;
@@ -420,7 +425,9 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 		size = info.Size()
 	}
 	r := bufio.NewReader(f)
-	if image, ok := readCacheHeader(r); !ok || image != cfg.Builder.Image {
+	magic, _ := r.Peek(len(builderCacheMagic))
+	legacy := string(magic) != builderCacheMagic && cfg.Builder.Image == legacyBuilderImage
+	if image, ok := readCacheHeader(r); !legacy && (!ok || image != cfg.Builder.Image) {
 		_ = os.Remove(file)
 		d.metrics.builderCache.WithLabelValues("restore", "stale").Inc()
 		d.log.Info("saved builder cache dropped: written by another builder image, starting empty",
@@ -449,7 +456,11 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 	// The modification time orders caches for makeRoomForCache: this one is in use.
 	now := time.Now()
 	_ = os.Chtimes(file, now, now)
-	d.metrics.builderCache.WithLabelValues("restore", "ok").Inc()
+	result := "ok"
+	if legacy {
+		result = "legacy" // its next save writes the header
+	}
+	d.metrics.builderCache.WithLabelValues("restore", result).Inc()
 	d.log.Info("builder cache restored", "project", project, "bytes", size,
 		"took", time.Since(start).Round(100*time.Millisecond).String())
 	return true, nil

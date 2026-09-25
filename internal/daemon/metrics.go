@@ -58,7 +58,7 @@ func NewMetrics() *Metrics {
 		builderRequests: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_builder_requests_total",
 			Help: "Jobs asking for their project's builder, by answer: ready (warm cache), booting, busy, disabled."}, []string{"state"}),
 		builderCache: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_builder_cache_total",
-			Help: "Builder caches copied to the host when a builder is deleted (save), loaded into the project's next builder (restore) and deleted to make room for another (evict), by result: ok, failed, skipped (no room), missing (no saved copy), stale (saved by another builder image, dropped)."}, []string{"op", "result"}),
+			Help: "Builder caches copied to the host when a builder is deleted (save), loaded into the project's next builder (restore) and deleted to make room for another (evict), by result: ok, failed, skipped (no room), missing (no saved copy), stale (saved by another builder image, dropped), legacy (saved before caches named their image, restored for the image of that time)."}, []string{"op", "result"}),
 		reg:         prometheus.NewRegistry(),
 		poolTarget:  prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_pool_target", Help: "Configured number of pre-booted microVMs."}),
 		poolReady:   prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_pool_ready", Help: "Pre-booted microVMs ready to be claimed."}),
@@ -190,6 +190,7 @@ func (m *Metrics) addBuilderMetrics() {
 	}
 	m.builderCache.WithLabelValues("restore", "missing")
 	m.builderCache.WithLabelValues("restore", "stale")
+	m.builderCache.WithLabelValues("restore", "legacy")
 	m.builderCache.WithLabelValues("evict", "ok")
 	m.reg.MustRegister(m.builders, m.builderSlots, m.builderRemovals)
 }
