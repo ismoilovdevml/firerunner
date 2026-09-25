@@ -284,16 +284,16 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 	if err == nil {
 		// Under mu, as RemoveBuilders marks and deletes: an operator's
 		// `builder rm` since this save started wins over the save. The
-		// previous copy is set aside rather than renamed over, so its blocks
-		// are freed after the lock is released.
+		// previous copy gets a second name before the new one is renamed over
+		// it: <project>.tar never goes missing (a builder booting meanwhile
+		// restores without the lock, and would start cold), and the old
+		// blocks are freed when that name is unlinked, after the lock is
+		// released.
 		file, aside := builderCacheFile(project), ""
 		d.mu.Lock()
 		if dropped = d.cacheDropped[project].After(started); !dropped {
-			aside = setAside(file)
-			if err = os.Rename(tmp.Name(), file); err != nil && aside != "" {
-				_ = os.Rename(aside, file) // keep the previous copy
-				aside = ""
-			}
+			aside = linkAside(file)
+			err = renameCache(tmp.Name(), file) // failed: the previous copy stays in place
 		}
 		d.mu.Unlock()
 		if aside != "" {
@@ -498,5 +498,20 @@ func setAside(path string) string {
 	return aside
 }
 
+// linkAside gives a saved cache a second, temporary name, so the file stays
+// in place and renaming a new copy over it does not free its blocks (see
+// setAside), and returns that name ("" if there was nothing to link, or the
+// link failed: then the rename over it frees them).
+func linkAside(path string) string {
+	aside := fmt.Sprintf("%s.tmp-old-%d", path, time.Now().UnixNano())
+	if os.Link(path, aside) != nil {
+		return ""
+	}
+	return aside
+}
+
 // unlinkCache deletes a file set aside (a variable for tests).
 var unlinkCache = os.Remove
+
+// renameCache puts a finished save in place (a variable for tests).
+var renameCache = os.Rename

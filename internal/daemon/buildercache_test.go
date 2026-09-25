@@ -819,6 +819,51 @@ func TestCacheUnlinkNeverBlocksClaims(t *testing.T) {
 	})
 }
 
+// A save replaces the project's copy without a moment in which there is
+// none: a builder booting then (its restore does not take the daemon lock)
+// would find no copy and start cold, and its own save later would replace the
+// good copy with that cold cache.
+func TestCacheReplaceNeverLeavesTheProjectWithoutACopy(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	var loaded []string
+	dir := stubBuilderCache(t, sizeOf(3), func(_ context.Context, _ config.Config, _ *vm.Instance, w io.Writer) error {
+		_, err := io.WriteString(w, "new")
+		return err
+	}, func(_ context.Context, _ config.Config, _ *vm.Instance, r io.Reader) error {
+		b, err := io.ReadAll(r)
+		loaded = append(loaded, string(b))
+		return err
+	})
+	file := filepath.Join(dir, "7.tar")
+	writeFile(t, file, saved("old"), time.Hour)
+	d, _ := newTestDaemon(t)
+	var restored bool
+	var restoreErr error
+	old := renameCache
+	renameCache = func(from, to string) error {
+		if to == file { // a builder of project 7 boots right now
+			restored, restoreErr = d.restoreBuilderCache(context.Background(), d.cfg, "7", &vm.Instance{ID: "bld-7-00000002"})
+		}
+		return old(from, to)
+	}
+	t.Cleanup(func() { renameCache = old })
+	d.builders = map[string]*builder{"7": readyBuilder("7", 20001, d.cfg.Builder.IdleTTL+time.Hour, builderSpec(d.cfg))}
+	d.expireBuilders()
+	d.bg.Wait()
+	if !restored || restoreErr != nil || strings.Join(loaded, ",") != "old" {
+		t.Fatalf("boot during the replace: restored %v, %v, loaded %q; want the previous copy", restored, restoreErr, loaded)
+	}
+	if n := cacheCount(d, "restore", "missing"); n != 0 {
+		t.Fatalf("restore missing = %v", n)
+	}
+	if got := readFile(t, file); got != saved("new") {
+		t.Fatalf("saved cache = %q, want the new copy", got)
+	}
+	if names := listDir(dir); len(names) != 1 {
+		t.Fatalf("left behind: %v", names)
+	}
+}
+
 // reservedBytes is what saves in progress may still write (cacheReserved).
 func reservedBytes(d *Daemon) int64 {
 	d.cacheMu.Lock()
