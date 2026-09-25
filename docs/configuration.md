@@ -31,7 +31,8 @@ Set `pool.size` to the number of jobs that usually start at once.
 | `builder.idle_ttl` | `24h` | an unused builder is deleted; its cache is saved |
 | `builder.saved_cache_gb` | `100` | host disk for the caches of deleted builders; `0` saves none |
 
-When a builder is deleted because it was idle or its slot was needed, its cache is copied to
+When a builder is deleted because it was idle, its slot was needed, it was a week old, or its
+images or settings changed (not its size), its cache is copied to
 `/var/lib/firerunner/builder-cache/<project>.tar` and loaded into the project's next builder. So
 every project keeps a warm cache while only `builder.max` builders use memory. When the saved
 caches pass `builder.saved_cache_gb`, or the disk has less than 10% free, the least recently used
@@ -44,8 +45,10 @@ A new builder size applies to builders started later; existing caches are kept.
 A VM starts only when its memory fits. Jobs that do not fit wait, so the host never runs out of memory.
 
 ```text
-(jobs × vm.memory_mb) + (pool.size × vm.memory_mb) + (builder.max × builder.memory_mb) ≤ RAM − 1 GB
+((jobs × vm.memory_mb) + (pool.size × vm.memory_mb) + (builder.max × builder.memory_mb)) × 1.05 ≤ RAM − 1 GB
 ```
+
+`1.05` adds Firecracker's own memory, 5% per VM; 1 GB is `vm.host_reserve_mb`.
 
 For example, 64 GB fits 10 jobs and 4 pool VMs at 1.5 GB plus 4 builders at 8 GB.
 Set the parallel jobs with `sudo firerunner runner concurrent 10`.
