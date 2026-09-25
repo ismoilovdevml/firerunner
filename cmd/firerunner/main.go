@@ -339,7 +339,7 @@ func cmdStatus(cfg config.Config) error {
 		fmt.Fprintf(w, "Runner\t%s -> %s (executor %s, concurrent %d)\n", r.Name, r.URL, r.Executor, r.Concurrent)
 		fmt.Fprintf(w, "Cache\t%s\n", cacheDesc(r))
 	} else {
-		fmt.Fprintf(w, "Runner\tnot registered (firerunner runner register --url ... --token glrt-...)\n")
+		fmt.Fprintf(w, "Runner\tnot registered (firerunner runner register --url ... --token -)\n")
 	}
 	return nil
 }
