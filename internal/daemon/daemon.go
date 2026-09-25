@@ -208,6 +208,9 @@ type Daemon struct {
 	bootingIDs map[string]bool
 	// booted pool VMs still preloading images, by uid; counted in booting
 	preloading map[string]*preloadingVM
+	// refillNow wakes the main loop when a job took a pool VM, so its
+	// replacement starts booting at once instead of at the next refill tick.
+	refillNow chan struct{}
 	claimed    map[string]time.Time // uid -> claim time; protects it until the job writes its state
 	firstSee   map[string]time.Time // uid -> first time reconcile saw it
 	builders   map[string]*builder  // project id -> BuildKit builder
@@ -318,7 +321,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 	}
 	d := &Daemon{cfgPath: cfgPath, log: log, cfg: cfg, fl: fl, metrics: NewMetrics(),
 		claimed: map[string]time.Time{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{},
-		bootingIDs: map[string]bool{},
+		bootingIDs: map[string]bool{}, refillNow: make(chan struct{}, 1),
 		builders:   map[string]*builder{}, builderFailed: map[string]time.Time{},
 		saving: map[string]*cacheSave{}, cacheDropped: map[string]time.Time{}, runCtx: context.Background(),
 		oomKills: -1}
@@ -393,6 +396,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			if !errors.Is(err, http.ErrServerClosed) {
 				return err
 			}
+		case <-d.refillNow:
+			d.refill(ctx)
 		case <-refill.C:
 			d.reloadConfig(ctx)
 			d.expireIdle(ctx)
@@ -469,6 +474,7 @@ func (d *Daemon) claim() *pooled {
 			d.metrics.poolReady.Set(float64(len(d.ready)))
 			d.savePoolLocked()
 			d.metrics.claims.WithLabelValues("hit").Inc()
+			d.wakeRefill()
 			return p
 		}
 		// Booted with an old config: never hand it out.
@@ -485,10 +491,20 @@ func (d *Daemon) claim() *pooled {
 		d.claimed[uid] = time.Now()
 		d.metrics.claims.WithLabelValues("hit").Inc()
 		d.log.Info("pool VM claimed before its preload finished", "vm", p.inst.ID)
+		d.wakeRefill()
 		return &pooled{inst: p.inst, bornAt: time.Now(), specID: p.specID}
 	}
 	d.metrics.claims.WithLabelValues("miss").Inc()
 	return nil
+}
+
+// wakeRefill asks the main loop to refill the pool now; one pending request
+// is enough, refill counts what is missing itself.
+func (d *Daemon) wakeRefill() {
+	select {
+	case d.refillNow <- struct{}{}:
+	default:
+	}
 }
 
 // unclaim puts a claimed VM the job never received back at the head of the

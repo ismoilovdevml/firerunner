@@ -741,3 +741,47 @@ func TestReloadConfigOnAnyChange(t *testing.T) {
 		t.Fatalf("unchanged config reloaded again:\n%s", logs)
 	}
 }
+
+// A claim starts the replacement pool VM at once, not at the next refill
+// tick (2 s): in a burst every claim waited up to a tick for its refill.
+func TestClaimRefillsWithoutWaitingForTheTick(t *testing.T) {
+	d, srv := newTestDaemon(t)
+	fp := fingerprint(d.cfg)
+	booted := make(chan time.Time, 4)
+	old := poolBoot
+	poolBoot = func(context.Context, config.Config, *flintlock.Client, string, map[string]string) (*vm.Instance, error) {
+		booted <- time.Now()
+		return nil, errors.New("no microVMs in tests")
+	}
+	t.Cleanup(func() { poolBoot = old })
+	d.mu.Lock()
+	d.ready = []*pooled{pooledVM("a", fp, 0), pooledVM("b", fp, 0)} // pool.size 2: full
+	d.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for srv.ListCalls() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("daemon never listed flintlock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	claimed := time.Now()
+	if d.Claim() == nil {
+		t.Fatal("no pool VM claimed")
+	}
+	select {
+	case at := <-booted:
+		if wait := at.Sub(claimed); wait > time.Second {
+			t.Fatalf("replacement booted %s after the claim; want at once", wait)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no replacement boot within 1 s of the claim (the refill tick is 2 s)")
+	}
+}
