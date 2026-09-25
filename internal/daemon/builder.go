@@ -40,7 +40,9 @@ const (
 // reach builders through the bridge address, so the name is not a host name.
 const BuilderServerName = "builder"
 
-// builderMaxAge replaces a builder even when busy, so it picks up new images.
+// builderMaxAge replaces a builder so it picks up new images: once it is older,
+// expireBuilders removes it when no running job uses it and it has been idle
+// for 10 minutes (a busy builder is never replaced).
 const builderMaxAge = 7 * 24 * time.Hour
 
 // builderRetryAfter keeps a project from booting its builder again right after
