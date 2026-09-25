@@ -170,11 +170,14 @@ func (w *cacheWriter) Write(p []byte) (int, error) {
 		w.over = true
 		return 0, errCacheOverrun
 	}
+	// Written bytes move from the reservation to the temp file in one step
+	// under cacheMu: makeRoomForCache counts both, and between the two it
+	// counted them twice and turned other saves away.
+	w.d.cacheMu.Lock()
+	defer w.d.cacheMu.Unlock()
 	n, err := w.f.Write(p)
 	w.left -= int64(n)
-	w.d.cacheMu.Lock()
 	w.d.cacheReserved -= int64(n)
-	w.d.cacheMu.Unlock()
 	return n, err
 }
 
