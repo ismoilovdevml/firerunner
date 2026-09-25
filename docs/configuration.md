@@ -45,11 +45,16 @@ boot and counts its own size.
 | `builder.saved_cache_gb` | `100` | host disk for the caches of deleted builders; `0` saves none |
 
 When a builder is deleted because it was idle, its slot was needed, it was a week old, or its
-images or settings changed (not its size), its cache is copied to
+settings changed (not its size), its cache is copied to
 `/var/lib/firerunner/builder-cache/<project>.tar` and loaded into the project's next builder. So
 every project keeps a warm cache while only `builder.max` builders use memory. When the saved
 caches pass `builder.saved_cache_gb`, or the disk has less than 10% free, the least recently used
 are deleted. `firerunner builder rm` deletes a project's saved cache too.
+
+A saved cache names the builder image it came from and is only loaded into a builder of the same
+image. A builder deleted because `builder.image` changed is not copied out, and a cache of another
+image is dropped when the next builder starts. After an upgrade from a version that did not record
+the image, each project's first build starts with an empty cache.
 
 A new builder size applies to builders started later; existing caches are kept.
 
