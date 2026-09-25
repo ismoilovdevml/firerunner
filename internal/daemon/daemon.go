@@ -732,7 +732,7 @@ func (d *Daemon) delete(ctx context.Context, inst *vm.Instance, reason string) b
 		d.log.Error("delete failed", "vm", inst.ID, "reason", reason, "err", err)
 		return false
 	}
-	vm.Forget(d.cfgSnapshot(), inst.ID)
+	vm.ForgetInstance(d.cfgSnapshot(), inst)
 	d.log.Info("deleted microVM", "vm", inst.ID, "reason", reason)
 	return true
 }

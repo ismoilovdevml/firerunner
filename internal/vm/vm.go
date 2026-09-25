@@ -110,16 +110,27 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 		return nil, err
 	}
 	mac := MAC(id)
+	// A lease dnsmasq already holds for this MAC belongs to another VM: an id
+	// used again while its old VM still runs, or a guest that took the MAC.
+	// The new VM's address is a lease that was not there before the create.
+	held, err := leasedIPs(cfg.Network.LeasesFile, mac)
+	if err != nil {
+		return nil, fmt.Errorf("reading DHCP leases: %w", err)
+	}
 	uid, err := fl.Create(ctx, Spec(cfg, id, mac, strings.TrimSpace(string(pub)), hostKey, labels, ca))
 	if err != nil {
 		return nil, fmt.Errorf("creating microVM %s: %w", id, err)
 	}
 	inst := &Instance{ID: id, UID: uid, HostKey: hostKey.Public}
+	isNew := func(l lease) bool { return !held[l.ip] }
 
 	fail := func(err error) (*Instance, error) {
 		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = Destroy(dctx, cfg, fl, id, uid)
+		if fl.Delete(dctx, uid) == nil {
+			// Its own lease only: the other VM's lease for the MAC stays.
+			forget(cfg, id, func(l lease) bool { return l.ip == inst.IP || (inst.IP == "" && isNew(l)) })
+		}
 		return nil, err
 	}
 
@@ -128,13 +139,16 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 		if time.Now().After(deadline) {
 			return fail(notReady{fmt.Sprintf("microVM %s got no DHCP lease within %s (see: firerunner vm logs %s)", id, cfg.VM.BootTimeout, id)})
 		}
-		if inst.IP, err = LeaseIP(cfg.Network.LeasesFile, mac); err != nil {
+		l, err := findLease(cfg.Network.LeasesFile, mac, isNew)
+		if err != nil {
 			return fail(err)
 		}
-		if inst.IP == "" {
-			if err := sleep(ctx, bootPoll); err != nil {
-				return fail(err)
-			}
+		if l != nil {
+			inst.IP = l.ip
+			break
+		}
+		if err := sleep(ctx, bootPoll); err != nil {
+			return fail(err)
 		}
 	}
 	// SSH refuses to connect when the key cannot be pinned: say so now rather
@@ -265,11 +279,18 @@ func MAC(id string) string {
 
 // LeaseIP returns the address dnsmasq leased to mac, or "" if there is none yet.
 func LeaseIP(leasesFile, mac string) (string, error) {
-	l, err := findLease(leasesFile, mac)
+	l, err := findLease(leasesFile, mac, nil)
 	if l == nil {
 		return "", err
 	}
 	return l.ip, err
+}
+
+// leasedIPs returns the addresses leased to mac.
+func leasedIPs(leasesFile, mac string) (map[string]bool, error) {
+	ips := map[string]bool{}
+	_, err := findLease(leasesFile, mac, func(l lease) bool { ips[l.ip] = true; return false })
+	return ips, err
 }
 
 type lease struct{ mac, ip, clientID string }
@@ -308,7 +329,9 @@ func Leases(leasesFile string) ([]Lease, error) {
 	return out, sc.Err()
 }
 
-func findLease(leasesFile, mac string) (*lease, error) {
+// findLease returns the last lease for mac in the leases file that match
+// accepts (nil: any), or nil.
+func findLease(leasesFile, mac string, match func(lease) bool) (*lease, error) {
 	f, err := os.Open(leasesFile)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -322,11 +345,15 @@ func findLease(leasesFile, mac string) (*lease, error) {
 	for sc.Scan() {
 		// <expiry> <mac> <ip> <hostname> <client-id>
 		fields := strings.Fields(sc.Text())
-		if len(fields) >= 3 && strings.EqualFold(fields[1], mac) {
-			found = &lease{mac: fields[1], ip: fields[2]}
-			if len(fields) >= 5 && fields[4] != "*" {
-				found.clientID = fields[4]
-			}
+		if len(fields) < 3 || !strings.EqualFold(fields[1], mac) {
+			continue
+		}
+		l := lease{mac: fields[1], ip: fields[2]}
+		if len(fields) >= 5 && fields[4] != "*" {
+			l.clientID = fields[4]
+		}
+		if match == nil || match(l) {
+			found = &l
 		}
 	}
 	return found, sc.Err()
@@ -345,11 +372,23 @@ func Destroy(ctx context.Context, cfg config.Config, fl *flintlock.Client, id, u
 
 // Forget drops what the host keeps about a deleted microVM: its pinned host
 // key and its DHCP lease. Releasing the lease frees the address at once;
-// without it every VM holds an address until the lease expires.
-func Forget(cfg config.Config, id string) {
+// without it every VM holds an address until the lease expires. Without the
+// VM's address the newest lease of its MAC is released; ForgetInstance
+// releases the lease of a known address only.
+func Forget(cfg config.Config, id string) { forget(cfg, id, nil) }
+
+// ForgetInstance is Forget for a VM whose address may be known: then only
+// the lease of inst.IP is released, never another VM's lease for the same MAC
+// (dnsmasq would hand that live VM's address to the next one).
+func ForgetInstance(cfg config.Config, inst *Instance) {
+	forget(cfg, inst.ID, func(l lease) bool { return inst.IP == "" || l.ip == inst.IP })
+}
+
+// forget releases the newest lease of the VM's MAC that match accepts.
+func forget(cfg config.Config, id string, match func(lease) bool) {
 	RemoveKnownHosts(id)
 	_ = os.Remove(muxPath(id)) // a master exits by itself when its VM is gone
-	l, err := findLease(cfg.Network.LeasesFile, MAC(id))
+	l, err := findLease(cfg.Network.LeasesFile, MAC(id), match)
 	if err != nil || l == nil {
 		return
 	}
