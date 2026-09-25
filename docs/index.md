@@ -42,4 +42,6 @@ stage in it and deletes it when the job ends.
 
 - Writing `.gitlab-ci.yml`: [Writing jobs](jobs.md)
 - Running the hosts: [Install](install.md), [Configuration](configuration.md), [Operations](operations.md)
+- Behind a proxy or with internal registries: [Corporate networks](corporate-network.md)
 - How it works and what it protects: [How it works](how-it-works.md)
+- Commands, metrics and limits: [Reference](reference.md)

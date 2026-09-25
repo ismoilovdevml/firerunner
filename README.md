@@ -61,7 +61,9 @@ The documentation is at **[ismoilovdevml.github.io/firerunner](https://ismoilovd
 - [Install](https://ismoilovdevml.github.io/firerunner/install/): requirements, installation, connecting GitLab
 - [Writing jobs](https://ismoilovdevml.github.io/firerunner/jobs/): for engineers who write `.gitlab-ci.yml`
 - [Configuration](https://ismoilovdevml.github.io/firerunner/configuration/) and [Operations](https://ismoilovdevml.github.io/firerunner/operations/): sizing, upgrades, monitoring, troubleshooting
+- [Corporate networks](https://ismoilovdevml.github.io/firerunner/corporate-network/): HTTP proxy, company CA, internal registries
 - [How it works](https://ismoilovdevml.github.io/firerunner/how-it-works/): architecture and security model
+- [Reference](https://ismoilovdevml.github.io/firerunner/reference/): CLI commands, metrics, limits
 
 ## Status
 
