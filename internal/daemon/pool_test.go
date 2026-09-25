@@ -692,3 +692,49 @@ func TestStartupListFailureRetriesAdoption(t *testing.T) {
 		t.Fatalf("pool.json after shutdown = %v, want [warm]", got)
 	}
 }
+
+// Restoring an older backup of the config (cp -p, a rollback) is a change
+// too: the config is reloaded when its mtime or size differs at all.
+func TestReloadConfigOnAnyChange(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	logs := captureLog(d)
+	orig, err := os.ReadFile(d.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(d.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write := func(poolSize int, mtime time.Time) {
+		t.Helper()
+		data := append(append([]byte{}, orig...), fmt.Sprintf("pool:\n  size: %d\n", poolSize)...)
+		if err := os.WriteFile(d.cfgPath, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(d.cfgPath, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	size := func() int {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.cfg.Pool.Size
+	}
+
+	write(5, fi.ModTime().Add(-time.Hour)) // an older backup restored
+	d.reloadConfig(context.Background())
+	if size() != 5 {
+		t.Fatalf("pool.size = %d after restoring an older config, want 5", size())
+	}
+	write(12, fi.ModTime().Add(-time.Hour)) // same mtime, other size
+	d.reloadConfig(context.Background())
+	if size() != 12 {
+		t.Fatalf("pool.size = %d after a change that kept the mtime, want 12", size())
+	}
+	before := strings.Count(logs.String(), "config reloaded")
+	d.reloadConfig(context.Background()) // unchanged
+	if n := strings.Count(logs.String(), "config reloaded"); n != before {
+		t.Fatalf("unchanged config reloaded again:\n%s", logs)
+	}
+}

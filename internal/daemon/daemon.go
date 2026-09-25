@@ -197,7 +197,8 @@ type Daemon struct {
 
 	mu      sync.Mutex
 	cfg     config.Config
-	cfgMod  time.Time
+	cfgMod  time.Time // mtime and size of the config file cfg was loaded from
+	cfgLen  int64
 	fl      *flintlock.Client
 	ready   []*pooled
 	booting int
@@ -323,7 +324,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 		oomKills: -1}
 	fl.OnError = d.flintlockFailed
 	if fi, err := os.Stat(cfgPath); err == nil {
-		d.cfgMod = fi.ModTime()
+		d.cfgMod, d.cfgLen = fi.ModTime(), fi.Size()
 	}
 	return d, nil
 }
@@ -729,10 +730,11 @@ func (d *Daemon) cfgSnapshot() config.Config {
 	return d.cfg
 }
 
-// reloadConfig picks up `firerunner config set` without a restart.
+// reloadConfig picks up `firerunner config set` without a restart. Any other
+// mtime or size is a change: a restored older backup (cp -p) has an older one.
 func (d *Daemon) reloadConfig(ctx context.Context) {
 	fi, err := os.Stat(d.cfgPath)
-	if err != nil || !fi.ModTime().After(d.cfgMod) {
+	if err != nil || (fi.ModTime().Equal(d.cfgMod) && fi.Size() == d.cfgLen) {
 		return
 	}
 	cfg, err := config.Load(d.cfgPath)
@@ -741,7 +743,7 @@ func (d *Daemon) reloadConfig(ctx context.Context) {
 		return
 	}
 	d.mu.Lock()
-	d.cfg, d.cfgMod = cfg, fi.ModTime()
+	d.cfg, d.cfgMod, d.cfgLen = cfg, fi.ModTime(), fi.Size()
 	d.mu.Unlock()
 	d.log.Info("config reloaded", "pool", cfg.Pool.Size, "vcpu", cfg.VM.VCPU, "memory_mb", cfg.VM.MemoryMB)
 }
