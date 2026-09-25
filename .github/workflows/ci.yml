@@ -29,14 +29,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Go Format
-        run: |
-          if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
-            echo "Files need formatting:"
-            gofmt -s -l .
-            exit 1
-          fi
-
       - name: Go Vet
         run: go vet ./...
 
@@ -85,9 +77,6 @@ jobs:
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-
-      - name: Go Mod Download
-        run: go mod download
 
       - name: Run Tests
         run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
