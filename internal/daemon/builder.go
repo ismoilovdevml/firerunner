@@ -455,7 +455,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	d.saveBuildersLocked()
 	d.metrics.builders.Set(float64(len(d.builders)))
 	d.metrics.bootSeconds.WithLabelValues("builder").Observe(time.Since(start).Seconds())
-	d.log.Info("builder ready", "project", project, "id", inst.ID, "ip", inst.IP, "port", b.Port,
+	d.log.Info("builder ready", "project", project, "vm", inst.ID, "ip", inst.IP, "port", b.Port,
 		"took", time.Since(start).Round(100*time.Millisecond).String())
 }
 
@@ -776,7 +776,7 @@ func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
 				d.removeBuilderLocked(b, "not answering")
 				continue
 			}
-			d.log.Warn("builder not answering", "project", b.Project, "id", b.Instance.ID,
+			d.log.Warn("builder not answering", "project", b.Project, "vm", b.Instance.ID,
 				"strikes", b.strikes, "in_use", busy[b.Project])
 		}
 		remap = append(remap, *b)
@@ -856,7 +856,7 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 		}
 		// Two tries: one missed probe must not cost a project its warm cache.
 		if !answersWithin(b.Instance.IP, 2) {
-			d.log.Warn("builder from previous run not answering, left for reconcile", "project", b.Project, "id", b.Instance.ID)
+			d.log.Warn("builder from previous run not answering, left for reconcile", "project", b.Project, "vm", b.Instance.ID)
 			continue
 		}
 		keep = append(keep, b)
@@ -868,13 +868,13 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 	var adopted []builder
 	for _, b := range keep {
 		if _, taken := d.builders[b.Project]; taken {
-			d.log.Warn("builder from previous run not adopted: the project has a new one", "project", b.Project, "id", b.Instance.ID)
+			d.log.Warn("builder from previous run not adopted: the project has a new one", "project", b.Project, "vm", b.Instance.ID)
 			continue
 		}
 		if d.portUsedLocked(b.Port) {
 			old := b.Port
 			if b.Port = d.freePortLocked(d.cfg); b.Port == 0 {
-				d.log.Warn("builder from previous run not adopted: no free port", "project", b.Project, "id", b.Instance.ID)
+				d.log.Warn("builder from previous run not adopted: no free port", "project", b.Project, "vm", b.Instance.ID)
 				continue
 			}
 			d.log.Info("builder from previous run moved to a free port", "project", b.Project, "from", old, "to", b.Port)
@@ -885,7 +885,7 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 		}
 		d.builders[b.Project] = b
 		adopted = append(adopted, *b)
-		d.log.Info("adopted builder from previous run", "project", b.Project, "id", b.Instance.ID)
+		d.log.Info("adopted builder from previous run", "project", b.Project, "vm", b.Instance.ID)
 	}
 	d.buildersAdopted = true
 	d.saveBuildersLocked()
