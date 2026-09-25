@@ -71,7 +71,11 @@ type builder struct {
 	SpecID   string      `json:"spec_id"`
 	BornAt   time.Time   `json:"born_at"`
 	LastUsed time.Time   `json:"last_used"`
-	ready    bool
+	// Unsaved marks a record of a removed builder whose cache copy the
+	// daemon's stop cut off: its VM was kept, and the next run copies the
+	// cache and deletes it. It is when the builder was removed.
+	Unsaved time.Time `json:"unsaved,omitzero"`
+	ready   bool
 	// creds are created with the entry, so jobs can be configured for the
 	// builder while it is still starting (only a starting builder needs them).
 	creds *builderCreds
@@ -237,21 +241,31 @@ func (d *Daemon) removeBuilderLocked(b *builder, reason string) {
 	delete(d.builders, b.Project)
 	d.saveBuildersLocked()
 	d.metrics.builders.Set(float64(len(d.builders)))
-	project, port, inst, nft := b.Project, b.Port, b.Instance, nftRun
-	cfg, ctx := d.cfg, d.runCtx
+	d.retireLocked(b.Project, b.Port, b.Instance, b.SpecID, "builder: "+reason, keepsCache(reason), time.Now())
+}
+
+// retireLocked unmaps a removed builder's port (0: none), copies its cache
+// to the host if save is set and the cache is worth it, and deletes its VM,
+// all in the background. removed is when the builder was removed.
+func (d *Daemon) retireLocked(project string, port int, inst vm.Instance, specID, reason string, save bool, removed time.Time) {
+	nft, cfg, ctx := nftRun, d.cfg, d.runCtx
 	// Only a builder.image builder's cache is worth copying: a new image's
 	// builder would not take it (see restoreBuilderCache).
-	image := specImage(b.SpecID)
+	image := specImage(specID)
 	var saved *cacheSave
-	if keepsCache(reason) && cfg.Builder.SavedCacheGB > 0 && inst.UID != "" && d.saving[project] == nil && image == cfg.Builder.Image {
-		saved = &cacheSave{done: make(chan struct{}), uid: inst.UID, start: time.Now()}
+	if save && cfg.Builder.SavedCacheGB > 0 && inst.UID != "" && d.saving[project] == nil && image == cfg.Builder.Image {
+		saved = &cacheSave{done: make(chan struct{}), uid: inst.UID, start: removed, inst: inst, specID: specID}
 		d.saving[project] = saved
 	}
 	d.spawn(func() {
-		_, _ = nft("", "delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", port))
+		if port != 0 {
+			_, _ = nft("", "delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", port))
+		}
 		if saved != nil {
-			if ctx.Err() == nil {
-				d.saveBuilderCache(ctx, cfg, project, &inst, image, saved.start)
+			// A copy the daemon's stop cuts off (or that could not start
+			// before it) keeps the VM for the next run.
+			if (ctx.Err() != nil || d.saveBuilderCache(ctx, cfg, project, &inst, image, saved.start)) && d.keepCutSave(project, saved) {
+				return
 			}
 			defer func() {
 				d.mu.Lock()
@@ -262,9 +276,28 @@ func (d *Daemon) removeBuilderLocked(b *builder, reason string) {
 			}()
 		}
 		if inst.UID != "" {
-			d.delete(context.Background(), &inst, "builder: "+reason)
+			d.delete(context.Background(), &inst, reason)
 		}
 	})
+}
+
+// keepCutSave keeps the VM of a cache copy the daemon's stop cut off, unless
+// an operator's `builder rm` dropped the project's cache meanwhile: the save
+// stays in d.saving, marked cut, and builders.json records it, so the next
+// run copies the cache and deletes the VM (see adoptBuilders). It reports
+// whether it kept the VM.
+func (d *Daemon) keepCutSave(project string, s *cacheSave) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.cacheDropped[project].After(s.start) {
+		return false
+	}
+	s.cut = true
+	d.saveBuildersLocked()
+	close(s.done)
+	d.log.Info("builder cache copy stopped by shutdown; the VM is kept and the next start copies it",
+		"project", project, "vm", s.inst.ID)
+	return true
 }
 
 // Removal is the result of an operator's builder removal, by project id.
@@ -825,6 +858,11 @@ func (d *Daemon) saveBuildersLocked() {
 			list = append(list, b)
 		}
 	}
+	for project, s := range d.saving {
+		if s.cut {
+			list = append(list, &builder{Project: project, Instance: s.inst, SpecID: s.specID, Unsaved: s.start})
+		}
+	}
 	data, err := json.Marshal(list)
 	if err != nil {
 		return
@@ -849,9 +887,13 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 		d.log.Warn("builders of the previous run not adopted", "err", err)
 		list = nil
 	}
-	var keep []*builder
+	var keep, cut []*builder
 	for _, b := range list {
 		if !projectID.MatchString(b.Project) || !live[b.Instance.UID] {
+			continue
+		}
+		if !b.Unsaved.IsZero() {
+			cut = append(cut, b) // its buildkitd is stopped: not probed
 			continue
 		}
 		// Two tries: one missed probe must not cost a project its warm cache.
@@ -886,6 +928,12 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 		d.builders[b.Project] = b
 		adopted = append(adopted, *b)
 		d.log.Info("adopted builder from previous run", "project", b.Project, "vm", b.Instance.ID)
+	}
+	for _, b := range cut {
+		// The previous run stopped while it copied this removed builder's
+		// cache: copy it now, then delete the VM.
+		d.log.Info("resuming a builder cache copy cut off by the previous run's stop", "project", b.Project, "vm", b.Instance.ID)
+		d.retireLocked(b.Project, 0, b.Instance, b.SpecID, "builder: cache copied after a restart", true, b.Unsaved)
 	}
 	d.buildersAdopted = true
 	d.saveBuildersLocked()

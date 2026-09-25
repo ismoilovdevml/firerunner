@@ -30,7 +30,12 @@ import (
 type cacheSave struct {
 	done  chan struct{}
 	uid   string
-	start time.Time
+	start time.Time // when the builder was removed
+	// inst and specID are recorded in builders.json when the daemon's stop
+	// cuts the copy off (cut); see keepCutSave.
+	inst   vm.Instance
+	specID string
+	cut    bool
 }
 
 // builderCacheDir holds <project>.tar files (a variable for tests).
@@ -214,10 +219,16 @@ func keepsCache(reason string) bool {
 // header naming the builder's image. Any failure leaves the previous saved
 // copy (if any) in place. Saves copy side by side, but each reserves its size
 // first (see makeRoomForCache); started is when the builder was removed (see
-// cacheDropped).
-func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, project string, inst *vm.Instance, image string, started time.Time) {
+// cacheDropped). It reports whether ctx ended (the daemon stops) before the
+// copy finished; such a save is not counted as failed.
+func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, project string, inst *vm.Instance, image string, started time.Time) (stopped bool) {
 	result := "failed"
-	defer func() { d.metrics.builderCache.WithLabelValues("save", result).Inc() }()
+	parent := ctx
+	defer func() {
+		if stopped = result == "failed" && parent.Err() != nil; !stopped {
+			d.metrics.builderCache.WithLabelValues("save", result).Inc()
+		}
+	}()
 	ctx, cancel := context.WithTimeout(ctx, builderCacheTimeout)
 	defer cancel()
 	start := time.Now()
@@ -312,6 +323,7 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 	result = "ok"
 	d.log.Info("builder cache saved", "project", project, "bytes", size,
 		"took", time.Since(start).Round(100*time.Millisecond).String())
+	return false
 }
 
 // makeRoomForCache deletes other projects' saved caches, least recently used

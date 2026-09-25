@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1109,6 +1110,102 @@ func TestRemoveBuildersDuringRestore(t *testing.T) {
 				if cooling {
 					t.Fatal("an operator's rm put the project on a failed-boot cooldown")
 				}
+			}
+		})
+	}
+}
+
+// builderRecords reads builders.json.
+func builderRecords(t *testing.T, d *Daemon) []map[string]any {
+	t.Helper()
+	var list []map[string]any
+	data, err := os.ReadFile(d.buildersFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &list); err != nil {
+		t.Fatal(err)
+	}
+	return list
+}
+
+// Stopping the daemon (every upgrade) cut a cache save off and then deleted
+// the VM: the project's layers since its last save were lost. The VM of a cut
+// save is kept and recorded instead, and the next run copies its cache and
+// deletes it. A save whose cache the operator dropped meanwhile is not kept.
+func TestSaveCutByShutdownIsResumedByTheNextRun(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		rmFirst bool // builder rm while the save runs
+	}{
+		{"shutdown during the copy", false},
+		{"builder rm, then shutdown", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubBuilders(t, func(string) bool { return true })
+			entered := make(chan struct{})
+			var content atomic.Value
+			content.Store("")
+			dir := stubBuilderCache(t, sizeOf(4), func(ctx context.Context, _ config.Config, _ *vm.Instance, w io.Writer) error {
+				if data := content.Load().(string); data != "" {
+					_, err := io.WriteString(w, data)
+					return err
+				}
+				close(entered)
+				<-ctx.Done() // a long copy: the daemon stops first
+				return ctx.Err()
+			}, nil)
+			d, srv := newTestDaemon(t)
+			ctx, stop := context.WithCancel(context.Background())
+			t.Cleanup(stop)
+			d.mu.Lock()
+			d.runCtx = ctx
+			d.mu.Unlock()
+			d.builders = map[string]*builder{"7": readyBuilder("7", 20001, d.cfg.Builder.IdleTTL+time.Hour, builderSpec(d.cfg))}
+			recordBuilders(d)
+			d.expireBuilders()
+			<-entered
+			if tc.rmFirst {
+				d.RemoveBuilders("7", false)
+			}
+			stop() // the daemon stops
+			d.bg.Wait()
+			if tc.rmFirst {
+				srv.WaitDeleted(t, "uid-7", 2*time.Second)
+				if recs := builderRecords(t, d); len(recs) != 0 {
+					t.Fatalf("dropped cache recorded for the next run: %v", recs)
+				}
+				return
+			}
+			if deleted(srv.Deleted(), "uid-7") {
+				t.Fatal("VM deleted with its cache copy cut off: its layers are lost")
+			}
+			recs := builderRecords(t, d)
+			if len(recs) != 1 || recs[0]["project"] != "7" || recs[0]["unsaved"] == nil {
+				t.Fatalf("builders.json = %v, want the cut save of project 7", recs)
+			}
+			if n := cacheCount(d, "save", "failed"); n != 0 {
+				t.Fatalf("a save cut by shutdown counted as failed (%v)", n)
+			}
+
+			// The next run copies the cache and deletes the VM.
+			content.Store("warm")
+			d2, srv2 := newTestDaemon(t)
+			d2.cfg.Daemon.Socket = d.cfg.Daemon.Socket
+			d2.adoptBuilders(map[string]bool{"uid-7": true})
+			srv2.WaitDeleted(t, "uid-7", 2*time.Second)
+			d2.bg.Wait()
+			if got := readFile(t, filepath.Join(dir, "7.tar")); got != saved("warm") {
+				t.Fatalf("saved cache = %q", got)
+			}
+			if d2.builders["7"] != nil {
+				t.Fatal("the cut save's VM was adopted as a builder")
+			}
+			if recs := builderRecords(t, d2); len(recs) != 0 {
+				t.Fatalf("builders.json after the copy = %v", recs)
+			}
+			if n := cacheCount(d2, "save", "ok"); n != 1 {
+				t.Fatalf("save ok = %v", n)
 			}
 		})
 	}
