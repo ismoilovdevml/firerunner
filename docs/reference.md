@@ -7,11 +7,12 @@ All commands need root.
 | Command | |
 |---|---|
 | `firerunner status` · `doctor` | overview · every check with a hint |
-| `firerunner config show` · `keys` · `get <key>` · `set <key> <value>` | settings |
-| `firerunner runner register --url URL --token glrt-... [--concurrent N]` | register this host |
+| `firerunner config show` · `keys` · `path` · `get <key>` · `set <key> <value>` | settings; `path` prints the config file |
+| `firerunner config unset vm.kernel_cmdline.<arg>` | remove a guest kernel argument |
+| `firerunner runner register --url URL --token glrt-... [--concurrent N] [--name NAME]` | register this host; the name shown in GitLab defaults to `firerunner-<hostname>` |
 | `firerunner runner status` · `concurrent N` · `unregister` | the GitLab runner |
-| `firerunner runner cache [local \| off \| s3 --server H:P --bucket B]` | where `cache:` is stored |
-| `firerunner vm list` · `logs <id>` · `rm <id> \| --all` | microVMs |
+| `firerunner runner cache [local \| off \| s3 --server H:P --bucket B [--insecure]]` | where `cache:` is stored; `--insecure` uses plain HTTP |
+| `firerunner vm list` · `logs <id> [-n N]` · `rm <id> \| --all` | microVMs; `logs` prints the last N lines of a VM's console (default 100) |
 | `firerunner pool [refresh]` | pre-booted VMs; refresh replaces them |
 | `firerunner builder list` · `rm <project> \| --all [--force]` | builders; a builder in use is kept unless `--force` |
 | `firerunner run [--keep] -- <command>` | run a command in a throwaway VM |
