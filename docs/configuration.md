@@ -76,5 +76,7 @@ the keys are:
 | `proxy.listen` | `10.200.0.1:3128` | the forwarder on the bridge address (and 127.0.0.1) |
 | `proxy.upstream_file` | `/etc/firerunner/proxy-upstream` | root-only file with `http://[user:password@]host:port` |
 | `proxy.no_proxy` | none | hosts, `.domains` and CIDRs reached directly; local addresses are always added |
+| `proxy.connect_ports` | `[443]` | ports HTTPS tunnels through the proxy may go to |
+| `network.egress_deny` | none | networks jobs must not reach, directly or through the proxy (installer: `FR_EGRESS_DENY`) |
 | `vm.ca_file` | none | PEM root CA trusted by microVMs, their Docker, builders and job containers |
 | `vm.insecure_registries` | none | `host:port` (TLS without a check) or `http://host:port` (plain HTTP) |

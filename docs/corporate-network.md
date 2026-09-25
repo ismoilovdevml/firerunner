@@ -19,7 +19,8 @@ it up once on the host; jobs do not change.
 microVMs never talk to the corporate proxy directly. They use a small forwarder on the host,
 `firerunner-proxy`, at the bridge address (`10.200.0.1:3128`). It adds the proxy's credentials,
 so no job can read the proxy password, and it accepts connections only from microVMs and the host
-itself.
+itself. Each request is logged with the client address, target, status and size
+(`journalctl -u firerunner-proxy`).
 
 ## Set it up
 
@@ -38,34 +39,37 @@ when idle; their caches are kept.
 
 | Variable | |
 |---|---|
-| `FR_PROXY` | `http://[user:password@]host:port` of the corporate proxy |
+| `FR_PROXY` | `http://host:port` of the corporate proxy (for a password, see [below](#a-proxy-with-a-password)) |
 | `FR_NO_PROXY` | hosts, `.domains` and CIDRs reached directly, comma-separated |
 | `FR_CA_FILE` | PEM file with the company root CA, see [below](#company-ca-and-tls-inspection) |
 | `FR_INSECURE_REGISTRIES` | registries without a checkable certificate, see [below](#internal-registries) |
 
 ## A proxy with a password
 
-Write the password %-encoded: `p@ss:w/rd` becomes `p%40ss%3Aw%2Frd`, a domain user `CORP\bob`
-becomes `CORP%5Cbob`.
+Put the URL with the password in `/etc/firerunner/proxy-upstream` yourself, then run the
+installer without `FR_PROXY`: it finds the file. A password on the command line would be visible
+to other users in the process list and would stay in your shell history.
 
 ```bash
-sudo FR_PROXY='http://CORP%5Cbob:p%40ss%3Aw%2Frd@proxy.corp.example:3128' bash install.sh
+sudo install -D -m 600 /dev/null /etc/firerunner/proxy-upstream
+sudoedit /etc/firerunner/proxy-upstream     # one line: http://CORP%5Cbob:p%40ss%3Aw%2Frd@proxy.corp.example:3128
+curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo \
+  FR_NO_PROXY='gitlab.corp.example,.corp.example,10.0.0.0/8' bash
 ```
 
-The URL is stored in `/etc/firerunner/proxy-upstream`, readable by root only; the forwarder
-refuses to use it if others can read it. It is read for every connection, so a new password takes
-effect at once:
+Write the user and password %-encoded: `p@ss:w/rd` becomes `p%40ss%3Aw%2Frd`, a domain user
+`CORP\bob` becomes `CORP%5Cbob`. The forwarder uses the file only while it is a regular file
+owned by root and readable by nobody else.
 
-```bash
-echo 'http://CORP%5Cbob:NEW%21pass@proxy.corp.example:3128' | sudo tee /etc/firerunner/proxy-upstream >/dev/null
-```
-
-If the proxy refuses the credentials, jobs get `502 Bad Gateway` and
-`journalctl -u firerunner-proxy` says `upstream proxy refused the credentials`.
+The file is read for every connection, so a new password takes effect at once: edit it with
+`sudoedit`. If the proxy refuses the credentials, jobs get `502 Bad Gateway` and
+`journalctl -u firerunner-proxy` says `upstream proxy refused the credentials`. The refused
+credentials are not sent again for 5 minutes, or until you change the file, so a changed password
+cannot lock the account with a flood of failed logins.
 
 The forwarder speaks Basic authentication. For NTLM or Kerberos proxies (Windows domains), run
-[CNTLM](https://cntlm.sourceforge.net/) or [px](https://github.com/genotrance/px) on the host and
-set `FR_PROXY=http://127.0.0.1:<their port>`.
+[CNTLM](https://cntlm.sourceforge.net/) or [px](https://github.com/genotrance/px) on the host on
+a port other than 3128 (the forwarder's), and put `http://127.0.0.1:<their port>` in the file.
 
 ## What bypasses the proxy
 
@@ -80,8 +84,32 @@ A missing entry sends internal traffic to the proxy, which usually cannot reach 
 sudo firerunner config set proxy.no_proxy 'gitlab.corp.example,.corp.example,10.0.0.0/8'
 ```
 
+New microVMs use the new list at once. Host services (containerd, gitlab-runner) get it when you
+run the installer again with the same `FR_NO_PROXY`.
+
 CIDRs work for Go programs, curl 7.86+ and Docker. Some tools (wget, older curl) only match names,
 so list internal hosts by name as well.
+
+## What jobs can reach through the proxy
+
+Proxied traffic leaves from the host, so the forwarder applies the host's rules for microVMs
+itself. It refuses, with `403`, requests to:
+
+- the host and other microVMs: loopback, the bridge network and the host's own addresses;
+- cloud metadata and other link-local addresses;
+- the networks in `FR_EGRESS_DENY` (config `network.egress_deny`);
+- `localhost` names and IP addresses written in other forms, such as `2130706433`;
+- host names that resolve to any of these.
+
+HTTPS tunnels (`CONNECT`) go only to port 443. Allow more with
+`sudo firerunner config set proxy.connect_ports '[443, 8443]'`.
+
+The forwarder checks a host name when it resolves it, and the corporate proxy resolves it again,
+so a name whose DNS answer changes in between can still get through. Restrict the runner's
+account on the corporate proxy as well.
+
+A job can hold at most 256 connections through the forwarder, all clients together 4096. A tunnel
+without traffic for 15 minutes is closed.
 
 ## Company CA and TLS inspection
 
@@ -145,5 +173,14 @@ sudo firerunner run -- sh -c 'env | grep -i proxy; curl -sI https://github.com |
   TLS (`https://`) are not supported. Traffic to `https://` sites is still end-to-end TLS.
 - A host without any internet access (air-gapped) is not supported: the installer and the
   microVM images are downloaded from GitHub and GHCR.
-- Rolling back to a FireRunner version older than this feature needs the `config.yaml` from
-  before the upgrade: older versions refuse the `proxy` keys.
+- Rolling back to v0.1.0 or older: while the proxy, `vm.ca_file` and insecure registries are
+  unused, `config.yaml` stays readable by older versions. Once you use them, restore the
+  `config.yaml` from before the upgrade together with the older binary.
+
+## Upgrades and restarts
+
+`firerunner upgrade` leaves `firerunner-proxy` running on the previous build, because a restart
+cuts the open tunnels of running jobs. Restart it when the runner is idle:
+`sudo systemctl restart firerunner-proxy`. The installer does the same: while jobs run, it does
+not restart the forwarder, containerd, flintlockd, the Docker Hub cache or gitlab-runner, and says
+which restarts are pending.

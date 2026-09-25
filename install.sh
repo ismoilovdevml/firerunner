@@ -24,17 +24,20 @@
 #   FR_POOL_SIZE            pre-booted microVMs kept ready (default: 2)
 #   FR_METRICS_ALLOW        source IPv4/CIDR allowed to scrape :9477/metrics (default: none, localhost only;
 #                           remembered for later re-runs)
-#   FR_EGRESS_DENY          comma-separated IPv4 CIDRs jobs must not reach, e.g. 192.168.0.0/16
-#                           (default: none; link-local 169.254.0.0/16 is always blocked)
+#   FR_EGRESS_DENY          comma-separated IPv4 CIDRs jobs must not reach, e.g. 192.168.0.0/16,
+#                           directly or through the proxy (default: none; remembered for later
+#                           re-runs, FR_EGRESS_DENY=none clears it; link-local is always blocked)
 #   REGISTRY_VERSION        Docker Hub pull-through mirror for microVMs (default: 3.1.1)
 #   VERSITYGW_VERSION       S3 server for the runner's cache: (default: 1.8.0)
 #   FR_CACHE_DAYS           delete cache: archives not written for this many days (default: 14)
 #   GITLAB_RUNNER_VERSION   (default: 19.4.0)
 #
 # Corporate networks (all remembered for later re-runs):
-#   FR_PROXY                corporate HTTP proxy, http://[user:password@]host:port (%-encode
-#                           special characters in the password). Stored root-only; microVMs and
-#                           host services use a local forwarder and never see the password.
+#   FR_PROXY                corporate HTTP proxy, http://host:port. With a password, write
+#                           http://user:password@host:port into /etc/firerunner/proxy-upstream
+#                           (root only, 0600) before running the installer instead: a value here
+#                           is visible in the process list while the installer runs. microVMs
+#                           and host services use a local forwarder and never see the password.
 #   FR_NO_PROXY             comma-separated hosts, .domains and CIDRs reached without the proxy,
 #                           e.g. gitlab.corp.example,.corp.example,10.0.0.0/8
 #   FR_CA_FILE              PEM file with a company root CA (internal registries, S3, or a
@@ -78,6 +81,7 @@ FR_PROXY="${FR_PROXY:-}"
 FR_NO_PROXY="${FR_NO_PROXY:-}"
 FR_CA_FILE="${FR_CA_FILE:-}"
 FR_INSECURE_REGISTRIES="${FR_INSECURE_REGISTRIES:-}"
+PROXY_PORT=3128                       # the forwarder (proxy.listen); opened on the bridge
 FR_REPO=ismoilovdevml/firerunner
 
 BIN_DIR=/usr/local/bin
@@ -144,11 +148,21 @@ preflight_settings() {
         is_ipv4_cidr "$FR_METRICS_ALLOW" || die "FR_METRICS_ALLOW=$FR_METRICS_ALLOW is not an IPv4 address or CIDR"
     fi
     local cidr
-    for cidr in ${FR_EGRESS_DENY//,/ }; do
-        is_ipv4_cidr "$cidr" || die "FR_EGRESS_DENY: $cidr is not an IPv4 address or CIDR"
-    done
-    if [[ -n $FR_PROXY && ! $FR_PROXY =~ ^http://([^@/[:space:]]+@)?[A-Za-z0-9.-]+:[0-9]+/?$ ]]; then
-        die "FR_PROXY must be http://[user:password@]host:port (%-encode special characters)"
+    if [[ $FR_EGRESS_DENY != none ]]; then
+        for cidr in ${FR_EGRESS_DENY//,/ }; do
+            is_ipv4_cidr "$cidr" || die "FR_EGRESS_DENY: $cidr is not an IPv4 address or CIDR"
+        done
+    fi
+    # user and password: unreserved characters and %XX only, as the forwarder parses them.
+    local ui='([A-Za-z0-9._~!$&()*+,;=-]|%[0-9A-Fa-f]{2})'
+    local proxy_re="^http://(${ui}+(:${ui}*)?@)?([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?):([0-9]{1,5})/?\$"
+    if [[ -n $FR_PROXY ]]; then
+        [[ $FR_PROXY =~ $proxy_re ]] ||
+            die "FR_PROXY must be http://[user:password@]host:port (%-encode other characters in the password)"
+        local phost=${BASH_REMATCH[5]} pport=${BASH_REMATCH[7]}
+        if [[ $pport == "$PROXY_PORT" && $phost =~ ^(localhost|127\.[0-9.]+|0\.0\.0\.0|${FR_SUBNET//./\\.}\.1)$ ]]; then
+            die "FR_PROXY points at the FireRunner forwarder itself (port $PROXY_PORT): give a local proxy (CNTLM, px) another port"
+        fi
     fi
     if [[ -n $FR_NO_PROXY && ! $FR_NO_PROXY =~ ^[A-Za-z0-9.,:/*_-]+$ ]]; then
         die "FR_NO_PROXY: only hosts, .domains and CIDRs, comma-separated"
@@ -169,7 +183,35 @@ preflight_settings() {
 
 PROXY_FILE="$CONF_DIR/proxy-upstream"
 CA_FILE="$CONF_DIR/ca.pem"
-PROXY_PORT=3128
+EGRESS_FILE="$CONF_DIR/egress-deny"
+
+# jobs_running: microVM jobs are in progress on this host.
+jobs_running() { compgen -G "/run/firerunner/jobs/*.json" >/dev/null; }
+
+# restart_when_idle SERVICE: restart now, or, while jobs run, say it is pending
+# (containerd, flintlockd, the registry mirror and gitlab-runner serve them).
+PENDING=""
+restart_when_idle() {
+    if systemctl is-active -q "$1" && jobs_running; then
+        warn "  $1 not restarted: jobs are running (re-run the installer when the runner is idle)"
+        PENDING+="$1 "
+        return 0
+    fi
+    log "  restarting $1"
+    systemctl restart "$1"
+}
+
+# The networks jobs must not reach. Remembered, so a re-run without
+# FR_EGRESS_DENY keeps them; FR_EGRESS_DENY=none clears them.
+egress_deny() {
+    if [[ $FR_EGRESS_DENY == none ]]; then
+        return 0
+    elif [[ -n $FR_EGRESS_DENY ]]; then
+        echo "$FR_EGRESS_DENY"
+    elif [[ -s $EGRESS_FILE ]]; then
+        cat "$EGRESS_FILE"
+    fi
+}
 
 # proxy_on: a corporate proxy is configured (now or by an earlier run).
 proxy_on() { [[ -s $PROXY_FILE ]]; }
@@ -194,6 +236,14 @@ setup_proxy() {
     if [[ -n $FR_PROXY ]]; then
         log "using the corporate proxy (stored in $PROXY_FILE, root only)"
         (umask 077; printf '%s\n' "${FR_PROXY%/}" | put "$PROXY_FILE" 0600)
+    elif proxy_on; then
+        chmod 0600 "$PROXY_FILE"
+        log "using the corporate proxy from $PROXY_FILE"
+    fi
+    if [[ $FR_EGRESS_DENY == none ]]; then
+        rm -f "$EGRESS_FILE"
+    elif [[ -n $FR_EGRESS_DENY ]]; then
+        echo "$FR_EGRESS_DENY" | put "$EGRESS_FILE" 0644
     fi
     proxy_on || return 0
     # The installer's own downloads go straight to the corporate proxy.
@@ -245,10 +295,13 @@ configure_proxy() {
     if [[ -n $FR_INSECURE_REGISTRIES ]]; then
         $fr config set vm.insecure_registries "[${FR_INSECURE_REGISTRIES}]" >/dev/null
     fi
+    # The forwarder refuses these too: proxied traffic leaves from the host.
+    $fr config set network.egress_deny "[$(egress_deny)]" >/dev/null
     if ! proxy_on; then
         if systemctl is-enabled -q firerunner-proxy 2>/dev/null; then
-            systemctl disable --now -q firerunner-proxy
             $fr config set proxy.enabled false >/dev/null
+            proxy_dropins_apply
+            systemctl disable --now -q firerunner-proxy
         fi
         return 0
     fi
@@ -286,9 +339,29 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable -q firerunner-proxy
-    if ! systemctl is-active -q firerunner-proxy || changed /etc/systemd/system/firerunner-proxy.service "$BIN_DIR/firerunner"; then
+    if ! systemctl is-active -q firerunner-proxy; then
         systemctl restart firerunner-proxy
+    elif changed /etc/systemd/system/firerunner-proxy.service "$BIN_DIR/firerunner"; then
+        # A restart cuts the open tunnels (clones, pulls) of running jobs.
+        restart_when_idle firerunner-proxy
     fi
+    # Host services go through the forwarder only once it runs.
+    proxy_dropins_apply
+}
+
+# proxy_dropins_apply writes or removes the host services' proxy drop-ins and
+# restarts the services whose drop-in changed (later, while jobs run).
+proxy_dropins_apply() {
+    local svc
+    for svc in containerd-flintlock firerunner-registry gitlab-runner; do
+        proxy_dropin "$svc"
+    done
+    systemctl daemon-reload
+    for svc in containerd-flintlock firerunner-registry gitlab-runner; do
+        if changed "/etc/systemd/system/$svc.service.d/firerunner-proxy.conf" && systemctl is-active -q "$svc"; then
+            restart_when_idle "$svc"
+        fi
+    done
 }
 
 install_packages() {
@@ -380,10 +453,10 @@ state = "${CONTAINERD_STATE}"
   root_path = "${CONTAINERD_ROOT}/snapshotter/devmapper"
   base_image_size = "${FR_VM_DISK}"
   # Discarding a deleted VM's blocks runs inside the snapshotter's write
-  # transaction and stalls the next VM's snapshot; the thin pool frees the
-  # blocks of a deleted thin device anyway, and zeroes every chunk it hands
-  # out again (setup_thinpool), so no VM reads what an earlier one wrote.
-  discard_blocks = false
+  # transaction and stalls the next VM's snapshot. It is off when the thin pool
+  # zeroes every chunk it hands out again (setup_thinpool), so no VM reads what
+  # an earlier one wrote; on for an older pool that does not.
+  discard_blocks = $(discard_blocks)
 EOF
 
     # Dedicated instance so it never clashes with a Docker/Kubernetes containerd.
@@ -417,6 +490,15 @@ EOF
 # --------------------------------------------------------------------------
 
 # Prints the first whole disk that has no partitions, filesystem, LVM or mount.
+# discard_blocks: containerd's setting for the thin pool (see containerd.toml).
+discard_blocks() {
+    if lvs "$VG/thinpool" >/dev/null 2>&1 && [[ $(lvs --noheadings -o zero "$VG/thinpool" | tr -d ' ') != zero ]]; then
+        echo true
+    else
+        echo false
+    fi
+}
+
 find_blank_disk() {
     local name type
     while read -r name type; do
@@ -527,8 +609,10 @@ metrics_input_rules() {
 
 # FR_EGRESS_DENY: extra destinations jobs must not reach, e.g. internal ranges.
 egress_deny_rules() {
-    [[ -n $FR_EGRESS_DENY ]] || return 0
-    printf '    iifname "%s" ip daddr { %s } drop\n' "$FR_BRIDGE" "${FR_EGRESS_DENY//,/, }"
+    local deny
+    deny=$(egress_deny)
+    [[ -n $deny ]] || return 0
+    printf '    iifname "%s" ip daddr { %s } drop\n' "$FR_BRIDGE" "${deny//,/, }"
 }
 
 setup_network() {
@@ -1032,18 +1116,15 @@ register_runner() {
 # --------------------------------------------------------------------------
 
 start_services() {
-    # containerd pulls the microVM images, the registry mirror Docker Hub layers.
-    proxy_dropin containerd-flintlock
-    proxy_dropin firerunner-registry
     systemctl daemon-reload
     local svc files
     for svc in containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd; do
         systemctl enable -q "$svc"
         case $svc in
-            containerd-flintlock) files="$CONF_DIR/containerd.toml $BIN_DIR/containerd /etc/systemd/system/$svc.service.d/firerunner-proxy.conf" ;;
+            containerd-flintlock) files="$CONF_DIR/containerd.toml $BIN_DIR/containerd" ;;
             firerunner-net)       files="$LIB_DIR/net-up.sh" ;;
             firerunner-dnsmasq)   files="$CONF_DIR/dnsmasq.conf" ;;
-            firerunner-registry)  files="$CONF_DIR/registry.yml $BIN_DIR/registry /etc/systemd/system/$svc.service.d/firerunner-proxy.conf" ;;
+            firerunner-registry)  files="$CONF_DIR/registry.yml $BIN_DIR/registry" ;;
             firerunner-cache)     files="$CONF_DIR/cache.env $BIN_DIR/versitygw" ;;
             flintlockd)           files="/etc/opt/flintlockd/config.yaml $BIN_DIR/flintlockd $BIN_DIR/firecracker" ;;
         esac
@@ -1052,14 +1133,17 @@ start_services() {
             log "  starting $svc"
             systemctl restart "$svc"
         elif changed "/etc/systemd/system/$svc.service" $files; then
-            if [[ $svc == firerunner-net ]]; then
-                # A restart would delete the bridge and cut every running microVM off.
-                log "  reloading $svc rules"
-                systemctl reload "$svc"
-            else
-                log "  restarting $svc"
-                systemctl restart "$svc"
-            fi
+            case $svc in
+                firerunner-net)
+                    # A restart would delete the bridge and cut every running microVM off.
+                    log "  reloading $svc rules"
+                    systemctl reload "$svc" ;;
+                containerd-flintlock|flintlockd|firerunner-registry)
+                    restart_when_idle "$svc" ;;
+                *)
+                    log "  restarting $svc"
+                    systemctl restart "$svc" ;;
+            esac
         fi
     done
     systemctl enable -q --now firerunner-cache-clean.timer
@@ -1105,7 +1189,7 @@ FireRunner host is ready.
 Next steps:
   firerunner doctor                  check the host
   firerunner run -- uname -a         boot a throwaway microVM
-  firerunner runner register --url https://gitlab.example.com --token glrt-...
+  firerunner runner register --url https://gitlab.example.com --token -   # paste the glrt-... token
   firerunner config set vm.vcpu 4    tune microVM size
 EOF
 }
@@ -1130,6 +1214,13 @@ uninstall() {
         rm -f "/etc/systemd/system/$svc.service" "/etc/systemd/system/$svc.service.d/firerunner-proxy.conf"
     done
     rm -f /etc/systemd/system/gitlab-runner.service.d/firerunner-proxy.conf
+    # The host stops trusting the company CA it was given.
+    if [[ -f /etc/pki/ca-trust/source/anchors/firerunner-ca.pem ]]; then
+        rm -f /etc/pki/ca-trust/source/anchors/firerunner-ca.pem && update-ca-trust
+    fi
+    if [[ -f /usr/local/share/ca-certificates/firerunner-ca.crt ]]; then
+        rm -f /usr/local/share/ca-certificates/firerunner-ca.crt && update-ca-certificates >/dev/null
+    fi
     systemctl daemon-reload
     rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry" \
         "$BIN_DIR/versitygw" "$BIN_DIR/firecracker" "$BIN_DIR/jailer"
@@ -1167,13 +1258,12 @@ main() {
     open_metrics_port
     verify_install
     register_runner
-    # gitlab-runner talks to GitLab through the forwarder as well.
-    proxy_dropin gitlab-runner
-    if changed /etc/systemd/system/gitlab-runner.service.d/firerunner-proxy.conf; then
-        systemctl daemon-reload
-        systemctl try-restart gitlab-runner
-    fi
+    # gitlab-runner is installed by the registration: give it the proxy now.
+    proxy_on && proxy_dropins_apply
     configure_runner_cache
+    if [[ -n $PENDING ]]; then
+        warn "restarts pending while jobs run: ${PENDING}- re-run the installer when the runner is idle"
+    fi
 }
 
 main "$@"

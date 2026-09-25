@@ -42,7 +42,7 @@ Options go before `bash`, for example `sudo FR_DISK=/dev/sdb bash`:
 | `FR_VERSION` | `edge` | firerunner release to install: `edge` (the latest `main`) or a version tag |
 | `FR_CACHE_DAYS` | `14` | `cache:` archives not written for this many days are deleted |
 | `FR_METRICS_ALLOW` | none | CIDR that may scrape `:9477`; without it metrics stay local. Kept for later runs |
-| `FR_EGRESS_DENY` | none | comma-separated CIDRs jobs must not reach, e.g. `192.168.0.0/16` |
+| `FR_EGRESS_DENY` | none | comma-separated CIDRs jobs must not reach, e.g. `192.168.0.0/16`. Kept for later runs; `none` clears it |
 | `FR_GITLAB_URL`, `FR_RUNNER_TOKEN` | none | register the runner during install |
 | `FR_RUNNER_CONCURRENT` | `4` | parallel jobs of the runner registered during install |
 | `FR_SUBNET` | `10.200.0` | /24 for microVMs |

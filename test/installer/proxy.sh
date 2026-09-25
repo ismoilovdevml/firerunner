@@ -23,7 +23,7 @@ expect() {
 # shellcheck disable=SC1090,SC1091
 source $WORK/install-lib.sh
 set +e; trap - ERR
-CONF_DIR=$WORK/conf PROXY_FILE=$WORK/conf/proxy-upstream CA_FILE=$WORK/conf/ca.pem
+CONF_DIR=$WORK/conf PROXY_FILE=$WORK/conf/proxy-upstream CA_FILE=$WORK/conf/ca.pem EGRESS_FILE=$WORK/conf/egress-deny
 FR_SUBNET=10.200.0 BIN_DIR=$WORK/bin
 mkdir -p /etc/systemd/system /usr/local/share/ca-certificates
 update-ca-certificates() { echo updated > $WORK/ca-updated; }
@@ -41,6 +41,12 @@ echo "not a cert" > $WORK/bad.pem
 expect "FR_CA_FILE without a certificate refused" ! check_preflight "" "" $WORK/bad.pem
 expect "FR_INSECURE_REGISTRIES with a path refused" ! check_preflight "" "" "" "harbor.corp/v2"
 expect "FR_INSECURE_REGISTRIES http:// and host:port allowed" check_preflight "" "" "" "harbor.corp:443,http://10.0.0.5:5000"
+expect "FR_PROXY with # in the password refused"   ! check_preflight "http://bob:p#ss@proxy:3128"
+expect "FR_PROXY with a bare % refused"            ! check_preflight "http://bob:50%off@proxy:3128"
+expect "FR_PROXY at the forwarder itself refused"  ! check_preflight "http://127.0.0.1:3128"
+expect "FR_PROXY at localhost:3128 refused"        ! check_preflight "http://localhost:3128"
+expect "FR_PROXY at the bridge address refused"    ! check_preflight "http://10.200.0.1:3128"
+expect "FR_PROXY at a local CNTLM on 3129 allowed"   check_preflight "http://127.0.0.1:3129"
 
 # ---- setup_proxy: password file root-only, CA trusted, downloads use the proxy
 printf -- '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n' > $WORK/corp.pem
@@ -67,6 +73,35 @@ rm -f $PROXY_FILE
 proxy_dropin containerd-flintlock >/dev/null
 expect "drop-in removed without a proxy" test ! -f $D
 expect "no firewall rule without a proxy" test -z "$(proxy_input_rules)"
+
+# ---- FR_EGRESS_DENY is remembered; FR_EGRESS_DENY=none clears it
+FR_PROXY='' FR_CA_FILE='' FR_EGRESS_DENY=192.168.0.0/16,10.9.0.0/16
+setup_proxy >/dev/null 2>&1
+FR_EGRESS_DENY=''
+expect "egress deny remembered for a re-run" test "$(egress_deny)" = "192.168.0.0/16,10.9.0.0/16"
+expect "firewall rule from the remembered list" test "$(egress_deny_rules)" = '    iifname "br-fc" ip daddr { 192.168.0.0/16, 10.9.0.0/16 } drop'
+FR_EGRESS_DENY=none
+setup_proxy >/dev/null 2>&1
+expect "FR_EGRESS_DENY=none clears it" test -z "$(egress_deny)"
+FR_EGRESS_DENY=''
+expect "cleared list stays cleared" test -z "$(egress_deny)"
+
+# ---- discard_blocks follows the pool's zeroing
+lvs() { [[ $1 == --noheadings ]] && echo "  $LVS_ZERO"; return 0; }
+LVS_ZERO=zero; expect "zeroing pool: discard off" test "$(discard_blocks)" = false
+LVS_ZERO="";   expect "pool without zeroing: discard on" test "$(discard_blocks)" = true
+unset -f lvs
+
+# ---- restarts wait while jobs run
+systemctl() { echo "$*" >> $WORK/systemctl.log; [[ $1 == is-active ]] && return 0; return 0; }
+mkdir -p /run/firerunner/jobs; : > /run/firerunner/jobs/job-1.json
+: > $WORK/systemctl.log; PENDING=""
+restart_when_idle containerd-flintlock >/dev/null 2>&1
+expect "no restart while a job runs" ! grep -q "^restart containerd-flintlock" $WORK/systemctl.log
+expect "the restart is reported as pending" test "$PENDING" = "containerd-flintlock "
+rm -f /run/firerunner/jobs/job-1.json
+restart_when_idle containerd-flintlock >/dev/null 2>&1
+expect "restart when no job runs" grep -q "^restart containerd-flintlock" $WORK/systemctl.log
 
 echo "RESULT pass=$pass fail=$fail"
 [[ $fail -eq 0 ]]
