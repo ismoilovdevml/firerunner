@@ -427,9 +427,7 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 		}
 		_ = os.Remove(file)
 		d.log.Warn("saved builder cache refused and deleted, starting empty", "project", project, "err", err)
-		wctx, wcancel := context.WithTimeout(ctx, time.Minute)
-		defer wcancel()
-		if werr := builderCacheWipe(wctx, cfg, inst); werr != nil {
+		if werr := wipeBuilderCache(ctx, cfg, inst); werr != nil {
 			return false, fmt.Errorf("partly restored builder cache could not be removed: %w", werr)
 		}
 		return false, nil
@@ -441,6 +439,14 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 	d.log.Info("builder cache restored", "project", project, "bytes", size,
 		"took", time.Since(start).Round(100*time.Millisecond).String())
 	return true, nil
+}
+
+// wipeBuilderCache removes the volume a restore loaded (all or part of), so
+// buildkitd starts empty.
+func wipeBuilderCache(ctx context.Context, cfg config.Config, inst *vm.Instance) error {
+	wctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	return builderCacheWipe(wctx, cfg, inst)
 }
 
 // dropSavedCachesLocked moves the saved cache of project ("all": every

@@ -1041,3 +1041,75 @@ func TestSpecImage(t *testing.T) {
 		t.Fatalf("legacy spec: %q, want unknown", got)
 	}
 }
+
+// `builder rm` while the project's builder is booting: the saved copy it is
+// loading from an open file is gone from the disk, and must not survive in the
+// builder either. A restore that finished is wiped before buildkitd starts; a
+// builder that became ready on it meanwhile is not used.
+func TestRemoveBuildersDuringRestore(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rmDuring string // restore or setup
+	}{
+		{"while the cache loads", "restore"},
+		{"while buildkitd starts on it", "setup"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubBuilders(t, func(string) bool { return true })
+			nft := stubNft(t)
+			var d *Daemon
+			rm := func() {
+				if out := d.RemoveBuilders("7", false); len(out.Removed)+len(out.Skipped) != 0 {
+					t.Errorf("rm of a booting builder = %+v", out)
+				}
+			}
+			dir := stubBuilderCache(t, nil, nil, func(_ context.Context, _ config.Config, _ *vm.Instance, r io.Reader) error {
+				if tc.rmDuring == "restore" {
+					rm()
+				}
+				_, err := io.ReadAll(r) // the unlinked file is still open
+				return err
+			})
+			var wipes atomic.Int32
+			builderCacheWipe = func(context.Context, config.Config, *vm.Instance) error { wipes.Add(1); return nil }
+			boots := stubBoot(t, nil)
+			builderSetup = func(context.Context, config.Config, *vm.Instance, *builderCreds) error {
+				if tc.rmDuring == "setup" {
+					rm()
+				}
+				return nil
+			}
+			var srv interface{ Deleted() []string }
+			d, srv = newTestDaemon(t)
+			writeFile(t, filepath.Join(dir, "7.tar"), saved("purged layers"), time.Minute)
+			d.Builder("7", true)
+			port := d.builders["7"].Port
+			d.bootBuilder(context.Background(), d.cfg, "7")
+			d.bg.Wait()
+			if _, err := os.Stat(filepath.Join(dir, "7.tar")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("saved cache kept after builder rm")
+			}
+			d.mu.Lock()
+			b := d.builders["7"]
+			ready := b != nil && b.ready
+			_, cooling := d.builderFailed["7"]
+			d.mu.Unlock()
+			switch tc.rmDuring {
+			case "restore": // wiped before buildkitd started: the builder starts empty
+				if wipes.Load() != 1 || !ready {
+					t.Fatalf("wipes %d, builder ready %v; want the volume wiped and the builder ready", wipes.Load(), ready)
+				}
+			case "setup": // too late to wipe: the builder is not used
+				if b != nil || !deleted(srv.Deleted(), "uid-"+boots.last()) {
+					t.Fatalf("builder kept (ready %v) with the removed cache; deleted %v", ready, srv.Deleted())
+				}
+				if _, ok := nft.elems[port]; ok {
+					t.Fatalf("port %d still mapped to the dropped builder", port)
+				}
+				if cooling {
+					t.Fatal("an operator's rm put the project on a failed-boot cooldown")
+				}
+			}
+		})
+	}
+}

@@ -77,6 +77,10 @@ type builder struct {
 	creds *builderCreds
 	// strikes counts consecutive reconciles whose buildkitd probe failed.
 	strikes int
+	// dropped: an operator's `builder rm` came while the builder booted. The
+	// saved cache it may be loading (from a file that is open, so unlinking it
+	// does not stop the load) must not stay in it; see bootBuilder.
+	dropped bool
 }
 
 // builderStrikes consecutive failed probes drop a builder. One missed 3 s dial
@@ -272,7 +276,8 @@ type Removal struct {
 // RemoveBuilders deletes the ready builder of project ("all": every ready
 // builder) with its layer cache, and the saved cache of a deleted builder.
 // Builders a running job builds on are kept unless force is set: deleting one
-// fails that job's docker build.
+// fails that job's docker build. A builder still booting keeps booting, but
+// without the saved cache it may be loading (see builder.dropped).
 func (d *Daemon) RemoveBuilders(project string, force bool) Removal {
 	out := Removal{Removed: []string{}, Skipped: []string{}}
 	if project != "all" && !projectID.MatchString(project) {
@@ -281,7 +286,11 @@ func (d *Daemon) RemoveBuilders(project string, force bool) Removal {
 	busy := busyBuilders() // file reads: outside the lock
 	d.mu.Lock()
 	for _, b := range d.builders {
-		if !b.ready || (project != "all" && b.Project != project) {
+		if project != "all" && b.Project != project {
+			continue
+		}
+		if !b.ready {
+			b.dropped = true // its saved cache is dropped below
 			continue
 		}
 		if busy[b.Project] && !force {
@@ -382,6 +391,18 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		fail(inst, err) // the VM may hold part of a cache: start over in a new one
 		return
 	}
+	d.mu.Lock()
+	dropped := d.builders[project] != nil && d.builders[project].dropped
+	d.mu.Unlock()
+	if restored && dropped {
+		// `builder rm` threw the saved cache away while it loaded.
+		if err := wipeBuilderCache(ctx, bcfg, inst); err != nil {
+			fail(inst, fmt.Errorf("saved builder cache removed by the operator could not be wiped: %w", err))
+			return
+		}
+		restored = false
+		d.log.Info("builder cache removed by the operator while it loaded: wiped, starting empty", "project", project)
+	}
 	if err := builderSetup(ctx, bcfg, inst, creds); err != nil {
 		if restored && errors.Is(err, errBuildkitDown) {
 			// buildkitd ran but did not come up on the restored state: do not
@@ -410,6 +431,13 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	b, ok := d.builders[project]
+	if ok && restored && b.dropped {
+		// `builder rm` came after the wipe check, while buildkitd started on
+		// the removed cache: do not use this builder; the next job starts one.
+		delete(d.builders, project)
+		ok = false
+		d.log.Info("builder dropped: its cache was removed by the operator while it started", "project", project)
+	}
 	if !ok || ctx.Err() != nil {
 		// Removed while booting, or shutting down. The port leads to this VM
 		// unless another builder took it meanwhile.
