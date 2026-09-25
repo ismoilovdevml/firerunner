@@ -735,6 +735,12 @@ func (d *Daemon) mapBuilderPorts(bs ...builder) error {
 	}
 	out, err := nftRun("", "list", "map", "inet", "firerunner", "builders")
 	if err != nil {
+		if len(bs) == 0 {
+			// Only sweeping, and no readable map: a firewall from before
+			// builders has none, so nothing to sweep. Not worth an error on
+			// every reconcile; the next one tries again.
+			return nil
+		}
 		return err
 	}
 	have := parseBuilderMap(out)

@@ -1313,3 +1313,26 @@ func TestStaleBuilderPortsAreUnmapped(t *testing.T) {
 		}
 	})
 }
+
+// A host whose firewall has no builders map (rules from before builders) and
+// no builders: reconcile's sweep of stale mappings logs nothing, while a
+// builder that needs its mapping still gets the error.
+func TestBuilderSweepWithoutTheMapIsQuiet(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	old := nftRun
+	nftRun = func(string, ...string) (string, error) {
+		return "", errors.New("Error: No such file or directory; did you mean map 'builders' in table inet 'firerunner'?")
+	}
+	t.Cleanup(func() { nftRun = old })
+	d, _ := newTestDaemon(t)
+	d.mu.Lock()
+	d.buildersAdopted = true
+	d.builders = map[string]*builder{}
+	d.mu.Unlock()
+	if err := d.mapBuilderPorts(); err != nil {
+		t.Fatalf("sweep without a map = %v, want nothing to do", err)
+	}
+	if err := d.mapBuilderPorts(builder{Project: "1", Port: 20001, Instance: vm.Instance{IP: "10.200.0.1"}}); err == nil {
+		t.Fatal("a builder that needs its mapping got no error")
+	}
+}
