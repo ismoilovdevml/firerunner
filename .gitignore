@@ -1,10 +1,5 @@
 # Binaries
 build/
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
 /firerunner
 
 # Test and coverage
