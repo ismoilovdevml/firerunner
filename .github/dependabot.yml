@@ -1,0 +1,23 @@
+# Weekly updates, one pull request per ecosystem. Actions are pinned by commit
+# SHA with the tag in a comment (see ci.yml); Dependabot updates both.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      github-actions:
+        patterns: [ '*' ]
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+    groups:
+      go-modules:
+        patterns: [ '*' ]
