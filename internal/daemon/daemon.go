@@ -992,6 +992,35 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 	for _, f := range capVMFiles(filepath.Join(flintlockVMDir, cfg.Flintlock.Namespace), vmFileMax) {
 		d.log.Warn("microVM file over its size bound, emptied", "file", f, "bytes", vmFileMax)
 	}
+	d.bindAddresses(ctx, cfg, vms)
+}
+
+// reconcileBindings is vm.ReconcileBindings (a variable for tests).
+var reconcileBindings = vm.ReconcileBindings
+
+// bindAddresses keeps the bridge's address bindings (see vm.Bind) in line
+// with the listed microVMs: VMs booted by an older binary, a binding that
+// failed at boot, sets a firewall reload emptied, taps that are gone.
+func (d *Daemon) bindAddresses(ctx context.Context, cfg config.Config, vms []*types.MicroVM) {
+	want := map[string]vm.Binding{}
+	for _, v := range vms {
+		tap, mac := vm.Tap(v), vm.GuestMAC(v)
+		if tap == "" || mac == "" {
+			continue
+		}
+		if ip, err := vm.LeaseIP(cfg.Network.LeasesFile, mac); err == nil && ip != "" {
+			want[tap] = vm.Binding{Tap: tap, MAC: mac, IP: ip}
+		}
+	}
+	added, removed, err := reconcileBindings(ctx, want)
+	switch {
+	case errors.Is(err, vm.ErrNoBindingSets):
+		// A firewall from before address bindings: nothing is checked.
+	case err != nil:
+		d.warnLimited("bindings", "cannot reconcile the bridge address bindings", "err", err)
+	case len(added)+len(removed) > 0:
+		d.log.Info("bridge address bindings reconciled", "added", added, "removed", removed)
+	}
 }
 
 // vmFileMax bounds each file firecracker appends to in a microVM's state dir:

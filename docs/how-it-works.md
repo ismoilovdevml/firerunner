@@ -28,7 +28,7 @@ control plane, or anything the next job will use.
 
 | Boundary | Control |
 |---|---|
-| Job and job | a new VM with its own kernel per job, never reused; the host drops all traffic from one VM to another, on the bridge and routed through the host (a job reaches only its own project's builder, through the host) |
+| Job and job | a new VM with its own kernel per job, never reused; the host drops all traffic from one VM to another, on the bridge and routed through the host (a job reaches only its own project's builder, through the host); each VM's port on the bridge may only send from that VM's MAC and address, so a VM cannot take another one's address (ARP) or MAC |
 | Job and host | the host accepts only DHCP, DNS, the Docker Hub cache and `cache:` storage from VMs; cloud metadata (`169.254.169.254`) is blocked; nothing a VM sends on its metadata interface (`eth0`) reaches the host |
 | Network and job | hosts on your network cannot open connections to microVMs or to the services the host runs for them; microVMs only get replies to connections they opened |
 | Project and project | each builder has its own certificate authority; a job gets a client certificate of its own for its project's builder only, valid for `daemon.job_max_age`. `cache:` is stored per project and reached through short-lived signed URLs |
@@ -44,10 +44,10 @@ Not covered yet:
 - Firecracker runs as root without its jailer, which flintlock does not support: Firecracker's
   seccomp filters and KVM are the barrier between a VM and the host, and an escape from the VMM
   would be root on the host.
-- On the bridge a VM can send frames with another VM's MAC or IP address (ARP). SSH host keys and
-  the builders' certificates keep scripts, secrets and builds from reaching the wrong VM, but such
-  a VM can disturb other jobs' connections. Binding each VM's network port to its own addresses is
-  in progress.
+- A VM can send DHCP requests with made-up client ids from its own address and use up the
+  addresses of the microVM network, so other jobs cannot start until those leases expire (15 min).
+- A VM whose network port flintlock does not report runs without its address binding (the
+  daemon binds it at its next pass, within a minute).
 - The signature does not say which build of `edge` a release is: an older signed `edge` build can
   be served in place of the newest one. Tagged releases are checked (`v1.2.0` must say `v1.2.0`).
 

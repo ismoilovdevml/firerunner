@@ -714,6 +714,9 @@ func Cleanup(cfg config.Config) error {
 			// A VM that is still running keeps its lease and pinned key until
 			// the daemon deletes it (Daemon.delete forgets them then).
 			vm.Forget(cfg, vmID)
+			if stErr == nil {
+				vm.UnbindInstance(&st.Instance)
+			}
 		}
 	}
 	if stErr == nil {
@@ -773,7 +776,9 @@ func deleteVM(cfg config.Config, inst *vm.Instance) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	vm.StopMux(inst) // prepare may have started one; it would linger until ServerAlive ends it
-	_ = vm.Destroy(ctx, cfg, fl, inst.ID, inst.UID)
+	if vm.Destroy(ctx, cfg, fl, inst.ID, inst.UID) == nil {
+		vm.UnbindInstance(inst)
+	}
 }
 
 // Only failures of the job's own commands count as build failures.

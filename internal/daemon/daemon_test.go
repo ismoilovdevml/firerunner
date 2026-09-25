@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/liquidmetal-dev/flintlock/api/types"
+
 	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/flintlock"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
@@ -38,6 +40,7 @@ func TestMain(m *testing.M) {
 		return nil, errors.New("no microVMs in tests")
 	}
 	nftRun = func(string, ...string) (string, error) { return "", errors.New("nft is not run in tests") }
+	reconcileBindings = func(context.Context, map[string]vm.Binding) ([]string, []string, error) { return nil, nil, nil }
 	alive = func(config.Config, *vm.Instance) bool { return false }
 	warmDocker = func(config.Config, *vm.Instance) error { return nil }
 	serviceActive = func(context.Context, string) bool { return false }
@@ -262,5 +265,42 @@ func TestCapVMFiles(t *testing.T) {
 	}
 	if got := capVMFiles(filepath.Join(root, "missing"), limit); len(got) != 0 {
 		t.Fatalf("missing root: %v", got)
+	}
+}
+
+// Reconcile binds every listed microVM whose tap and address are known: VMs
+// of an older binary, a binding that failed at boot, sets a firewall reload
+// emptied. VMs without a reported tap or a lease are left unchecked.
+func TestBindAddressesFromTheListing(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	var got map[string]vm.Binding
+	old := reconcileBindings
+	reconcileBindings = func(_ context.Context, want map[string]vm.Binding) ([]string, []string, error) {
+		got = want
+		return nil, nil, nil
+	}
+	t.Cleanup(func() { reconcileBindings = old })
+	listed := func(id, tap string) *types.MicroVM {
+		mac := vm.MAC(id)
+		dev := "eth1"
+		v := &types.MicroVM{Spec: &types.MicroVMSpec{Id: id, Interfaces: []*types.NetworkInterface{{DeviceId: dev, GuestMac: &mac}}},
+			Status: &types.MicroVMStatus{State: types.MicroVMStatus_CREATED}}
+		if tap != "" {
+			v.Status.NetworkInterfaces = map[string]*types.NetworkInterfaceStatus{dev: {HostDeviceName: tap}}
+		}
+		return v
+	}
+	exp := time.Now().Add(15 * time.Minute).Unix()
+	leases := fmt.Sprintf("%d %s 10.200.0.21 job-1 *\n%d %s 10.200.0.22 job-2 *\n", exp, vm.MAC("job-1"), exp, vm.MAC("job-2"))
+	if err := os.WriteFile(d.cfg.Network.LeasesFile, []byte(leases), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d.bindAddresses(context.Background(), d.cfg, []*types.MicroVM{
+		listed("job-1", "fltap1"), // bound
+		listed("job-2", ""),       // flintlock reports no tap: unchecked
+		listed("job-3", "fltap3"), // no lease yet: unchecked
+	})
+	if len(got) != 1 || got["fltap1"] != (vm.Binding{Tap: "fltap1", MAC: vm.MAC("job-1"), IP: "10.200.0.21"}) {
+		t.Fatalf("bindings wanted: %+v", got)
 	}
 }
