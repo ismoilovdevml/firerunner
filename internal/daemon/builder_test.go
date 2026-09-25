@@ -1186,3 +1186,130 @@ func TestBuilderMetrics(t *testing.T) {
 	}
 	d.bg.Wait()
 }
+
+// A port no builder holds leads to the address of a deleted builder (an
+// orphan reconcile removed, one adoption skipped), which dnsmasq hands to the
+// next VM: any job VM would then receive other jobs' connections to that
+// builder port. Once the previous run's builders are adopted, the port
+// mappings are checked against the builders the daemon has and the others are
+// removed, in the same nft transaction as the missing ones are added.
+func TestStaleBuilderPortsAreUnmapped(t *testing.T) {
+	t.Run("reconcile", func(t *testing.T) {
+		stubBuilders(t, func(string) bool { return true })
+		nft := stubNft(t)
+		d, _ := newTestDaemon(t)
+		recordBuilders(d)
+		d.builders = map[string]*builder{
+			"1": readyBuilder("1", 20001, 0, builderSpec(d.cfg)),
+			"2": {Project: "2", Port: 20002, LastUsed: time.Now()}, // booting: maps its port when ready
+		}
+		nft.elems = map[int]string{
+			20002: "10.200.0.99 . 1234", // a previous holder's; builder 2 replaces it
+			20003: "10.200.0.33 . 1234", // a builder reconcile deleted as an orphan
+		}
+		d.checkBuilders(map[string]bool{"uid-1": true}, time.Now())
+		want := "-f -\ndelete element inet firerunner builders { 20003 }\n" +
+			"add element inet firerunner builders { 20001 : 10.200.0.1 . 1234 }"
+		if got := nft.writes(); strings.Join(got, "|") != want {
+			t.Fatalf("nft writes %q, want one transaction %q", got, want)
+		}
+		if want := map[int]string{20001: "10.200.0.1 . 1234", 20002: "10.200.0.99 . 1234"}; !maps.Equal(nft.elems, want) {
+			t.Fatalf("map = %v, want %v", nft.elems, want)
+		}
+	})
+	t.Run("adoption", func(t *testing.T) {
+		stubBuilders(t, func(ip string) bool { return ip != "10.200.0.2" })
+		nft := stubNft(t)
+		d, _ := newTestDaemon(t)
+		spec := builderSpec(d.cfg)
+		d.builders = map[string]*builder{"1": readyBuilder("1", 20001, 0, spec), "2": readyBuilder("2", 20002, 0, spec),
+			"3": readyBuilder("3", 20003, 0, spec)}
+		recordBuilders(d)
+		nft.elems = map[int]string{20001: "10.200.0.1 . 1234", 20002: "10.200.0.2 . 1234", 20003: "10.200.0.3 . 1234"}
+
+		d2, _ := newTestDaemon(t)
+		d2.cfg.Daemon.Socket = d.cfg.Daemon.Socket
+		d2.adoptBuilders(map[string]bool{"uid-1": true, "uid-2": true}) // 2 is not answering, 3's VM is gone
+		if d2.builders["1"] == nil || len(d2.builders) != 1 {
+			t.Fatalf("adopted %v", d2.builders)
+		}
+		if want := map[int]string{20001: "10.200.0.1 . 1234"}; !maps.Equal(nft.elems, want) {
+			t.Fatalf("map = %v, want %v (builders left for reconcile unmapped)", nft.elems, want)
+		}
+	})
+	t.Run("a builder that lost its port is not mapped", func(t *testing.T) {
+		stubBuilders(t, func(string) bool { return true })
+		nft := stubNft(t)
+		d, _ := newTestDaemon(t)
+		recordBuilders(d)
+		gone := readyBuilder("5", 20005, 0, builderSpec(d.cfg))  // removed after checkBuilders read it
+		moved := readyBuilder("6", 20006, 0, builderSpec(d.cfg)) // removed; its port went to builder 8
+		d.builders = map[string]*builder{"8": {Project: "8", Port: 20006, LastUsed: time.Now()}}
+		nft.elems = map[int]string{20005: "10.200.0.5 . 1234"}
+		if err := d.mapBuilderPorts(*gone, *moved); err != nil {
+			t.Fatal(err)
+		}
+		if len(nft.elems) != 0 {
+			t.Fatalf("map = %v, want empty: builders that no longer hold their port were mapped", nft.elems)
+		}
+	})
+	t.Run("a removal waits for a mapping in progress", func(t *testing.T) {
+		stubBuilders(t, func(string) bool { return true })
+		nft := stubNft(t)
+		inTx, release := make(chan struct{}), make(chan struct{})
+		var unmapped atomic.Bool
+		old := nftRun
+		nftRun = func(script string, args ...string) (string, error) {
+			switch {
+			case script != "":
+				close(inTx)
+				<-release
+			case args[0] == "delete":
+				unmapped.Store(true)
+			}
+			return nft.run(script, args...)
+		}
+		t.Cleanup(func() { nftRun = old })
+		d, _ := newTestDaemon(t)
+		recordBuilders(d)
+		b := readyBuilder("1", 20001, 0, builderSpec(d.cfg))
+		d.builders = map[string]*builder{"1": b}
+		done := make(chan error, 1)
+		go func() { done <- d.mapBuilderPorts(*b) }()
+		<-inTx
+		unmapDone := make(chan struct{})
+		go func() { d.unmapBuilderPort(nftRun, 20001); close(unmapDone) }()
+		time.Sleep(100 * time.Millisecond)
+		early := unmapped.Load()
+		close(release)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-unmapDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the removal never ran")
+		}
+		if early {
+			t.Fatal("a port was unmapped between mapBuilderPorts' listing and its transaction")
+		}
+		if len(nft.elems) != 0 {
+			t.Fatalf("map = %v, want the removed builder's port unmapped", nft.elems)
+		}
+	})
+	t.Run("nothing is removed before adoption", func(t *testing.T) {
+		stubBuilders(t, func(string) bool { return true })
+		nft := stubNft(t)
+		boots := stubBoot(t, nil)
+		// Its startup listing failed: builders.json is not read yet, and the
+		// previous run's builder is still mapped.
+		d, _ := newTestDaemon(t)
+		nft.elems = map[int]string{20002: "10.200.0.2 . 1234"}
+		d.Builder("9", true)
+		port := d.builders["9"].Port
+		d.bootBuilder(context.Background(), d.cfg, "9")
+		if want := map[int]string{port: "10.200.0.77 . 1234", 20002: "10.200.0.2 . 1234"}; !maps.Equal(nft.elems, want) {
+			t.Fatalf("map = %v, want %v (booted %s)", nft.elems, want, boots.last())
+		}
+	})
+}

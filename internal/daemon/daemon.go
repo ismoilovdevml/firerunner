@@ -245,6 +245,10 @@ type Daemon struct {
 	// the same free space.
 	cacheMu       sync.Mutex
 	cacheReserved int64
+	// nftMu serializes changes to the builders port map: mapBuilderPorts
+	// decides from one listing, and no other change may land between that
+	// listing and its transaction. Taken before mu, never while holding it.
+	nftMu sync.Mutex
 }
 
 // warnEvery is how often a problem that repeats every pass of the main loop
