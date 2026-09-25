@@ -136,7 +136,7 @@ func TestIdenticalReleaseIsNotDownloaded(t *testing.T) {
 }
 
 func TestUpgradeReplacesTheExecutable(t *testing.T) {
-	newBin := []byte("#!/bin/sh\necho firerunner v9\n")
+	newBin := []byte("#!/bin/sh\necho firerunner edge-abc1234\n")
 	_, done := release(t, newBin, sha(newBin), signed)
 	defer done()
 	exe := installed(t, []byte("old binary"))
@@ -144,8 +144,8 @@ func TestUpgradeReplacesTheExecutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Changed || res.To != "v9" {
-		t.Fatalf("res %+v, want changed to v9", res)
+	if !res.Changed || res.To != "edge-abc1234" || res.Unsigned {
+		t.Fatalf("res %+v, want a signed change to edge-abc1234", res)
 	}
 	if got, _ := os.ReadFile(exe); string(got) != string(newBin) {
 		t.Fatal("executable not replaced")
@@ -172,7 +172,7 @@ func TestUnsignedReleaseIsRefused(t *testing.T) {
 	exe := installed(t, []byte("old binary"))
 	for _, check := range []bool{true, false} {
 		_, err := Run(context.Background(), "v0.1.1", "v8", Options{CheckOnly: check})
-		if err == nil || !strings.Contains(err.Error(), "not signed") || !strings.Contains(err.Error(), "--allow-unsigned") {
+		if err == nil || !strings.Contains(err.Error(), "before releases were signed") || !strings.Contains(err.Error(), "--allow-unsigned") {
 			t.Fatalf("check=%v: err = %v, want refused as unsigned", check, err)
 		}
 	}
@@ -182,7 +182,7 @@ func TestUnsignedReleaseIsRefused(t *testing.T) {
 }
 
 func TestUnsignedReleaseWithAllowUnsigned(t *testing.T) {
-	newBin := []byte("#!/bin/sh\necho firerunner v9\n")
+	newBin := []byte("#!/bin/sh\necho firerunner v0.1.1\n")
 	_, done := release(t, newBin, sha(newBin), unsigned)
 	defer done()
 	exe := installed(t, []byte("old binary"))
@@ -288,5 +288,63 @@ func TestInstallerHasTheReleaseKey(t *testing.T) {
 	}
 	if !bytes.Contains(sh, bytes.TrimSpace(releaseKeyPEM)) {
 		t.Fatal("install.sh does not contain internal/upgrade/release-signing.pub")
+	}
+}
+
+// Only the releases published before signing may lack a signature; for any
+// other one --allow-unsigned does not help: it is being published or forged.
+func TestMissingSignatureOfASignedReleaseIsNeverAllowed(t *testing.T) {
+	newBin := []byte("#!/bin/sh\necho firerunner edge-abc1234\n")
+	downloads, done := release(t, newBin, sha(newBin), unsigned)
+	defer done()
+	exe := installed(t, []byte("old binary"))
+	for _, tag := range []string{"edge", "latest", "v0.2.0"} {
+		_, err := Run(context.Background(), tag, "v8", Options{AllowUnsigned: true})
+		if err == nil || !strings.Contains(err.Error(), "no signature") || strings.Contains(err.Error(), "--allow-unsigned") {
+			t.Fatalf("%s: err = %v, want refused without a way around", tag, err)
+		}
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "old binary" || *downloads != 0 {
+		t.Fatalf("executable replaced or binary downloaded (%d)", *downloads)
+	}
+}
+
+// An unsigned release is refused even when it is the binary already installed.
+func TestUnsignedIdenticalReleaseIsRefused(t *testing.T) {
+	bin := []byte("#!/bin/sh\necho firerunner edge-abc1234\n")
+	_, done := release(t, bin, sha(bin), unsigned)
+	defer done()
+	installed(t, bin)
+	if _, err := Run(context.Background(), "edge", "edge-abc1234", Options{CheckOnly: true}); err == nil {
+		t.Fatal("an unsigned edge passed because it matched the installed binary")
+	}
+}
+
+// A signed release of another version served in place of the one asked for
+// (an older one, to roll a host back) is not installed.
+func TestAnotherSignedReleaseIsNotInstalled(t *testing.T) {
+	for _, c := range []struct{ tag, says string }{
+		{"v0.3.0", "v0.2.0"},
+		{"edge", "v0.2.0"},
+		{"latest", "edge-abc1234"},
+	} {
+		newBin := []byte("#!/bin/sh\necho firerunner " + c.says + "\n")
+		_, done := release(t, newBin, sha(newBin), signed)
+		exe := installed(t, []byte("old binary"))
+		_, err := Run(context.Background(), c.tag, "v8", Options{})
+		done()
+		if err == nil || !strings.Contains(err.Error(), "not installing it") {
+			t.Fatalf("%s saying %s: err = %v, want refused", c.tag, c.says, err)
+		}
+		if got, _ := os.ReadFile(exe); string(got) != "old binary" {
+			t.Fatalf("%s saying %s: executable replaced", c.tag, c.says)
+		}
+	}
+	newBin := []byte("#!/bin/sh\necho firerunner v0.3.0\n")
+	_, done := release(t, newBin, sha(newBin), signed)
+	defer done()
+	installed(t, []byte("old binary"))
+	if res, err := Run(context.Background(), "v0.3.0", "v8", Options{}); err != nil || res.To != "v0.3.0" {
+		t.Fatalf("the release asked for: res %+v err %v", res, err)
 	}
 }

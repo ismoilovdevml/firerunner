@@ -93,6 +93,11 @@ type Result struct {
 // errNotFound is a download that does not exist (HTTP 404).
 var errNotFound = errors.New("not found")
 
+// unsignedReleases were published before releases were signed: only these can
+// be installed without a signature (Options.AllowUnsigned). Any other release
+// without one is being published or was tampered with.
+var unsignedReleases = map[string]bool{"v0.1.0": true, "v0.1.1": true}
+
 // Run downloads the release, verifies the signature of its checksums and the
 // checksum of the binary, and atomically replaces the current executable.
 // Whether the release differs from the running binary is decided by checksum,
@@ -157,10 +162,32 @@ func Run(ctx context.Context, tag, current string, opts Options) (*Result, error
 		return nil, fmt.Errorf("downloaded binary does not run: %w", err)
 	}
 	next := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(out)), "firerunner"))
+	if err := releaseMatches(tag, next); err != nil {
+		return nil, err
+	}
 	if err := os.Rename(tmp.Name(), exe); err != nil {
 		return nil, fmt.Errorf("replacing %s: %w", exe, err)
 	}
 	return &Result{From: current, To: next, Changed: true, Unsigned: unsigned}, nil
+}
+
+// releaseMatches: the binary says it is the release asked for, so an older
+// signed release served in its place is not installed. An older build of edge
+// still passes.
+func releaseMatches(tag, version string) error {
+	var ok bool
+	switch tag {
+	case "edge":
+		ok = strings.HasPrefix(version, "edge-")
+	case "latest":
+		ok = strings.HasPrefix(version, "v")
+	default:
+		ok = version == tag
+	}
+	if !ok {
+		return fmt.Errorf("release %s contains firerunner %q; not installing it", tag, version)
+	}
+	return nil
 }
 
 // verifySums checks checksums.txt against the release signature. It reports
@@ -172,10 +199,14 @@ func verifySums(ctx context.Context, base, tag string, sums []byte, allowUnsigne
 	}
 	sig, err := fetch(ctx, base+"/checksums.txt.sig")
 	if errors.Is(err, errNotFound) {
-		if allowUnsigned {
+		switch {
+		case !unsignedReleases[tag]:
+			return false, fmt.Errorf("release %s has no signature (checksums.txt.sig): it is being published "+
+				"(try again in a minute) or was tampered with; not installing it", tag)
+		case allowUnsigned:
 			return true, nil
 		}
-		return false, fmt.Errorf("release %s is not signed (releases published before signing are not); --allow-unsigned installs it anyway", tag)
+		return false, fmt.Errorf("release %s was published before releases were signed; --allow-unsigned installs it anyway", tag)
 	}
 	if err != nil {
 		return false, fmt.Errorf("release %s: %w", tag, err)

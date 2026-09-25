@@ -44,26 +44,41 @@ busybox httpd -p 127.0.0.1:18080 -h "$SRV" -c "$WORK/httpd.conf"
 sleep 0.5
 URL=http://127.0.0.1:18080
 
-# release NAME [FR_ALLOW_UNSIGNED]: what install_firerunner does with a release's checksums.
+# release NAME VERSION [FR_ALLOW_UNSIGNED]: what install_firerunner does with a release's checksums.
 release() {
     local dir=$WORK/dl/$1; mkdir -p "$dir"
     curl -fsS -o "$dir/fr.sums" "$URL/$1/checksums.txt" 2>/dev/null || cp "$SRV/$1/checksums.txt" "$dir/fr.sums"
-    ( FR_VERSION=v9.9.9 FR_ALLOW_UNSIGNED=${2:-} verify_release "$dir/fr.sums" "$URL/$1/checksums.txt.sig" ) 2>"$dir/err"
+    ( FR_VERSION=$2 FR_ALLOW_UNSIGNED=${3:-} verify_release "$dir/fr.sums" "$URL/$1/checksums.txt.sig" ) 2>"$dir/err"
 }
-expect "signed release accepted"                               release signed
-expect "unsigned release refused"                            ! release unsigned
-grep -q "FR_ALLOW_UNSIGNED=1 installs it anyway" "$WORK/dl/unsigned/err" && ok "refusal names FR_ALLOW_UNSIGNED" || bad "refusal names FR_ALLOW_UNSIGNED"
-expect "unsigned release with FR_ALLOW_UNSIGNED=1"             release unsigned 1
-grep -q "WARNING: firerunner v9.9.9 is not signed" "$WORK/dl/unsigned/err" && ok "unsigned install warns" || bad "unsigned install warns"
-expect "release signed with another key refused"             ! release forged
-expect "...also with FR_ALLOW_UNSIGNED=1"                    ! release forged 1
-expect "checksums changed after signing refused"             ! release tampered
-expect "signature download error (401) is not 'unsigned'"    ! release locked 1
-grep -q "HTTP 401" "$WORK/dl/locked/err" && ok "download error named" || bad "download error named"
+said() { grep -q "$2" "$WORK/dl/$1/err"; }
+expect "signed release accepted"                               release signed v0.2.0
+expect "pre-signing release (v0.1.1) refused"                ! release unsigned v0.1.1
+expect "...and the refusal names FR_ALLOW_UNSIGNED"            said unsigned "FR_ALLOW_UNSIGNED=1 installs it anyway"
+expect "pre-signing release with FR_ALLOW_UNSIGNED=1"          release unsigned v0.1.1 1
+expect "...warns"                                              said unsigned "WARNING: firerunner v0.1.1 is not signed"
+expect "unsigned edge refused, also with FR_ALLOW_UNSIGNED=1" ! release unsigned edge 1
+expect "...as being published or tampered with"               said unsigned "being published (try again in a minute) or was tampered with"
+expect "unsigned later release refused with FR_ALLOW_UNSIGNED=1" ! release unsigned v0.2.0 1
+expect "release signed with another key refused"             ! release forged v0.2.0
+expect "...also with FR_ALLOW_UNSIGNED=1"                    ! release forged v0.1.1 1
+expect "...with openssl's reason and a retry hint"             said forged "Signature Verification Failure.*try again"
+expect "checksums changed after signing refused"             ! release tampered v0.2.0
+expect "signature download error (401) is not 'unsigned'"    ! release locked v0.1.1 1
+expect "...and is named"                                       said locked "HTTP 401"
+
+# The binary must say it is the release asked for (no older release in its place).
+matches() { FR_VERSION=$1 release_matches "$2"; }
+expect "edge build for edge"                                   matches edge edge-abc1234
+expect "a tagged release for edge refused"                   ! matches edge v0.2.0
+expect "the tag asked for"                                     matches v0.3.0 v0.3.0
+expect "an older tag for v0.3.0 refused"                     ! matches v0.3.0 v0.2.0
+expect "a binary that does not run refused"                  ! matches v0.3.0 ""
 
 # install_firerunner checks the signature before it trusts a checksum.
 signature_first() { declare -f install_firerunner | grep -A1 'verify_release ' | grep -q 'verify "'; }
 expect "install_firerunner checks the signature before the checksum" signature_first
+version_first() { declare -f install_firerunner | grep -B1 'put "$BIN_DIR/firerunner" 0755 < "$TMP_DIR/$bin"' | grep -q release_matches; }
+expect "install_firerunner checks the version before installing" version_first
 # The key in install.sh is the one release.yml signs with; its Go copy is
 # compared by internal/upgrade's tests.
 ( source "$WORK/install-lib.sh"; printf '%s\n' "$RELEASE_KEY" > "$WORK/shipped.pub" )

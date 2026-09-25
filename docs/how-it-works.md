@@ -35,7 +35,7 @@ control plane, or anything the next job will use.
 | Host and VM | each VM gets its own SSH host key and every connection checks it, so scripts and secrets go only to the job's own VM. Job and project ids come from gitlab-runner, not from job variables |
 | Local users | the microVM API listens on 127.0.0.1 with a token in a root-only file; with `flintlock.tls_ca_file` (and a client certificate) firerunner and flintlockd check each other's certificates, so a process that takes the API's port gets nothing. VM state files are root-only |
 | Memory and disk | a VM starts only when its memory fits and the thin pool that holds VM disks has room; the console and Firecracker files of a VM are bounded |
-| Supply chain | every download is checksum-verified; the checksums of firerunner releases are signed (Ed25519), and `firerunner upgrade` and the installer refuse a release whose signature does not verify; releases have an SBOM and a signed provenance (`gh attestation verify firerunner-linux-amd64 --repo ismoilovdevml/firerunner`) |
+| Supply chain | every download is checksum-verified; the checksums of firerunner releases are signed (Ed25519), and `firerunner upgrade` and the installer refuse a release whose signature is missing or does not verify, or whose binary is not the version asked for; releases have an SBOM and a signed provenance (`gh attestation verify firerunner-linux-amd64 --repo ismoilovdevml/firerunner`) |
 
 Not covered yet:
 
@@ -48,6 +48,8 @@ Not covered yet:
   the builders' certificates keep scripts, secrets and builds from reaching the wrong VM, but such
   a VM can disturb other jobs' connections. Binding each VM's network port to its own addresses is
   in progress.
+- The signature does not say which build of `edge` a release is: an older signed `edge` build can
+  be served in place of the newest one. Tagged releases are checked (`v1.2.0` must say `v1.2.0`).
 
 The code was audited with
 [cloudflare/security-audit-skill](https://github.com/cloudflare/security-audit-skill); the findings
