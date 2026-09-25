@@ -563,10 +563,10 @@ func TestShutdownMessagesAreInfo(t *testing.T) {
 	d.delete(context.Background(), &vm.Instance{ID: "pool-d", UID: "d"}, "shutdown")
 
 	for _, want := range []string{
-		`level=ERROR msg="image preload failed, VM kept without it" id=pool-a`,
-		`level=INFO msg="image preload stopped: daemon shutting down" id=pool-b`,
-		`level=ERROR msg="delete failed" id=pool-c`,
-		`level=INFO msg="delete not finished before shutdown" id=pool-d`,
+		`level=ERROR msg="image preload failed, VM kept without it" vm=pool-a`,
+		`level=INFO msg="image preload stopped: daemon shutting down" vm=pool-b`,
+		`level=ERROR msg="delete failed" vm=pool-c`,
+		`level=INFO msg="delete not finished before shutdown" vm=pool-d`,
 	} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("log lacks %q:\n%s", want, logs.String())

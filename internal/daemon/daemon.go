@@ -689,10 +689,10 @@ func (d *Daemon) delete(ctx context.Context, inst *vm.Instance, reason string) b
 	if err := d.fl.Delete(ctx, inst.UID); err != nil {
 		if d.stopping() {
 			// Expected when the shutdown wait ends first; reconcile removes it next start.
-			d.log.Info("delete not finished before shutdown", "id", inst.ID, "reason", reason, "err", err)
+			d.log.Info("delete not finished before shutdown", "vm", inst.ID, "reason", reason, "err", err)
 			return false
 		}
-		d.log.Error("delete failed", "id", inst.ID, "reason", reason, "err", err)
+		d.log.Error("delete failed", "vm", inst.ID, "reason", reason, "err", err)
 		return false
 	}
 	vm.Forget(d.cfgSnapshot(), inst.ID)
@@ -712,11 +712,11 @@ func (d *Daemon) stopping() bool {
 // reclaims the VM.
 func (d *Daemon) preloadFailed(ctx context.Context, id string, err error) {
 	if ctx.Err() != nil {
-		d.log.Info("image preload stopped: daemon shutting down", "id", id)
+		d.log.Info("image preload stopped: daemon shutting down", "vm", id)
 		return
 	}
 	d.metrics.bootFailures.WithLabelValues("preload").Inc()
-	d.log.Error("image preload failed, VM kept without it", "id", id, "err", err)
+	d.log.Error("image preload failed, VM kept without it", "vm", id, "err", err)
 }
 
 func (d *Daemon) cfgSnapshot() config.Config {
