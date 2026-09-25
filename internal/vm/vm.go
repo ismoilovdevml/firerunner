@@ -111,19 +111,38 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 		return nil, err
 	}
 	mac := MAC(id)
-	// A lease dnsmasq already holds for this MAC belongs to another VM: an id
-	// used again while its old VM still runs, or a guest that took the MAC.
-	// The new VM's address is a lease that was not there before the create.
-	held, err := leasedIPs(cfg.Network.LeasesFile, mac)
+	// flintlock makes the MAC, a hash of the id, the VM's DHCP client id, so
+	// dnsmasq gives this VM the address an earlier VM with the same id leased
+	// (gitlab-runner retries a failed prepare with the same job id). While
+	// flintlock lists that VM (its delete still queued, a duplicate id) or
+	// cannot say, the address is that VM's and this VM never takes it. Once
+	// the VM is gone, a lease line that was not there before the create is
+	// this VM's, for the same address too.
+	before, err := macLeases(cfg.Network.LeasesFile, mac)
 	if err != nil {
 		return nil, fmt.Errorf("reading DHCP leases: %w", err)
+	}
+	oldGone := len(before) == 0 || !otherVMListed(ctx, fl, id, "")
+	if oldGone {
+		// Left by a VM that is gone (its delete or dhcp_release failed). Free
+		// them before this VM asks: afterwards the entry would be its own.
+		for i := range before {
+			release(&before[i])
+		}
 	}
 	uid, err := fl.Create(ctx, Spec(cfg, id, mac, strings.TrimSpace(string(pub)), hostKey, labels, ca))
 	if err != nil {
 		return nil, fmt.Errorf("creating microVM %s: %w", id, err)
 	}
 	inst := &Instance{ID: id, UID: uid, HostKey: hostKey.Public}
-	isNew := func(l lease) bool { return !held[l.ip] }
+	isNew := func(l lease) bool {
+		for _, b := range before {
+			if b == l || (!oldGone && b.ip == l.ip) {
+				return false
+			}
+		}
+		return true
+	}
 
 	fail := func(err error) (*Instance, error) {
 		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -136,7 +155,10 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 	}
 
 	deadline := time.Now().Add(cfg.VM.BootTimeout)
-	for inst.IP == "" {
+	for polls := 1; inst.IP == ""; polls++ {
+		if !oldGone && polls%leaseRecheck == 0 {
+			oldGone = !otherVMListed(ctx, fl, id, uid)
+		}
 		if time.Now().After(deadline) {
 			return fail(notReady{fmt.Sprintf("microVM %s got no DHCP lease within %s (see: firerunner vm logs %s)", id, cfg.VM.BootTimeout, id)})
 		}
@@ -288,13 +310,6 @@ func LeaseIP(leasesFile, mac string) (string, error) {
 	return l.ip, err
 }
 
-// leasedIPs returns the addresses leased to mac.
-func leasedIPs(leasesFile, mac string) (map[string]bool, error) {
-	ips := map[string]bool{}
-	_, err := findLease(leasesFile, mac, func(l lease) bool { ips[l.ip] = true; return false })
-	return ips, err
-}
-
 // lease is one line of the dnsmasq leases file.
 type lease struct {
 	mac, ip, clientID string
@@ -439,6 +454,30 @@ func forget(cfg config.Config, id string, match func(lease) bool) {
 	if err != nil || l == nil {
 		return
 	}
+	release(l)
+}
+
+// leaseRecheck is how many lease polls Boot waits between asking flintlock
+// whether an earlier VM with the same id is gone (about a second).
+const leaseRecheck = 4
+
+// otherVMListed reports whether flintlock lists a microVM with this id other
+// than uid, or cannot say.
+func otherVMListed(ctx context.Context, fl *flintlock.Client, id, uid string) bool {
+	vms, err := fl.ListOnce(ctx)
+	if err != nil {
+		return true
+	}
+	for _, v := range vms {
+		if v.GetSpec().GetId() == id && v.GetSpec().GetUid() != uid {
+			return true
+		}
+	}
+	return false
+}
+
+// release asks dnsmasq to free a lease at once.
+func release(l *lease) {
 	dev := routeDev(l.ip)
 	if dev == "" {
 		return

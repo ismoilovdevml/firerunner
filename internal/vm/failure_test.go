@@ -249,30 +249,66 @@ func bootEnv(t *testing.T, leases string) (cfg config.Config, srv *flintlocktest
 	return cfg, srv, dialFake(t, srv), released
 }
 
-// A lease dnsmasq already held for the new VM's MAC before the create belongs
-// to another VM (an id used again, or a guest that took the MAC). Boot never
-// takes that address, and a failed boot never releases that VM's lease.
-func TestBootIgnoresLeasesFromBeforeCreate(t *testing.T) {
-	const id = "bld-7"
+// flintlock makes the VM's MAC, a hash of its id, the DHCP client id, so
+// dnsmasq gives a VM the address an earlier VM with the same id leased (a
+// job's prepare retried by gitlab-runner). While flintlock lists a VM with that
+// id (a failed delete, a duplicate id), or cannot be asked, the leases its MAC
+// holds are that VM's: Boot never takes their address, not even renewed, and a
+// failed boot releases only its own lease. When no VM with the id is listed,
+// they are a gone VM's (its delete or dhcp_release failed, or its lease came
+// after its last look): Boot releases them before the create and accepts a new
+// lease for the same address; before, every retry failed without a lease.
+func TestBootLeasesOfAnEarlierVMWithTheSameID(t *testing.T) {
+	const id = "job-7"
 	mac := MAC(id)
-	exp := time.Now().Add(time.Hour).Unix()
-	old := fmt.Sprintf("%d %s 10.200.0.50 %s 01:%s\n", exp, mac, id, mac)
+	exp := time.Now().Add(15 * time.Minute).Unix()
+	line := func(exp int64, ip string) string { return fmt.Sprintf("%d %s %s %s 01:%s\n", exp, mac, ip, id, mac) }
 	for _, tc := range []struct {
 		name    string
-		fresh   string // lease line dnsmasq writes once the VM exists
+		listed  string // the old VM: "running", "deleted" (once the new VM exists), "gone", or "unknown" (listings fail)
+		old     string // the MAC's lease before the create
+		fresh   string // lease line dnsmasq writes once the new VM exists ("" none)
 		wantErr string
-		release string // address released when the boot fails
+		release string // addresses released, in order
+		early   string // of those, released before the create
 	}{
-		{"only the old VM's lease", "", "got no DHCP lease", ""},
-		{"a new lease after the create", fmt.Sprintf("%d %s 127.0.0.1 %s 01:%s\n", exp+60, mac, id, mac), "at 127.0.0.1", "127.0.0.1"},
+		{"old VM running, no new lease", "running", line(exp, "10.200.0.50"), "", "got no DHCP lease", "", ""},
+		{"old VM running, a new address", "running", line(exp, "10.200.0.50"), line(exp+60, "127.0.0.1"), "at 127.0.0.1", "127.0.0.1", ""},
+		{"old VM running, its address renewed", "running", line(exp, "10.200.0.50"), line(exp+60, "10.200.0.50"), "got no DHCP lease", "", ""},
+		{"flintlock not answering", "unknown", line(exp, "10.200.0.50"), line(exp+60, "10.200.0.50"), "got no DHCP lease", "", ""},
+		{"old VM deleted during the boot", "deleted", line(exp, "127.0.0.1"), line(exp+60, "127.0.0.1"), "at 127.0.0.1", "127.0.0.1", ""},
+		{"old VM gone, no new lease", "gone", line(exp, "127.0.0.1"), "", "got no DHCP lease", "127.0.0.1", "127.0.0.1"},
+		{"old VM gone, its address again", "gone", line(exp, "127.0.0.1"), line(exp+60, "127.0.0.1"), "at 127.0.0.1", "127.0.0.1,127.0.0.1", "127.0.0.1"},
+		{"old VM gone, its lease expired", "gone", line(time.Now().Unix()-1, "127.0.0.1"), line(exp+60, "127.0.0.1"), "at 127.0.0.1", "127.0.0.1", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg, srv, fl, released := bootEnv(t, old)
+			cfg, srv, fl, released := bootEnv(t, tc.old)
+			switch tc.listed {
+			case "running", "deleted":
+				uid := "uid-old"
+				srv.SetVMs(&types.MicroVM{Spec: &types.MicroVMSpec{Id: id, Uid: &uid},
+					Status: &types.MicroVMStatus{State: types.MicroVMStatus_CREATED}})
+			case "unknown":
+				for i := 0; i < 50; i++ {
+					srv.FailList(status.Error(codes.Unavailable, "flintlockd restarting"))
+				}
+			}
+			record := releaseLease
+			var preCreate []string // addresses released before the create
+			releaseLease = func(args ...string) error {
+				if len(srv.Created()) == 0 {
+					preCreate = append(preCreate, args[1])
+				}
+				return record(args...)
+			}
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
 				for tc.fresh != "" && len(srv.Created()) == 0 {
 					time.Sleep(5 * time.Millisecond)
+				}
+				if tc.listed == "deleted" {
+					srv.SetVMs() // its queued delete ran
 				}
 				if tc.fresh != "" {
 					f, err := os.OpenFile(cfg.Network.LeasesFile, os.O_APPEND|os.O_WRONLY, 0)
@@ -295,7 +331,10 @@ func TestBootIgnoresLeasesFromBeforeCreate(t *testing.T) {
 				ips = append(ips, args[1])
 			}
 			if strings.Join(ips, ",") != tc.release {
-				t.Fatalf("released %v, want %q (never the old VM's 10.200.0.50)", ips, tc.release)
+				t.Fatalf("released %v, want %q", ips, tc.release)
+			}
+			if strings.Join(preCreate, ",") != tc.early {
+				t.Fatalf("released before the create %v, want %q", preCreate, tc.early)
 			}
 		})
 	}
