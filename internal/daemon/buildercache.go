@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,17 +44,29 @@ var builderCacheTimeout = 15 * time.Minute
 // builderCacheMinFree is the share of the disk a save must leave free.
 const builderCacheMinFree = 0.10
 
-// The volume is read and written in the builder VM; the save stops buildkitd
+// builderCacheSlack is reserved on top of a save's size (a variable for
+// tests). The size is exact (see builderSizeScript), so it only has to cover
+// a few bytes more, if any.
+var builderCacheSlack int64 = 1 << 20
+
+// The volume is read and written in the builder VM; buildkitd is stopped
 // first, so its database is consistent. Sockets left by builds are skipped.
 // The archive ends with a marker file: tar accepts an archive cut off between
 // two members, so a load without the marker is incomplete and is thrown away.
+//
+// The size step reports the archive's exact size, which is what a save
+// reserves on the host: GNU tar sizes an archive written to /dev/null without
+// reading file contents (--totals). The volume's du is no measure: 20,000
+// hard links under a deep path take 2 bytes of du and 133 MB of tar.
 const (
-	builderVolume     = `mp=$(docker volume inspect -f '{{.Mountpoint}}' buildkit)`
-	builderMarker     = `.firerunner-complete`
-	builderSizeScript = builderVolume + ` && du -sb "$mp" | cut -f1`
-	builderSaveScript = `docker stop -t 30 buildkitd >/dev/null && ` + builderVolume +
-		` && m=$(mktemp -d) && touch "$m/` + builderMarker + `"` +
-		` && tar --warning=no-file-ignored -cf - -C "$mp" . -C "$m" ` + builderMarker
+	builderStop    = `docker stop -t 30 buildkitd >/dev/null`
+	builderVolume  = `mp=$(docker volume inspect -f '{{.Mountpoint}}' buildkit)`
+	builderMarker  = `.firerunner-complete`
+	builderArchive = `m=$(mktemp -d) && touch "$m/` + builderMarker + `" && LC_ALL=C tar --warning=no-file-ignored`
+	builderMembers = ` -C "$mp" . -C "$m" ` + builderMarker
+
+	builderSizeScript = builderStop + ` && ` + builderVolume + ` && ` + builderArchive + ` --totals -cf /dev/null` + builderMembers + ` 2>&1`
+	builderSaveScript = builderStop + ` && ` + builderVolume + ` && ` + builderArchive + ` -cf -` + builderMembers
 	builderLoadScript = `docker volume create buildkit >/dev/null && ` + builderVolume +
 		` && tar -C "$mp" -xf - && [ -e "$mp/` + builderMarker + `" ] && rm -f "$mp/` + builderMarker + `"` +
 		` || { docker volume rm -f buildkit >/dev/null 2>&1; exit 1; }`
@@ -66,7 +79,7 @@ var (
 		if err != nil {
 			return 0, fmt.Errorf("%w: %s", err, strings.TrimSpace(out))
 		}
-		return strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+		return parseTarTotal(out)
 	}
 	builderCacheSave = func(ctx context.Context, cfg config.Config, inst *vm.Instance, w io.Writer) error {
 		return streamSSH(ctx, cfg, inst, builderSaveScript, nil, w)
@@ -116,6 +129,49 @@ func streamSSH(ctx context.Context, cfg config.Config, inst *vm.Instance, script
 	}
 }
 
+// tarTotal is the line GNU tar's --totals prints.
+var tarTotal = regexp.MustCompile(`Total bytes written: ([0-9]+)`)
+
+// parseTarTotal reads the archive size from the size step's output.
+func parseTarTotal(out string) (int64, error) {
+	m := tarTotal.FindStringSubmatch(out)
+	if m == nil {
+		return 0, fmt.Errorf("no archive size in %q", strings.TrimSpace(out))
+	}
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// errCacheOverrun: a save's archive outgrew the bytes it reserved.
+var errCacheOverrun = errors.New("the archive outgrew its reservation")
+
+// cacheWriter writes a save into its temp file and refuses bytes past the
+// save's reservation: the size came from the guest, and the host bounds what
+// it takes on trust. Written bytes leave cacheReserved as they reach the file
+// (makeRoomForCache counts the temp file), so they are never counted twice.
+type cacheWriter struct {
+	d    *Daemon
+	f    *os.File
+	left int64 // reserved bytes not written yet
+	over bool
+}
+
+func (w *cacheWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) > w.left {
+		w.over = true
+		return 0, errCacheOverrun
+	}
+	n, err := w.f.Write(p)
+	w.left -= int64(n)
+	w.d.cacheMu.Lock()
+	w.d.cacheReserved -= int64(n)
+	w.d.cacheMu.Unlock()
+	return n, err
+}
+
 func builderCacheFile(project string) string {
 	return filepath.Join(builderCacheDir, project+".tar")
 }
@@ -145,11 +201,15 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 	limit := builderCacheLimit(cfg)
 
 	size, err := builderCacheSize(ctx, cfg, inst)
+	if err == nil && size < 0 {
+		err = fmt.Errorf("negative size %d", size)
+	}
 	if err != nil {
 		d.log.Warn("builder cache not saved: size unknown", "project", project, "err", err)
 		return
 	}
-	if size > limit {
+	reserve := size + builderCacheSlack
+	if reserve > limit {
 		result = "skipped"
 		d.log.Warn("builder cache not saved: larger than builder.saved_cache_gb", "project", project, "bytes", size)
 		return
@@ -159,9 +219,9 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 		return
 	}
 	d.cacheMu.Lock()
-	err = d.makeRoomForCache(project, size, limit, d.cacheReserved)
+	err = d.makeRoomForCache(project, reserve, limit, d.cacheReserved)
 	if err == nil {
-		d.cacheReserved += size
+		d.cacheReserved += reserve
 	}
 	d.cacheMu.Unlock()
 	if err != nil {
@@ -169,9 +229,10 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 		d.log.Warn("builder cache not saved", "project", project, "err", err)
 		return
 	}
+	w := &cacheWriter{d: d, left: reserve}
 	defer func() {
 		d.cacheMu.Lock()
-		d.cacheReserved -= size
+		d.cacheReserved -= w.left // what was written left the reservation already
 		d.cacheMu.Unlock()
 	}()
 	tmp, err := os.CreateTemp(builderCacheDir, project+".tar.tmp-*")
@@ -179,7 +240,12 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 		d.log.Warn("builder cache not saved", "project", project, "err", err)
 		return
 	}
-	err = builderCacheSave(ctx, cfg, inst, tmp)
+	w.f = tmp
+	err = builderCacheSave(ctx, cfg, inst, w)
+	if w.over {
+		// The copy is cut off at the reservation, whatever the stream says.
+		err = fmt.Errorf("%w of %d bytes", errCacheOverrun, reserve)
+	}
 	if err == nil {
 		err = tmp.Sync()
 	}
@@ -224,8 +290,10 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 
 // makeRoomForCache deletes other projects' saved caches, least recently used
 // first, until a new one of size fits into limit and leaves builderCacheMinFree
-// of the disk free, counting reserved bytes of saves still being written. The
-// project's own old copy stays until the new one replaces it. Callers hold cacheMu.
+// of the disk free. Saves still being written count with what they wrote (their
+// temp files, which the disk no longer has free) and with reserved, the bytes
+// they may still write. The project's own old copy stays until the new one
+// replaces it. Callers hold cacheMu.
 func (d *Daemon) makeRoomForCache(project string, size, limit, reserved int64) error {
 	type saved struct {
 		path string
@@ -241,12 +309,18 @@ func (d *Daemon) makeRoomForCache(project string, size, limit, reserved int64) e
 	for _, e := range entries {
 		name := e.Name()
 		if strings.Contains(name, ".tar.tmp-") {
-			// A save cut off by a crash; no save of this project runs now (at most
-			// one per project), and other projects' temp files are only this old
-			// when their daemon is gone.
-			if info, err := e.Info(); err == nil && time.Since(info.ModTime()) > builderCacheTimeout {
-				_ = os.Remove(filepath.Join(builderCacheDir, name))
+			info, err := e.Info()
+			if err != nil {
+				continue
 			}
+			if time.Since(info.ModTime()) > builderCacheTimeout {
+				// A save cut off by a crash; no save of this project runs now (at
+				// most one per project), and other projects' temp files are only
+				// this old when their daemon is gone.
+				_ = os.Remove(filepath.Join(builderCacheDir, name))
+				continue
+			}
+			total += info.Size() // a save being written, or a copy set aside
 			continue
 		}
 		if !strings.HasSuffix(name, ".tar") || name == project+".tar" {
@@ -266,7 +340,7 @@ func (d *Daemon) makeRoomForCache(project string, size, limit, reserved int64) e
 		return err
 	}
 	minFree := int64(float64(disk) * builderCacheMinFree)
-	avail := int64(free) - reserved // written as the other saves go on
+	avail := int64(free) - reserved // still to be written by the other saves
 	total += reserved
 	for len(others) > 0 && (total+size > limit || avail-size < minFree) {
 		o := others[0]

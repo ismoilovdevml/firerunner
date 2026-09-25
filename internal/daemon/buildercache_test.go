@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,7 +45,10 @@ func stubBuilderCache(t *testing.T,
 		builderCacheLoad = load
 	}
 	diskSpace = func(string) (uint64, uint64, error) { return 1 << 40, 2 << 40, nil }
+	oldSlack := builderCacheSlack
+	builderCacheSlack = 0
 	t.Cleanup(func() {
+		builderCacheSlack = oldSlack
 		builderCacheDir, builderCacheSize, builderCacheSave, builderCacheLoad, diskSpace = oldDir, oldSize, oldSave, oldLoad, oldDisk
 		builderCacheWipe = oldWipe
 	})
@@ -289,6 +293,16 @@ func TestMakeRoomForCache(t *testing.T) {
 	}
 	if err := d.makeRoomForCache("9", 60, 100, 50); err == nil {
 		t.Fatal("reservation ignored: 50 reserved + 60 new fit a 100-byte budget")
+	}
+
+	// What a save in progress has written so far is in its temp file, no
+	// longer in its reservation: it still counts against the budget.
+	writeFile(t, filepath.Join(dir, "5.tar.tmp-2"), strings.Repeat("w", 60), 0)
+	if err := d.makeRoomForCache("9", 50, 100, 0); err == nil {
+		t.Fatal("written bytes of a save in progress ignored: 60 written + 50 new fit a 100-byte budget")
+	}
+	if !exists("5.tar.tmp-2") {
+		t.Fatal("temp file of a save in progress removed")
 	}
 }
 
@@ -784,4 +798,156 @@ func TestCacheUnlinkNeverBlocksClaims(t *testing.T) {
 			t.Fatalf("left behind: %v", names)
 		}
 	})
+}
+
+// reservedBytes is what saves in progress may still write (cacheReserved).
+func reservedBytes(d *Daemon) int64 {
+	d.cacheMu.Lock()
+	defer d.cacheMu.Unlock()
+	return d.cacheReserved
+}
+
+// The guest's size is the only figure a save reserves disk for, and the host
+// cannot check it: a copy that grows past its reservation is cut off and
+// removed, and a negative size is refused, with the previous copy kept.
+func TestBuilderCacheSaveBoundedByReservation(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		size  int64
+		write int
+	}{
+		{"archive larger than reserved", 10, 64 << 10},
+		{"negative size", -5, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubBuilders(t, func(string) bool { return true })
+			var written atomic.Int64
+			dir := stubBuilderCache(t, sizeOf(tc.size), func(_ context.Context, _ config.Config, _ *vm.Instance, w io.Writer) error {
+				chunk := []byte(strings.Repeat("x", 1024))
+				for i := 0; i < tc.write/len(chunk)+1; i++ {
+					n, err := w.Write(chunk)
+					written.Add(int64(n))
+					if err != nil {
+						return err
+					}
+				}
+				return nil
+			}, nil)
+			writeFile(t, filepath.Join(dir, "7.tar"), "previous", time.Hour)
+			d, srv := newTestDaemon(t)
+			d.builders = map[string]*builder{"7": readyBuilder("7", 20001, d.cfg.Builder.IdleTTL+time.Hour, builderSpec(d.cfg))}
+			d.expireBuilders()
+			srv.WaitDeleted(t, "uid-7", 2*time.Second)
+			d.bg.Wait()
+			if got := readFile(t, filepath.Join(dir, "7.tar")); got != "previous" {
+				t.Fatalf("saved cache = %d bytes, want the previous copy", len(got))
+			}
+			if names := listDir(dir); len(names) != 1 {
+				t.Fatalf("left behind: %v", names)
+			}
+			if n, bound := written.Load(), max(tc.size, 0)+builderCacheSlack; n > bound {
+				t.Fatalf("%d bytes reached the host for a %d-byte reservation", n, bound)
+			}
+			if n := cacheCount(d, "save", "failed"); n != 1 {
+				t.Fatalf("save failed = %v", n)
+			}
+			if r := reservedBytes(d); r != 0 {
+				t.Fatalf("%d bytes still reserved", r)
+			}
+		})
+	}
+}
+
+// A save in progress reserves its size once: the bytes it has written are on
+// the disk (statfs no longer counts them as free) and are no longer reserved,
+// so a second save is not refused for want of room the first one counts twice.
+func TestParallelSavesCountWrittenBytesOnce(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	wrote, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }) }
+	dir := stubBuilderCache(t,
+		func(_ context.Context, _ config.Config, inst *vm.Instance) (int64, error) {
+			if inst.ID == "bld-1" {
+				return 500, nil
+			}
+			return 300, nil
+		},
+		func(_ context.Context, _ config.Config, inst *vm.Instance, w io.Writer) error {
+			if inst.ID != "bld-1" {
+				_, err := io.WriteString(w, strings.Repeat("b", 300))
+				return err
+			}
+			if _, err := io.WriteString(w, strings.Repeat("a", 500)); err != nil {
+				return err
+			}
+			close(wrote)
+			<-release // still streaming (e.g. waiting for tar to exit)
+			return nil
+		}, nil)
+	// A 1000-byte disk that must keep 100 free, whose free space is what the
+	// files in the cache directory leave.
+	diskSpace = func(string) (uint64, uint64, error) {
+		used := uint64(0)
+		for _, n := range listDir(dir) {
+			if info, err := os.Stat(filepath.Join(dir, n)); err == nil {
+				used += uint64(info.Size())
+			}
+		}
+		return 1000 - used, 1000, nil
+	}
+	d, _ := newTestDaemon(t)
+	t.Cleanup(free) // before bg.Wait: a failing test must not hang on the blocked save
+	spec := builderSpec(d.cfg)
+	d.builders = map[string]*builder{"1": readyBuilder("1", 20001, d.cfg.Builder.IdleTTL+time.Hour, spec)}
+	d.expireBuilders()
+	<-wrote // 500 bytes on disk, 500 free
+	d.mu.Lock()
+	d.builders = map[string]*builder{"2": readyBuilder("2", 20002, d.cfg.Builder.IdleTTL+time.Hour, spec)}
+	d.mu.Unlock()
+	d.expireBuilders()
+	deadline := time.Now().Add(2 * time.Second)
+	for cacheCount(d, "save", "ok")+cacheCount(d, "save", "skipped") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("second save never finished")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := cacheCount(d, "save", "ok"); n != 1 {
+		t.Fatalf("second save: ok %v, skipped %v; 300 bytes fit into 500 free with 100 kept", n, cacheCount(d, "save", "skipped"))
+	}
+	free()
+	d.bg.Wait()
+	if cacheCount(d, "save", "ok") != 2 || reservedBytes(d) != 0 {
+		t.Fatalf("save ok = %v, reserved = %d", cacheCount(d, "save", "ok"), reservedBytes(d))
+	}
+}
+
+// The size a save reserves is GNU tar's own count of the archive, from its
+// --totals line; anything else is an error, not a size.
+func TestParseTarTotal(t *testing.T) {
+	for _, tc := range []struct {
+		out  string
+		want int64
+		ok   bool
+	}{
+		{"Total bytes written: 18831360 (18MiB, 1.9GiB/s)\n", 18831360, true},
+		{"tar: ./a/sock: socket ignored\nTotal bytes written: 10240 (10KiB, 20MiB/s)\n", 10240, true},
+		{"", 0, false},
+		{"Total bytes written: -5\n", 0, false},
+		{"Total bytes written: 99999999999999999999999\n", 0, false},
+		{"Error response from daemon: No such container: buildkitd\n", 0, false},
+	} {
+		got, err := parseTarTotal(tc.out)
+		if (err == nil) != tc.ok || got != tc.want {
+			t.Errorf("parseTarTotal(%q) = %d, %v; want %d, ok %v", tc.out, got, err, tc.want, tc.ok)
+		}
+	}
+	// The size is taken the way the save archives: buildkitd stopped, the same
+	// members, and tar's messages in English.
+	for _, want := range []string{"docker stop -t 30 buildkitd", "LC_ALL=C tar", "--totals -cf /dev/null", `-C "$mp" . -C "$m" ` + builderMarker} {
+		if !strings.Contains(builderSizeScript, want) {
+			t.Errorf("size script lacks %q: %s", want, builderSizeScript)
+		}
+	}
 }
