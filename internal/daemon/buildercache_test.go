@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -307,6 +308,18 @@ func TestMakeRoomForCache(t *testing.T) {
 	}
 	if !exists("5.tar.tmp-2") {
 		t.Fatal("temp file of a save in progress removed")
+	}
+
+	// A size that is no size (zero, negative, past the budget) is refused
+	// before anything is evicted: the sums below would wrap around.
+	writeFile(t, filepath.Join(dir, "6.tar"), "six", time.Hour)
+	for _, size := range []int64{0, -1, math.MinInt64 + 100, 1<<30 + 1, math.MaxInt64} {
+		if err := d.makeRoomForCache("9", size, 1<<30, 0); err == nil {
+			t.Errorf("makeRoomForCache(%d) = nil, want a refusal", size)
+		}
+		if !exists("6.tar") {
+			t.Fatalf("a cache was evicted for a %d-byte save", size)
+		}
 	}
 }
 
@@ -815,20 +828,29 @@ func reservedBytes(d *Daemon) int64 {
 
 // The guest's size is the only figure a save reserves disk for, and the host
 // cannot check it: a copy that grows past its reservation is cut off and
-// removed, and a negative size is refused, with the previous copy kept.
+// removed, a negative size is refused, and a size past the budget is refused
+// before anything is added to it (root in a builder can print any "Total bytes
+// written"; math.MaxInt64 plus the header wrapped into a negative reservation
+// that passed the budget check and evicted every other project's cache). The
+// previous copy and other projects' copies are kept.
 func TestBuilderCacheSaveBoundedByReservation(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		size  int64
-		write int
+		name   string
+		size   int64
+		write  int
+		result string
+		bound  int64 // bytes that may reach the host
 	}{
-		{"archive larger than reserved", 10, 64 << 10},
-		{"negative size", -5, 1},
+		{"archive larger than reserved", 10, 64 << 10, "failed", 10},
+		{"negative size", -5, 1, "failed", 0},
+		{"size at the int64 limit", math.MaxInt64, 1, "skipped", 0},
+		{"size just past the budget", 100 << 30, 1, "skipped", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stubBuilders(t, func(string) bool { return true })
-			var written atomic.Int64
+			var written, saves atomic.Int64
 			dir := stubBuilderCache(t, sizeOf(tc.size), func(_ context.Context, _ config.Config, _ *vm.Instance, w io.Writer) error {
+				saves.Add(1)
 				chunk := []byte(strings.Repeat("x", 1024))
 				for i := 0; i < tc.write/len(chunk)+1; i++ {
 					n, err := w.Write(chunk)
@@ -840,6 +862,8 @@ func TestBuilderCacheSaveBoundedByReservation(t *testing.T) {
 				return nil
 			}, nil)
 			writeFile(t, filepath.Join(dir, "7.tar"), "previous", time.Hour)
+			writeFile(t, filepath.Join(dir, "5.tar"), saved("five"), 2*time.Hour)
+			writeFile(t, filepath.Join(dir, "6.tar"), saved("six"), 3*time.Hour)
 			d, srv := newTestDaemon(t)
 			d.builders = map[string]*builder{"7": readyBuilder("7", 20001, d.cfg.Builder.IdleTTL+time.Hour, builderSpec(d.cfg))}
 			d.expireBuilders()
@@ -848,14 +872,23 @@ func TestBuilderCacheSaveBoundedByReservation(t *testing.T) {
 			if got := readFile(t, filepath.Join(dir, "7.tar")); got != "previous" {
 				t.Fatalf("saved cache = %d bytes, want the previous copy", len(got))
 			}
-			if names := listDir(dir); len(names) != 1 {
+			if readFile(t, filepath.Join(dir, "5.tar")) != saved("five") || readFile(t, filepath.Join(dir, "6.tar")) != saved("six") {
+				t.Fatalf("other projects' caches evicted for a save that was not made: %v", listDir(dir))
+			}
+			if names := listDir(dir); len(names) != 3 {
 				t.Fatalf("left behind: %v", names)
 			}
-			if n, bound := written.Load(), max(tc.size, 0)+builderCacheSlack; n > bound {
+			if n, bound := written.Load(), tc.bound+builderCacheSlack; n > bound {
 				t.Fatalf("%d bytes reached the host for a %d-byte reservation", n, bound)
 			}
-			if n := cacheCount(d, "save", "failed"); n != 1 {
-				t.Fatalf("save failed = %v", n)
+			if tc.result == "skipped" && saves.Load() != 0 {
+				t.Fatal("the copy started for a size past the budget")
+			}
+			if n := cacheCount(d, "save", tc.result); n != 1 {
+				t.Fatalf("save %s = %v", tc.result, n)
+			}
+			if n := cacheCount(d, "evict", "ok"); n != 0 {
+				t.Fatalf("evict ok = %v", n)
 			}
 			if r := reservedBytes(d); r != 0 {
 				t.Fatalf("%d bytes still reserved", r)
@@ -944,6 +977,9 @@ func TestParseTarTotal(t *testing.T) {
 		{"tar: ./a/sock: socket ignored\nTotal bytes written: 10240 (10KiB, 20MiB/s)\n", 10240, true},
 		{"", 0, false},
 		{"Total bytes written: -5\n", 0, false},
+		// Parsed as is: the save refuses a size past its budget (see
+		// TestBuilderCacheSaveBoundedByReservation).
+		{"Total bytes written: 9223372036854775807\n", math.MaxInt64, true},
 		{"Total bytes written: 99999999999999999999999\n", 0, false},
 		{"Error response from daemon: No such container: buildkitd\n", 0, false},
 	} {

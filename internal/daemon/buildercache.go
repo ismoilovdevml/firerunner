@@ -231,12 +231,15 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 		return
 	}
 	header := cacheHeader(image)
-	reserve := size + int64(len(header)) + builderCacheSlack
-	if reserve > limit {
+	// The size is the guest's word: it is checked against the budget before
+	// anything is added to it, so no size wraps around into a small (or
+	// negative) reservation.
+	if limit <= 0 || size > limit-int64(len(header))-builderCacheSlack {
 		result = "skipped"
 		d.log.Warn("builder cache not saved: larger than builder.saved_cache_gb", "project", project, "bytes", size)
 		return
 	}
+	reserve := size + int64(len(header)) + builderCacheSlack
 	if err := os.MkdirAll(builderCacheDir, 0o700); err != nil {
 		d.log.Warn("builder cache not saved", "project", project, "err", err)
 		return
@@ -319,8 +322,13 @@ func (d *Daemon) saveBuilderCache(ctx context.Context, cfg config.Config, projec
 // of the disk free. Saves still being written count with what they wrote (their
 // temp files, which the disk no longer has free) and with reserved, the bytes
 // they may still write. The project's own old copy stays until the new one
-// replaces it. Callers hold cacheMu.
+// replaces it. A size that is not positive or exceeds limit is refused before
+// anything is deleted: the sums below would wrap around and read as room that
+// every other cache has to make. Callers hold cacheMu.
 func (d *Daemon) makeRoomForCache(project string, size, limit, reserved int64) error {
+	if size <= 0 || size > limit {
+		return fmt.Errorf("no room for a %d-byte cache in a %d-byte budget", size, limit)
+	}
 	type saved struct {
 		path string
 		size int64
