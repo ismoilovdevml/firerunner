@@ -152,8 +152,9 @@ type Daemon struct {
 	fl      *flintlock.Client
 	ready   []*pooled
 	booting int
-	// bootingIDs are the ids of the pool VMs counted in booting, so reconcile
-	// can tell them from orphans while other boots are in flight.
+	// bootingIDs are the ids of VMs being booted (pool VMs counted in booting,
+	// and builders), so reconcile can tell them from orphans: their uid is
+	// known only once the boot returns.
 	bootingIDs map[string]bool
 	// booted pool VMs still preloading images, by uid; counted in booting
 	preloading map[string]*preloadingVM
@@ -647,9 +648,9 @@ func decide(f vmFacts, cfg config.Config) string {
 		return "pool VM from a previous daemon run"
 	case f.Role == "pool" && !f.Booting && f.Age > cfg.VM.BootTimeout:
 		return "orphaned pool VM"
-	case f.Role == "builder" && f.Startup:
+	case f.Role == "builder" && f.Startup && !f.Booting:
 		return "builder from a previous daemon run"
-	case f.Role == "builder" && f.Age > 2*cfg.VM.BootTimeout+5*time.Minute:
+	case f.Role == "builder" && !f.Booting && f.Age > 2*cfg.VM.BootTimeout+5*time.Minute:
 		return "orphaned builder"
 	case f.Role == "run" && f.Age > cfg.Daemon.JobMaxAge:
 		return "abandoned `firerunner run` VM"

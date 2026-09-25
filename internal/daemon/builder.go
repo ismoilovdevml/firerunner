@@ -316,7 +316,18 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		fail(nil, err)
 		return
 	}
-	inst, err := builderVMBoot(ctx, bcfg, d.fl, "bld-"+project, map[string]string{LabelRole: "builder"})
+	// A daemon that just started reconciles builder VMs it did not adopt as
+	// left over: this one is ours, though its uid is not known until Boot returns.
+	id := "bld-" + project
+	d.mu.Lock()
+	d.bootingIDs[id] = true
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		delete(d.bootingIDs, id)
+		d.mu.Unlock()
+	}()
+	inst, err := builderVMBoot(ctx, bcfg, d.fl, id, map[string]string{LabelRole: "builder"})
 	if err != nil {
 		fail(nil, err)
 		return

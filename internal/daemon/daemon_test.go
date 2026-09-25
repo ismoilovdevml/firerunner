@@ -39,6 +39,8 @@ func TestDecide(t *testing.T) {
 		{"builder from previous run", vmFacts{State: "CREATED", Role: "builder", Startup: true}, false},
 		{"booting builder", vmFacts{State: "CREATED", Role: "builder", Age: 5 * time.Minute}, true},
 		{"orphaned builder", vmFacts{State: "CREATED", Role: "builder", Age: 20 * time.Minute}, false},
+		{"builder booting while the daemon starts", vmFacts{State: "CREATED", Role: "builder", Startup: true, Booting: true}, true},
+		{"builder left by a previous run", vmFacts{State: "CREATED", Role: "builder", Startup: true}, false},
 	}
 	for _, c := range cases {
 		if got := decide(c.f, cfg); (got == "") != c.keep {

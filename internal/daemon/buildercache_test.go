@@ -662,3 +662,29 @@ func TestSlowSaveDoesNotStallOthers(t *testing.T) {
 	}
 	free()
 }
+
+// Measured on the trial host: a builder booting right after a daemon restart
+// was deleted by the startup reconcile as "left by a previous run", because
+// its uid is known only once Boot returns. Its id marks it as booting.
+func TestStartupReconcileSparesBootingBuilder(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	stubBuilderCache(t, nil, nil, nil)
+	stubBoot(t, nil)
+	d, srv := newTestDaemon(t)
+	uid := "uid-new"
+	srv.SetVMs(&types.MicroVM{Spec: &types.MicroVMSpec{Id: "bld-7", Uid: &uid},
+		Status: &types.MicroVMStatus{State: types.MicroVMStatus_CREATED}})
+	builderVMBoot = func(ctx context.Context, _ config.Config, _ *flintlock.Client, id string, _ map[string]string) (*vm.Instance, error) {
+		d.reconcile(ctx, true) // the startup reconcile runs while this VM boots
+		return &vm.Instance{ID: id, UID: uid, IP: "10.200.0.77"}, nil
+	}
+	d.Builder("7", true)
+	d.bootBuilder(context.Background(), d.cfg, "7")
+	time.Sleep(200 * time.Millisecond)
+	if deleted(srv.Deleted(), uid) {
+		t.Fatal("startup reconcile deleted the builder VM that was booting")
+	}
+	if d.bootingIDs["bld-7"] {
+		t.Fatal("booting mark left after the boot")
+	}
+}
