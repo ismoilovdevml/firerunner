@@ -443,6 +443,14 @@ func proxySpec(c config.Config) string {
 // wait for memory held by a VM that is only warming its image cache. nil means
 // the pool has nothing to give.
 func (d *Daemon) Claim() *vm.Instance {
+	if p := d.claim(); p != nil {
+		return p.inst
+	}
+	return nil
+}
+
+// claim is Claim, with what unclaim needs to put the VM back.
+func (d *Daemon) claim() *pooled {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	fp := fingerprint(d.cfg)
@@ -454,7 +462,7 @@ func (d *Daemon) Claim() *vm.Instance {
 			d.metrics.poolReady.Set(float64(len(d.ready)))
 			d.savePoolLocked()
 			d.metrics.claims.WithLabelValues("hit").Inc()
-			return p.inst
+			return p
 		}
 		// Booted with an old config: never hand it out.
 		inst := p.inst
@@ -469,11 +477,22 @@ func (d *Daemon) Claim() *vm.Instance {
 		p.cancel()
 		d.claimed[uid] = time.Now()
 		d.metrics.claims.WithLabelValues("hit").Inc()
-		d.log.Info("pool VM claimed before its preload finished", "id", p.inst.ID)
-		return p.inst
+		d.log.Info("pool VM claimed before its preload finished", "vm", p.inst.ID)
+		return &pooled{inst: p.inst, bornAt: time.Now(), specID: p.specID}
 	}
 	d.metrics.claims.WithLabelValues("miss").Inc()
 	return nil
+}
+
+// unclaim puts a claimed VM the job never received back at the head of the
+// pool (the next job gets it) and ends its claim.
+func (d *Daemon) unclaim(p *pooled) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.claimed, p.inst.UID)
+	d.ready = append([]*pooled{p}, d.ready...)
+	d.metrics.poolReady.Set(float64(len(d.ready)))
+	d.savePoolLocked()
 }
 
 func (d *Daemon) refill(ctx context.Context) {

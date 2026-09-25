@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -56,13 +57,27 @@ var FailureReasons = []string{
 func (d *Daemon) apiHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /claim", func(w http.ResponseWriter, r *http.Request) {
-		inst := d.Claim()
-		if inst == nil {
+		p := d.claim()
+		if p == nil {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		d.log.Info("pool VM claimed", "id", inst.ID, "job", r.URL.Query().Get("job"))
-		_ = json.NewEncoder(w).Encode(inst)
+		job := strings.TrimPrefix(r.URL.Query().Get("job"), "job-") // the GitLab job id, as in job events
+		// The executor gives up after 3 s (Client) and cold-boots: a VM it
+		// never received must not stay claimed for nobody.
+		err := r.Context().Err()
+		if err == nil {
+			err = json.NewEncoder(w).Encode(p.inst)
+		}
+		if err == nil {
+			err = http.NewResponseController(w).Flush()
+		}
+		if err != nil {
+			d.unclaim(p)
+			d.log.Warn("pool VM claim not delivered, VM back in the pool", "vm", p.inst.ID, "job", job, "err", err)
+			return
+		}
+		d.log.Info("pool VM claimed", "vm", p.inst.ID, "job", job)
 	})
 	mux.HandleFunc("POST /event", func(w http.ResponseWriter, r *http.Request) {
 		var e Event
