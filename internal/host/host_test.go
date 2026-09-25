@@ -1,8 +1,11 @@
 package host
 
 import (
+	"context"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseOOMKills(t *testing.T) {
@@ -23,6 +26,63 @@ func TestParseDHCPRange(t *testing.T) {
 	for _, bad := range []string{"interface=br-fc\n", "dhcp-range=10.200.0.250,10.200.0.10,15m\n", "dhcp-range=::1,::2\n"} {
 		if _, err := parseDHCPRange(strings.NewReader(bad)); err == nil {
 			t.Errorf("parseDHCPRange(%q) accepted", bad)
+		}
+	}
+}
+
+// stubCommands makes host probes run script under sh instead of the real
+// command, with a short timeout.
+func stubCommands(t *testing.T, script string) {
+	t.Helper()
+	oldCmd, oldTimeout := command, commandTimeout
+	command = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", script)
+	}
+	commandTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { command, commandTimeout = oldCmd, oldTimeout })
+}
+
+func TestThinPoolUsage(t *testing.T) {
+	cases := []struct {
+		name       string
+		script     string
+		data, meta float64
+		wantErr    bool
+	}{
+		{"usage", `echo "  41.50   7.25"`, 41.5, 7.25, false},
+		{"lvs fails", `echo "Volume group not found" >&2; exit 5`, 0, 0, true},
+		{"unexpected output", `echo "  41.50"`, 0, 0, true},
+		{"not a number", `echo "  n/a   7.25"`, 0, 0, true},
+		// A hung lvs (LVM stuck on a device) must not hang the daemon's loop.
+		{"hung lvs", `sleep 30`, 0, 0, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			stubCommands(t, c.script)
+			start := time.Now()
+			data, meta, err := ThinPoolUsageContext(context.Background())
+			if took := time.Since(start); took > 5*time.Second {
+				t.Fatalf("took %s", took)
+			}
+			if (err != nil) != c.wantErr || data != c.data || meta != c.meta {
+				t.Fatalf("ThinPoolUsage = %v, %v, %v; want %v, %v, err %v", data, meta, err, c.data, c.meta, c.wantErr)
+			}
+		})
+	}
+}
+
+func TestServiceActive(t *testing.T) {
+	for _, c := range []struct {
+		script string
+		want   bool
+	}{{"exit 0", true}, {"exit 3", false}, {"sleep 30", false}} {
+		stubCommands(t, c.script)
+		start := time.Now()
+		if got := ServiceActiveContext(context.Background(), "flintlockd"); got != c.want {
+			t.Errorf("%q: ServiceActive = %v, want %v", c.script, got, c.want)
+		}
+		if took := time.Since(start); took > 5*time.Second {
+			t.Errorf("%q: took %s", c.script, took)
 		}
 	}
 }

@@ -1,11 +1,14 @@
 package daemon
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,4 +181,30 @@ func series(t *testing.T, c prometheus.Collector) int {
 	c.Collect(ch)
 	close(ch)
 	return len(ch)
+}
+
+// A thin pool usage that cannot be read is absent, not the last value read:
+// a frozen gauge would keep FireRunnerThinPoolFull from ever firing. The
+// failure is logged at Warn once, not on every 15 s pass.
+func TestThinPoolUsageUnknownWhenLvsFails(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	logs := captureLog(d)
+	var lvsErr error
+	old := thinPoolUsage
+	thinPoolUsage = func(context.Context) (float64, float64, error) { return 50, 10, lvsErr }
+	t.Cleanup(func() { thinPoolUsage = old })
+
+	d.collectHost(context.Background())
+	if got := value(t, d.metrics.thinPool.WithLabelValues("data")); got != 0.5 {
+		t.Fatalf("thin pool data = %v, want 0.5", got)
+	}
+	lvsErr = errors.New("lvs: signal: killed")
+	d.collectHost(context.Background())
+	d.collectHost(context.Background())
+	if n := series(t, d.metrics.thinPool); n != 0 {
+		t.Fatalf("thin pool gauge kept %d series after lvs failed; want none (unknown)", n)
+	}
+	if n := strings.Count(logs.String(), "level=WARN"); n != 1 {
+		t.Fatalf("%d warnings for two failed passes, want 1:\n%s", n, logs)
+	}
 }

@@ -3,6 +3,7 @@ package host
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -28,8 +30,29 @@ const DnsmasqConfig = "/etc/firerunner/dnsmasq.conf"
 var Services = []string{"containerd-flintlock", "firerunner-net", "firerunner-dnsmasq", "firerunner-registry",
 	"firerunner-cache", "flintlockd"}
 
-func ServiceActive(name string) bool {
-	return exec.Command("systemctl", "is-active", "--quiet", name).Run() == nil
+// commandTimeout bounds each systemctl and lvs run: systemd or LVM stuck on
+// a device must not stall the caller, the daemon's main loop included.
+var commandTimeout = 10 * time.Second
+
+// command builds the commands of host probes (a variable for tests).
+var command = exec.CommandContext
+
+// probe runs name with commandTimeout and returns its standard output.
+func probe(ctx context.Context, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, commandTimeout)
+	defer cancel()
+	cmd := command(ctx, name, args...)
+	cmd.WaitDelay = time.Second // children holding stdout must not keep Output waiting
+	return cmd.Output()
+}
+
+func ServiceActive(name string) bool { return ServiceActiveContext(context.Background(), name) }
+
+// ServiceActiveContext reports whether a systemd unit is active; a systemctl
+// that does not answer within commandTimeout reads as inactive.
+func ServiceActiveContext(ctx context.Context, name string) bool {
+	_, err := probe(ctx, "systemctl", "is-active", "--quiet", name)
+	return err == nil
 }
 
 func KVM() error {
@@ -45,7 +68,12 @@ func KVM() error {
 
 // ThinPoolUsage returns data and metadata usage of the devmapper pool in percent.
 func ThinPoolUsage() (data, meta float64, err error) {
-	out, err := exec.Command("lvs", "--noheadings", "--nosuffix", "-o", "data_percent,metadata_percent", ThinPool).Output()
+	return ThinPoolUsageContext(context.Background())
+}
+
+// ThinPoolUsageContext is ThinPoolUsage with lvs bounded by ctx and commandTimeout.
+func ThinPoolUsageContext(ctx context.Context) (data, meta float64, err error) {
+	out, err := probe(ctx, "lvs", "--noheadings", "--nosuffix", "-o", "data_percent,metadata_percent", ThinPool)
 	if err != nil {
 		return 0, 0, fmt.Errorf("lvs %s: %w", ThinPool, err)
 	}
@@ -53,8 +81,11 @@ func ThinPoolUsage() (data, meta float64, err error) {
 	if len(f) != 2 {
 		return 0, 0, fmt.Errorf("unexpected lvs output %q", out)
 	}
-	data, _ = strconv.ParseFloat(f[0], 64)
-	meta, _ = strconv.ParseFloat(f[1], 64)
+	data, derr := strconv.ParseFloat(f[0], 64)
+	meta, merr := strconv.ParseFloat(f[1], 64)
+	if derr != nil || merr != nil {
+		return 0, 0, fmt.Errorf("unexpected lvs output %q", out)
+	}
 	return data, meta, nil
 }
 

@@ -1048,17 +1048,27 @@ func jobStates() map[string]runningJob {
 	return out
 }
 
+// Probes of collectHost, bounded by host's command timeout (variables for tests).
+var (
+	serviceActive = host.ServiceActiveContext
+	thinPoolUsage = host.ThinPoolUsageContext
+)
+
 func (d *Daemon) collectHost(ctx context.Context) {
 	for _, s := range append(host.Services, "gitlab-runner") {
 		up := 0.0
-		if host.ServiceActive(s) {
+		if serviceActive(ctx, s) {
 			up = 1
 		}
 		d.metrics.serviceUp.WithLabelValues(s).Set(up)
 	}
-	if data, meta, err := host.ThinPoolUsage(); err == nil {
+	if data, meta, err := thinPoolUsage(ctx); err == nil {
 		d.metrics.thinPool.WithLabelValues("data").Set(data / 100)
 		d.metrics.thinPool.WithLabelValues("metadata").Set(meta / 100)
+	} else {
+		// Unknown, not the last value read: that would hide a filling pool.
+		d.metrics.thinPool.Reset()
+		d.warnLimited("thinpool", "cannot read the thin pool usage; firerunner_thinpool_usage_ratio is absent until lvs answers", "err", err)
 	}
 	if avail, err := host.MemAvailableMB(); err == nil {
 		d.metrics.memAvailable.Set(float64(avail) * 1024 * 1024)
