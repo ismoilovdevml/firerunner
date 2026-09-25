@@ -53,7 +53,9 @@ Usage:
   firerunner config set <key> <value>       e.g. vm.vcpu 4, vm.memory_mb 4096, vm.boot_timeout 2m
   firerunner config unset vm.kernel_cmdline.<arg>
 
-  firerunner runner register --url <gitlab-url> --token <glrt-...> [--concurrent 4] [--name NAME]
+  firerunner runner register --url <gitlab-url> --token - [--concurrent 4] [--name NAME]
+                                            reads the glrt-... token from stdin
+                                            (or from FIRERUNNER_RUNNER_TOKEN without --token)
   firerunner runner status
   firerunner runner concurrent <n>          max parallel jobs (= microVMs)
   firerunner runner cache [local|off|s3 --server HOST:PORT --bucket B [--insecure]]
@@ -447,17 +449,29 @@ func cmdRunner(args []string) error {
 	case "register":
 		fs := flag.NewFlagSet("runner register", flag.ContinueOnError)
 		url := fs.String("url", "", "GitLab URL, e.g. https://gitlab.example.com")
-		token := fs.String("token", os.Getenv("FIRERUNNER_RUNNER_TOKEN"), "runner authentication token (glrt-...)")
+		tokenArg := fs.String("token", "", "- reads the runner authentication token (glrt-...) from stdin; or set "+tokenEnv)
 		hostname, _ := os.Hostname()
 		name := fs.String("name", "firerunner-"+hostname, "runner name shown in GitLab")
 		concurrent := fs.Int("concurrent", 4, "max parallel jobs")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		if *url == "" || *token == "" {
-			return errors.New("--url and --token are required (create the runner in GitLab: Settings > CI/CD > Runners > New runner)")
+		if *tokenArg != "" && *tokenArg != "-" {
+			return errArgvToken
 		}
-		if err := host.RegisterRunner(*url, *token, *name, *concurrent); err != nil {
+		if *url == "" {
+			return errors.New("--url is required (create the runner in GitLab: Settings > CI/CD > Runners > New runner)")
+		}
+		if *tokenArg == "-" {
+			if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+				fmt.Fprint(os.Stderr, "Runner authentication token (glrt-...): ")
+			}
+		}
+		token, err := runnerToken(*tokenArg, os.Getenv(tokenEnv), os.Stdin)
+		if err != nil {
+			return err
+		}
+		if err := host.RegisterRunner(*url, token, *name, *concurrent); err != nil {
 			return err
 		}
 		fmt.Printf("Runner %s registered with %s (%d concurrent microVM jobs)\n", *name, *url, *concurrent)
@@ -493,6 +507,37 @@ func cmdRunner(args []string) error {
 		return host.UnregisterRunner()
 	}
 	return errors.New("usage: firerunner runner register|status|concurrent|cache|unregister")
+}
+
+// tokenEnv carries the runner token to `runner register` (install.sh passes
+// FR_RUNNER_TOKEN in it).
+const tokenEnv = "FIRERUNNER_RUNNER_TOKEN"
+
+// errArgvToken does not repeat the token: the error may end up in a log.
+var errArgvToken = errors.New("the runner token must not be on the command line, where every local user can read it (ps, /proc/<pid>/cmdline): " +
+	"use --token - and paste it on stdin, or set " + tokenEnv)
+
+// runnerToken returns the runner authentication token from stdin (arg "-") or
+// from the environment (no --token), never from the command line.
+func runnerToken(arg, env string, stdin io.Reader) (string, error) {
+	switch arg {
+	case "":
+		if token := strings.TrimSpace(env); token != "" {
+			return token, nil
+		}
+		return "", errors.New("no runner token: use --token - and paste it on stdin, or set " + tokenEnv +
+			" (create the runner in GitLab: Settings > CI/CD > Runners > New runner)")
+	case "-":
+		line, err := bufio.NewReader(io.LimitReader(stdin, 4096)).ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", fmt.Errorf("reading the runner token from stdin: %w", err)
+		}
+		if token := strings.TrimSpace(line); token != "" {
+			return token, nil
+		}
+		return "", errors.New("no runner token on stdin")
+	}
+	return "", errArgvToken
 }
 
 func cacheDesc(r *host.Runner) string {

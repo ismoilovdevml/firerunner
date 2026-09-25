@@ -25,7 +25,7 @@ stage in it and deletes it when the job ends.
 3. Register it and check the host:
 
     ```bash
-    sudo firerunner runner register --url https://gitlab.example.com --token glrt-...
+    sudo firerunner runner register --url https://gitlab.example.com --token -   # paste the glrt-... token
     sudo firerunner doctor
     ```
 

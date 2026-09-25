@@ -9,7 +9,7 @@ All commands need root.
 | `firerunner status` · `doctor` | overview · every check with a hint |
 | `firerunner config show` · `keys` · `path` · `get <key>` · `set <key> <value>` | settings; `path` prints the config file |
 | `firerunner config unset vm.kernel_cmdline.<arg>` | remove a guest kernel argument |
-| `firerunner runner register --url URL --token glrt-... [--concurrent N] [--name NAME]` | register this host; the name shown in GitLab defaults to `firerunner-<hostname>` |
+| `firerunner runner register --url URL --token - [--concurrent N] [--name NAME]` | register this host; the `glrt-...` token is read from stdin (or `FIRERUNNER_RUNNER_TOKEN`), never from the command line; the name shown in GitLab defaults to `firerunner-<hostname>` |
 | `firerunner runner status` · `concurrent N` · `unregister` | the GitLab runner |
 | `firerunner runner cache [local \| off \| s3 --server H:P --bucket B [--insecure]]` | where `cache:` is stored; `--insecure` uses plain HTTP |
 | `firerunner vm list` · `logs <id> [-n N]` · `rm <id> \| --all` | microVMs; `logs` prints the last N lines of a VM's console (default 100) |

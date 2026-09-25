@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -100,5 +103,59 @@ func TestConsoleText(t *testing.T) {
 		if got := consoleText(c.in); got != c.want {
 			t.Errorf("consoleText(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// A runner token in argv is readable by every local user (ps,
+// /proc/<pid>/cmdline): register refuses it before touching the host, and
+// never repeats it in the error.
+func TestRunnerRegisterRejectsATokenInArgv(t *testing.T) {
+	t.Setenv("FIRERUNNER_RUNNER_TOKEN", "")
+	for _, args := range [][]string{
+		{"register", "--url", "https://gitlab.example.com", "--token", "glrt-secret123"},
+		{"register", "--url", "https://gitlab.example.com", "--token=glrt-secret123"},
+		{"register", "--token", "glrt-secret123"},
+	} {
+		err := cmdRunner(args)
+		if err == nil || !strings.Contains(err.Error(), "--token -") || !strings.Contains(err.Error(), "FIRERUNNER_RUNNER_TOKEN") {
+			t.Errorf("cmdRunner(%q) = %v, want the argv token refused with how to pass it", args, err)
+		}
+		if err != nil && strings.Contains(err.Error(), "glrt-secret123") {
+			t.Errorf("the error repeats the token: %v", err)
+		}
+	}
+}
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, errors.New("stdin closed") }
+
+func TestRunnerToken(t *testing.T) {
+	for _, c := range []struct {
+		name, arg, env string
+		stdin          io.Reader
+		want           string // "" means an error
+	}{
+		{"stdin", "-", "", strings.NewReader("glrt-abc\n"), "glrt-abc"},
+		{"stdin without newline", "-", "", strings.NewReader("  glrt-abc \t"), "glrt-abc"},
+		{"stdin: first line only", "-", "", strings.NewReader("glrt-abc\nmore\n"), "glrt-abc"},
+		{"stdin wins over the environment", "-", "glrt-env", strings.NewReader("glrt-abc\n"), "glrt-abc"},
+		{"environment", "", "glrt-env", strings.NewReader("ignored\n"), "glrt-env"},
+		{"empty stdin", "-", "", strings.NewReader(""), ""},
+		{"blank line on stdin", "-", "", strings.NewReader("\n"), ""},
+		{"stdin fails", "-", "", failingReader{}, ""},
+		{"nothing at all", "", "", strings.NewReader("glrt-abc\n"), ""},
+		{"token in argv", "glrt-abc", "", strings.NewReader(""), ""},
+		{"token in argv with the environment set", "glrt-abc", "glrt-env", strings.NewReader(""), ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := runnerToken(c.arg, c.env, c.stdin)
+			switch {
+			case c.want == "" && err == nil:
+				t.Fatalf("runnerToken = %q, want an error", got)
+			case c.want != "" && (err != nil || got != c.want):
+				t.Fatalf("runnerToken = %q, %v; want %q", got, err, c.want)
+			}
+		})
 	}
 }

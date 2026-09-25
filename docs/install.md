@@ -56,7 +56,7 @@ Options go before `bash`, for example `sudo FR_DISK=/dev/sdb bash`:
 2. Register it on the host:
 
     ```bash
-    sudo firerunner runner register --url https://gitlab.example.com --token glrt-...
+    sudo firerunner runner register --url https://gitlab.example.com --token -   # paste the glrt-... token
     ```
 
 3. Check:

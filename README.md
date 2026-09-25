@@ -35,7 +35,7 @@ disk for microVM storage and GitLab 16 or newer.
 
 ```bash
 curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash
-sudo firerunner runner register --url https://gitlab.example.com --token glrt-...
+sudo firerunner runner register --url https://gitlab.example.com --token -   # paste the glrt-... token
 sudo firerunner doctor
 ```
 
