@@ -53,9 +53,10 @@ func TestDecide(t *testing.T) {
 	}{
 		{"failed VM", vmFacts{State: "FAILED", Owned: true}, false},
 		{"owned pool VM", vmFacts{State: "CREATED", Role: "pool", Owned: true, Age: time.Hour}, true},
-		{"job older than max age", vmFacts{State: "CREATED", Role: "job", Job: "job-1", Owned: true, InJob: true, Age: 4 * time.Hour}, false},
-		{"job on a pool VM older than max age", vmFacts{State: "CREATED", Role: "pool", Owned: true, InJob: true, Age: 4 * time.Hour}, false},
-		{"running job", vmFacts{State: "CREATED", Role: "job", Job: "job-1", Owned: true, InJob: true, Age: 20 * time.Minute}, true},
+		{"job older than max age", vmFacts{State: "CREATED", Role: "job", Job: "job-1", Owned: true, InJob: true, Age: 4 * time.Hour, JobAge: 4 * time.Hour}, false},
+		{"job on a pool VM older than max age", vmFacts{State: "CREATED", Role: "pool", Owned: true, InJob: true, Age: time.Minute, JobAge: 4 * time.Hour}, false},
+		{"running job", vmFacts{State: "CREATED", Role: "job", Job: "job-1", Owned: true, InJob: true, Age: 20 * time.Minute, JobAge: 20 * time.Minute}, true},
+		{"young job on a pool VM that idled long", vmFacts{State: "CREATED", Role: "pool", Owned: true, InJob: true, Age: 4 * time.Hour, JobAge: time.Hour}, true},
 		{"idle pool VM older than job max age", vmFacts{State: "CREATED", Role: "pool", Owned: true, Age: 4 * time.Hour}, true},
 		{"pool VM from previous run", vmFacts{State: "CREATED", Role: "pool", Startup: true}, false},
 		{"young orphan pool VM", vmFacts{State: "CREATED", Role: "pool", Age: time.Minute}, true},

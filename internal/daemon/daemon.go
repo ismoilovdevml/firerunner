@@ -679,12 +679,16 @@ func (d *Daemon) admitBuilder(ctx context.Context, bcfg config.Config, id string
 
 // vmFacts is what reconcile knows about one microVM.
 type vmFacts struct {
-	State   string // flintlock state, e.g. CREATED, FAILED
-	Role    string // firerunner/role label
-	Job     string // firerunner/job label
-	Owned   bool   // in the pool, a builder, just claimed, or referenced by a job state file
-	InJob   bool   // referenced by a job state file: a job runs on it
-	Age     time.Duration
+	State string // flintlock state, e.g. CREATED, FAILED
+	Role  string // firerunner/role label
+	Job   string // firerunner/job label
+	Owned bool   // in the pool, a builder, just claimed, or referenced by a job state file
+	InJob bool   // referenced by a job state file: a job runs on it
+	Age   time.Duration
+	// JobAge is how long the job on it runs (InJob), from its state file: Age
+	// also counts the time a pool VM idled before a job took it, and starts
+	// again when the daemon restarts.
+	JobAge  time.Duration
 	Startup bool // first reconcile of this daemon
 	Booting bool // this daemon is booting this pool VM right now
 }
@@ -694,7 +698,7 @@ func decide(f vmFacts, cfg config.Config) string {
 	switch {
 	case f.State == "FAILED":
 		return "failed"
-	case f.InJob && f.Age > cfg.Daemon.JobMaxAge:
+	case f.InJob && f.JobAge > cfg.Daemon.JobMaxAge:
 		return "older than daemon.job_max_age"
 	case f.Owned:
 		// Idle pool VMs are bounded by pool.max_idle (expireIdle), builders by
@@ -760,16 +764,16 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 	for _, v := range vms {
 		present[v.GetSpec().GetUid()] = true
 	}
-	inJob := map[string]bool{}
-	for uid, file := range jobStates() {
+	jobs := jobStates()
+	for uid, j := range jobs {
 		if present[uid] {
-			owned[uid], inJob[uid] = true, true
+			owned[uid] = true
 			continue
 		}
 		// The job's VM is gone (cleanup failed or the host rebooted): drop the stale state.
-		if fi, err := os.Stat(file); err == nil && time.Since(fi.ModTime()) > 10*time.Minute {
-			_ = os.Remove(file)
-			d.log.Info("removed stale job state", "file", file)
+		if fi, err := os.Stat(j.file); err == nil && time.Since(fi.ModTime()) > 10*time.Minute {
+			_ = os.Remove(j.file)
+			d.log.Info("removed stale job state", "file", j.file)
 		}
 	}
 
@@ -787,8 +791,15 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 		d.mu.Unlock()
 
 		role, job := RoleOf(v.GetSpec().GetId())
-		reason := decide(vmFacts{State: state, Role: role, Job: job, Owned: owned[uid], InJob: inJob[uid],
-			Age: time.Since(first), Startup: startup, Booting: booting[v.GetSpec().GetId()]}, cfg)
+		f := vmFacts{State: state, Role: role, Job: job, Owned: owned[uid], Age: time.Since(first),
+			Startup: startup, Booting: booting[v.GetSpec().GetId()]}
+		if j, ok := jobs[uid]; ok {
+			f.InJob, f.JobAge = true, time.Since(j.startedAt)
+			if j.startedAt.IsZero() {
+				f.JobAge = f.Age // a state file without a start time
+			}
+		}
+		reason := decide(f, cfg)
 		if reason != "" && d.delete(ctx, &vm.Instance{ID: v.GetSpec().GetId(), UID: uid}, reason) {
 			d.metrics.orphansDeleted.WithLabelValues(reason).Inc()
 		}
@@ -849,13 +860,33 @@ func tidyVMDirs(root string, live map[string]bool) error {
 // jobStateGlob matches the state files `executor prepare` writes (a variable for tests).
 var jobStateGlob = "/run/firerunner/jobs/*.json"
 
+// runningJob is what the state file of a job in progress tells the daemon.
+type runningJob struct {
+	file      string
+	uid, id   string    // the microVM the job runs on
+	startedAt time.Time // when its prepare started
+	builder   string    // project whose builder the job uses, if any
+}
+
+// runningJobs reads the state files `executor prepare` writes, one per job in
+// progress; unreadable files are skipped.
+func runningJobs() []runningJob {
+	files, _ := filepath.Glob(jobStateGlob)
+	out := make([]runningJob, 0, len(files))
+	for _, f := range files {
+		if st, err := vm.LoadJobState(f); err == nil {
+			out = append(out, runningJob{file: f, uid: st.UID, id: st.ID, startedAt: st.StartedAt, builder: st.BuilderProject})
+		}
+	}
+	return out
+}
+
 // busyBuilders returns the projects whose builder a running job uses.
 func busyBuilders() map[string]bool {
 	out := map[string]bool{}
-	files, _ := filepath.Glob(jobStateGlob)
-	for _, f := range files {
-		if st, err := vm.LoadJobState(f); err == nil && st.BuilderProject != "" {
-			out[st.BuilderProject] = true
+	for _, j := range runningJobs() {
+		if j.builder != "" {
+			out[j.builder] = true
 		}
 	}
 	return out
@@ -905,14 +936,11 @@ func (d *Daemon) recordCapacity(cfg config.Config, vms []*types.MicroVM) {
 	}
 }
 
-// jobStates maps microVM uid -> state file for jobs in progress (written by `executor prepare`).
-func jobStates() map[string]string {
-	out := map[string]string{}
-	files, _ := filepath.Glob(jobStateGlob)
-	for _, f := range files {
-		if st, err := vm.LoadJobState(f); err == nil {
-			out[st.UID] = f
-		}
+// jobStates maps microVM uid -> the job in progress on it.
+func jobStates() map[string]runningJob {
+	out := map[string]runningJob{}
+	for _, j := range runningJobs() {
+		out[j.uid] = j
 	}
 	return out
 }

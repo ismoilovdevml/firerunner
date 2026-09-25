@@ -464,3 +464,48 @@ func TestPoolAndBuilderAdmissionsShareTheHost(t *testing.T) {
 		t.Fatalf("%d MB still reserved after every boot returned", got)
 	}
 }
+
+// tempJobStates points the job state glob at a temporary directory and
+// returns it.
+func tempJobStates(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	old := jobStateGlob
+	jobStateGlob = filepath.Join(dir, "*.json")
+	t.Cleanup(func() { jobStateGlob = old })
+	return dir
+}
+
+// daemon.job_max_age counts from the job's start (its state file), not from
+// when this daemon first saw the VM: a pool VM idles before a job claims it,
+// and a restarted daemon sees every VM anew.
+func TestJobMaxAgeCountsFromTheJobStart(t *testing.T) {
+	cases := []struct {
+		name               string
+		started, firstSeen time.Duration // ago
+		deleted            bool
+	}{
+		{"young job on a pool VM seen long ago", time.Hour, 4 * time.Hour, false},
+		{"job past max age, seen only since a restart", 4 * time.Hour, time.Minute, true},
+		{"young job", time.Hour, time.Hour, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := tempJobStates(t)
+			d, srv := newTestDaemon(t)
+			uid := "u1"
+			srv.SetVMs(&types.MicroVM{Spec: &types.MicroVMSpec{Id: "pool-a1b2c3", Uid: &uid},
+				Status: &types.MicroVMStatus{State: types.MicroVMStatus_CREATED}})
+			st := &vm.JobState{Instance: vm.Instance{ID: "pool-a1b2c3", UID: uid}, Source: "pool",
+				StartedAt: time.Now().Add(-c.started)}
+			if err := vm.SaveJobState(filepath.Join(dir, "job-9.json"), st); err != nil {
+				t.Fatal(err)
+			}
+			d.firstSee[uid] = time.Now().Add(-c.firstSeen)
+			d.reconcile(context.Background(), false)
+			if got := len(srv.Deleted()) == 1; got != c.deleted {
+				t.Fatalf("deleted = %v (%v), want %v", got, srv.Deleted(), c.deleted)
+			}
+		})
+	}
+}
