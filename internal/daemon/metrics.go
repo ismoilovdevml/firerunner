@@ -27,6 +27,9 @@ type Metrics struct {
 	orphansDeleted                     *prometheus.CounterVec
 	admissionWaits                     prometheus.Counter
 	flintlockUp                        prometheus.Gauge
+	flintlockErrors                    *prometheus.CounterVec
+	jobsRunning                        prometheus.Gauge
+	diskFree, diskSize                 *prometheus.GaugeVec
 	serviceUp                          *prometheus.GaugeVec
 	thinPool                           *prometheus.GaugeVec
 	memAvailable                       prometheus.Gauge
@@ -102,6 +105,7 @@ func NewMetrics() *Metrics {
 		memAvailable:     prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_host_memory_available_bytes", Help: "MemAvailable on the host."}),
 		runnerConcurrent: prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_runner_concurrent", Help: "gitlab-runner concurrent limit."}),
 	}
+	m.addHostMetrics()
 	// Pre-create every label combination so dashboards show 0 instead of
 	// "No data" before the first job.
 	for _, r := range []string{"hit", "miss"} {
@@ -148,6 +152,20 @@ func NewMetrics() *Metrics {
 		m.admissionWait, m.memCommitted, m.memCapacity, m.dhcpLeases, m.dhcpCapacity, m.hostOOMKills, m.loopTick,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
+}
+
+// addHostMetrics registers what the daemon reads about jobs, disks and
+// flintlock calls outside the pool and builders.
+func (m *Metrics) addHostMetrics() {
+	m.jobsRunning = prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_jobs_running",
+		Help: "Jobs in progress on this host: the state files prepare writes and cleanup removes."})
+	m.diskFree = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "firerunner_disk_free_bytes",
+		Help: "Bytes available on the file system holding dir: the saved builder caches and flintlock's microVM state."}, []string{"dir"})
+	m.diskSize = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "firerunner_disk_size_bytes",
+		Help: "Size of the file system holding dir."}, []string{"dir"})
+	m.flintlockErrors = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_flintlock_errors_total",
+		Help: "Failed flintlock calls of the daemon by RPC (CreateMicroVM, DeleteMicroVM, ListMicroVMs) and gRPC code; every failed try of a retried listing counts."}, []string{"op", "code"})
+	m.reg.MustRegister(m.jobsRunning, m.diskFree, m.diskSize, m.flintlockErrors)
 }
 
 // roles are the microVM roles committed memory is reported by.

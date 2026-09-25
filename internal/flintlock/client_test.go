@@ -180,3 +180,23 @@ func TestDialMissingToken(t *testing.T) {
 		t.Fatalf("Dial err = %v, want wrapped ErrNotExist", err)
 	}
 }
+
+// OnError sees every failed call with its RPC name, each failed try of a
+// retried listing included, and nothing that succeeded.
+func TestOnError(t *testing.T) {
+	srv := flintlocktest.NewServer("uid-1")
+	fl := testClient(t, srv)
+	var got []string
+	fl.OnError = func(op string, err error) { got = append(got, op+":"+status.Code(err).String()) }
+	srv.FailList(errTransient, status.Error(codes.Unavailable, "down"))
+	srv.FailDelete(status.Error(codes.NotFound, "gone"))
+	_, _ = fl.List(context.Background()) // transient, then Unavailable (not retried)
+	_, _ = fl.List(context.Background())
+	_ = fl.Delete(context.Background(), "u1")
+	_ = fl.Delete(context.Background(), "u2")
+	_, _ = fl.Create(context.Background(), &types.MicroVMSpec{Id: "job-1"})
+	want := []string{"ListMicroVMs:Unknown", "ListMicroVMs:Unavailable", "DeleteMicroVM:NotFound"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("OnError saw %v, want %v", got, want)
+	}
+}

@@ -21,6 +21,17 @@ type Client struct {
 	conn      *grpc.ClientConn
 	api       mvmv1.MicroVMClient
 	namespace string
+
+	// OnError, if set, is called with the RPC name and the error of every
+	// failed call, each failed try of a retried listing included (the daemon
+	// counts them). Set it before the first call.
+	OnError func(op string, err error)
+}
+
+func (c *Client) failed(op string, err error) {
+	if err != nil && c.OnError != nil {
+		c.OnError(op, err)
+	}
 }
 
 // basicAuth sends flintlockd's --basic-auth-token as "authorization: basic base64(token)".
@@ -61,6 +72,7 @@ func (c *Client) Create(ctx context.Context, spec *types.MicroVMSpec) (string, e
 	spec.Namespace = c.namespace
 	resp, err := c.api.CreateMicroVM(ctx, &mvmv1.CreateMicroVMRequest{Microvm: spec})
 	if err != nil {
+		c.failed("CreateMicroVM", err)
 		return "", err
 	}
 	if resp.GetMicrovm().GetSpec().GetUid() == "" {
@@ -71,6 +83,7 @@ func (c *Client) Create(ctx context.Context, spec *types.MicroVMSpec) (string, e
 
 func (c *Client) Delete(ctx context.Context, uid string) error {
 	_, err := c.api.DeleteMicroVM(ctx, &mvmv1.DeleteMicroVMRequest{Uid: uid})
+	c.failed("DeleteMicroVM", err)
 	return err
 }
 
@@ -85,6 +98,7 @@ func (c *Client) List(ctx context.Context) ([]*types.MicroVM, error) {
 		if err == nil {
 			return resp.GetMicrovm(), nil
 		}
+		c.failed("ListMicroVMs", err)
 		if !IsTransient(err) {
 			return nil, err
 		}

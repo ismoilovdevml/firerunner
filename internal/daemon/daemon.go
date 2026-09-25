@@ -28,6 +28,8 @@ import (
 	"time"
 
 	"github.com/liquidmetal-dev/flintlock/api/types"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/flintlock"
@@ -319,6 +321,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 		builders:   map[string]*builder{}, builderFailed: map[string]time.Time{},
 		saving: map[string]*cacheSave{}, cacheDropped: map[string]time.Time{}, runCtx: context.Background(),
 		oomKills: -1}
+	fl.OnError = d.flintlockFailed
 	if fi, err := os.Stat(cfgPath); err == nil {
 		d.cfgMod = fi.ModTime()
 	}
@@ -394,6 +397,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.expireIdle(ctx)
 			d.expireBuilders()
 			d.refill(ctx)
+			d.countJobs()
 		case <-reconcile.C:
 			d.reconcile(ctx, false)
 		case <-host.C:
@@ -1064,6 +1068,46 @@ func jobStates() map[string]runningJob {
 	return out
 }
 
+// flintlockFailed counts a failed flintlock call by RPC and gRPC code.
+func (d *Daemon) flintlockFailed(op string, err error) {
+	code := status.Code(err)
+	switch {
+	case code != codes.Unknown:
+	case errors.Is(err, context.DeadlineExceeded):
+		code = codes.DeadlineExceeded // the client's own wait ended, not an answer
+	case errors.Is(err, context.Canceled):
+		code = codes.Canceled
+	}
+	d.metrics.flintlockErrors.WithLabelValues(op, code.String()).Inc()
+}
+
+// countJobs exports how many jobs are in progress (their state files).
+func (d *Daemon) countJobs() {
+	d.metrics.jobsRunning.Set(float64(len(runningJobs())))
+}
+
+// recordDisk exports the free and total bytes of the file system holding
+// dir. A directory not created yet (the builder caches before the first save)
+// is measured at its nearest existing parent; it will be on the same one.
+func (d *Daemon) recordDisk(dir string) {
+	at := dir
+	for {
+		if _, err := os.Stat(at); err == nil || filepath.Dir(at) == at {
+			break
+		}
+		at = filepath.Dir(at)
+	}
+	free, size, err := diskSpace(at)
+	if err != nil {
+		d.metrics.diskFree.DeleteLabelValues(dir)
+		d.metrics.diskSize.DeleteLabelValues(dir)
+		d.warnLimited("disk:"+dir, "cannot read the free space of "+dir, "err", err)
+		return
+	}
+	d.metrics.diskFree.WithLabelValues(dir).Set(float64(free))
+	d.metrics.diskSize.WithLabelValues(dir).Set(float64(size))
+}
+
 // Probes of collectHost, bounded by host's command timeout (variables for tests).
 var (
 	serviceActive = host.ServiceActiveContext
@@ -1085,6 +1129,9 @@ func (d *Daemon) collectHost(ctx context.Context) {
 		// Unknown, not the last value read: that would hide a filling pool.
 		d.metrics.thinPool.Reset()
 		d.warnLimited("thinpool", "cannot read the thin pool usage; firerunner_thinpool_usage_ratio is absent until lvs answers", "err", err)
+	}
+	for _, dir := range []string{builderCacheDir, flintlockVMDir} {
+		d.recordDisk(dir)
 	}
 	if avail, err := host.MemAvailableMB(); err == nil {
 		d.metrics.memAvailable.Set(float64(avail) * 1024 * 1024)

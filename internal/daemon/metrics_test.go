@@ -308,3 +308,120 @@ func TestLogLinesUseTheVMKey(t *testing.T) {
 		t.Fatalf("delete log line: %s", out)
 	}
 }
+
+// labelValue reads a counter or gauge of a vector by its label values; a
+// series that does not exist reads as -1.
+func labelValue(t *testing.T, d *Daemon, name string, labels map[string]string) float64 {
+	t.Helper()
+	mfs, err := d.metrics.reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+	metrics:
+		for _, m := range mf.GetMetric() {
+			if len(m.GetLabel()) != len(labels) {
+				continue
+			}
+			for _, l := range m.GetLabel() {
+				if labels[l.GetName()] != l.GetValue() {
+					continue metrics
+				}
+			}
+			return m.GetCounter().GetValue() + m.GetGauge().GetValue()
+		}
+	}
+	return -1
+}
+
+// firerunner_jobs_running counts the jobs in progress: their state files.
+func TestJobsRunning(t *testing.T) {
+	dir := tempJobStates(t)
+	d, _ := newTestDaemon(t)
+	for _, name := range []string{"job-1.json", "job-2.json"} {
+		if err := vm.SaveJobState(filepath.Join(dir, name), &vm.JobState{StartedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "job-3.json"), []byte("{torn"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d.countJobs()
+	if got := labelValue(t, d, "firerunner_jobs_running", nil); got != 2 {
+		t.Fatalf("jobs_running = %v, want 2 (the unreadable state file is no job)", got)
+	}
+	if err := os.Remove(filepath.Join(dir, "job-1.json")); err != nil {
+		t.Fatal(err)
+	}
+	d.countJobs()
+	if got := labelValue(t, d, "firerunner_jobs_running", nil); got != 1 {
+		t.Fatalf("jobs_running after a cleanup = %v, want 1", got)
+	}
+}
+
+// Free and total space of the file systems holding the saved builder caches
+// and flintlock's microVM state, by the directory FireRunner uses.
+func TestDiskSpaceMetrics(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	root := t.TempDir()
+	oldCache, oldVM := builderCacheDir, flintlockVMDir
+	builderCacheDir = filepath.Join(root, "missing", "builder-cache") // created at the first save
+	flintlockVMDir = root
+	t.Cleanup(func() { builderCacheDir, flintlockVMDir = oldCache, oldVM })
+
+	d.collectHost(context.Background())
+	for _, dir := range []string{builderCacheDir, flintlockVMDir} {
+		free := labelValue(t, d, "firerunner_disk_free_bytes", map[string]string{"dir": dir})
+		size := labelValue(t, d, "firerunner_disk_size_bytes", map[string]string{"dir": dir})
+		if size <= 0 || free < 0 || free > size {
+			t.Errorf("%s: free %v of %v bytes", dir, free, size)
+		}
+	}
+
+	logs := captureLog(d)
+	old := diskSpace
+	diskSpace = func(string) (uint64, uint64, error) { return 0, 0, errors.New("statfs: input/output error") }
+	t.Cleanup(func() { diskSpace = old })
+	d.collectHost(context.Background())
+	if n := series(t, d.metrics.diskFree) + series(t, d.metrics.diskSize); n != 0 {
+		t.Fatalf("%d disk series kept after statfs failed; want none (unknown)", n)
+	}
+	if !strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("failed statfs not logged:\n%s", logs)
+	}
+}
+
+// Every failed flintlock call is counted by RPC and gRPC code; successes and
+// errors that are not flintlock's (no uid in an answer) are not.
+func TestFlintlockErrorsCounted(t *testing.T) {
+	d, srv := newTestDaemon(t)
+	ctx := context.Background()
+	srv.FailList(status.Error(codes.Unavailable, "down"))
+	srv.FailDelete(status.Error(codes.NotFound, "no such microvm"))
+	_, _ = d.fl.List(ctx)
+	_, _ = d.fl.List(ctx) // works
+	_ = d.fl.Delete(ctx, "u1")
+	_, _ = d.fl.Create(ctx, &types.MicroVMSpec{Id: "pool-x"}) // the fake answers without a uid
+	expired, cancel := context.WithTimeout(ctx, -time.Second)
+	defer cancel()
+	_, _ = d.fl.List(expired)
+
+	for _, c := range []struct {
+		op, code string
+		want     float64
+	}{
+		{"ListMicroVMs", "Unavailable", 1},
+		{"DeleteMicroVM", "NotFound", 1},
+		{"ListMicroVMs", "DeadlineExceeded", 1},
+	} {
+		if got := labelValue(t, d, "firerunner_flintlock_errors_total", map[string]string{"op": c.op, "code": c.code}); got != c.want {
+			t.Errorf("flintlock_errors_total{op=%s,code=%s} = %v, want %v", c.op, c.code, got, c.want)
+		}
+	}
+	if n := series(t, d.metrics.flintlockErrors); n != 3 {
+		t.Errorf("%d error series, want 3", n)
+	}
+}
