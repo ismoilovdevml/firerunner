@@ -342,8 +342,24 @@ func (d *Daemon) listenSocket() (net.Listener, error) {
 
 // fingerprint changes whenever a setting that affects how a VM is booted changes.
 func fingerprint(c config.Config) string {
-	return fmt.Sprintf("%d/%d/%s/%s/%v/%s/%s/%s/%v", c.VM.VCPU, c.VM.MemoryMB, c.VM.KernelImage, c.VM.RootFSImage,
-		c.VM.KernelCmdline, c.VM.RegistryMirror, c.VM.DockerBIP, c.VM.DockerAddressPool, c.Pool.PreloadImages)
+	return fmt.Sprintf("%d/%d/%s/%s/%v/%s/%s/%s/%v%s", c.VM.VCPU, c.VM.MemoryMB, c.VM.KernelImage, c.VM.RootFSImage,
+		c.VM.KernelCmdline, c.VM.RegistryMirror, c.VM.DockerBIP, c.VM.DockerAddressPool, c.Pool.PreloadImages, proxySpec(c))
+}
+
+// proxySpec is the part of the proxy, CA and insecure registry settings a
+// booted VM holds; empty when none is set, so existing fingerprints stay the same.
+func proxySpec(c config.Config) string {
+	s := ""
+	if c.Proxy.Enabled {
+		s += fmt.Sprintf("|proxy:%s/%s", c.Proxy.Listen, c.Proxy.NoProxy)
+	}
+	if c.VM.CAFile != "" {
+		s += "|ca:" + c.VM.CAFile
+	}
+	if len(c.VM.InsecureRegistries) > 0 {
+		s += fmt.Sprintf("|insecure:%v", c.VM.InsecureRegistries)
+	}
+	return s
 }
 
 // Claim hands a ready pool VM to a job, or else one that has booted but is

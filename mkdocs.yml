@@ -44,6 +44,7 @@ nav:
   - Install: install.md
   - Writing jobs: jobs.md
   - Configuration: configuration.md
+  - Corporate networks: corporate-network.md
   - Operations: operations.md
   - How it works: how-it-works.md
   - Reference: reference.md

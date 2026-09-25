@@ -25,6 +25,9 @@ sed '$d' "$INSTALL_SH" > $WORK/install-lib.sh
     LIB_DIR=$WORK/lib CONF_DIR=$WORK/conf
     # shellcheck disable=SC2034
     FR_METRICS_ALLOW=192.0.2.10 FR_EGRESS_DENY=198.51.100.0/24
+    # A corporate proxy is configured: microVMs may use the forwarder on .1:3128.
+    PROXY_FILE=$WORK/conf/proxy-upstream
+    mkdir -p "$WORK/conf"; echo "http://proxy.corp:3128" > "$PROXY_FILE"
     systemctl() { return 1; }      # no firewalld
     put() { local f=$1 mode=${2:-0644}; mkdir -p "$(dirname "$f")"; cat >"$f"; chmod "$mode" "$f"; }
     setup_network >/dev/null
@@ -71,6 +74,8 @@ listen ip netns exec bld nc 10.200.0.13 1234
 listen nc 10.200.0.1 53
 listen nc 10.200.0.1 22
 listen nc 10.200.0.1 5000
+listen nc 10.200.0.1 3128
+listen nc 10.200.0.1 3129
 listen nc 0.0.0.0 9477
 listen ip netns exec out nc 169.254.169.254 80
 listen ip netns exec out nc 198.51.100.7 80
@@ -134,6 +139,10 @@ ip -n vmA route add 192.0.2.1/32 dev mds0 src 10.200.0.11
 check "metadata tap->host over IPv6 link-local"     blocked $A nc -6 -z -w2 "$HLL%mds0" 2222
 check "metadata tap->host uplink address (IPv4)"    blocked $A nc -z -w2 -s 10.200.0.11 192.0.2.1 2223
 check "metadata tap->other VM"                      blocked $A nc -z -w2 -s 169.254.0.1 10.200.0.12 1234
+# the proxy forwarder on the bridge address: for microVMs, not for the LAN
+check "VM->proxy forwarder .1:3128"                 ok      $A nc -z -w2 10.200.0.1 3128
+check "VM->other host port .1:3129"                 blocked $A nc -z -w2 10.200.0.1 3129
+check "LAN->proxy forwarder .1:3128"                blocked $L nc -z -w2 10.200.0.1 3128
 echo "---- rendered rules"; nft list table inet firerunner | sed -n '/chain input/,/^}/p'
 echo "RESULT pass=$pass fail=$fail"
 [[ $fail -eq 0 ]]

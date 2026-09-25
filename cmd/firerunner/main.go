@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -13,6 +14,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -30,6 +33,7 @@ import (
 	"github.com/ismoilovdevml/firerunner/internal/executor"
 	"github.com/ismoilovdevml/firerunner/internal/flintlock"
 	"github.com/ismoilovdevml/firerunner/internal/host"
+	"github.com/ismoilovdevml/firerunner/internal/proxy"
 	"github.com/ismoilovdevml/firerunner/internal/upgrade"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
@@ -68,6 +72,8 @@ Usage:
                                             running job builds on are kept without --force
 
   firerunner daemon                         pool + reconcile + metrics (systemd: firerunner.service)
+  firerunner proxy                          forwards microVM traffic to the corporate proxy
+                                            (systemd: firerunner-proxy.service; see proxy.*)
   firerunner executor prepare|run|cleanup   called by gitlab-runner (custom executor)
   firerunner upgrade [--version edge|latest|vX.Y.Z] [--check]
                                             replace this binary with a release (default: edge)
@@ -128,6 +134,8 @@ func dispatch(args []string) error {
 		return cmdExecutor(cfg, rest)
 	case "daemon":
 		return cmdDaemon()
+	case "proxy":
+		return cmdProxy(cfg)
 	case "builder", "builders":
 		return cmdBuilder(cfg, rest)
 	case "pool":
@@ -396,6 +404,30 @@ func cmdDoctor(cfg config.Config) error {
 		}
 	}
 
+	if cfg.Proxy.Enabled {
+		fmt.Println("Proxy")
+		var err error
+		if !host.ServiceActive("firerunner-proxy") {
+			err = errors.New("not running")
+		}
+		check("service firerunner-proxy", err, "journalctl -u firerunner-proxy -n 50")
+		up, err := proxy.LoadUpstream(cfg.Proxy.UpstreamFile)
+		check("upstream in "+cfg.Proxy.UpstreamFile, err, "echo 'http://user:password@proxy:port' > "+cfg.Proxy.UpstreamFile+"; chmod 600 it")
+		if err == nil {
+			c, derr := net.DialTimeout("tcp", up.Addr, 3*time.Second)
+			if derr == nil {
+				_ = c.Close()
+			}
+			check("upstream "+up.Addr+" reachable", derr, "check the proxy address and the host's firewall")
+			check("HTTPS through the proxy (registry-1.docker.io)", proxyConnect(cfg, "registry-1.docker.io:443"),
+				"journalctl -u firerunner-proxy -n 50 (a 407 means the upstream refused the credentials)")
+		}
+	}
+	if cfg.VM.CAFile != "" {
+		_, err := vm.ReadCA(cfg)
+		check("CA "+cfg.VM.CAFile, err, "vm.ca_file must be a PEM file with the root certificate(s)")
+	}
+
 	if failed > 0 {
 		return fmt.Errorf("%d check(s) failed", failed)
 	}
@@ -646,7 +678,7 @@ func cmdRun(cfg config.Config, args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "%s ready at %s in %s\n", id, inst.IP, time.Since(start).Round(100*time.Millisecond))
 
-	code, runErr := vm.RunScript(cfg, inst, strings.NewReader(strings.Join(command, " ")+"\n"), os.Stdout, os.Stderr)
+	code, runErr := vm.RunScript(cfg, inst, strings.NewReader(runCommandLine(command)+"\n"), os.Stdout, os.Stderr)
 	if *keep {
 		fmt.Fprintf(os.Stderr, "kept %s: ssh -i %s -o UserKnownHostsFile=%s/%s -o HostKeyAlias=%s root@%s   (delete: firerunner vm rm %s)\n",
 			id, cfg.Network.SSHKey, vm.KnownHostsDir, id, id, inst.IP, id)
@@ -703,6 +735,12 @@ func cmdUpgrade(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// Behind a corporate proxy the download goes through the local forwarder.
+	if cfg, err := config.Load(config.Path()); err == nil && cfg.Proxy.Enabled && os.Getenv("HTTPS_PROXY") == "" && os.Getenv("https_proxy") == "" {
+		if _, port, err := net.SplitHostPort(cfg.Proxy.Listen); err == nil {
+			_ = os.Setenv("HTTPS_PROXY", "http://"+net.JoinHostPort("127.0.0.1", port))
+		}
+	}
 	res, err := upgrade.Run(context.Background(), *tag, version, *check)
 	if err != nil {
 		return err
@@ -719,6 +757,13 @@ func cmdUpgrade(args []string) error {
 				return fmt.Errorf("restarting firerunner.service: %w", err)
 			}
 			fmt.Println("firerunner.service restarted")
+		}
+		if host.ServiceActive("firerunner-proxy") {
+			// A restart drops open tunnels; clients (docker, curl) retry.
+			if err := exec.Command("systemctl", "restart", "firerunner-proxy").Run(); err != nil {
+				return fmt.Errorf("restarting firerunner-proxy.service: %w", err)
+			}
+			fmt.Println("firerunner-proxy.service restarted")
 		}
 	}
 	return nil
@@ -737,6 +782,80 @@ func cmdDaemon() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return d.Run(ctx)
+}
+
+// runCommandLine turns `firerunner run -- ...` into the shell line run in the
+// VM: one argument is a shell command line ('env | grep proxy'), several are
+// argv and quoted one by one (sh -c 'a; b').
+func runCommandLine(args []string) string {
+	if len(args) == 1 {
+		return args[0]
+	}
+	quoted := make([]string, len(args))
+	for i, a := range args {
+		quoted[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+	}
+	return strings.Join(quoted, " ")
+}
+
+// ---------------------------------------------------------------------------
+// proxy
+
+// cmdProxy runs the forwarder on the bridge address (for microVMs) and on
+// 127.0.0.1 (for host services); only those networks may use it.
+func cmdProxy(cfg config.Config) error {
+	if !cfg.Proxy.Enabled {
+		return errors.New("proxy.enabled is false (firerunner config set proxy.enabled true)")
+	}
+	host, port, err := net.SplitHostPort(cfg.Proxy.Listen)
+	if err != nil {
+		return fmt.Errorf("proxy.listen: %w", err)
+	}
+	_, bridge, err := net.ParseCIDR(host + "/24")
+	if err != nil {
+		return fmt.Errorf("proxy.listen: %w", err)
+	}
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	if _, err := proxy.LoadUpstream(cfg.Proxy.UpstreamFile); err != nil {
+		// Keep running: the file is read per connection, so fixing it needs no restart.
+		log.Error("upstream proxy not usable yet", "err", err)
+	}
+	f := &proxy.Forwarder{
+		Upstream:    func() (proxy.Upstream, error) { return proxy.LoadUpstream(cfg.Proxy.UpstreamFile) },
+		Allowed:     proxy.AllowNets(bridge),
+		Log:         log,
+		DialTimeout: 15 * time.Second,
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return proxy.Serve(ctx, f, cfg.Proxy.Listen, net.JoinHostPort("127.0.0.1", port))
+}
+
+// proxyConnect opens a CONNECT tunnel to target through the local forwarder.
+func proxyConnect(cfg config.Config, target string) error {
+	_, port, err := net.SplitHostPort(cfg.Proxy.Listen)
+	if err != nil {
+		return err
+	}
+	c, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", port), 3*time.Second)
+	if err != nil {
+		return fmt.Errorf("forwarder: %w", err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(20 * time.Second))
+	if _, err := fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
+		return err
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

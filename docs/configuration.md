@@ -61,3 +61,17 @@ CPU is shared, not reserved: give VMs more vCPUs than the host has cores.
 | `daemon.metrics_listen` | `127.0.0.1:9477` | Prometheus endpoint |
 | `daemon.job_max_age` | `3h` | VMs of jobs older than this are deleted |
 | `vm.docker_bip`, `vm.docker_address_pool` | `10.201.0.1/24`, `10.202.0.0/16` | Docker networks in the VM; change them if they clash with your LAN |
+
+## Corporate networks
+
+Set these with the installer options described in [Corporate networks](corporate-network.md);
+the keys are:
+
+| Key | Default | |
+|---|---|---|
+| `proxy.enabled` | `false` | microVMs and host services use the corporate proxy through the forwarder |
+| `proxy.listen` | `10.200.0.1:3128` | the forwarder on the bridge address (and 127.0.0.1) |
+| `proxy.upstream_file` | `/etc/firerunner/proxy-upstream` | root-only file with `http://[user:password@]host:port` |
+| `proxy.no_proxy` | none | hosts, `.domains` and CIDRs reached directly; local addresses are always added |
+| `vm.ca_file` | none | PEM root CA trusted by microVMs, their Docker, builders and job containers |
+| `vm.insecure_registries` | none | `host:port` (TLS without a check) or `http://host:port` (plain HTTP) |

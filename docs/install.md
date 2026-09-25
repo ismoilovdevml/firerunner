@@ -36,6 +36,7 @@ Options go before `bash`, for example `sudo FR_DISK=/dev/sdb bash`:
 | `FR_EGRESS_DENY` | none | comma-separated CIDRs jobs must not reach, e.g. `192.168.0.0/16` |
 | `FR_GITLAB_URL`, `FR_RUNNER_TOKEN` | none | register the runner during install |
 | `FR_SUBNET` | `10.200.0` | /24 for microVMs |
+| `FR_PROXY`, `FR_NO_PROXY`, `FR_CA_FILE`, `FR_INSECURE_REGISTRIES` | none | behind a proxy or with internal registries: see [Corporate networks](corporate-network.md) |
 
 ## Connect GitLab
 

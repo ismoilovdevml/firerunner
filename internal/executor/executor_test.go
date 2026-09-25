@@ -142,7 +142,7 @@ func TestServicesScript(t *testing.T) {
 	sc := ServicesScript([]Service{
 		{Name: "postgres:16", Variables: map[string]string{"POSTGRES_PASSWORD": "p'w"}},
 		{Name: "redis:7", Entrypoint: []string{"/bin/sh", "-c"}, Command: []string{"redis-server --save ''"}},
-	})
+	}, "")
 	for _, want := range []string{
 		"docker network create firerunner-job",
 		"--network-alias 'postgres'",
@@ -325,4 +325,25 @@ func TestDeleteVMForgetsTheVM(t *testing.T) {
 		t.Fatalf("deleted %v, want [u3]", got)
 	}
 	forgotten(t, key)
+}
+
+// Job and service containers get the proxy exceptions and CA flags quoted,
+// and a job with services keeps their aliases out of the proxy in the VM's
+// /etc/environment for stage scripts without image:.
+func TestCorporateNetworkContainerFlags(t *testing.T) {
+	cmd := ContainerCommand("node:22", ServiceNetwork, "-e", "NO_PROXY=a,b", "-v", "/x:/y:ro", "-e", "it's")
+	if !strings.Contains(cmd, `'-e' 'NO_PROXY=a,b' '-v' '/x:/y:ro' '-e' 'it'\''s' 'node:22'`) {
+		t.Fatalf("container flags not quoted before the image: %s", cmd)
+	}
+	sc := ServicesScript([]Service{{Name: "minio/minio"}}, "localhost,minio", "-e", "SSL_CERT_FILE=/etc/firerunner/ca-bundle.crt")
+	if !strings.Contains(sc, "sed -i -e '/^no_proxy=/d' -e '/^NO_PROXY=/d' /etc/environment") ||
+		!strings.Contains(sc, "'no_proxy=localhost,minio' 'NO_PROXY=localhost,minio' >>/etc/environment") {
+		t.Fatalf("no_proxy not updated for stage scripts:\n%s", sc)
+	}
+	if !strings.Contains(sc, "'-e' 'SSL_CERT_FILE=/etc/firerunner/ca-bundle.crt'") {
+		t.Fatalf("service containers lack the CA flags:\n%s", sc)
+	}
+	if plain := ServicesScript([]Service{{Name: "redis"}}, ""); strings.Contains(plain, "/etc/environment") {
+		t.Fatal("no proxy, yet /etc/environment is rewritten")
+	}
 }

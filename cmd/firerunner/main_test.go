@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"os/exec"
+	"testing"
+)
 
 func TestParseBuilderRm(t *testing.T) {
 	ok := []struct {
@@ -30,5 +33,25 @@ func TestParseBuilderRm(t *testing.T) {
 		if project, _, err := parseBuilderRm(bad); err == nil {
 			t.Errorf("parseBuilderRm(%q) = %q, want a usage error", bad, project)
 		}
+	}
+}
+
+func TestRunCommandLine(t *testing.T) {
+	for _, tc := range []struct {
+		in   []string
+		want string
+	}{
+		{[]string{"env | grep -i proxy"}, "env | grep -i proxy"},
+		{[]string{"uname", "-a"}, "'uname' '-a'"},
+		{[]string{"sh", "-c", "env | grep x; echo 'hi'"}, `'sh' '-c' 'env | grep x; echo '\''hi'\'''`},
+	} {
+		if got := runCommandLine(tc.in); got != tc.want {
+			t.Errorf("runCommandLine(%q) = %s, want %s", tc.in, got, tc.want)
+		}
+	}
+	// What bash makes of it: the argv comes back unchanged.
+	out, err := exec.Command("bash", "-c", runCommandLine([]string{"printf", "%s|", "a b", "it's", "$HOME"})).Output()
+	if err != nil || string(out) != "a b|it's|$HOME|" {
+		t.Fatalf("round trip through bash: %q %v", out, err)
 	}
 }

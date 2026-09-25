@@ -22,6 +22,9 @@ run the installer again.
 
 After a new guest image is published, replace the idle VMs: `sudo firerunner pool refresh`.
 
+To roll back, restore the previous binary and the `config.yaml` saved before the upgrade: an older
+version refuses keys it does not know.
+
 ## microVMs
 
 ```bash

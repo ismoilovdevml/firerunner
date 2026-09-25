@@ -16,6 +16,7 @@ All commands need root.
 | `firerunner builder list` · `rm <project> \| --all [--force]` | builders; a builder in use is kept unless `--force` |
 | `firerunner run [--keep] -- <command>` | run a command in a throwaway VM |
 | `firerunner upgrade [--version V] [--check]` | update the binary |
+| `firerunner proxy` | the corporate proxy forwarder (systemd: `firerunner-proxy`), see [Corporate networks](corporate-network.md) |
 | `firerunner version` | |
 
 `firerunner daemon` and `firerunner executor …` are run by systemd and gitlab-runner.

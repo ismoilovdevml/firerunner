@@ -136,6 +136,9 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	st := &vm.JobState{Instance: *inst, Source: source, StartedAt: start}
 	if len(services) > 0 {
 		st.Network = ServiceNetwork
+		for _, svc := range services {
+			st.ServiceAliases = append(st.ServiceAliases, svc.Aliases()...)
+		}
 	}
 	// Exclusive: a job must never replace another job's VM binding.
 	if err := vm.CreateJobState(statePath(id), st); err != nil {
@@ -156,7 +159,12 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	}
 	if len(services) > 0 {
 		cmd := vm.SSH(cfg, inst, "/bin/bash")
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = strings.NewReader(ServicesScript(services)), os.Stdout, os.Stderr
+		noProxy := ""
+		if cfg.Proxy.Enabled {
+			noProxy = vm.NoProxy(cfg, st.ServiceAliases...)
+		}
+		script := ServicesScript(services, noProxy, vm.ContainerArgs(cfg, nil)...)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = strings.NewReader(script), os.Stdout, os.Stderr
 		if code, err := vm.ExitCode(cmd.Run()); err != nil || code != 0 {
 			return fail("services", fmt.Errorf("starting services failed (exit %d): %v", code, err))
 		}
@@ -328,9 +336,11 @@ chmod 0755 /usr/local/bin/docker
 	return b.String()
 }
 
+// writeDockerAuth replaces the microVM's Docker CLI config with the job's
+// DOCKER_AUTH_CONFIG, keeping the proxy settings the VM booted with.
 func writeDockerAuth(cfg config.Config, inst *vm.Instance, auth string) error {
 	cmd := vm.SSH(cfg, inst, "mkdir -p /root/.docker && umask 077 && cat > /root/.docker/config.json")
-	cmd.Stdin = strings.NewReader(auth)
+	cmd.Stdin = strings.NewReader(vm.MergeDockerConfig(cfg, auth))
 	return cmd.Run()
 }
 
@@ -357,7 +367,7 @@ func Run(cfg config.Config, script, stage string) error {
 		if strings.HasPrefix(image, "-") {
 			return buildFailure(fmt.Errorf("invalid image %q", image))
 		}
-		code, err = runInContainer(cfg, &st.Instance, image, st.Network, f)
+		code, err = runInContainer(cfg, &st.Instance, image, st.Network, f, vm.ContainerArgs(cfg, st.ServiceAliases)...)
 	} else {
 		var script io.Reader = f
 		if st.BuilderProject == "" && isUserStage(stage) {
@@ -402,18 +412,23 @@ func Run(cfg config.Config, script, stage string) error {
 // and cache dirs are shared with the VM, which ran get_sources there.
 // Like the docker executor, bash is used when the image has it, sh otherwise.
 // With services the container joins their network so their aliases resolve.
-func ContainerCommand(image, network string) string {
+// extra are further docker run flags (see vm.ContainerArgs), quoted here.
+func ContainerCommand(image, network string, extra ...string) string {
 	if network == "" {
 		network = "host"
 	}
+	var flags string
+	for _, a := range extra {
+		flags += shellQuote(a) + " "
+	}
 	return "docker run --rm -i --pull missing --network " + shellQuote(network) + " --entrypoint '' " +
-		"-v /root/builds:/root/builds -v /root/cache:/root/cache " +
+		"-v /root/builds:/root/builds -v /root/cache:/root/cache " + flags +
 		shellQuote(image) + " " +
 		`sh -c 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi'`
 }
 
-func runInContainer(cfg config.Config, inst *vm.Instance, image, network string, script io.Reader) (int, error) {
-	cmd := vm.SSH(cfg, inst, ContainerCommand(image, network))
+func runInContainer(cfg config.Config, inst *vm.Instance, image, network string, script io.Reader, extra ...string) (int, error) {
+	cmd := vm.SSH(cfg, inst, ContainerCommand(image, network, extra...))
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = script, os.Stdout, os.Stderr
 	return vm.ExitCode(cmd.Run())
 }

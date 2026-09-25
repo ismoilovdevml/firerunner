@@ -31,6 +31,17 @@
 #   FR_CACHE_DAYS           delete cache: archives not written for this many days (default: 14)
 #   GITLAB_RUNNER_VERSION   (default: 19.4.0)
 #
+# Corporate networks (all remembered for later re-runs):
+#   FR_PROXY                corporate HTTP proxy, http://[user:password@]host:port (%-encode
+#                           special characters in the password). Stored root-only; microVMs and
+#                           host services use a local forwarder and never see the password.
+#   FR_NO_PROXY             comma-separated hosts, .domains and CIDRs reached without the proxy,
+#                           e.g. gitlab.corp.example,.corp.example,10.0.0.0/8
+#   FR_CA_FILE              PEM file with a company root CA (internal registries, S3, or a
+#                           TLS-inspecting proxy): trusted by the host, microVMs and job containers
+#   FR_INSECURE_REGISTRIES  comma-separated registries without a checkable certificate (host:port)
+#                           or on plain HTTP (http://host:port)
+#
 # Register a GitLab runner right away (optional, can be done later with
 # `firerunner runner register`):
 #   FR_GITLAB_URL           e.g. https://gitlab.example.com
@@ -63,6 +74,10 @@ FR_RUNNER_CONCURRENT="${FR_RUNNER_CONCURRENT:-4}"
 FR_POOL_SIZE="${FR_POOL_SIZE:-2}"
 FR_METRICS_ALLOW="${FR_METRICS_ALLOW:-}"
 FR_EGRESS_DENY="${FR_EGRESS_DENY:-}"
+FR_PROXY="${FR_PROXY:-}"
+FR_NO_PROXY="${FR_NO_PROXY:-}"
+FR_CA_FILE="${FR_CA_FILE:-}"
+FR_INSECURE_REGISTRIES="${FR_INSECURE_REGISTRIES:-}"
 FR_REPO=ismoilovdevml/firerunner
 
 BIN_DIR=/usr/local/bin
@@ -93,15 +108,7 @@ trap 'printf "[firerunner] ERROR: line %s: %s (exit %s)\n" "$LINENO" "$BASH_COMM
 preflight() {
     [[ $EUID -eq 0 ]] || die "run as root (curl ... | sudo bash)"
     command -v systemctl >/dev/null || die "systemd is required"
-
-    # Both end up in firewall rules.
-    if [[ -n $FR_METRICS_ALLOW ]]; then
-        is_ipv4_cidr "$FR_METRICS_ALLOW" || die "FR_METRICS_ALLOW=$FR_METRICS_ALLOW is not an IPv4 address or CIDR"
-    fi
-    local cidr
-    for cidr in ${FR_EGRESS_DENY//,/ }; do
-        is_ipv4_cidr "$cidr" || die "FR_EGRESS_DENY: $cidr is not an IPv4 address or CIDR"
-    done
+    preflight_settings
 
     # Only x86_64 is built and tested for now.
     [[ "$(uname -m)" == x86_64 ]] || die "unsupported architecture: $(uname -m) (x86_64 only)"
@@ -127,6 +134,160 @@ preflight() {
     fi
     if systemd-detect-virt -q 2>/dev/null; then
         log "running inside a VM ($(systemd-detect-virt)); nested virtualization detected via /dev/kvm"
+    fi
+}
+
+# preflight_settings checks the FR_* settings that end up in firewall rules,
+# systemd units and the microVM config, before anything is changed.
+preflight_settings() {
+    if [[ -n $FR_METRICS_ALLOW ]]; then
+        is_ipv4_cidr "$FR_METRICS_ALLOW" || die "FR_METRICS_ALLOW=$FR_METRICS_ALLOW is not an IPv4 address or CIDR"
+    fi
+    local cidr
+    for cidr in ${FR_EGRESS_DENY//,/ }; do
+        is_ipv4_cidr "$cidr" || die "FR_EGRESS_DENY: $cidr is not an IPv4 address or CIDR"
+    done
+    if [[ -n $FR_PROXY && ! $FR_PROXY =~ ^http://([^@/[:space:]]+@)?[A-Za-z0-9.-]+:[0-9]+/?$ ]]; then
+        die "FR_PROXY must be http://[user:password@]host:port (%-encode special characters)"
+    fi
+    if [[ -n $FR_NO_PROXY && ! $FR_NO_PROXY =~ ^[A-Za-z0-9.,:/*_-]+$ ]]; then
+        die "FR_NO_PROXY: only hosts, .domains and CIDRs, comma-separated"
+    fi
+    if [[ -n $FR_CA_FILE ]]; then
+        grep -q -- "-----BEGIN CERTIFICATE-----" "$FR_CA_FILE" 2>/dev/null ||
+            die "FR_CA_FILE=$FR_CA_FILE is not a PEM file with a certificate"
+    fi
+    if [[ -n $FR_INSECURE_REGISTRIES && ! $FR_INSECURE_REGISTRIES =~ ^(http://)?[A-Za-z0-9.:-]+(,(http://)?[A-Za-z0-9.:-]+)*$ ]]; then
+        die "FR_INSECURE_REGISTRIES: host:port or http://host:port entries, comma-separated"
+    fi
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# Corporate proxy and company CA
+# --------------------------------------------------------------------------
+
+PROXY_FILE="$CONF_DIR/proxy-upstream"
+CA_FILE="$CONF_DIR/ca.pem"
+PROXY_PORT=3128
+
+# proxy_on: a corporate proxy is configured (now or by an earlier run).
+proxy_on() { [[ -s $PROXY_FILE ]]; }
+
+# setup_proxy runs first: every later download may need the proxy and the CA.
+setup_proxy() {
+    mkdir -p "$CONF_DIR"
+    if [[ -n $FR_CA_FILE ]]; then
+        log "trusting the company CA from $FR_CA_FILE"
+        put "$CA_FILE" 0644 <"$FR_CA_FILE"
+    fi
+    if [[ -f $CA_FILE ]]; then
+        # The host's own clients (curl, dnf/apt, containerd, the registry mirror) trust it too.
+        if [[ -d /etc/pki/ca-trust/source/anchors ]]; then
+            put /etc/pki/ca-trust/source/anchors/firerunner-ca.pem 0644 <"$CA_FILE"
+            changed /etc/pki/ca-trust/source/anchors/firerunner-ca.pem && update-ca-trust
+        elif [[ -d /usr/local/share/ca-certificates ]]; then
+            put /usr/local/share/ca-certificates/firerunner-ca.crt 0644 <"$CA_FILE"
+            changed /usr/local/share/ca-certificates/firerunner-ca.crt && update-ca-certificates >/dev/null
+        fi
+    fi
+    if [[ -n $FR_PROXY ]]; then
+        log "using the corporate proxy (stored in $PROXY_FILE, root only)"
+        (umask 077; printf '%s\n' "${FR_PROXY%/}" | put "$PROXY_FILE" 0600)
+    fi
+    proxy_on || return 0
+    # The installer's own downloads go straight to the corporate proxy.
+    local upstream no
+    upstream=$(<"$PROXY_FILE")
+    no="localhost,127.0.0.1,${FR_SUBNET}.1${FR_NO_PROXY:+,$FR_NO_PROXY}"
+    export http_proxy="$upstream" https_proxy="$upstream" no_proxy="$no"
+    export HTTP_PROXY="$upstream" HTTPS_PROXY="$upstream" NO_PROXY="$no"
+}
+
+# proxy_dropin SERVICE: host services reach the internet through the local
+# forwarder (the password stays in one root-only file).
+proxy_dropin() {
+    local d="/etc/systemd/system/$1.service.d/firerunner-proxy.conf"
+    if ! proxy_on; then
+        [[ -f $d ]] && { rm -f "$d"; CHANGED+="$d "; }
+        return 0
+    fi
+    local p="http://127.0.0.1:${PROXY_PORT}" no
+    no="localhost,127.0.0.1,::1,${FR_SUBNET}.1,${FR_SUBNET}.0/24$(no_proxy_extra)"
+    put "$d" 0644 <<EOF
+[Service]
+Environment="HTTP_PROXY=$p" "HTTPS_PROXY=$p" "NO_PROXY=$no" "http_proxy=$p" "https_proxy=$p" "no_proxy=$no"
+EOF
+}
+
+# no_proxy_extra: ",<proxy.no_proxy>" as configured now or by an earlier run.
+no_proxy_extra() {
+    local extra=$FR_NO_PROXY
+    if [[ -z $extra && -x $BIN_DIR/firerunner ]]; then
+        extra=$($BIN_DIR/firerunner config get proxy.no_proxy 2>/dev/null | tr -d "\"' " || true)
+    fi
+    [[ -n $extra ]] && printf ',%s' "$extra"
+    return 0
+}
+
+proxy_input_rules() {
+    proxy_on || return 0
+    printf '    iifname "%s" ip daddr %s.1 tcp dport %s accept\n' "$FR_BRIDGE" "$FR_SUBNET" "$PROXY_PORT"
+}
+
+# configure_proxy writes the proxy, CA and registry settings into the
+# firerunner config and runs the forwarder (after firerunner is installed).
+configure_proxy() {
+    local fr=$BIN_DIR/firerunner
+    if [[ -f $CA_FILE ]]; then
+        $fr config set vm.ca_file "$CA_FILE" >/dev/null
+    fi
+    if [[ -n $FR_INSECURE_REGISTRIES ]]; then
+        $fr config set vm.insecure_registries "[${FR_INSECURE_REGISTRIES}]" >/dev/null
+    fi
+    if ! proxy_on; then
+        if systemctl is-enabled -q firerunner-proxy 2>/dev/null; then
+            systemctl disable --now -q firerunner-proxy
+            $fr config set proxy.enabled false >/dev/null
+        fi
+        return 0
+    fi
+    $fr config set proxy.listen "${FR_SUBNET}.1:${PROXY_PORT}" >/dev/null
+    $fr config set proxy.upstream_file "$PROXY_FILE" >/dev/null
+    if [[ -n $FR_NO_PROXY ]]; then
+        $fr config set proxy.no_proxy "$FR_NO_PROXY" >/dev/null
+    fi
+    $fr config set proxy.enabled true >/dev/null
+    put /etc/systemd/system/firerunner-proxy.service <<EOF
+[Unit]
+Description=FireRunner proxy forwarder (microVMs and host services to the corporate proxy)
+Wants=firerunner-net.service
+After=firerunner-net.service
+
+[Service]
+ExecStart=${BIN_DIR}/firerunner proxy
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable -q firerunner-proxy
+    if ! systemctl is-active -q firerunner-proxy || changed /etc/systemd/system/firerunner-proxy.service "$BIN_DIR/firerunner"; then
+        systemctl restart firerunner-proxy
     fi
 }
 
@@ -416,6 +577,7 @@ table inet firerunner {
     iifname "${FR_BRIDGE}" udp dport 67 accept
     iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 udp dport 53 accept
     iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport { 53, 5000, 9000 } accept
+$(proxy_input_rules)
     iifname "${FR_BRIDGE}" ct state established,related accept
     iifname "${FR_BRIDGE}" drop
 $(metrics_input_rules)
@@ -862,15 +1024,18 @@ register_runner() {
 # --------------------------------------------------------------------------
 
 start_services() {
+    # containerd pulls the microVM images, the registry mirror Docker Hub layers.
+    proxy_dropin containerd-flintlock
+    proxy_dropin firerunner-registry
     systemctl daemon-reload
     local svc files
     for svc in containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd; do
         systemctl enable -q "$svc"
         case $svc in
-            containerd-flintlock) files="$CONF_DIR/containerd.toml $BIN_DIR/containerd" ;;
+            containerd-flintlock) files="$CONF_DIR/containerd.toml $BIN_DIR/containerd /etc/systemd/system/$svc.service.d/firerunner-proxy.conf" ;;
             firerunner-net)       files="$LIB_DIR/net-up.sh" ;;
             firerunner-dnsmasq)   files="$CONF_DIR/dnsmasq.conf" ;;
-            firerunner-registry)  files="$CONF_DIR/registry.yml $BIN_DIR/registry" ;;
+            firerunner-registry)  files="$CONF_DIR/registry.yml $BIN_DIR/registry /etc/systemd/system/$svc.service.d/firerunner-proxy.conf" ;;
             firerunner-cache)     files="$CONF_DIR/cache.env $BIN_DIR/versitygw" ;;
             flintlockd)           files="/etc/opt/flintlockd/config.yaml $BIN_DIR/flintlockd $BIN_DIR/firecracker" ;;
         esac
@@ -895,7 +1060,9 @@ start_services() {
 verify_install() {
     log "verifying"
     local ok=1 svc
-    for svc in containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd firerunner; do
+    local services="containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd firerunner"
+    proxy_on && services+=" firerunner-proxy"
+    for svc in $services; do
         if systemctl is-active -q "$svc"; then
             log "  $svc: active"
         else
@@ -950,10 +1117,11 @@ uninstall() {
     fi
     systemctl disable --now -q firerunner-cache-clean.timer 2>/dev/null || true
     rm -f /etc/systemd/system/firerunner-cache-clean.{service,timer}
-    for svc in firerunner flintlockd firerunner-cache firerunner-registry firerunner-dnsmasq firerunner-net containerd-flintlock; do
+    for svc in firerunner-proxy firerunner flintlockd firerunner-cache firerunner-registry firerunner-dnsmasq firerunner-net containerd-flintlock; do
         systemctl disable --now -q "$svc" 2>/dev/null || true
-        rm -f "/etc/systemd/system/$svc.service"
+        rm -f "/etc/systemd/system/$svc.service" "/etc/systemd/system/$svc.service.d/firerunner-proxy.conf"
     done
+    rm -f /etc/systemd/system/gitlab-runner.service.d/firerunner-proxy.conf
     systemctl daemon-reload
     rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry" \
         "$BIN_DIR/versitygw" "$BIN_DIR/firecracker" "$BIN_DIR/jailer"
@@ -970,6 +1138,7 @@ main() {
     esac
     preflight
     TMP_DIR=$(mktemp -d)
+    setup_proxy
     install_packages
     install_containerd
     setup_thinpool
@@ -986,9 +1155,16 @@ main() {
     if ! systemctl is-active -q firerunner || changed /etc/systemd/system/firerunner.service "$BIN_DIR/firerunner"; then
         systemctl restart firerunner
     fi
+    configure_proxy
     open_metrics_port
     verify_install
     register_runner
+    # gitlab-runner talks to GitLab through the forwarder as well.
+    proxy_dropin gitlab-runner
+    if changed /etc/systemd/system/gitlab-runner.service.d/firerunner-proxy.conf; then
+        systemctl daemon-reload
+        systemctl try-restart gitlab-runner
+    fi
     configure_runner_cache
 }
 

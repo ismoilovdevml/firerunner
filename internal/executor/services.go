@@ -68,13 +68,24 @@ func (s Service) Aliases() []string {
 // services on ServiceNetwork, publish their aliases in /etc/hosts (for jobs
 // without image:) and wait up to 30 s for each exposed TCP port, like the
 // docker executor's health check (a port that never opens is only a warning).
-func ServicesScript(services []Service) string {
+//
+// With the proxy, noProxy (the proxy exceptions plus the service aliases)
+// replaces the VM's no_proxy for stage scripts without image:, and extra
+// (vm.ContainerArgs) is passed to each service container.
+func ServicesScript(services []Service, noProxy string, extra ...string) string {
 	var b strings.Builder
 	b.WriteString("set -e\n")
+	if noProxy != "" {
+		fmt.Fprintf(&b, "sed -i -e '/^no_proxy=/d' -e '/^NO_PROXY=/d' /etc/environment\nprintf '%%s\\n' %s %s >>/etc/environment\n",
+			shellQuote("no_proxy="+noProxy), shellQuote("NO_PROXY="+noProxy))
+	}
 	fmt.Fprintf(&b, "docker network create %s >/dev/null\n", ServiceNetwork)
 	for i, svc := range services {
 		name := fmt.Sprintf("svc-%d", i)
 		args := []string{"docker", "run", "-d", "--name", name, "--network", ServiceNetwork, "--pull", "missing"}
+		for _, a := range extra {
+			args = append(args, shellQuote(a))
+		}
 		for _, a := range svc.Aliases() {
 			args = append(args, "--network-alias", shellQuote(a))
 		}

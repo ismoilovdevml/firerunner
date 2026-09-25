@@ -19,6 +19,8 @@ type JobState struct {
 	Reason string `json:"reason,omitempty"`
 	// Network is the Docker network job containers join (set when the job has services).
 	Network string `json:"network,omitempty"`
+	// ServiceAliases are the job's service host names, kept out of the proxy.
+	ServiceAliases []string `json:"service_aliases,omitempty"`
 	// BuilderProject is the project whose BuildKit builder `docker build` in
 	// this job uses; the daemon never deletes a builder a running job uses.
 	BuilderProject string `json:"builder_project,omitempty"`

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -87,7 +88,7 @@ func TestJobStateRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if *got != *want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("round trip: got %+v want %+v", got, want)
 	}
 }

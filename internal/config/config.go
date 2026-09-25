@@ -33,6 +33,25 @@ type Config struct {
 	Daemon    Daemon    `yaml:"daemon"`
 	Network   Network   `yaml:"network"`
 	Builder   Builder   `yaml:"builder"`
+	Proxy     Proxy     `yaml:"proxy"`
+}
+
+// Proxy sends the internet traffic of microVMs through a corporate HTTP proxy.
+// microVMs never see the corporate proxy or its password: they use a small
+// forwarder the daemon runs on the bridge address, which adds the credentials.
+type Proxy struct {
+	// Enabled turns the forwarder on and points microVMs and builders at it.
+	Enabled bool `yaml:"enabled"`
+	// Listen is the forwarder's address on the bridge, the one microVMs use.
+	// It also listens on 127.0.0.1 with the same port for host services.
+	Listen string `yaml:"listen"`
+	// UpstreamFile holds the corporate proxy URL, http://[user:password@]host:port,
+	// in a root-only file, so the password is not in this world-readable config.
+	UpstreamFile string `yaml:"upstream_file"`
+	// NoProxy lists extra hosts, domains (.corp.example) and CIDRs that
+	// microVMs reach directly, comma-separated: an internal GitLab or registry.
+	// Local addresses (the bridge, Docker networks in the VM, localhost) are always added.
+	NoProxy string `yaml:"no_proxy"`
 }
 
 // Builder is a long-lived microVM per GitLab project that runs BuildKit, so
@@ -96,6 +115,14 @@ type VM struct {
 	// Docker's default 172.17.0.0/16, which often collides with company LANs.
 	DockerBIP         string `yaml:"docker_bip"`
 	DockerAddressPool string `yaml:"docker_address_pool"`
+	// CAFile is a PEM file with extra root CAs microVMs, their Docker, builders
+	// and job containers trust: a company CA that signs internal registries and
+	// S3, or the CA of a TLS-inspecting proxy.
+	CAFile string `yaml:"ca_file"`
+	// InsecureRegistries are registries whose certificate is not checked
+	// ("host:port") or that speak plain HTTP ("http://host:port"), for the
+	// VM's Docker and for builders. Prefer vm.ca_file for a company CA.
+	InsecureRegistries []string `yaml:"insecure_registries"`
 }
 
 type Network struct {
@@ -131,6 +158,10 @@ func Default() Config {
 		Network: Network{
 			LeasesFile: "/var/lib/misc/firerunner-dnsmasq.leases",
 			SSHKey:     "/etc/firerunner/executor/id_ed25519",
+		},
+		Proxy: Proxy{
+			Listen:       "10.200.0.1:3128",
+			UpstreamFile: "/etc/firerunner/proxy-upstream",
 		},
 		Builder: Builder{
 			Enabled:      true,
@@ -217,6 +248,11 @@ func (c Config) Validate() error {
 	if _, _, err := net.ParseCIDR(c.VM.DockerAddressPool); err != nil {
 		errs = append(errs, "vm.docker_address_pool must be a CIDR like 10.202.0.0/16")
 	}
+	for _, r := range c.VM.InsecureRegistries {
+		if h := strings.TrimPrefix(r, "http://"); h == "" || strings.ContainsAny(h, "/ \t\r\n'\"\\$`;[]=") {
+			errs = append(errs, fmt.Sprintf("vm.insecure_registries entry %q must be host:port or http://host:port", r))
+		}
+	}
 	if c.VM.HostReserveMB < 0 {
 		errs = append(errs, "vm.host_reserve_mb must not be negative")
 	}
@@ -252,6 +288,19 @@ func (c Config) Validate() error {
 	}
 	if c.Builder.CacheMB < 1000 {
 		errs = append(errs, "builder.cache_mb must be at least 1000")
+	}
+	if c.Proxy.Enabled {
+		if host, port, err := net.SplitHostPort(c.Proxy.Listen); err != nil || net.ParseIP(host).To4() == nil || port == "" {
+			errs = append(errs, "proxy.listen must be the bridge address and a port, like 10.200.0.1:3128")
+		}
+		if c.Proxy.UpstreamFile == "" {
+			errs = append(errs, "proxy.upstream_file is required when the proxy is enabled")
+		}
+		for _, e := range SplitNoProxy(c.Proxy.NoProxy) {
+			if strings.ContainsAny(e, " \t\r\n'\"\\$`;=") {
+				errs = append(errs, fmt.Sprintf("proxy.no_proxy entry %q is not a host, domain or CIDR", e))
+			}
+		}
 	}
 	if c.Builder.SavedCacheGB < 0 {
 		errs = append(errs, "builder.saved_cache_gb must not be negative")
@@ -400,3 +449,17 @@ func join(prefix, k string) string {
 	}
 	return prefix + "." + k
 }
+
+// SplitNoProxy splits a comma-separated no_proxy list, dropping empty entries.
+func SplitNoProxy(s string) []string {
+	var out []string
+	for _, e := range strings.Split(s, ",") {
+		if e = strings.TrimSpace(e); e != "" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// RegistryHost is an insecure_registries entry without its http:// prefix.
+func RegistryHost(entry string) string { return strings.TrimPrefix(entry, "http://") }

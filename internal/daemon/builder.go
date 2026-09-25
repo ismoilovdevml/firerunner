@@ -87,7 +87,7 @@ var projectID = regexp.MustCompile(`^[0-9]{1,20}$`)
 // builders, and resizing must not throw away every project's warm cache.
 func builderSpec(c config.Config) string {
 	return fmt.Sprintf("v2|%s|%s|%s|%s|%d", c.Builder.Image,
-		c.VM.KernelImage, c.VM.RootFSImage, c.VM.RegistryMirror, c.Builder.CacheMB)
+		c.VM.KernelImage, c.VM.RootFSImage, c.VM.RegistryMirror, c.Builder.CacheMB) + proxySpec(c)
 }
 
 // legacyBuilderSpec is builderSpec before v2 (it included the size), so
@@ -429,28 +429,10 @@ func (d *Daemon) waitBuilderFits(ctx context.Context, bcfg config.Config) error 
 // setupBuildkit starts buildkitd with mutual TLS in the builder VM. Docker Hub
 // pulls go through the host's mirror like everywhere else.
 func setupBuildkit(ctx context.Context, cfg config.Config, inst *vm.Instance, c *builderCreds) error {
-	toml := ""
-	if mirror := strings.TrimPrefix(strings.TrimPrefix(cfg.VM.RegistryMirror, "http://"), "https://"); mirror != "" {
-		toml = fmt.Sprintf("[registry.\"docker.io\"]\n  mirrors = [%q]\n[registry.%q]\n  http = true\n", mirror, mirror)
-	}
-	files := map[string]string{"ca.pem": c.caPEM, "server.pem": c.serverCert, "server.key": c.serverKey, "buildkitd.toml": toml}
-	var script strings.Builder
-	script.WriteString("set -e\numask 077\nmkdir -p /etc/buildkit\n")
-	for _, name := range sortedNames(files) {
-		fmt.Fprintf(&script, "cat > /etc/buildkit/%s <<'FIRERUNNER_EOF'\n%sFIRERUNNER_EOF\n", name, ensureNL(files[name]))
-	}
-	fmt.Fprintf(&script, "docker run -d --name buildkitd --privileged --restart always -p 1234:1234 "+
-		"-v /etc/buildkit:/etc/buildkit:ro -v buildkit:/var/lib/buildkit %s "+
-		"--addr tcp://0.0.0.0:1234 --config /etc/buildkit/buildkitd.toml "+
-		"--tlscacert /etc/buildkit/ca.pem --tlscert /etc/buildkit/server.pem --tlskey /etc/buildkit/server.key "+
-		"--oci-worker-gc --oci-worker-gc-keepstorage %d >/dev/null\n", shellQuote(cfg.Builder.Image), cfg.Builder.CacheMB)
-	script.WriteString("for i in $(seq 1 180); do (</dev/tcp/127.0.0.1/1234) 2>/dev/null && exit 0; sleep 1; done\n" +
-		"docker logs --tail 20 buildkitd >&2; exit 3\n")
-
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	cmd := vm.SSH(cfg, inst, "bash")
-	cmd.Stdin = strings.NewReader(script.String())
+	cmd.Stdin = strings.NewReader(buildkitScript(cfg, c))
 	out, err := runWithContext(sctx, cmd)
 	if err != nil {
 		if exitCode(err) == 3 {
@@ -459,6 +441,39 @@ func setupBuildkit(ctx context.Context, cfg config.Config, inst *vm.Instance, c 
 		return fmt.Errorf("starting buildkitd: %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil
+}
+
+// buildkitScript writes the builder's certificates and config and starts
+// buildkitd; it exits 3 when buildkitd never listens (errBuildkitDown).
+func buildkitScript(cfg config.Config, c *builderCreds) string {
+	toml := buildkitdTOML(cfg)
+	files := map[string]string{"ca.pem": c.caPEM, "server.pem": c.serverCert, "server.key": c.serverKey, "buildkitd.toml": toml}
+	var script strings.Builder
+	script.WriteString("set -e\numask 077\nmkdir -p /etc/buildkit\n")
+	for _, name := range sortedNames(files) {
+		fmt.Fprintf(&script, "cat > /etc/buildkit/%s <<'FIRERUNNER_EOF'\n%sFIRERUNNER_EOF\n", name, ensureNL(files[name]))
+	}
+	// With the proxy, buildkitd pulls base images and fetches ADD URLs through
+	// it and trusts the proxy's CA (the VM's bundle holds it); RUN steps get
+	// the proxy as build arguments from the job's Docker CLI.
+	var proxyArgs []string
+	if cfg.Proxy.Enabled {
+		for _, e := range vm.ProxyEnv(cfg, vm.NoProxy(cfg)) {
+			proxyArgs = append(proxyArgs, "-e", shellQuote(e))
+		}
+	}
+	if cfg.VM.CAFile != "" {
+		// The builder VM's bundle holds vm.ca_file (cloud-init).
+		proxyArgs = append(proxyArgs, "-v", "/etc/ssl/certs:/etc/ssl/certs:ro")
+	}
+	fmt.Fprintf(&script, "docker run -d --name buildkitd --privileged --restart always -p 1234:1234 %s"+
+		"-v /etc/buildkit:/etc/buildkit:ro -v buildkit:/var/lib/buildkit %s "+
+		"--addr tcp://0.0.0.0:1234 --config /etc/buildkit/buildkitd.toml "+
+		"--tlscacert /etc/buildkit/ca.pem --tlscert /etc/buildkit/server.pem --tlskey /etc/buildkit/server.key "+
+		"--oci-worker-gc --oci-worker-gc-keepstorage %d >/dev/null\n", joinArgs(proxyArgs), shellQuote(cfg.Builder.Image), cfg.Builder.CacheMB)
+	script.WriteString("for i in $(seq 1 180); do (</dev/tcp/127.0.0.1/1234) 2>/dev/null && exit 0; sleep 1; done\n" +
+		"docker logs --tail 20 buildkitd >&2; exit 3\n")
+	return script.String()
 }
 
 // exitCode is the exit status of a finished command, or -1.
@@ -798,4 +813,41 @@ func newBuilderCreds() (*builderCreds, error) {
 func serial() *big.Int {
 	n, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 120))
 	return n
+}
+
+// buildkitdTOML points Docker Hub at the host's mirror (plain HTTP) and sets
+// vm.insecure_registries: http://host:port as plain HTTP, host:port as TLS
+// without a certificate check. BuildKit, unlike Docker, does not fall back
+// from one to the other. One table per registry: TOML refuses duplicates.
+func buildkitdTOML(cfg config.Config) string {
+	var b strings.Builder
+	seen := map[string]bool{}
+	table := func(host string, plainHTTP bool) {
+		if host == "" || seen[host] {
+			return
+		}
+		seen[host] = true
+		if plainHTTP {
+			fmt.Fprintf(&b, "[registry.%q]\n  http = true\n", host)
+		} else {
+			fmt.Fprintf(&b, "[registry.%q]\n  insecure = true\n", host)
+		}
+	}
+	mirror := strings.TrimPrefix(strings.TrimPrefix(cfg.VM.RegistryMirror, "http://"), "https://")
+	if mirror != "" {
+		fmt.Fprintf(&b, "[registry.\"docker.io\"]\n  mirrors = [%q]\n", mirror)
+		table(mirror, strings.HasPrefix(cfg.VM.RegistryMirror, "http://"))
+	}
+	for _, r := range cfg.VM.InsecureRegistries {
+		table(config.RegistryHost(r), strings.HasPrefix(r, "http://"))
+	}
+	return b.String()
+}
+
+// joinArgs joins already-quoted arguments with a trailing space ("" for none).
+func joinArgs(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return strings.Join(args, " ") + " "
 }

@@ -129,3 +129,38 @@ func TestUnsetOnlyKernelCmdline(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestProxyValidation(t *testing.T) {
+	ok := Default()
+	ok.Proxy.Enabled = true
+	ok.Proxy.NoProxy = "gitlab.corp, .corp,10.0.0.0/8"
+	ok.VM.InsecureRegistries = []string{"harbor.corp:443", "http://10.0.0.5:5000"}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("valid proxy config refused: %v", err)
+	}
+	for name, mutate := range map[string]func(*Config){
+		"newline in no_proxy":        func(c *Config) { c.Proxy.NoProxy = "a.corp\nLD_PRELOAD=/x.so" },
+		"assignment in no_proxy":     func(c *Config) { c.Proxy.NoProxy = "a=b" },
+		"quote in no_proxy":          func(c *Config) { c.Proxy.NoProxy = `a"b` },
+		"listen without port":        func(c *Config) { c.Proxy.Listen = "10.200.0.1" },
+		"listen on a name":           func(c *Config) { c.Proxy.Listen = "bridge:3128" },
+		"no upstream file":           func(c *Config) { c.Proxy.UpstreamFile = "" },
+		"registry with a path":       func(c *Config) { c.VM.InsecureRegistries = []string{"harbor.corp/v2"} },
+		"registry with https scheme": func(c *Config) { c.VM.InsecureRegistries = []string{"https://harbor.corp"} },
+		"empty registry":             func(c *Config) { c.VM.InsecureRegistries = []string{""} },
+		"registry with a newline":    func(c *Config) { c.VM.InsecureRegistries = []string{"a\nb"} },
+	} {
+		c := ok
+		c.VM.InsecureRegistries = append([]string(nil), ok.VM.InsecureRegistries...)
+		mutate(&c)
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	// With the proxy off, its fields are not checked (defaults stay valid).
+	off := Default()
+	off.Proxy.Listen = "nonsense"
+	if err := off.Validate(); err != nil {
+		t.Fatalf("proxy off: %v", err)
+	}
+}

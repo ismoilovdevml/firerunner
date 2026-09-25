@@ -616,3 +616,38 @@ func TestAdoptAfterNewBuildersStarted(t *testing.T) {
 		t.Fatalf("adopted builder not mapped on its new port: %v", calls())
 	}
 }
+
+// Builders pull through the proxy, trust vm.ca_file and reach insecure
+// registries the way the setting says (TLS without a check, or plain HTTP).
+func TestBuildkitScriptCorporateNetwork(t *testing.T) {
+	creds := &builderCreds{caPEM: "CA", serverCert: "CERT", serverKey: "KEY"}
+	plain := buildkitScript(config.Default(), creds)
+	if strings.Contains(plain, "HTTPS_PROXY") || strings.Contains(plain, "/etc/ssl/certs") || strings.Contains(plain, "insecure") {
+		t.Fatalf("defaults already set corporate options:\n%s", plain)
+	}
+
+	cfg := config.Default()
+	cfg.VM.RegistryMirror = "http://10.200.0.1:5000"
+	cfg.Proxy.Enabled = true
+	cfg.VM.CAFile = "/etc/firerunner/ca.pem"
+	cfg.VM.InsecureRegistries = []string{"harbor.corp:443", "http://10.0.0.5:5000", "10.200.0.1:5000"}
+	s := buildkitScript(cfg, creds)
+	for _, want := range []string{
+		"-e 'HTTPS_PROXY=http://10.200.0.1:3128'",
+		"-e 'NO_PROXY=localhost,127.0.0.1,::1,10.200.0.1,",
+		"-v /etc/ssl/certs:/etc/ssl/certs:ro",
+		"[registry.\"docker.io\"]\n  mirrors = [\"10.200.0.1:5000\"]\n",
+		"[registry.\"10.200.0.1:5000\"]\n  http = true\n",
+		"[registry.\"harbor.corp:443\"]\n  insecure = true\n",
+		"[registry.\"10.0.0.5:5000\"]\n  http = true\n",
+		"exit 3",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("script lacks %q", want)
+		}
+	}
+	// The mirror listed again as insecure must not produce a second TOML table.
+	if n := strings.Count(s, `[registry."10.200.0.1:5000"]`); n != 1 {
+		t.Fatalf("mirror table %d times: buildkitd refuses duplicate TOML tables", n)
+	}
+}

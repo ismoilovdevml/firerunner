@@ -56,7 +56,7 @@ func TestLeaseIP(t *testing.T) {
 func TestSpec(t *testing.T) {
 	cfg := config.Default()
 	cfg.VM.KernelCmdline["quiet"] = "1"
-	s := Spec(cfg, "job-7", MAC("job-7"), "ssh-ed25519 AAAA test", HostKey{Private: "PRIV", Public: "ssh-ed25519 HOST"}, map[string]string{"a": "b"})
+	s := Spec(cfg, "job-7", MAC("job-7"), "ssh-ed25519 AAAA test", HostKey{Private: "PRIV", Public: "ssh-ed25519 HOST"}, map[string]string{"a": "b"}, "")
 	if s.GetVcpu() != 2 || s.GetMemoryInMb() != 2048 {
 		t.Fatalf("size: %d %d", s.GetVcpu(), s.GetMemoryInMb())
 	}
@@ -81,7 +81,7 @@ func TestSpec(t *testing.T) {
 func TestDockerDaemonConfigAvoidsDefaultBridge(t *testing.T) {
 	cfg := config.Default()
 	cfg.VM.RegistryMirror = "http://10.200.0.1:5000"
-	s := Spec(cfg, "job-9", MAC("job-9"), "ssh-ed25519 AAAA k", HostKey{}, nil)
+	s := Spec(cfg, "job-9", MAC("job-9"), "ssh-ed25519 AAAA k", HostKey{}, nil, "")
 	ud, _ := base64.StdEncoding.DecodeString(s.GetMetadata()["user-data"])
 	var doc struct {
 		WriteFiles []struct{ Path, Content string } `yaml:"write_files"`
@@ -102,7 +102,7 @@ func TestDockerDaemonConfigAvoidsDefaultBridge(t *testing.T) {
 func TestCloudInitIsMarshalledNotFormatted(t *testing.T) {
 	cfg := config.Default()
 	evil := "job-1\nruncmd:\n  - touch /pwned"
-	s := Spec(cfg, evil, MAC(evil), "ssh-ed25519 AAAA k", HostKey{Private: "P", Public: "ssh-ed25519 H"}, nil)
+	s := Spec(cfg, evil, MAC(evil), "ssh-ed25519 AAAA k", HostKey{Private: "P", Public: "ssh-ed25519 H"}, nil, "")
 	ud, _ := base64.StdEncoding.DecodeString(s.GetMetadata()["user-data"])
 	var doc map[string]any
 	if err := yaml.Unmarshal(ud, &doc); err != nil {

@@ -74,7 +74,8 @@ tag). FireRunner waits up to 30 s for its ports before your script starts.
 ## Private registries
 
 Set the `DOCKER_AUTH_CONFIG` CI/CD variable. It is written into the VM before your script runs,
-for `image:`, `services:` and `docker pull` alike.
+for `image:`, `services:` and `docker pull` alike. Internal registries with a company CA or
+without TLS are set up on the host: see [Corporate networks](corporate-network.md).
 
 ## The VM
 

@@ -105,8 +105,12 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 	if err != nil {
 		return nil, fmt.Errorf("generating host key: %w", err)
 	}
+	ca, err := ReadCA(cfg)
+	if err != nil {
+		return nil, err
+	}
 	mac := MAC(id)
-	uid, err := fl.Create(ctx, Spec(cfg, id, mac, strings.TrimSpace(string(pub)), hostKey, labels))
+	uid, err := fl.Create(ctx, Spec(cfg, id, mac, strings.TrimSpace(string(pub)), hostKey, labels, ca))
 	if err != nil {
 		return nil, fmt.Errorf("creating microVM %s: %w", id, err)
 	}
@@ -150,10 +154,20 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 }
 
 // Spec builds the flintlock request for a job microVM. cloud-init documents
-// are marshalled, never formatted, so no value can inject YAML keys.
-func Spec(cfg config.Config, id, mac, sshPubKey string, hostKey HostKey, labels map[string]string) *types.MicroVMSpec {
+// are marshalled, never formatted, so no value can inject YAML keys. ca is
+// vm.ca_file's PEM (see ReadCA), "" for none.
+func Spec(cfg config.Config, id, mac, sshPubKey string, hostKey HostKey, labels map[string]string, ca string) *types.MicroVMSpec {
 	daemonJSON, _ := json.Marshal(DockerDaemonConfig(cfg))
-	ud, _ := yaml.Marshal(map[string]any{
+	files := []map[string]any{{"path": "/etc/docker/daemon.json", "content": string(daemonJSON)}}
+	if cfg.Proxy.Enabled {
+		np := NoProxy(cfg)
+		cli, _ := json.Marshal(map[string]any{"proxies": DockerCLIProxies(cfg, np)})
+		files = append(files,
+			// pam_env reads it for every SSH session: stage scripts, git, apt.
+			map[string]any{"path": "/etc/environment", "append": true, "content": strings.Join(ProxyEnv(cfg, np), "\n") + "\n"},
+			map[string]any{"path": "/root/.docker/config.json", "permissions": "0600", "content": string(cli)})
+	}
+	doc := map[string]any{
 		"hostname":     id,
 		"disable_root": false,
 		"users":        []map[string]any{{"name": "root", "ssh_authorized_keys": []string{sshPubKey}}},
@@ -162,8 +176,14 @@ func Spec(cfg config.Config, id, mac, sshPubKey string, hostKey HostKey, labels 
 		"ssh_deletekeys":  true,
 		"ssh_genkeytypes": []string{},
 		"ssh_keys":        map[string]string{"ed25519_private": hostKey.Private, "ed25519_public": hostKey.Public},
-		"write_files":     []map[string]string{{"path": "/etc/docker/daemon.json", "content": string(daemonJSON)}},
-	})
+		"write_files":     files,
+	}
+	if ca != "" {
+		// cloud-init's ca_certs runs before sshd is configured: a VM that
+		// answers SSH already trusts the CA (dockerd uses the system roots).
+		doc["ca_certs"] = map[string]any{"trusted": []string{ca}}
+	}
+	ud, _ := yaml.Marshal(doc)
 	userData := "#cloud-config\n" + string(ud)
 	md, _ := yaml.Marshal(map[string]string{
 		"instance_id":    cfg.Flintlock.Namespace + "/" + id,
@@ -215,6 +235,18 @@ func DockerDaemonConfig(cfg config.Config) map[string]any {
 	}
 	if cfg.VM.RegistryMirror != "" {
 		d["registry-mirrors"] = []string{cfg.VM.RegistryMirror}
+	}
+	if len(cfg.VM.InsecureRegistries) > 0 {
+		// Docker tries HTTPS without checking the certificate, then plain HTTP.
+		var hosts []string
+		for _, r := range cfg.VM.InsecureRegistries {
+			hosts = append(hosts, config.RegistryHost(r))
+		}
+		d["insecure-registries"] = hosts
+	}
+	if cfg.Proxy.Enabled {
+		p := ProxyURL(cfg)
+		d["proxies"] = map[string]string{"http-proxy": p, "https-proxy": p, "no-proxy": NoProxy(cfg)}
 	}
 	return d
 }
