@@ -307,8 +307,8 @@ func (c Config) Validate() error {
 		errs = append(errs, "builder.cache_mb must be at least 1000")
 	}
 	if c.Proxy.Enabled {
-		if host, port, err := net.SplitHostPort(c.Proxy.Listen); err != nil || net.ParseIP(host).To4() == nil || port != ProxyPort {
-			errs = append(errs, "proxy.listen must be the bridge address and port "+ProxyPort+", like 10.200.0.1:"+ProxyPort)
+		if host, port, err := net.SplitHostPort(c.Proxy.Listen); err != nil || net.ParseIP(host).To4() == nil || port == "" {
+			errs = append(errs, "proxy.listen must be the bridge address and a port, like 10.200.0.1:"+ProxyPort)
 		}
 		if c.Proxy.UpstreamFile == "" {
 			errs = append(errs, "proxy.upstream_file is required when the proxy is enabled")
@@ -389,9 +389,11 @@ func Save(path string, cfg Config) error {
 func pruneUnused(m map[string]any, cfg Config) {
 	def := Default().Proxy
 	p := cfg.Proxy
-	if !p.Enabled && p.Listen == def.Listen && p.UpstreamFile == def.UpstreamFile && p.NoProxy == "" &&
-		fmt.Sprint(p.ConnectPorts) == fmt.Sprint(def.ConnectPorts) {
+	defaultPorts := fmt.Sprint(p.ConnectPorts) == fmt.Sprint(def.ConnectPorts)
+	if !p.Enabled && p.Listen == def.Listen && p.UpstreamFile == def.UpstreamFile && p.NoProxy == "" && defaultPorts {
 		delete(m, "proxy")
+	} else if pm, ok := m["proxy"].(map[string]any); ok && defaultPorts {
+		delete(pm, "connect_ports") // unknown to v0.1.0
 	}
 	if vm, ok := m["vm"].(map[string]any); ok {
 		if cfg.VM.CAFile == "" {
@@ -409,7 +411,7 @@ func pruneUnused(m map[string]any, cfg Config) {
 var (
 	// noProxyEntry: host, .domain, *.domain, IP, CIDR (no characters systemd,
 	// the shell or TOML would read specially).
-	noProxyEntry = regexp.MustCompile(`^[A-Za-z0-9*][A-Za-z0-9.*:_-]*(/[0-9]{1,3})?$|^\.[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	noProxyEntry = regexp.MustCompile(`^[A-Za-z0-9*:][A-Za-z0-9.*:_-]*(/[0-9]{1,3})?$|^\.[A-Za-z0-9][A-Za-z0-9._-]*$`)
 	// registryEntry: host[:port] or http://host[:port].
 	registryEntry = regexp.MustCompile(`^(http://)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`)
 )

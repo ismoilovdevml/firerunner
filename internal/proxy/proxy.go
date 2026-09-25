@@ -206,7 +206,7 @@ func SelfLoop(upstream, listenPort string, local []net.IP) bool {
 	if err != nil || port != listenPort {
 		return false
 	}
-	if strings.EqualFold(host, "localhost") {
+	if h := strings.TrimSuffix(strings.ToLower(host), "."); h == "localhost" || strings.HasSuffix(h, ".localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)
@@ -228,8 +228,8 @@ func SelfLoop(upstream, listenPort string, local []net.IP) bool {
 type Limits struct {
 	// Zero means no limit for every field.
 	PerClient   int           // concurrent requests and tunnels per microVM address
-	Loopback    int           // the same for host services on 127.0.0.1 (one address)
-	Total       int           // all clients together
+	Loopback    int           // host services on 127.0.0.1: a budget of their own
+	Total       int           // all microVMs together
 	TunnelIdle  time.Duration // a tunnel without traffic this long is closed
 	ServerIdle  time.Duration // idle keep-alive connections
 	HeaderWait  time.Duration // the upstream's answer to a plain request
@@ -261,8 +261,9 @@ type Forwarder struct {
 	active  map[string]int
 	total   int
 	refused struct {
-		key string // upstream address and credentials the upstream refused
-		at  time.Time
+		key     string // upstream address and credentials the upstream refused
+		at      time.Time
+		probing bool // after RefusedWait, one request tries them again
 	}
 }
 
@@ -290,11 +291,16 @@ func (f *Forwarder) acquire(client string, loopback bool) bool {
 	if f.active == nil {
 		f.active = map[string]int{}
 	}
-	max := f.Limits.PerClient
+	// Host services (containerd, gitlab-runner) have their own budget: microVMs
+	// cannot take it, however many addresses a job gives its VM.
 	if loopback {
-		max = f.Limits.Loopback
+		if f.Limits.Loopback > 0 && f.active[client] >= f.Limits.Loopback {
+			return false
+		}
+		f.active[client]++
+		return true
 	}
-	if (f.Limits.Total > 0 && f.total >= f.Limits.Total) || (max > 0 && f.active[client] >= max) {
+	if (f.Limits.Total > 0 && f.total >= f.Limits.Total) || (f.Limits.PerClient > 0 && f.active[client] >= f.Limits.PerClient) {
 		return false
 	}
 	f.active[client]++
@@ -302,22 +308,39 @@ func (f *Forwarder) acquire(client string, loopback bool) bool {
 	return true
 }
 
-func (f *Forwarder) release(client string) {
+func (f *Forwarder) release(client string, loopback bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.active[client]--; f.active[client] <= 0 {
 		delete(f.active, client)
 	}
-	f.total--
+	if !loopback {
+		f.total--
+	}
 }
 
-// knownRefused reports whether the upstream refused these credentials within
-// Limits.RefusedWait: they are not sent again, so a changed password does not
-// lock the corporate account through a flood of failed logins.
-func (f *Forwarder) knownRefused(up Upstream) bool {
+// knownRefused reports whether these credentials must not be sent: the
+// upstream refused them within Limits.RefusedWait, or after it one request is
+// already trying them again (probe). A changed password must not lock the
+// corporate account through a burst of failed logins. The caller of a probe
+// calls endProbe when it is done.
+func (f *Forwarder) knownRefused(up Upstream) (refused, probe bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.refused.key == up.Addr+"\x00"+up.Auth && time.Since(f.refused.at) < f.Limits.RefusedWait
+	if f.refused.key != up.Addr+"\x00"+up.Auth {
+		return false, false
+	}
+	if time.Since(f.refused.at) < f.Limits.RefusedWait || f.refused.probing {
+		return true, false
+	}
+	f.refused.probing = true
+	return false, true
+}
+
+func (f *Forwarder) endProbe() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refused.probing = false
 }
 
 func (f *Forwarder) setRefused(up Upstream, refused bool) {
@@ -326,11 +349,11 @@ func (f *Forwarder) setRefused(up Upstream, refused bool) {
 	defer f.mu.Unlock()
 	switch {
 	case refused && f.refused.key != key:
-		f.refused.key, f.refused.at = key, time.Now()
+		f.refused.key, f.refused.at, f.refused.probing = key, time.Now(), false
 		f.Log.Error("upstream proxy refused the credentials; not retrying them for a while (fix the upstream file)",
 			"upstream", up.Addr, "with_credentials", up.Auth != "", "retry_after", f.Limits.RefusedWait.String())
 	case refused:
-		f.refused.at = time.Now()
+		f.refused.at, f.refused.probing = time.Now(), false
 	case f.refused.key == key:
 		f.refused.key = ""
 	}
@@ -369,16 +392,20 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "firerunner proxy: too many connections from this client", http.StatusServiceUnavailable)
 		return
 	}
-	defer f.release(host)
+	defer f.release(host, ip.IsLoopback())
 	up, err := f.Upstream()
 	if err != nil {
 		f.Log.Error("proxy request refused: no upstream", "err", err)
 		http.Error(w, "firerunner proxy: upstream proxy not configured (see journalctl -u firerunner-proxy)", http.StatusBadGateway)
 		return
 	}
-	if f.knownRefused(up) {
+	refused, probe := f.knownRefused(up)
+	if refused {
 		http.Error(w, "firerunner proxy: the upstream proxy refused this host's credentials", http.StatusBadGateway)
 		return
+	}
+	if probe {
+		defer f.endProbe()
 	}
 	var status int
 	var bytes int64
@@ -541,7 +568,11 @@ func (f *Forwarder) forward(w http.ResponseWriter, r *http.Request, up Upstream)
 			IdleConnTimeout:       90 * time.Second,
 		}
 	})
-	out := r.Clone(r.Context())
+	// Not the request's context: a client that half-closes (busybox) cancels it.
+	// The answer is abandoned instead when no byte comes for HeaderWait.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := r.Clone(ctx)
 	out.RequestURI = ""
 	removeHopHeaders(out.Header)
 	if up.Auth != "" {
@@ -554,7 +585,35 @@ func (f *Forwarder) forward(w http.ResponseWriter, r *http.Request, up Upstream)
 		return http.StatusBadGateway, 0
 	}
 	defer resp.Body.Close()
+	resp.Body = idleBody(resp.Body, f.Limits.HeaderWait, cancel)
 	return f.relay(w, resp, up, r.URL.Host)
+}
+
+// idleBody gives up on a body that sends nothing for idle (0: never), by
+// calling stop, which ends the request.
+func idleBody(body io.ReadCloser, idle time.Duration, stop func()) io.ReadCloser {
+	if idle <= 0 {
+		return body
+	}
+	return &idleReader{ReadCloser: body, t: time.AfterFunc(idle, stop), idle: idle}
+}
+
+type idleReader struct {
+	io.ReadCloser
+	t    *time.Timer
+	idle time.Duration
+}
+
+func (r *idleReader) Read(p []byte) (int, error) {
+	r.t.Reset(r.idle)
+	n, err := r.ReadCloser.Read(p)
+	r.t.Reset(r.idle)
+	return n, err
+}
+
+func (r *idleReader) Close() error {
+	r.t.Stop()
+	return r.ReadCloser.Close()
 }
 
 // passThrough sends an absolute-form request to the upstream as it came,
@@ -593,6 +652,7 @@ func (f *Forwarder) passThrough(w http.ResponseWriter, r *http.Request, up Upstr
 	}
 	defer resp.Body.Close()
 	_ = conn.SetDeadline(time.Time{})
+	resp.Body = idleBody(resp.Body, f.Limits.HeaderWait, func() { _ = conn.Close() })
 	return f.relay(w, resp, up, r.URL.Host)
 }
 

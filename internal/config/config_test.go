@@ -204,8 +204,12 @@ func TestSaveLeavesOutUnusedNewKeys(t *testing.T) {
 			t.Errorf("used %s not written", key)
 		}
 	}
-	if got, err := Load(path); err != nil || !got.Proxy.Enabled || got.Network.EgressDeny[0] != "192.168.0.0/16" {
+	if got, err := Load(path); err != nil || !got.Proxy.Enabled || got.Network.EgressDeny[0] != "192.168.0.0/16" || len(got.Proxy.ConnectPorts) != 1 {
 		t.Fatalf("reload with proxy: %+v %v", got, err)
+	}
+	// connect_ports is unknown to v0.1.0: written only when not the default.
+	if strings.Contains(string(data), "connect_ports") {
+		t.Fatalf("default connect_ports written:\n%s", data)
 	}
 }
 
@@ -218,7 +222,7 @@ func TestCorporateValuesAllowList(t *testing.T) {
 		"pipe in no_proxy":              func(c *Config) { c.Proxy.NoProxy = "a|b&c" },
 		"control char in registry":      func(c *Config) { c.VM.InsecureRegistries = []string{"harbor\x01:443"} },
 		"bad egress_deny":               func(c *Config) { c.Network.EgressDeny = []string{"10.0.0.0/33"} },
-		"proxy port other than 3128":    func(c *Config) { c.Proxy.Enabled = true; c.Proxy.Listen = "10.200.0.1:3129" },
+		"proxy listen without a port":   func(c *Config) { c.Proxy.Enabled = true; c.Proxy.Listen = "10.200.0.1" },
 		"connect port 0":                func(c *Config) { c.Proxy.Enabled = true; c.Proxy.ConnectPorts = []int{0} },
 	} {
 		c := Default()
@@ -228,7 +232,7 @@ func TestCorporateValuesAllowList(t *testing.T) {
 		}
 	}
 	ok := Default()
-	ok.Proxy.NoProxy = "gitlab.corp,.corp,*.corp,10.0.0.0/8,fd00::/8,host_1"
+	ok.Proxy.NoProxy = "gitlab.corp,.corp,*.corp,10.0.0.0/8,fd00::/8,host_1,::1"
 	ok.VM.InsecureRegistries = []string{"harbor.corp:443", "http://10.0.0.5:5000", "registry"}
 	ok.Network.EgressDeny = []string{"192.168.0.0/16", "10.1.2.3"}
 	if err := ok.Validate(); err != nil {

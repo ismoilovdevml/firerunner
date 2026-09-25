@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -883,13 +884,40 @@ func cmdProxy(cfg config.Config) error {
 		}
 		deny = append(deny, n)
 	}
-	// The upstream file is read for every connection, so fixing it needs no restart.
+	if port != config.ProxyPort {
+		log.Warn("proxy.listen port is not "+config.ProxyPort+": install.sh opens only that port for microVMs", "listen", cfg.Proxy.Listen)
+	}
+	// The upstream file is read for every connection, so fixing it needs no
+	// restart. A name is resolved (at most once a minute) to spot a loop.
+	var selfMu sync.Mutex
+	selfChecked := map[string]time.Time{}
 	upstream := func() (proxy.Upstream, error) {
 		up, err := proxy.LoadUpstream(cfg.Proxy.UpstreamFile)
-		if err == nil && proxy.SelfLoop(up.Addr, port, localAddrs()) {
+		if err != nil {
+			return up, err
+		}
+		local := localAddrs()
+		loop := proxy.SelfLoop(up.Addr, port, local)
+		if h, p, err := net.SplitHostPort(up.Addr); !loop && err == nil && p == port && net.ParseIP(h) == nil {
+			selfMu.Lock()
+			fresh := time.Since(selfChecked[up.Addr]) < time.Minute
+			selfMu.Unlock()
+			if !fresh {
+				ips, _ := net.DefaultResolver.LookupIP(context.Background(), "ip", h)
+				for _, ip := range ips {
+					loop = loop || proxy.SelfLoop(net.JoinHostPort(ip.String(), p), port, local)
+				}
+				if !loop {
+					selfMu.Lock()
+					selfChecked[up.Addr] = time.Now()
+					selfMu.Unlock()
+				}
+			}
+		}
+		if loop {
 			return proxy.Upstream{}, fmt.Errorf("upstream proxy %s is this forwarder itself: give a local proxy (CNTLM, px) another port than %s", up.Addr, port)
 		}
-		return up, err
+		return up, nil
 	}
 	if _, err := upstream(); err != nil {
 		log.Error("upstream proxy not usable yet", "err", err)

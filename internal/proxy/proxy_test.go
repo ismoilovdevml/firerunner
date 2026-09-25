@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -446,6 +445,7 @@ func TestSelfLoop(t *testing.T) {
 	for up, want := range map[string]bool{
 		"127.0.0.1:3128": true, "localhost:3128": true, "[::1]:3128": true, "0.0.0.0:3128": true,
 		"10.200.0.1:3128": true, "172.17.4.40:3128": true,
+		"localhost.:3128": true, "db.localhost:3128": true,
 		"127.0.0.1:3129": false, "proxy.corp:3128": false, "10.0.0.5:3128": false,
 	} {
 		if got := SelfLoop(up, "3128", local); got != want {
@@ -516,10 +516,6 @@ func TestForwarderEnforcesPolicy(t *testing.T) {
 func TestForwarderLimitsConnections(t *testing.T) {
 	up := startUpstream(t, "")
 	echo := echoServer(t)
-	p := testPolicy()
-	p.ConnectPorts = []int{portOf(echo)}
-	p.LocalAddrs = func() []net.IP { return nil }
-	p.Resolve = nil
 	fwd, _ := startForwarderWith(t, "http://"+up.addr, nil, Limits{Loopback: 1, PerClient: 1})
 	c1, _, code := connect(t, fwd, echo)
 	if code != 200 {
@@ -562,12 +558,6 @@ func echoServer(t *testing.T) string {
 		}
 	}()
 	return l.Addr().String()
-}
-
-func portOf(addr string) int {
-	_, p, _ := net.SplitHostPort(addr)
-	n, _ := strconv.Atoi(p)
-	return n
 }
 
 // A tunnel without traffic is closed after TunnelIdle; one with traffic is not.
@@ -728,5 +718,121 @@ func TestLoadUpstreamRefusesSymlink(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("LoadUpstream blocked on a FIFO")
+	}
+}
+
+// Host services keep a budget of their own: microVMs, however many addresses
+// they use, cannot take it.
+func TestLoopbackBudgetNotStarvedByMicroVMs(t *testing.T) {
+	f := &Forwarder{Limits: Limits{PerClient: 1, Total: 2, Loopback: 2}, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	if !f.acquire("10.200.0.2", false) || !f.acquire("10.200.0.3", false) {
+		t.Fatal("microVMs within limits refused")
+	}
+	if f.acquire("10.200.0.4", false) {
+		t.Fatal("microVM total exceeded")
+	}
+	for i := 0; i < 2; i++ {
+		if !f.acquire("127.0.0.1", true) {
+			t.Fatal("host services refused while microVMs hold the total")
+		}
+	}
+	if f.acquire("127.0.0.1", true) {
+		t.Fatal("host services exceeded their own budget")
+	}
+	f.release("127.0.0.1", true)
+	f.release("10.200.0.2", false)
+	if !f.acquire("10.200.0.4", false) {
+		t.Fatal("released microVM slot not reusable")
+	}
+}
+
+// After RefusedWait, one request tries refused credentials again; requests
+// arriving meanwhile do not, so a burst cannot lock the corporate account.
+func TestRefusedCredentialsProbeOnce(t *testing.T) {
+	up := startUpstream(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("bob:right")))
+	fwd, _ := startForwarderWith(t, "http://bob:wrong@"+up.addr, nil, Limits{RefusedWait: 200 * time.Millisecond})
+	c, _, _ := connect(t, fwd, "example.com:443")
+	c.Close()
+	time.Sleep(300 * time.Millisecond)
+	var wg sync.WaitGroup
+	for i := 0; i < 30; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := net.Dial("tcp", fwd)
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+			fmt.Fprint(c, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+			_, _ = http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodConnect})
+		}()
+	}
+	wg.Wait()
+	if n := len(up.requests()); n > 2 {
+		t.Fatalf("refused password sent %d times; want the first attempt and one probe", n)
+	}
+}
+
+// An upstream that stops in the middle of a body is given up after
+// HeaderWait without data, also when the client has left.
+func TestPassThroughMidBodyStall(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	closed := make(chan struct{})
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		br := bufio.NewReader(c)
+		_, _ = http.ReadRequest(br)
+		fmt.Fprint(c, "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial")
+		_, _ = io.Copy(io.Discard, br) // stalls; returns when the forwarder closes
+		close(closed)
+	}()
+	fwd, _ := startForwarderWith(t, "http://"+l.Addr().String(), nil, Limits{HeaderWait: 500 * time.Millisecond})
+	c, err := net.Dial("tcp", fwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprint(c, "GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	time.Sleep(200 * time.Millisecond)
+	c.Close()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stalled body kept the upstream connection open")
+	}
+}
+
+// Plain http:// requests from a client that half-closes still get the answer.
+func TestForwardHalfClose(t *testing.T) {
+	web := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		_, _ = io.WriteString(w, "plain")
+	}))
+	defer web.Close()
+	up := startUpstream(t, "")
+	fwd, _ := startForwarderWith(t, "http://"+up.addr, nil, Limits{HeaderWait: time.Minute})
+	c, err := net.Dial("tcp", fwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	fmt.Fprintf(c, "GET %s/ HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", web.URL, web.Listener.Addr())
+	_ = c.(*net.TCPConn).CloseWrite()
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || string(body) != "plain" {
+		t.Fatalf("half-closed client got %d %q", resp.StatusCode, body)
 	}
 }
