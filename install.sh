@@ -167,7 +167,7 @@ preflight_settings() {
     if [[ -n $FR_NO_PROXY && ! $FR_NO_PROXY =~ ^[A-Za-z0-9.,:/*_-]+$ ]]; then
         die "FR_NO_PROXY: only hosts, .domains and CIDRs, comma-separated"
     fi
-    if [[ -n $FR_CA_FILE ]]; then
+    if [[ -n $FR_CA_FILE && $FR_CA_FILE != none ]]; then
         grep -q -- "-----BEGIN CERTIFICATE-----" "$FR_CA_FILE" 2>/dev/null ||
             die "FR_CA_FILE=$FR_CA_FILE is not a PEM file with a certificate"
     fi
@@ -188,17 +188,41 @@ EGRESS_FILE="$CONF_DIR/egress-deny"
 # jobs_running: microVM jobs are in progress on this host.
 jobs_running() { compgen -G "/run/firerunner/jobs/*.json" >/dev/null; }
 
-# restart_when_idle SERVICE: restart now, or, while jobs run, say it is pending
-# (containerd, flintlockd, the registry mirror and gitlab-runner serve them).
+# restart_when_idle SERVICE: restart now or, while jobs run, remember it in
+# PENDING_FILE, so a later run of the installer when idle does it
+# (containerd, flintlockd, the registry mirror and gitlab-runner serve jobs).
+PENDING_FILE=/var/lib/firerunner/pending-restarts
 PENDING=""
 restart_when_idle() {
     if systemctl is-active -q "$1" && jobs_running; then
         warn "  $1 not restarted: jobs are running (re-run the installer when the runner is idle)"
         PENDING+="$1 "
+        mkdir -p "$(dirname "$PENDING_FILE")"
+        grep -qx "restart $1" "$PENDING_FILE" 2>/dev/null || echo "restart $1" >> "$PENDING_FILE"
         return 0
     fi
     log "  restarting $1"
     systemctl restart "$1"
+    [[ -f $PENDING_FILE ]] && sed -i "/^restart $1\$/d" "$PENDING_FILE"
+    return 0
+}
+
+# apply_pending runs, when no job runs, what earlier runs had to leave:
+# restarts, and stopping the forwarder once nothing uses it.
+apply_pending() {
+    [[ -s $PENDING_FILE ]] || return 0
+    if jobs_running; then
+        warn "still pending while jobs run: $(tr '\n' ' ' <"$PENDING_FILE")- re-run the installer when the runner is idle"
+        return 0
+    fi
+    local action svc
+    while read -r action svc; do
+        case $action in
+            restart) log "  restarting $svc (pending)"; systemctl restart "$svc" ;;
+            stop)    log "  stopping $svc (pending)"; systemctl disable --now -q "$svc" ;;
+        esac
+    done <"$PENDING_FILE"
+    rm -f "$PENDING_FILE"
 }
 
 # The networks jobs must not reach. Remembered, so a re-run without
@@ -219,7 +243,16 @@ proxy_on() { [[ -s $PROXY_FILE ]]; }
 # setup_proxy runs first: every later download may need the proxy and the CA.
 setup_proxy() {
     mkdir -p "$CONF_DIR"
-    if [[ -n $FR_CA_FILE ]]; then
+    if [[ $FR_CA_FILE == none ]]; then
+        log "dropping the company CA"
+        rm -f "$CA_FILE"
+        if [[ -f /etc/pki/ca-trust/source/anchors/firerunner-ca.pem ]]; then
+            rm -f /etc/pki/ca-trust/source/anchors/firerunner-ca.pem && update-ca-trust
+        fi
+        if [[ -f /usr/local/share/ca-certificates/firerunner-ca.crt ]]; then
+            rm -f /usr/local/share/ca-certificates/firerunner-ca.crt && update-ca-certificates >/dev/null
+        fi
+    elif [[ -n $FR_CA_FILE ]]; then
         log "trusting the company CA from $FR_CA_FILE"
         put "$CA_FILE" 0644 <"$FR_CA_FILE"
     fi
@@ -244,6 +277,11 @@ setup_proxy() {
         rm -f "$EGRESS_FILE"
     elif [[ -n $FR_EGRESS_DENY ]]; then
         echo "$FR_EGRESS_DENY" | put "$EGRESS_FILE" 0644
+    elif [[ ! -f $EGRESS_FILE && -f $LIB_DIR/net-up.sh ]]; then
+        # Given to a run from before the list was remembered: keep it.
+        local old
+        old=$(sed -n 's/.*ip daddr { \(.*\) } drop$/\1/p' "$LIB_DIR/net-up.sh" | head -1 | tr -d ' ')
+        [[ -n $old ]] && echo "$old" | put "$EGRESS_FILE" 0644
     fi
     proxy_on || return 0
     # The installer's own downloads go straight to the corporate proxy.
@@ -291,20 +329,24 @@ configure_proxy() {
     local fr=$BIN_DIR/firerunner
     if [[ -f $CA_FILE ]]; then
         $fr config set vm.ca_file "$CA_FILE" >/dev/null
+    elif [[ $FR_CA_FILE == none ]]; then
+        $fr config set vm.ca_file '""' >/dev/null
     fi
     if [[ -n $FR_INSECURE_REGISTRIES ]]; then
         $fr config set vm.insecure_registries "[${FR_INSECURE_REGISTRIES}]" >/dev/null
     fi
-    # The forwarder refuses these too: proxied traffic leaves from the host.
-    $fr config set network.egress_deny "[$(egress_deny)]" >/dev/null
     if ! proxy_on; then
+        # Only the forwarder reads network.egress_deny (the firewall has the list
+        # itself): without it the key stays out, and v0.1.0 can still read the config.
+        $fr config set network.egress_deny "[]" >/dev/null
         if systemctl is-enabled -q firerunner-proxy 2>/dev/null; then
             $fr config set proxy.enabled false >/dev/null
-            proxy_dropins_apply
-            systemctl disable --now -q firerunner-proxy
+            STOP_FORWARDER=1 # after the services that use it are restarted (main)
         fi
         return 0
     fi
+    # The forwarder refuses these too: proxied traffic leaves from the host.
+    $fr config set network.egress_deny "[$(egress_deny)]" >/dev/null
     $fr config set proxy.listen "${FR_SUBNET}.1:${PROXY_PORT}" >/dev/null
     $fr config set proxy.upstream_file "$PROXY_FILE" >/dev/null
     if [[ -n $FR_NO_PROXY ]]; then
@@ -345,8 +387,19 @@ EOF
         # A restart cuts the open tunnels (clones, pulls) of running jobs.
         restart_when_idle firerunner-proxy
     fi
-    # Host services go through the forwarder only once it runs.
-    proxy_dropins_apply
+}
+
+# stop_forwarder disables the forwarder once no host service still points at
+# it; while one's restart is pending, the stop waits in PENDING_FILE too.
+STOP_FORWARDER=0
+stop_forwarder() {
+    if grep -qE '^restart (containerd-flintlock|firerunner-registry|gitlab-runner)$' "$PENDING_FILE" 2>/dev/null; then
+        grep -qx "stop firerunner-proxy" "$PENDING_FILE" || echo "stop firerunner-proxy" >> "$PENDING_FILE"
+        PENDING+="firerunner-proxy(stop) "
+        return 0
+    fi
+    log "  stopping firerunner-proxy"
+    systemctl disable --now -q firerunner-proxy
 }
 
 # proxy_dropins_apply writes or removes the host services' proxy drop-ins and
@@ -489,7 +542,6 @@ EOF
 # LVM thin pool
 # --------------------------------------------------------------------------
 
-# Prints the first whole disk that has no partitions, filesystem, LVM or mount.
 # discard_blocks: containerd's setting for the thin pool (see containerd.toml).
 discard_blocks() {
     if lvs "$VG/thinpool" >/dev/null 2>&1 && [[ $(lvs --noheadings -o zero "$VG/thinpool" | tr -d ' ') != zero ]]; then
@@ -499,6 +551,7 @@ discard_blocks() {
     fi
 }
 
+# Prints the first whole disk that has no partitions, filesystem, LVM or mount.
 find_blank_disk() {
     local name type
     while read -r name type; do
@@ -1086,7 +1139,11 @@ EOF
 
     local have=""
     [[ -x $BIN_DIR/gitlab-runner ]] && have=$($BIN_DIR/gitlab-runner --version 2>/dev/null | awk '/^Version:/ {print $2}' || true)
-    if [[ "$have" != "${GITLAB_RUNNER_VERSION}" ]]; then
+    if [[ -n $have && "$have" != "${GITLAB_RUNNER_VERSION}" ]] && systemctl is-active -q gitlab-runner && jobs_running; then
+        # Stopping gitlab-runner would abort the running jobs; the next run when idle upgrades it.
+        warn "gitlab-runner $have not upgraded to v${GITLAB_RUNNER_VERSION}: jobs are running"
+        PENDING+="gitlab-runner(upgrade) "
+    elif [[ "$have" != "${GITLAB_RUNNER_VERSION}" ]]; then
         log "installing gitlab-runner v${GITLAB_RUNNER_VERSION}"
         local base="https://gitlab-runner-downloads.s3.amazonaws.com/v${GITLAB_RUNNER_VERSION}"
         local bin="gitlab-runner-linux-${ARCH}"
@@ -1258,11 +1315,15 @@ main() {
     open_metrics_port
     verify_install
     register_runner
-    # gitlab-runner is installed by the registration: give it the proxy now.
-    proxy_on && proxy_dropins_apply
+    # Host services use the forwarder only once it runs, and gitlab-runner
+    # exists only after the registration: their drop-ins come last.
+    proxy_dropins_apply
+    [[ $STOP_FORWARDER == 1 ]] && stop_forwarder
     configure_runner_cache
     if [[ -n $PENDING ]]; then
-        warn "restarts pending while jobs run: ${PENDING}- re-run the installer when the runner is idle"
+        warn "left for a run when no job runs: ${PENDING}- re-run the installer then"
+    else
+        apply_pending
     fi
 }
 

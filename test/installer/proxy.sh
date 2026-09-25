@@ -24,6 +24,7 @@ expect() {
 source $WORK/install-lib.sh
 set +e; trap - ERR
 CONF_DIR=$WORK/conf PROXY_FILE=$WORK/conf/proxy-upstream CA_FILE=$WORK/conf/ca.pem EGRESS_FILE=$WORK/conf/egress-deny
+PENDING_FILE=$WORK/pending-restarts LIB_DIR=$WORK/lib
 FR_SUBNET=10.200.0 BIN_DIR=$WORK/bin
 mkdir -p /etc/systemd/system /usr/local/share/ca-certificates
 update-ca-certificates() { echo updated > $WORK/ca-updated; }
@@ -99,9 +100,47 @@ mkdir -p /run/firerunner/jobs; : > /run/firerunner/jobs/job-1.json
 restart_when_idle containerd-flintlock >/dev/null 2>&1
 expect "no restart while a job runs" ! grep -q "^restart containerd-flintlock" $WORK/systemctl.log
 expect "the restart is reported as pending" test "$PENDING" = "containerd-flintlock "
+expect "the pending restart is remembered for a later run" grep -qx "restart containerd-flintlock" $PENDING_FILE
+
+# ---- the forwarder stops only after the services that use it
+STOP_FORWARDER=1; : > $WORK/systemctl.log
+stop_forwarder >/dev/null 2>&1
+expect "forwarder kept while a service restart is pending" ! grep -q "disable --now -q firerunner-proxy" $WORK/systemctl.log
+expect "its stop is remembered after the restart" test "$(tail -1 $PENDING_FILE)" = "stop firerunner-proxy"
+
+# ---- a later run while jobs still run applies nothing; an idle one applies all, in order
+: > $WORK/systemctl.log
+apply_pending >/dev/null 2>&1
+expect "nothing applied while jobs run" test ! -s $WORK/systemctl.log
 rm -f /run/firerunner/jobs/job-1.json
-restart_when_idle containerd-flintlock >/dev/null 2>&1
-expect "restart when no job runs" grep -q "^restart containerd-flintlock" $WORK/systemctl.log
+apply_pending >/dev/null 2>&1
+expect "idle run: pending restart applied" grep -qx "restart containerd-flintlock" $WORK/systemctl.log
+expect "idle run: then the forwarder stopped" test "$(tail -1 $WORK/systemctl.log)" = "disable --now -q firerunner-proxy"
+expect "pending list cleared" test ! -f $PENDING_FILE
+
+# ---- a restart done now drops the same pending entry
+echo "restart firerunner-registry" > $PENDING_FILE; : > $WORK/systemctl.log
+restart_when_idle firerunner-registry >/dev/null 2>&1
+expect "restart when no job runs" grep -q "^restart firerunner-registry" $WORK/systemctl.log
+expect "its pending entry is dropped" ! grep -q firerunner-registry $PENDING_FILE
+
+# ---- FR_EGRESS_DENY given to a run from before it was remembered is kept
+rm -f $EGRESS_FILE; mkdir -p $LIB_DIR
+printf '    iifname "br-fc" ip daddr { 192.168.0.0/16, 172.16.0.0/12 } drop\n    iifname "br-fc" ip daddr 169.254.0.0/16 drop\n' > $LIB_DIR/net-up.sh
+FR_EGRESS_DENY='' FR_PROXY='' FR_CA_FILE=''
+setup_proxy >/dev/null 2>&1
+expect "old FR_EGRESS_DENY recovered from net-up.sh" test "$(egress_deny)" = "192.168.0.0/16,172.16.0.0/12"
+
+# ---- FR_CA_FILE=none drops the CA
+expect "FR_CA_FILE=none passes preflight" check_preflight "" "" none
+printf -- '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n' > $CA_FILE
+FR_CA_FILE=none
+setup_proxy >/dev/null 2>&1
+expect "FR_CA_FILE=none removes the CA" test ! -f $CA_FILE
+FR_CA_FILE=''
+
+# ---- the drop-ins are applied once per run (a second call restarts again)
+expect "proxy_dropins_apply is called once in main" test "$(grep -c '^    proxy_dropins_apply$' "$INSTALL_SH")" = 1
 
 echo "RESULT pass=$pass fail=$fail"
 [[ $fail -eq 0 ]]

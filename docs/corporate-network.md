@@ -41,7 +41,7 @@ when idle; their caches are kept.
 |---|---|
 | `FR_PROXY` | `http://host:port` of the corporate proxy (for a password, see [below](#a-proxy-with-a-password)) |
 | `FR_NO_PROXY` | hosts, `.domains` and CIDRs reached directly, comma-separated |
-| `FR_CA_FILE` | PEM file with the company root CA, see [below](#company-ca-and-tls-inspection) |
+| `FR_CA_FILE` | PEM file with the company root CA, see [below](#company-ca-and-tls-inspection); `none` removes it |
 | `FR_INSECURE_REGISTRIES` | registries without a checkable certificate, see [below](#internal-registries) |
 
 ## A proxy with a password
@@ -108,8 +108,9 @@ The forwarder checks a host name when it resolves it, and the corporate proxy re
 so a name whose DNS answer changes in between can still get through. Restrict the runner's
 account on the corporate proxy as well.
 
-A job can hold at most 256 connections through the forwarder, all clients together 4096. A tunnel
-without traffic for 15 minutes is closed.
+Each microVM address can hold 256 connections through the forwarder, all microVMs together 4096;
+host services have a budget of their own, so busy jobs cannot cut containerd or gitlab-runner off.
+A tunnel, or an answer, without data for 15 or 5 minutes is closed.
 
 ## Company CA and TLS inspection
 
@@ -181,6 +182,10 @@ sudo firerunner run -- sh -c 'env | grep -i proxy; curl -sI https://github.com |
 
 `firerunner upgrade` leaves `firerunner-proxy` running on the previous build, because a restart
 cuts the open tunnels of running jobs. Restart it when the runner is idle:
-`sudo systemctl restart firerunner-proxy`. The installer does the same: while jobs run, it does
-not restart the forwarder, containerd, flintlockd, the Docker Hub cache or gitlab-runner, and says
-which restarts are pending.
+`sudo systemctl restart firerunner-proxy`.
+
+The installer is careful in the same way. While jobs run it does not restart the forwarder,
+containerd, flintlockd, the Docker Hub cache or gitlab-runner, and does not upgrade gitlab-runner.
+It lists what it left and keeps it in `/var/lib/firerunner/pending-restarts`; run the installer
+again when the runner is idle and it catches up. Removing the proxy stops the forwarder only after
+the services that used it were restarted.
