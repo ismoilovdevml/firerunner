@@ -211,9 +211,9 @@ type Daemon struct {
 	// refillNow wakes the main loop when a job took a pool VM, so its
 	// replacement starts booting at once instead of at the next refill tick.
 	refillNow chan struct{}
-	claimed    map[string]time.Time // uid -> claim time; protects it until the job writes its state
-	firstSee   map[string]time.Time // uid -> first time reconcile saw it
-	builders   map[string]*builder  // project id -> BuildKit builder
+	claimed   map[string]time.Time // uid -> claim time; protects it until the job writes its state
+	firstSee  map[string]time.Time // uid -> first time reconcile saw it
+	builders  map[string]*builder  // project id -> BuildKit builder
 	// project id -> last failed builder boot (see builderRetryAfter)
 	builderFailed map[string]time.Time
 	runCtx        context.Context // cancelled on shutdown; builders boot under it
@@ -322,7 +322,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 	d := &Daemon{cfgPath: cfgPath, log: log, cfg: cfg, fl: fl, metrics: NewMetrics(),
 		claimed: map[string]time.Time{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{},
 		bootingIDs: map[string]bool{}, refillNow: make(chan struct{}, 1),
-		builders:   map[string]*builder{}, builderFailed: map[string]time.Time{},
+		builders: map[string]*builder{}, builderFailed: map[string]time.Time{},
 		saving: map[string]*cacheSave{}, cacheDropped: map[string]time.Time{}, runCtx: context.Background(),
 		oomKills: -1}
 	fl.OnError = d.flintlockFailed
