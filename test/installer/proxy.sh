@@ -142,5 +142,14 @@ FR_CA_FILE=''
 # ---- the drop-ins are applied once per run (a second call restarts again)
 expect "proxy_dropins_apply is called once in main" test "$(grep -c '^    proxy_dropins_apply$' "$INSTALL_SH")" = 1
 
+# ---- `sudo firerunner` works where sudo's secure_path lacks /usr/local/bin
+mkdir -p $WORK/bin /usr/bin; : > $WORK/bin/firerunner
+BIN_DIR=$WORK/bin link_on_sudo_path
+expect "firerunner linked into /usr/bin" test "$(readlink /usr/bin/firerunner)" = "$WORK/bin/firerunner"
+rm -f /usr/bin/firerunner; echo "not ours" > /usr/bin/firerunner
+BIN_DIR=$WORK/bin link_on_sudo_path
+expect "an existing /usr/bin/firerunner is not replaced" grep -q "not ours" /usr/bin/firerunner
+rm -f /usr/bin/firerunner
+
 echo "RESULT pass=$pass fail=$fail"
 [[ $fail -eq 0 ]]

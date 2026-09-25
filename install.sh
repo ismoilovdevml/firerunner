@@ -1083,6 +1083,15 @@ open_metrics_port() {
     fi
 }
 
+# link_on_sudo_path makes `sudo firerunner` work where sudo's secure_path
+# leaves out /usr/local/bin (RHEL, Rocky). An existing file is never replaced.
+link_on_sudo_path() {
+    local link=/usr/bin/firerunner
+    if [[ -L $link || ! -e $link ]]; then
+        ln -sfn "$BIN_DIR/firerunner" "$link"
+    fi
+}
+
 install_firerunner() {
     if [[ -n $FR_BINARY ]]; then
         log "installing firerunner from $FR_BINARY"
@@ -1097,6 +1106,7 @@ install_firerunner() {
         put "$BIN_DIR/firerunner" 0755 <"$TMP_DIR/$bin"
     fi
     log "  $($BIN_DIR/firerunner version)"
+    link_on_sudo_path
 
     mkdir -p "$CONF_DIR/executor" /var/lib/firerunner/builder-cache
     chmod 0700 "$CONF_DIR/executor" /var/lib/firerunner/builder-cache
@@ -1261,6 +1271,9 @@ uninstall() {
     local svc
     if [[ -x $BIN_DIR/gitlab-runner ]]; then
         # The runner stays registered in GitLab; delete it there if it is no longer needed.
+        # Stop it first: removing the service leaves a running process that
+        # still asks GitLab for jobs.
+        systemctl stop gitlab-runner 2>/dev/null || true
         $BIN_DIR/gitlab-runner uninstall --service gitlab-runner >/dev/null 2>&1 || true
         rm -f "$BIN_DIR/gitlab-runner"
     fi
@@ -1279,6 +1292,7 @@ uninstall() {
         rm -f /usr/local/share/ca-certificates/firerunner-ca.crt && update-ca-certificates >/dev/null
     fi
     systemctl daemon-reload
+    [[ -L /usr/bin/firerunner ]] && rm -f /usr/bin/firerunner
     rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry" \
         "$BIN_DIR/versitygw" "$BIN_DIR/firecracker" "$BIN_DIR/jailer"
     rm -rf "$LIB_DIR" /etc/opt/flintlockd   # flintlockd's config holds the API token
