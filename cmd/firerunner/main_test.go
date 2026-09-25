@@ -159,3 +159,41 @@ func TestRunnerToken(t *testing.T) {
 		})
 	}
 }
+
+// Keys that only make sense together are set by one `config set`; one of them
+// alone is refused and leaves the file as it was.
+func TestConfigSetSeveralKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("FIRERUNNER_CONFIG", path)
+	if err := cmdConfig([]string{"set", "flintlock.tls_cert_file", "/tls/client.crt"}); err == nil {
+		t.Fatal("a client certificate without its key and CA was saved")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a refused set wrote the config: %v", err)
+	}
+	if err := cmdConfig([]string{"set", "flintlock.tls_ca_file", "/tls/ca.crt",
+		"flintlock.tls_cert_file", "/tls/client.crt", "flintlock.tls_key_file", "/tls/client.key"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"tls_ca_file: /tls/ca.crt", "tls_cert_file: /tls/client.crt", "tls_key_file: /tls/client.key"} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("config lacks %q:\n%s", want, data)
+		}
+	}
+	for _, bad := range [][]string{
+		{"set", "pool.size"},
+		{"set", "pool.size", "2", "vm.vcpu"},
+		{"set", "pool.size", "2", "no.such_key", "1"},
+	} {
+		if err := cmdConfig(bad); err == nil {
+			t.Errorf("config %q: want an error", bad)
+		}
+	}
+	if got, _ := os.ReadFile(path); string(got) != string(data) {
+		t.Error("a refused set changed the config")
+	}
+}

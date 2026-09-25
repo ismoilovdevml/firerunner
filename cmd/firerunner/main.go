@@ -272,16 +272,20 @@ func cmdConfig(args []string) error {
 		}
 		fmt.Println(v)
 		return nil
-	case sub == "set" && len(args) == 3:
-		next, err := config.Set(cfg, args[1], args[2])
+	case sub == "set" && len(args) >= 3 && len(args)%2 == 1:
+		// Several keys are set and checked together: some only make sense as a
+		// pair (flintlock.tls_cert_file and tls_key_file).
+		next, err := config.SetAll(cfg, args[1:]...)
 		if err != nil {
 			return err
 		}
 		if err := config.Save(path, next); err != nil {
 			return err
 		}
-		v, _ := config.Get(next, args[1])
-		fmt.Printf("%s = %s (applies to the next job)\n", args[1], v)
+		for i := 1; i < len(args); i += 2 {
+			v, _ := config.Get(next, args[i])
+			fmt.Printf("%s = %s (applies to the next job)\n", args[i], v)
+		}
 		return nil
 	case sub == "unset" && len(args) == 2:
 		next, err := config.Unset(cfg, args[1])
@@ -290,7 +294,7 @@ func cmdConfig(args []string) error {
 		}
 		return config.Save(path, next)
 	}
-	return errors.New("usage: firerunner config show|keys|path|get <key>|set <key> <value>|unset <key>")
+	return errors.New("usage: firerunner config show|keys|path|get <key>|set <key> <value> [<key> <value>...]|unset <key>")
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +396,14 @@ func cmdDoctor(cfg config.Config) error {
 	fmt.Println("flintlock")
 	_, err = listVMs(cfg)
 	check("API "+cfg.Flintlock.Endpoint, err, "systemctl status flintlockd; token in "+cfg.Flintlock.TokenFile)
+	if cfg.Flintlock.TLSCAFile == "" {
+		fmt.Println("  warn  API without TLS: the token goes to whatever listens on " + cfg.Flintlock.Endpoint)
+		fmt.Println("        -> re-run install.sh when no job runs (it sets up mutual TLS)")
+	} else {
+		check("TLS certificates valid for 90 more days",
+			host.CertsValidFor(90*24*time.Hour, cfg.Flintlock.TLSCAFile, cfg.Flintlock.TLSCertFile),
+			"re-run install.sh when no job runs (it renews them)")
+	}
 	_, err = os.Stat(cfg.Network.SSHKey)
 	check("executor SSH key", err, "re-run install.sh")
 

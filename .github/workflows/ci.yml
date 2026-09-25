@@ -45,7 +45,7 @@ jobs:
 
       - name: ShellCheck install.sh
         # shellcheck is preinstalled on ubuntu-latest runners.
-        run: shellcheck -S warning install.sh images/rootfs/firerunner-netfilter test/network/run.sh test/installer/proxy.sh
+        run: shellcheck -S warning install.sh images/rootfs/firerunner-netfilter test/network/run.sh test/installer/proxy.sh test/installer/flintlock-tls.sh
 
   vulncheck:
     name: Vulnerability check
@@ -121,6 +121,9 @@ jobs:
 
       - name: Test the installer's proxy, CA and registry steps
         run: docker run --rm -v "$PWD":/src:ro ubuntu:24.04 bash /src/test/installer/proxy.sh
+
+      - name: Test the installer's mutual TLS for flintlockd
+        run: docker run --rm -v "$PWD":/src:ro ubuntu:24.04 bash /src/test/installer/flintlock-tls.sh
 
   alerts:
     name: Alert rules

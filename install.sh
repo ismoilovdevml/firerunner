@@ -93,6 +93,9 @@ CONTAINERD_ROOT=/var/lib/containerd-flintlock
 CONTAINERD_STATE=/run/containerd-flintlock
 CONTAINERD_SOCK="${CONTAINERD_STATE}/containerd.sock"
 FLINTLOCK_ENDPOINT=127.0.0.1:9090
+FLINTLOCK_TLS_DIR=$CONF_DIR/flintlock-tls  # CA, flintlockd's and firerunner's certificates
+FLINTLOCK_TLS_LATER=""                      # why flintlockd's TLS waits for another run
+FLINTLOCK_TLS_WAIT=30                       # seconds flintlockd has to answer over TLS after a restart
 
 TMP_DIR=""
 
@@ -422,9 +425,9 @@ install_packages() {
     if [[ $PKG == apt ]]; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq curl tar lvm2 thin-provisioning-tools dnsmasq-base dnsmasq-utils nftables iproute2 openssh-client >/dev/null
+        apt-get install -y -qq curl tar openssl lvm2 thin-provisioning-tools dnsmasq-base dnsmasq-utils nftables iproute2 openssh-client >/dev/null
     else
-        dnf install -y -q curl tar lvm2 device-mapper-persistent-data dnsmasq dnsmasq-utils nftables iproute openssh-clients >/dev/null
+        dnf install -y -q curl tar openssl lvm2 device-mapper-persistent-data dnsmasq dnsmasq-utils nftables iproute openssh-clients >/dev/null
     fi
 }
 
@@ -852,6 +855,137 @@ EOF
 # flintlockd
 # --------------------------------------------------------------------------
 
+# flintlock_tls_issue NAME SUBJECT EXTENSION...: NAME.key and NAME.crt signed by
+# the host's flintlock CA, made again when missing, not from that CA or
+# expiring within 90 days.
+flintlock_tls_issue() {
+    local d=$FLINTLOCK_TLS_DIR name=$1 subj=$2; shift 2
+    if [[ -s $d/$name.key ]] && openssl verify -CAfile "$d/ca.crt" "$d/$name.crt" >/dev/null 2>&1 &&
+        openssl x509 -checkend 7776000 -noout -in "$d/$name.crt" >/dev/null 2>&1; then
+        return 0
+    fi
+    log "  issuing the flintlock TLS certificate $name"
+    printf '%s\n' "basicConstraints=critical,CA:FALSE" "keyUsage=critical,digitalSignature" "$@" >"$TMP_DIR/$name.ext"
+    (umask 077 &&
+        openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "$subj" \
+            -keyout "$TMP_DIR/$name.key" -out "$TMP_DIR/$name.csr" 2>/dev/null &&
+        openssl x509 -req -in "$TMP_DIR/$name.csr" -CA "$d/ca.crt" -CAkey "$d/ca.key" \
+            -set_serial "0x$(openssl rand -hex 16)" -days 3650 -extfile "$TMP_DIR/$name.ext" \
+            -out "$TMP_DIR/$name.crt" 2>/dev/null) || die "could not issue the flintlock TLS certificate $name"
+    # The key first: a certificate never sits next to a key it does not match for long.
+    mv -f "$TMP_DIR/$name.key" "$d/$name.key"
+    mv -f "$TMP_DIR/$name.crt" "$d/$name.crt"
+    installed "$d/$name.crt"
+}
+
+# flintlock_tls_certs: flintlockd serves its API over TLS and accepts only
+# clients with a certificate from a CA of this host's own, so the API token
+# never goes to another process that took the port, and no other process can
+# use the API without root. Made once; certificates are valid for 10 years
+# and made again by a run within 90 days of that.
+flintlock_tls_certs() {
+    local d=$FLINTLOCK_TLS_DIR
+    mkdir -p "$d"
+    chmod 0700 "$d"
+    # Never replaced while it works: the running flintlockd and firerunner trust it.
+    if [[ ! -s $d/ca.key ]] || ! openssl x509 -noout -in "$d/ca.crt" >/dev/null 2>&1; then
+        log "  creating the flintlock TLS certificate authority"
+        (umask 077 &&
+            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 7300 \
+                -subj "/CN=FireRunner flintlock CA" -addext "basicConstraints=critical,CA:TRUE" \
+                -addext "keyUsage=critical,keyCertSign,cRLSign" \
+                -keyout "$TMP_DIR/ca.key" -out "$TMP_DIR/ca.crt" 2>/dev/null) ||
+            die "could not create the flintlock TLS certificate authority"
+        mv -f "$TMP_DIR/ca.key" "$d/ca.key"
+        mv -f "$TMP_DIR/ca.crt" "$d/ca.crt"
+        installed "$d/ca.crt"
+    fi
+    flintlock_tls_issue server "/CN=flintlockd" extendedKeyUsage=serverAuth "subjectAltName=IP:${FLINTLOCK_ENDPOINT%:*},DNS:localhost"
+    flintlock_tls_issue client "/CN=firerunner" extendedKeyUsage=clientAuth
+}
+
+# firerunner_uses_tls: firerunner's config has the client certificate.
+firerunner_uses_tls() {
+    [[ "$("$BIN_DIR/firerunner" config get flintlock.tls_cert_file 2>/dev/null)" == "$FLINTLOCK_TLS_DIR/client.crt" ]]
+}
+
+# flintlock_tls_now: flintlockd may serve TLS from its next start, because
+# firerunner follows at once: it uses TLS already, is not installed yet, or
+# knows the keys while no job runs (flintlockd restarts in this run). Otherwise
+# firerunner would lose flintlockd at its next restart (a crash, a reboot).
+flintlock_tls_now() {
+    local fr=$BIN_DIR/firerunner
+    [[ -x $fr ]] || return 0
+    firerunner_uses_tls && return 0
+    if ! "$fr" config get flintlock.tls_ca_file >/dev/null 2>&1; then
+        FLINTLOCK_TLS_LATER="the installed firerunner predates it"
+        return 1
+    fi
+    if jobs_running; then
+        FLINTLOCK_TLS_LATER="jobs are running"
+        return 1
+    fi
+}
+
+# flintlock_tls_deferred: jobs started before flintlockd could restart with
+# TLS, so its config goes back to no TLS until a run when the runner is idle.
+flintlock_tls_deferred() {
+    grep -qx "restart flintlockd" "$PENDING_FILE" 2>/dev/null || return 0
+    grep -qx "insecure: false" /etc/opt/flintlockd/config.yaml || return 0
+    [[ -x $BIN_DIR/firerunner ]] && firerunner_uses_tls && return 0
+    flintlock_config 0
+    FLINTLOCK_TLS_LATER="jobs are running"
+}
+
+# flintlock_tls_client gives firerunner the client certificate once the
+# running flintlockd answers over TLS with it, and restarts the daemon. The
+# keys are never removed here.
+flintlock_tls_client() {
+    local d=$FLINTLOCK_TLS_DIR fr=$BIN_DIR/firerunner i
+    [[ -x $fr ]] && "$fr" config get flintlock.tls_ca_file >/dev/null 2>&1 || return 0
+    firerunner_uses_tls && return 0
+    grep -qx "insecure: false" /etc/opt/flintlockd/config.yaml || return 0
+    systemctl is-active -q flintlockd || return 0
+    grep -qx "restart flintlockd" "$PENDING_FILE" 2>/dev/null && return 0
+    for i in $(seq 1 "$FLINTLOCK_TLS_WAIT"); do
+        if timeout 5 openssl s_client -connect "$FLINTLOCK_ENDPOINT" -verify_return_error -verify_ip "${FLINTLOCK_ENDPOINT%:*}" \
+            -CAfile "$d/ca.crt" -cert "$d/client.crt" -key "$d/client.key" </dev/null >/dev/null 2>&1; then
+            "$fr" config set flintlock.tls_ca_file "$d/ca.crt" flintlock.tls_cert_file "$d/client.crt" \
+                flintlock.tls_key_file "$d/client.key" >/dev/null || die "could not set firerunner's flintlock TLS keys"
+            log "  firerunner talks to flintlockd over mutual TLS"
+            if systemctl is-active -q firerunner; then
+                systemctl restart firerunner
+            fi
+            return 0
+        fi
+        sleep 1
+    done
+    warn "flintlockd does not answer over TLS; firerunner keeps using its API without TLS (journalctl -u flintlockd)"
+}
+
+# flintlock_config TLS: flintlockd's settings; TLS=1 serves the API over mutual TLS.
+flintlock_config() {
+    local tls="insecure: true"
+    if [[ $1 == 1 ]]; then
+        tls="insecure: false
+tls-cert: ${FLINTLOCK_TLS_DIR}/server.crt
+tls-key: ${FLINTLOCK_TLS_DIR}/server.key
+tls-client-validate: true
+tls-client-ca: ${FLINTLOCK_TLS_DIR}/ca.crt"
+    fi
+    # flintlockd reads every flag from this file (viper); the token never appears in argv.
+    put /etc/opt/flintlockd/config.yaml 0600 <<EOF
+containerd-socket: ${CONTAINERD_SOCK}
+grpc-endpoint: ${FLINTLOCK_ENDPOINT}
+bridge-name: ${FR_BRIDGE}
+firecracker-bin: ${BIN_DIR}/firecracker
+basic-auth-token: $(cat "$CONF_DIR/flintlock.token")
+${tls}
+log-format: json
+verbosity: 1
+EOF
+}
+
 install_flintlock() {
     local have=""
     [[ -x $BIN_DIR/flintlockd ]] && have=$($BIN_DIR/flintlockd version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
@@ -874,17 +1008,8 @@ install_flintlock() {
     fi
     chmod 0600 "$CONF_DIR/flintlock.token"
     rm -f "$CONF_DIR/flintlock.env"   # older installs passed the token on the command line
-    # flintlockd reads every flag from this file (viper); the token never appears in argv.
-    put /etc/opt/flintlockd/config.yaml 0600 <<EOF
-containerd-socket: ${CONTAINERD_SOCK}
-grpc-endpoint: ${FLINTLOCK_ENDPOINT}
-bridge-name: ${FR_BRIDGE}
-firecracker-bin: ${BIN_DIR}/firecracker
-basic-auth-token: $(cat "$CONF_DIR/flintlock.token")
-insecure: true
-log-format: json
-verbosity: 1
-EOF
+    flintlock_tls_certs
+    if flintlock_tls_now; then flintlock_config 1; else flintlock_config 0; fi
 
     # flintlockd writes each VM's user-data, which holds the VM's SSH host
     # private key, to metadata.json with mode 0644: keep its state root-only.
@@ -1193,7 +1318,7 @@ start_services() {
             firerunner-dnsmasq)   files="$CONF_DIR/dnsmasq.conf" ;;
             firerunner-registry)  files="$CONF_DIR/registry.yml $BIN_DIR/registry" ;;
             firerunner-cache)     files="$CONF_DIR/cache.env $BIN_DIR/versitygw" ;;
-            flintlockd)           files="/etc/opt/flintlockd/config.yaml $BIN_DIR/flintlockd $BIN_DIR/firecracker" ;;
+            flintlockd)           files="/etc/opt/flintlockd/config.yaml $BIN_DIR/flintlockd $BIN_DIR/firecracker $FLINTLOCK_TLS_DIR/ca.crt $FLINTLOCK_TLS_DIR/server.crt" ;;
         esac
         # shellcheck disable=SC2086
         if ! systemctl is-active -q "$svc"; then
@@ -1248,7 +1373,7 @@ verify_install() {
     cat <<EOF
 
 FireRunner host is ready.
-  flintlock API : ${FLINTLOCK_ENDPOINT} (localhost only)
+  flintlock API : ${FLINTLOCK_ENDPOINT} (localhost only, mutual TLS: ${FLINTLOCK_TLS_DIR})
   API token     : ${CONF_DIR}/flintlock.token (root only)
   microVM net   : ${FR_BRIDGE} ${FR_SUBNET}.0/24, DHCP + NAT
   versions      : containerd ${CONTAINERD_VERSION}, firecracker ${FIRECRACKER_VERSION}, flintlock ${FLINTLOCK_VERSION}
@@ -1318,8 +1443,11 @@ main() {
     install_registry_mirror
     install_cache_server
     start_services
+    flintlock_tls_deferred
+    flintlock_tls_client
     apply_vm_disk_size
     install_firerunner
+    flintlock_tls_client
     systemctl daemon-reload
     systemctl enable -q firerunner
     if ! systemctl is-active -q firerunner || changed /etc/systemd/system/firerunner.service "$BIN_DIR/firerunner"; then
@@ -1338,6 +1466,9 @@ main() {
         warn "left for a run when no job runs: ${PENDING}- re-run the installer then"
     else
         apply_pending
+    fi
+    if [[ -n $FLINTLOCK_TLS_LATER ]]; then
+        warn "flintlockd's API stays without TLS for now (${FLINTLOCK_TLS_LATER}); re-run the installer when the runner is idle"
     fi
 }
 

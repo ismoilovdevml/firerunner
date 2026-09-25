@@ -33,7 +33,7 @@ control plane, or anything the next job will use.
 | Network and job | hosts on your network cannot open connections to microVMs or to the services the host runs for them; microVMs only get replies to connections they opened |
 | Project and project | each builder has its own certificate authority; a job gets a client certificate of its own for its project's builder only, valid for `daemon.job_max_age`. `cache:` is stored per project and reached through short-lived signed URLs |
 | Host and VM | each VM gets its own SSH host key and every connection checks it, so scripts and secrets go only to the job's own VM. Job and project ids come from gitlab-runner, not from job variables |
-| Local users | the microVM API listens on 127.0.0.1 with a token in a root-only file; with `flintlock.tls_ca_file` (and a client certificate) firerunner and flintlockd check each other's certificates, so a process that takes the API's port gets nothing. VM state files are root-only |
+| Local users | the microVM API listens on 127.0.0.1 with a token in a root-only file, over mutual TLS: firerunner and flintlockd check each other's certificate, issued by a CA of the host's own (`/etc/firerunner/flintlock-tls`, root-only), so a process that takes the API's port gets nothing. VM state files are root-only |
 | Memory and disk | a VM starts only when its memory fits and the thin pool that holds VM disks has room; the console and Firecracker files of a VM are bounded |
 | Supply chain | every download is checksum-verified; releases have an SBOM and a signed provenance (`gh attestation verify firerunner-linux-amd64 --repo ismoilovdevml/firerunner`) |
 
