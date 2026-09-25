@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 
 	"github.com/liquidmetal-dev/flintlock/api/types"
 
@@ -888,15 +889,46 @@ func dash(s string) string {
 	return s
 }
 
+// tail prints the last n lines of a microVM's console log, made safe for a
+// terminal by consoleText.
 func tail(path string, n int, w io.Writer) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	lines := strings.Split(strings.TrimRight(string(b), "\r\n"), "\n")
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
 	}
-	_, err = fmt.Fprintln(w, strings.Join(lines, "\n"))
+	_, err = fmt.Fprintln(w, consoleText(strings.Join(lines, "\n")))
 	return err
+}
+
+// consoleText makes guest console output safe to print on the operator's
+// terminal. A job controls those bytes, and escape sequences could clear the
+// screen, set the window title or hide lines. Control characters other than
+// newline and tab (C0 with ESC, DEL, C1) and bytes that are not UTF-8 become
+// visible escapes such as \x1b; only "\r\n" line endings become plain newlines.
+func consoleText(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			fmt.Fprintf(&b, `\x%02x`, s[i])
+		case r == '\r' && strings.HasPrefix(s[i+1:], "\n"):
+			// dropped: the newline that follows ends the line
+		case r == '\n' || r == '\t':
+			b.WriteRune(r)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		case r >= 0x80 && r <= 0x9f:
+			fmt.Fprintf(&b, `\u%04x`, r)
+		default:
+			b.WriteString(s[i : i+size])
+		}
+		i += size
+	}
+	return b.String()
 }
