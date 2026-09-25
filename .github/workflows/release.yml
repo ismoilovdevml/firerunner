@@ -61,6 +61,22 @@ jobs:
           (cd dist && sha256sum firerunner-linux-* install.sh firerunner.spdx.json > checksums.txt)
           cat dist/checksums.txt
 
+      # An Ed25519 signature over checksums.txt: a release asset replaced on
+      # GitHub (with matching checksums) fails the check in `firerunner
+      # upgrade` and install.sh, which carry the public key
+      # (internal/upgrade/release-signing.pub).
+      - name: Sign checksums
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          umask 077
+          key="$RUNNER_TEMP/release-signing.key"
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+          openssl pkeyutl -sign -inkey "$key" -rawin -in dist/checksums.txt -out dist/checksums.txt.sig
+          rm -f "$key"
+          openssl pkeyutl -verify -pubin -inkey internal/upgrade/release-signing.pub -rawin \
+            -in dist/checksums.txt -sigfile dist/checksums.txt.sig
+
       # Signed build provenance: verify with
       #   gh attestation verify firerunner-linux-amd64 --repo ismoilovdevml/firerunner
       - name: Attest build provenance
@@ -82,7 +98,7 @@ jobs:
           if gh release view edge >/dev/null 2>&1; then
             gh release edit edge --prerelease --title "edge (main @ ${GITHUB_SHA::7})" --notes "$notes"
             gh release upload edge dist/firerunner-linux-amd64 dist/install.sh dist/firerunner.spdx.json --clobber
-            gh release upload edge dist/checksums.txt --clobber
+            gh release upload edge dist/checksums.txt dist/checksums.txt.sig --clobber
           else
             gh release create edge dist/* --prerelease --title "edge (main @ ${GITHUB_SHA::7})" --notes "$notes"
           fi
