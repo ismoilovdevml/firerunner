@@ -477,8 +477,9 @@ func Cleanup(cfg config.Config) error {
 		if j, err := currentJob(); err == nil {
 			project = j.Project
 		}
+		// Err is the failed delete: the daemon's log then says why the VM outlived its job.
 		_ = daemon.NewClient(cfg.Daemon.Socket).Send(daemon.Event{Kind: "finish", Result: result, Reason: reason,
-			Seconds: time.Since(st.StartedAt).Seconds(), Job: jobNumber(id), Project: project, VM: st.ID})
+			Seconds: time.Since(st.StartedAt).Seconds(), Job: jobNumber(id), Project: project, VM: st.ID, Err: errText(delErr)})
 	}
 	// The state file goes even when the delete failed: nothing retries cleanup,
 	// and while the file exists reconcile treats the VM as a running job and

@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/daemon"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
@@ -137,13 +138,7 @@ func fakeDaemon(t *testing.T, socket string) func() []daemon.Event {
 // even though GitLab shows only "system failure".
 func TestCleanupReportsTheRecordedFailure(t *testing.T) {
 	cfg, _ := cleanupFixture(t)
-	dir, err := os.MkdirTemp("", "fre") // short: unix socket paths are limited
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	cfg.Daemon.Socket = filepath.Join(dir, "d.sock")
-	events := fakeDaemon(t, cfg.Daemon.Socket)
+	events := withEvents(t, &cfg)
 	st, err := vm.LoadJobState(statePath("job-555"))
 	if err != nil {
 		t.Fatal(err)
@@ -163,5 +158,39 @@ func TestCleanupReportsTheRecordedFailure(t *testing.T) {
 	if e.Kind != "finish" || e.Result != daemon.ResultSystemFailure || e.Reason != "ssh_lost" ||
 		e.Job != "555" || e.Project != "1" || e.VM != "job-555" {
 		t.Fatalf("finish event %+v", e)
+	}
+	if e.Err != "" {
+		t.Fatalf("finish event of a job whose VM was deleted carries an error: %q", e.Err)
+	}
+}
+
+// withEvents gives the cleanup fixture a fake daemon and returns what it received.
+func withEvents(t *testing.T, cfg *config.Config) func() []daemon.Event {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "fre") // short: unix socket paths are limited
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	cfg.Daemon.Socket = filepath.Join(dir, "d.sock")
+	return fakeDaemon(t, cfg.Daemon.Socket)
+}
+
+// The daemon's log is where an operator looks for a job's leaked VM: the
+// finish event says why its delete failed.
+func TestCleanupReportsAFailedDelete(t *testing.T) {
+	cfg, srv := cleanupFixture(t)
+	events := withEvents(t, &cfg)
+	down := status.Error(codes.Unavailable, "flintlockd is down")
+	srv.FailDelete(down, down, down)
+	if err := Cleanup(cfg); err == nil {
+		t.Fatal("Cleanup succeeded although every delete failed")
+	}
+	got := events()
+	if len(got) != 1 || got[0].Kind != "finish" {
+		t.Fatalf("events %+v, want one finish event", got)
+	}
+	if !strings.Contains(got[0].Err, "flintlockd is down") {
+		t.Fatalf("finish event Err = %q, want the delete error", got[0].Err)
 	}
 }
