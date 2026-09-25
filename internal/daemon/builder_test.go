@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -570,5 +571,48 @@ func TestShutdownMessagesAreInfo(t *testing.T) {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("log lacks %q:\n%s", want, logs.String())
 		}
+	}
+}
+
+// Measured on the trial host: a job asked for a builder seconds after the
+// daemon restarted, before the old builders were adopted. The new builder
+// took an adopted builder's port, and two projects shared one DNAT port.
+func TestAdoptAfterNewBuildersStarted(t *testing.T) {
+	calls := stubBuilders(t, func(string) bool { return true })
+	d, _ := newTestDaemon(t)
+	base := d.cfg.Builder.PortBase
+	d.builders["1"] = readyBuilder("1", base+1, 0, builderSpec(d.cfg))
+	d.builders["2"] = readyBuilder("2", base+2, 0, builderSpec(d.cfg))
+	d.mu.Lock()
+	d.saveBuildersLocked()
+	d.mu.Unlock()
+
+	d2, _ := newTestDaemon(t)
+	d2.cfg.Daemon.Socket = d.cfg.Daemon.Socket
+	d2.Builder("9", true) // booting, took the first port
+	d2.Builder("2", true) // project 2 got a new builder before adoption
+	if d2.builders["9"].Port != base+1 {
+		t.Fatalf("new builder port %d", d2.builders["9"].Port)
+	}
+	newTwo := d2.builders["2"]
+	d2.adoptBuilders(map[string]bool{"uid-1": true, "uid-2": true})
+
+	if d2.builders["2"] != newTwo {
+		t.Fatal("adoption replaced the project's new builder")
+	}
+	one := d2.builders["1"]
+	if one == nil || !one.ready || one.Port == base+1 {
+		t.Fatalf("adopted builder 1 = %+v, want it on a free port", one)
+	}
+	ports := map[int]string{}
+	for p, b := range d2.builders {
+		if other, dup := ports[b.Port]; dup {
+			t.Fatalf("projects %s and %s share port %d", other, p, b.Port)
+		}
+		ports[b.Port] = p
+	}
+	want := fmt.Sprintf("add element inet firerunner builders { %d : 10.200.0.1 . 1234 }", one.Port)
+	if !strings.Contains(calls(), want) {
+		t.Fatalf("adopted builder not mapped on its new port: %v", calls())
 	}
 }

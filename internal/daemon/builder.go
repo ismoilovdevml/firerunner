@@ -188,6 +188,15 @@ func (d *Daemon) evictLRULocked() bool {
 	return true
 }
 
+func (d *Daemon) portUsedLocked(port int) bool {
+	for _, b := range d.builders {
+		if b.Port == port {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *Daemon) freePortLocked(cfg config.Config) int {
 	used := map[int]bool{}
 	for _, b := range d.builders {
@@ -686,19 +695,36 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 		}
 		keep = append(keep, b)
 	}
+	// Jobs may have asked for builders since the daemon started: a project
+	// with a new builder keeps it (reconcile removes the old VM), and an old
+	// builder whose port a new one took gets another port.
 	d.mu.Lock()
+	var adopted []*builder
 	for _, b := range keep {
+		if _, taken := d.builders[b.Project]; taken {
+			d.log.Warn("builder from previous run not adopted: the project has a new one", "project", b.Project, "id", b.Instance.ID)
+			continue
+		}
+		if d.portUsedLocked(b.Port) {
+			old := b.Port
+			if b.Port = d.freePortLocked(d.cfg); b.Port == 0 {
+				d.log.Warn("builder from previous run not adopted: no free port", "project", b.Project, "id", b.Instance.ID)
+				continue
+			}
+			d.log.Info("builder from previous run moved to a free port", "project", b.Project, "from", old, "to", b.Port)
+		}
 		b.ready = true
 		if b.SpecID == legacyBuilderSpec(d.cfg) {
 			b.SpecID = builderSpec(d.cfg)
 		}
 		d.builders[b.Project] = b
+		adopted = append(adopted, b)
 		d.log.Info("adopted builder from previous run", "project", b.Project, "id", b.Instance.ID)
 	}
 	d.saveBuildersLocked()
 	d.metrics.builders.Set(float64(len(d.builders)))
 	d.mu.Unlock()
-	for _, b := range keep {
+	for _, b := range adopted {
 		if err := mapBuilderPort(b); err != nil {
 			d.log.Error("builder port mapping failed", "project", b.Project, "err", err)
 		}
