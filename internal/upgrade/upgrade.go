@@ -4,8 +4,13 @@ package upgrade
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/x509"
+	_ "embed"
 	"encoding/hex"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,9 +35,33 @@ func BaseURL(tag string) string {
 	return "https://github.com/" + repo + "/releases/download/" + tag
 }
 
-// releaseBase and executable are variables so tests need no GitHub and do not
-// replace the test binary.
+// releaseKeyPEM is the public half of the key release.yml signs checksums.txt
+// with (checksums.txt.sig, a raw Ed25519 signature of its exact bytes).
+//
+//go:embed release-signing.pub
+var releaseKeyPEM []byte
+
+// ParseKey returns the Ed25519 public key in a PEM (SPKI) block.
+func ParseKey(pemBytes []byte) (ed25519.PublicKey, error) {
+	b, _ := pem.Decode(pemBytes)
+	if b == nil {
+		return nil, errors.New("no PEM block in the release signing key")
+	}
+	k, err := x509.ParsePKIXPublicKey(b.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("release signing key: %w", err)
+	}
+	pub, ok := k.(ed25519.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("release signing key is %T, not Ed25519", k)
+	}
+	return pub, nil
+}
+
+// releaseBase, executable and releaseKey are variables so tests need no
+// GitHub, do not replace the test binary and sign with a key of their own.
 var (
+	releaseKey  = func() (ed25519.PublicKey, error) { return ParseKey(releaseKeyPEM) }
 	releaseBase = BaseURL
 	executable  = func() (string, error) {
 		exe, err := os.Executable()
@@ -43,17 +72,33 @@ var (
 	}
 )
 
+// Options says how Run treats a release.
+type Options struct {
+	// CheckOnly downloads and runs nothing but checksums.txt and its signature.
+	CheckOnly bool
+	// AllowUnsigned accepts a release without a signature: the ones published
+	// before releases were signed. A signature that does not verify is never
+	// accepted.
+	AllowUnsigned bool
+}
+
 // Result describes what Run did.
 type Result struct {
 	From, To string
 	Changed  bool
+	// Unsigned: the release had no signature and Options.AllowUnsigned took it.
+	Unsigned bool
 }
 
-// Run downloads the release, verifies its checksum and atomically replaces
-// the current executable. Whether the release differs from the running binary
-// is decided by checksum, so checkOnly downloads and runs nothing but
-// checksums.txt, and an identical release is not downloaded at all.
-func Run(ctx context.Context, tag, current string, checkOnly bool) (*Result, error) {
+// errNotFound is a download that does not exist (HTTP 404).
+var errNotFound = errors.New("not found")
+
+// Run downloads the release, verifies the signature of its checksums and the
+// checksum of the binary, and atomically replaces the current executable.
+// Whether the release differs from the running binary is decided by checksum,
+// so CheckOnly downloads and runs nothing but checksums.txt and its signature,
+// and an identical release is not downloaded at all.
+func Run(ctx context.Context, tag, current string, opts Options) (*Result, error) {
 	exe, err := executable()
 	if err != nil {
 		return nil, err
@@ -64,6 +109,10 @@ func Run(ctx context.Context, tag, current string, checkOnly bool) (*Result, err
 	if err != nil {
 		return nil, fmt.Errorf("release %s: %w", tag, err)
 	}
+	unsigned, err := verifySums(ctx, base, tag, sums, opts.AllowUnsigned)
+	if err != nil {
+		return nil, err
+	}
 	want, err := checksumFor(string(sums), asset)
 	if err != nil {
 		return nil, err
@@ -73,11 +122,11 @@ func Run(ctx context.Context, tag, current string, checkOnly bool) (*Result, err
 		return nil, err
 	}
 	if have == want {
-		return &Result{From: current, To: current}, nil
+		return &Result{From: current, To: current, Unsigned: unsigned}, nil
 	}
-	if checkOnly {
+	if opts.CheckOnly {
 		// The new version string would need running the new binary (as root).
-		return &Result{From: current, To: tag, Changed: true}, nil
+		return &Result{From: current, To: tag, Changed: true, Unsigned: unsigned}, nil
 	}
 
 	// Download next to the executable so the final rename is atomic.
@@ -111,7 +160,31 @@ func Run(ctx context.Context, tag, current string, checkOnly bool) (*Result, err
 	if err := os.Rename(tmp.Name(), exe); err != nil {
 		return nil, fmt.Errorf("replacing %s: %w", exe, err)
 	}
-	return &Result{From: current, To: next, Changed: true}, nil
+	return &Result{From: current, To: next, Changed: true, Unsigned: unsigned}, nil
+}
+
+// verifySums checks checksums.txt against the release signature. It reports
+// whether the release is unsigned, which is an error unless allowUnsigned.
+func verifySums(ctx context.Context, base, tag string, sums []byte, allowUnsigned bool) (bool, error) {
+	key, err := releaseKey()
+	if err != nil {
+		return false, err
+	}
+	sig, err := fetch(ctx, base+"/checksums.txt.sig")
+	if errors.Is(err, errNotFound) {
+		if allowUnsigned {
+			return true, nil
+		}
+		return false, fmt.Errorf("release %s is not signed (releases published before signing are not); --allow-unsigned installs it anyway", tag)
+	}
+	if err != nil {
+		return false, fmt.Errorf("release %s: %w", tag, err)
+	}
+	if !ed25519.Verify(key, sums, sig) {
+		return false, fmt.Errorf("release %s: checksums.txt does not match its signature, not installing it "+
+			"(while a release is being published this can happen for a minute: try again)", tag)
+	}
+	return false, nil
 }
 
 func fileSHA256(path string) (string, error) {
@@ -150,6 +223,9 @@ func fetch(ctx context.Context, url string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("GET %s: %w", url, errNotFound)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
 	}

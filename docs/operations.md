@@ -16,8 +16,10 @@ sudo firerunner upgrade            # latest build of main (edge)
 sudo firerunner upgrade --version v1.2.0
 ```
 
-The binary is checksum-verified and replaced in place. Running jobs, pre-booted VMs and builders
-keep running. To upgrade the host stack (containerd, Firecracker, flintlock, gitlab-runner, network),
+The release's `checksums.txt` must carry the release signature (Ed25519, key in
+`internal/upgrade/release-signing.pub`), and the binary must match its checksum; then it is
+replaced in place. Releases published before signing (v0.1.1 and older) are refused unless you add
+`--allow-unsigned`. Running jobs, pre-booted VMs and builders keep running. To upgrade the host stack (containerd, Firecracker, flintlock, gitlab-runner, network),
 run the installer again.
 
 After a new guest image is published, replace the idle VMs: `sudo firerunner pool refresh`.

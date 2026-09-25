@@ -794,6 +794,7 @@ func cmdUpgrade(args []string) error {
 	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	tag := fs.String("version", "edge", "release to install: edge (main), latest (newest stable) or a tag like v1.2.0")
 	check := fs.Bool("check", false, "only tell whether the release differs from this binary (runs nothing)")
+	allowUnsigned := fs.Bool("allow-unsigned", false, "accept a release without a signature (published before releases were signed)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -803,15 +804,22 @@ func cmdUpgrade(args []string) error {
 			_ = os.Setenv("HTTPS_PROXY", "http://"+net.JoinHostPort("127.0.0.1", port))
 		}
 	}
-	res, err := upgrade.Run(context.Background(), *tag, version, *check)
+	res, err := upgrade.Run(context.Background(), *tag, version, upgrade.Options{CheckOnly: *check, AllowUnsigned: *allowUnsigned})
 	if err != nil {
 		return err
+	}
+	if res.Unsigned {
+		fmt.Fprintf(os.Stderr, "warning: release %s is not signed; its checksums were not verified against the release key\n", *tag)
 	}
 	switch {
 	case !res.Changed:
 		fmt.Printf("firerunner %s is already the %s release\n", res.From, *tag)
 	case *check:
-		fmt.Printf("firerunner %s: a different %s build is available (run: firerunner upgrade --version %s)\n", res.From, *tag, *tag)
+		hint := "firerunner upgrade --version " + *tag
+		if res.Unsigned {
+			hint += " --allow-unsigned"
+		}
+		fmt.Printf("firerunner %s: a different %s build is available (run: %s)\n", res.From, *tag, hint)
 	default:
 		fmt.Printf("firerunner upgraded %s -> %s\n", res.From, res.To)
 		if host.ServiceActive("firerunner") {
