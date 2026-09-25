@@ -14,8 +14,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -100,7 +102,7 @@ func startUpstream(t *testing.T, want string) *fakeUpstream {
 			}
 			w.WriteHeader(http.StatusOK)
 			c, buf, _ := w.(http.Hijacker).Hijack()
-			splice(c, buf.Reader, dst, dst)
+			splice(c, buf.Reader, dst, dst, 0)
 			return
 		}
 		out := r.Clone(context.Background())
@@ -375,5 +377,328 @@ func TestForwarderPassesAbsoluteHTTPS(t *testing.T) {
 	fmt.Fprint(c2, "GET https://example.com/x HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
 	if resp, err := http.ReadResponse(bufio.NewReader(c2), nil); err != nil || resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("wrong credentials: %v %v, want 502", resp, err)
+	}
+}
+
+func testPolicy() *Policy {
+	_, bridge, _ := net.ParseCIDR("10.200.0.0/24")
+	_, deny, _ := net.ParseCIDR("192.168.0.0/16")
+	return &Policy{Bridge: bridge, Deny: []*net.IPNet{deny}, ConnectPorts: []int{443},
+		Resolve: func(_ context.Context, h string) ([]net.IP, error) {
+			switch h {
+			case "evil.example":
+				return []net.IP{net.ParseIP("127.0.0.1")}, nil
+			case "internal.example":
+				return []net.IP{net.ParseIP("192.168.5.5")}, nil
+			case "github.com":
+				return []net.IP{net.ParseIP("140.82.121.4")}, nil
+			}
+			return nil, errors.New("no such host")
+		},
+		LocalAddrs: func() []net.IP { return []net.IP{net.ParseIP("172.17.4.40")} }}
+}
+
+// Proxied traffic leaves from the host, so the forwarder refuses what the
+// host's firewall keeps from microVMs.
+func TestPolicy(t *testing.T) {
+	p := testPolicy()
+	for _, tc := range []struct {
+		host    string
+		port    int
+		connect bool
+		denied  bool
+	}{
+		{"github.com", 443, true, false},
+		{"unresolvable.corp", 443, true, false}, // the upstream resolves it
+		{"140.82.121.4", 80, false, false},
+		{"github.com", 22, true, true}, // CONNECT only to proxy.connect_ports
+		{"github.com", 8080, false, false},
+		{"localhost", 443, true, true},
+		{"db.localhost", 443, true, true},
+		{"LOCALHOST.", 443, true, true},
+		{"127.0.0.1", 443, true, true},
+		{"::1", 443, true, true},
+		{"0.0.0.0", 443, true, true},
+		{"169.254.169.254", 80, false, true},
+		{"fe80::1", 443, true, true},
+		{"fe80::1%eth0", 443, true, true},
+		{"224.0.0.1", 443, true, true},
+		{"10.200.0.12", 443, true, true},  // another microVM
+		{"10.200.0.1", 443, true, true},   // the bridge address
+		{"172.17.4.40", 443, true, true},  // the host itself
+		{"192.168.1.10", 443, true, true}, // network.egress_deny
+		{"evil.example", 443, true, true}, // a name that resolves to loopback
+		{"internal.example", 80, false, true},
+		{"2130706433", 443, true, true}, // 127.0.0.1 as one number
+		{"0x7f000001", 443, true, true},
+		{"127.1", 443, true, true},
+		{"", 443, true, true},
+	} {
+		why := p.Check(context.Background(), tc.host, tc.port, tc.connect)
+		if (why != "") != tc.denied {
+			t.Errorf("Check(%q, %d, connect=%v) = %q, want denied=%v", tc.host, tc.port, tc.connect, why, tc.denied)
+		}
+	}
+}
+
+func TestSelfLoop(t *testing.T) {
+	local := []net.IP{net.ParseIP("10.200.0.1"), net.ParseIP("172.17.4.40")}
+	for up, want := range map[string]bool{
+		"127.0.0.1:3128": true, "localhost:3128": true, "[::1]:3128": true, "0.0.0.0:3128": true,
+		"10.200.0.1:3128": true, "172.17.4.40:3128": true,
+		"127.0.0.1:3129": false, "proxy.corp:3128": false, "10.0.0.5:3128": false,
+	} {
+		if got := SelfLoop(up, "3128", local); got != want {
+			t.Errorf("SelfLoop(%s) = %v, want %v", up, got, want)
+		}
+	}
+}
+
+// startForwarderWith runs a Forwarder with a policy and limits.
+func startForwarderWith(t *testing.T, upstreamURL string, p *Policy, lim Limits) (string, string) {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "upstream")
+	if err := os.WriteFile(file, []byte(upstreamURL), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := &Forwarder{Upstream: func() (Upstream, error) { return LoadUpstream(file) }, Allowed: AllowNets(),
+		Policy: p, Limits: lim, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), DialTimeout: 2 * time.Second}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: f}
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return l.Addr().String(), file
+}
+
+func connect(t *testing.T, fwd, target string) (net.Conn, *bufio.Reader, int) {
+	t.Helper()
+	c, err := net.Dial("tcp", fwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
+	br := bufio.NewReader(c)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.SetDeadline(time.Time{})
+	return c, br, resp.StatusCode
+}
+
+// A refused destination never reaches the upstream.
+func TestForwarderEnforcesPolicy(t *testing.T) {
+	up := startUpstream(t, "")
+	fwd, _ := startForwarderWith(t, "http://"+up.addr, testPolicy(), Limits{})
+	for _, target := range []string{"127.0.0.1:9090", "169.254.169.254:443", "10.200.0.12:443", "192.168.1.10:443", "localhost:443", "github.com:22"} {
+		c, _, code := connect(t, fwd, target)
+		c.Close()
+		if code != http.StatusForbidden {
+			t.Errorf("CONNECT %s: %d, want 403", target, code)
+		}
+	}
+	resp, err := client(fwd).Get("http://169.254.169.254/latest/meta-data/")
+	if err != nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("GET metadata: %v %v, want 403", resp, err)
+	}
+	resp.Body.Close()
+	if n := len(up.requests()); n != 0 {
+		t.Fatalf("upstream saw %d refused requests: %v", n, up.requests())
+	}
+}
+
+// One client cannot hold more than its share; the slot comes back when its
+// tunnel closes.
+func TestForwarderLimitsConnections(t *testing.T) {
+	up := startUpstream(t, "")
+	echo := echoServer(t)
+	p := testPolicy()
+	p.ConnectPorts = []int{portOf(echo)}
+	p.LocalAddrs = func() []net.IP { return nil }
+	p.Resolve = nil
+	fwd, _ := startForwarderWith(t, "http://"+up.addr, nil, Limits{Loopback: 1, PerClient: 1})
+	c1, _, code := connect(t, fwd, echo)
+	if code != 200 {
+		t.Fatalf("first tunnel: %d", code)
+	}
+	c2, _, code := connect(t, fwd, echo)
+	c2.Close()
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("second tunnel from the same client: %d, want 503", code)
+	}
+	c1.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c3, _, code := connect(t, fwd, echo)
+		c3.Close()
+		if code == 200 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("slot not released after the tunnel closed: %d", code)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func echoServer(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(c, c); c.Close() }()
+		}
+	}()
+	return l.Addr().String()
+}
+
+func portOf(addr string) int {
+	_, p, _ := net.SplitHostPort(addr)
+	n, _ := strconv.Atoi(p)
+	return n
+}
+
+// A tunnel without traffic is closed after TunnelIdle; one with traffic is not.
+func TestTunnelIdleTimeout(t *testing.T) {
+	up := startUpstream(t, "")
+	echo := echoServer(t)
+	fwd, _ := startForwarderWith(t, "http://"+up.addr, nil, Limits{TunnelIdle: 400 * time.Millisecond})
+	c, br, code := connect(t, fwd, echo)
+	if code != 200 {
+		t.Fatal(code)
+	}
+	defer c.Close()
+	for i := 0; i < 5; i++ { // 1 s of traffic every 200 ms: stays open
+		fmt.Fprint(c, "x")
+		_ = c.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := br.ReadByte(); err != nil {
+			t.Fatalf("active tunnel closed: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := br.ReadByte(); err == nil || strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("idle tunnel not closed by the forwarder: %v", err)
+	}
+}
+
+// busybox-style https requests: a client that goes away closes the upstream
+// connection even when the upstream never answers.
+func TestPassThroughClosesWithClient(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	closed := make(chan struct{})
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, c) // never answers; returns when the forwarder closes
+		close(closed)
+	}()
+	fwd, _ := startForwarderWith(t, "http://"+l.Addr().String(), nil, Limits{HeaderWait: time.Minute})
+	c, err := net.Dial("tcp", fwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprint(c, "GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	time.Sleep(300 * time.Millisecond)
+	c.Close()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("upstream connection left open after the client went away")
+	}
+}
+
+// Refused credentials are not sent again until the file changes or
+// RefusedWait passes: a rotated password must not lock the corporate account.
+func TestRefusedCredentialsNotRetried(t *testing.T) {
+	up := startUpstream(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("bob:right")))
+	fwd, file := startForwarderWith(t, "http://bob:wrong@"+up.addr, nil, Limits{RefusedWait: time.Hour})
+	for i := 0; i < 5; i++ {
+		c, _, code := connect(t, fwd, "example.com:443")
+		c.Close()
+		if code != http.StatusBadGateway {
+			t.Fatalf("attempt %d: %d, want 502", i, code)
+		}
+	}
+	if n := len(up.requests()); n != 1 {
+		t.Fatalf("refused password sent %d times, want once", n)
+	}
+	if err := os.WriteFile(file, []byte("http://bob:right@"+up.addr), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	echo := echoServer(t)
+	c, _, code := connect(t, fwd, echo)
+	c.Close()
+	if code != 200 {
+		t.Fatalf("after fixing the password: %d, want 200 at once", code)
+	}
+}
+
+// Headers the client lists in Connection are hop-by-hop too (RFC 9110 7.6.1).
+func TestConnectionListedHeadersRemoved(t *testing.T) {
+	var got http.Header
+	web := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { got = r.Header.Clone() }))
+	defer web.Close()
+	up := startUpstream(t, "")
+	fwd, _ := startForwarderWith(t, "http://"+up.addr, nil, Limits{})
+	req, _ := http.NewRequest(http.MethodGet, web.URL, nil)
+	req.Header.Set("Connection", "X-Hop, keep-alive")
+	req.Header.Set("X-Hop", "secret")
+	req.Header.Set("X-Keep", "kept")
+	resp, err := client(fwd).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got.Get("X-Hop") != "" || got.Get("X-Keep") != "kept" {
+		t.Fatalf("origin saw X-Hop=%q X-Keep=%q", got.Get("X-Hop"), got.Get("X-Keep"))
+	}
+}
+
+func TestLoadUpstreamRefusesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.WriteFile(real, []byte("http://proxy:3128"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "upstream")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadUpstream(link); err == nil {
+		t.Fatal("symlink accepted")
+	}
+	// A FIFO with safe permissions: reading it would block the forwarder.
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := LoadUpstream(fifo); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO accepted")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("LoadUpstream blocked on a FIFO")
 	}
 }

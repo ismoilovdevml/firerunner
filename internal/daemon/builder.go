@@ -838,7 +838,11 @@ func buildkitdTOML(cfg config.Config) string {
 	mirror := strings.TrimPrefix(strings.TrimPrefix(cfg.VM.RegistryMirror, "http://"), "https://")
 	if mirror != "" {
 		fmt.Fprintf(&b, "[registry.\"docker.io\"]\n  mirrors = [%q]\n", mirror)
-		table(mirror, strings.HasPrefix(cfg.VM.RegistryMirror, "http://"))
+		// Only a plain-HTTP mirror needs a table; an https:// one keeps its
+		// certificate checked unless it is listed in vm.insecure_registries.
+		if strings.HasPrefix(cfg.VM.RegistryMirror, "http://") {
+			table(mirror, true)
+		}
 	}
 	for _, r := range cfg.VM.InsecureRegistries {
 		table(config.RegistryHost(r), strings.HasPrefix(r, "http://"))

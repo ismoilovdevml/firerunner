@@ -378,6 +378,16 @@ func cmdDoctor(cfg config.Config) error {
 	}
 	check("thin pool below 80%", err, "remove unused images or extend the flintlock volume group")
 
+	if cfg.Builder.Enabled && cfg.Builder.SavedCacheGB > 0 && host.ServiceActive("firerunner") {
+		// Hosts upgraded with `firerunner upgrade` alone keep an older unit.
+		out, _ := exec.Command("systemctl", "show", "firerunner", "-p", "ReadWritePaths", "--value").Output()
+		var err error
+		if !strings.Contains(string(out), "/var/lib/firerunner/builder-cache") {
+			err = errors.New("firerunner.service cannot write /var/lib/firerunner/builder-cache")
+		}
+		check("builder caches can be saved", err, "re-run install.sh (it updates the unit)")
+	}
+
 	fmt.Println("flintlock")
 	_, err = listVMs(cfg)
 	check("API "+cfg.Flintlock.Endpoint, err, "systemctl status flintlockd; token in "+cfg.Flintlock.TokenFile)
@@ -387,7 +397,7 @@ func cmdDoctor(cfg config.Config) error {
 	fmt.Println("GitLab runner")
 	if r, err := host.ReadRunner(); err != nil {
 		fmt.Println("  warn  not registered yet")
-		fmt.Println("        -> firerunner runner register --url <gitlab-url> --token <glrt-...>")
+		fmt.Println("        -> firerunner runner register --url <gitlab-url> --token -   # paste the glrt-... token")
 	} else {
 		var err error
 		if !host.ServiceActive("gitlab-runner") {
@@ -415,7 +425,8 @@ func cmdDoctor(cfg config.Config) error {
 		}
 		check("service firerunner-proxy", err, "journalctl -u firerunner-proxy -n 50")
 		up, err := proxy.LoadUpstream(cfg.Proxy.UpstreamFile)
-		check("upstream in "+cfg.Proxy.UpstreamFile, err, "echo 'http://user:password@proxy:port' > "+cfg.Proxy.UpstreamFile+"; chmod 600 it")
+		check("upstream in "+cfg.Proxy.UpstreamFile, err, "sudo install -m 600 /dev/null "+cfg.Proxy.UpstreamFile+
+			" && sudoedit "+cfg.Proxy.UpstreamFile+"   # one line: http://user:password@proxy:port")
 		if err == nil {
 			c, derr := net.DialTimeout("tcp", up.Addr, 3*time.Second)
 			if derr == nil {
@@ -809,11 +820,9 @@ func cmdUpgrade(args []string) error {
 			fmt.Println("firerunner.service restarted")
 		}
 		if host.ServiceActive("firerunner-proxy") {
-			// A restart drops open tunnels; clients (docker, curl) retry.
-			if err := exec.Command("systemctl", "restart", "firerunner-proxy").Run(); err != nil {
-				return fmt.Errorf("restarting firerunner-proxy.service: %w", err)
-			}
-			fmt.Println("firerunner-proxy.service restarted")
+			// A restart would cut every open tunnel (a clone, a pull) of running jobs.
+			fmt.Println("firerunner-proxy keeps running the previous build; restart it when no job runs:\n" +
+				"  sudo systemctl restart firerunner-proxy")
 		}
 	}
 	return nil
@@ -866,19 +875,49 @@ func cmdProxy(cfg config.Config) error {
 		return fmt.Errorf("proxy.listen: %w", err)
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
-	if _, err := proxy.LoadUpstream(cfg.Proxy.UpstreamFile); err != nil {
-		// Keep running: the file is read per connection, so fixing it needs no restart.
+	var deny []*net.IPNet
+	for _, d := range cfg.Network.EgressDeny {
+		n, err := config.ParseNet(d)
+		if err != nil {
+			return err
+		}
+		deny = append(deny, n)
+	}
+	// The upstream file is read for every connection, so fixing it needs no restart.
+	upstream := func() (proxy.Upstream, error) {
+		up, err := proxy.LoadUpstream(cfg.Proxy.UpstreamFile)
+		if err == nil && proxy.SelfLoop(up.Addr, port, localAddrs()) {
+			return proxy.Upstream{}, fmt.Errorf("upstream proxy %s is this forwarder itself: give a local proxy (CNTLM, px) another port than %s", up.Addr, port)
+		}
+		return up, err
+	}
+	if _, err := upstream(); err != nil {
 		log.Error("upstream proxy not usable yet", "err", err)
 	}
 	f := &proxy.Forwarder{
-		Upstream:    func() (proxy.Upstream, error) { return proxy.LoadUpstream(cfg.Proxy.UpstreamFile) },
-		Allowed:     proxy.AllowNets(bridge),
+		Upstream: upstream,
+		Allowed:  proxy.AllowNets(bridge),
+		Policy: &proxy.Policy{Bridge: bridge, Deny: deny, ConnectPorts: cfg.Proxy.ConnectPorts,
+			LocalAddrs: localAddrs},
+		Limits:      proxy.DefaultLimits,
 		Log:         log,
 		DialTimeout: 15 * time.Second,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return proxy.Serve(ctx, f, cfg.Proxy.Listen, net.JoinHostPort("127.0.0.1", port))
+}
+
+// localAddrs are the host's own addresses.
+func localAddrs() []net.IP {
+	addrs, _ := net.InterfaceAddrs()
+	var out []net.IP
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok {
+			out = append(out, n.IP)
+		}
+	}
+	return out
 }
 
 // proxyConnect opens a CONNECT tunnel to target through the local forwarder.

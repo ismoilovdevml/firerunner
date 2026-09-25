@@ -142,13 +142,20 @@ func ReadCA(cfg config.Config) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("vm.ca_file: %w", err)
 	}
+	// Only the certificates go to microVMs: a key pasted into the same file by
+	// mistake must not end up in every VM's user-data.
+	var out []byte
 	for rest := data; ; {
 		var b *pem.Block
 		if b, rest = pem.Decode(rest); b == nil {
-			return "", fmt.Errorf("vm.ca_file %s holds no PEM certificate", cfg.VM.CAFile)
+			break
 		}
 		if b.Type == "CERTIFICATE" {
-			return string(data), nil
+			out = append(out, pem.EncodeToMemory(&pem.Block{Type: b.Type, Bytes: b.Bytes})...)
 		}
 	}
+	if len(out) == 0 {
+		return "", fmt.Errorf("vm.ca_file %s holds no PEM certificate", cfg.VM.CAFile)
+	}
+	return string(out), nil
 }

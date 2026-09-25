@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -442,7 +443,9 @@ func proxySpec(c config.Config) string {
 		s += fmt.Sprintf("|proxy:%s/%s", c.Proxy.Listen, c.Proxy.NoProxy)
 	}
 	if c.VM.CAFile != "" {
-		s += "|ca:" + c.VM.CAFile
+		// The content, not the path: a rotated CA at the same path must reach
+		// pool VMs and builders too.
+		s += "|ca:" + caDigest(c.VM.CAFile)
 	}
 	if len(c.VM.InsecureRegistries) > 0 {
 		s += fmt.Sprintf("|insecure:%v", c.VM.InsecureRegistries)
@@ -1177,3 +1180,30 @@ func (d *Daemon) collectHost(ctx context.Context) {
 		d.oomKills = n
 	}
 }
+
+// caDigest is a short hash of the CA file, recomputed only when the file's
+// size or modification time changes (fingerprint runs on every claim).
+func caDigest(path string) string {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return path + "?"
+	}
+	stamp := fmt.Sprintf("%s|%d|%d", path, fi.Size(), fi.ModTime().UnixNano())
+	caDigestMu.Lock()
+	defer caDigestMu.Unlock()
+	if caDigestStamp == stamp {
+		return caDigestValue
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return path + "?"
+	}
+	sum := sha256.Sum256(data)
+	caDigestStamp, caDigestValue = stamp, hex.EncodeToString(sum[:8])
+	return caDigestValue
+}
+
+var (
+	caDigestMu                   sync.Mutex
+	caDigestStamp, caDigestValue string
+)

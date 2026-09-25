@@ -651,3 +651,42 @@ func TestBuildkitScriptCorporateNetwork(t *testing.T) {
 		t.Fatalf("mirror table %d times: buildkitd refuses duplicate TOML tables", n)
 	}
 }
+
+// An https:// mirror keeps its certificate checked: only a plain-HTTP mirror
+// and vm.insecure_registries get tables.
+func TestBuildkitdTOMLHTTPSMirror(t *testing.T) {
+	cfg := config.Default()
+	cfg.VM.RegistryMirror = "https://mirror.corp:5000"
+	if s := buildkitdTOML(cfg); strings.Contains(s, "insecure") || strings.Contains(s, "http = true") || !strings.Contains(s, `mirrors = ["mirror.corp:5000"]`) {
+		t.Fatalf("https mirror:\n%s", s)
+	}
+	cfg.VM.InsecureRegistries = []string{"mirror.corp:5000"}
+	if s := buildkitdTOML(cfg); !strings.Contains(s, "[registry.\"mirror.corp:5000\"]\n  insecure = true") {
+		t.Fatalf("https mirror listed as insecure:\n%s", s)
+	}
+}
+
+// A CA rotated in place changes the fingerprint, so pool VMs and builders
+// with the old CA are replaced.
+func TestFingerprintFollowsCAContent(t *testing.T) {
+	cfg := config.Default()
+	cfg.VM.CAFile = filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(cfg.VM.CAFile, []byte("old CA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before, bspec := fingerprint(cfg), builderSpec(cfg)
+	if fingerprint(cfg) != before {
+		t.Fatal("fingerprint not stable")
+	}
+	if err := os.WriteFile(cfg.VM.CAFile, []byte("new CA, other size"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if fingerprint(cfg) == before || builderSpec(cfg) == bspec {
+		t.Fatal("a new CA at the same path does not replace VMs or builders")
+	}
+	// No CA, no proxy, no insecure registries: the v0.1.0 fingerprint.
+	plain := config.Default()
+	if strings.Contains(fingerprint(plain), "|") || strings.Contains(builderSpec(plain), "|ca:") {
+		t.Fatalf("defaults changed the fingerprint: %s / %s", fingerprint(plain), builderSpec(plain))
+	}
+}

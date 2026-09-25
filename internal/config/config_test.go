@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -162,5 +163,75 @@ func TestProxyValidation(t *testing.T) {
 	off.Proxy.Listen = "nonsense"
 	if err := off.Validate(); err != nil {
 		t.Fatalf("proxy off: %v", err)
+	}
+}
+
+// A config written by this version stays loadable by v0.1.0 and older while
+// the newer settings are unused: those binaries refuse unknown keys.
+func TestSaveLeavesOutUnusedNewKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := Default()
+	cfg.Pool.Size = 3
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	for _, key := range []string{"proxy:", "ca_file:", "insecure_registries:", "egress_deny:"} {
+		if strings.Contains(string(data), key) {
+			t.Errorf("unused %s written:\n%s", key, data)
+		}
+	}
+	got, err := Load(path)
+	if err != nil || got.Pool.Size != 3 || got.Proxy.Listen != "10.200.0.1:3128" || len(got.Proxy.ConnectPorts) != 1 {
+		t.Fatalf("reload: %+v %v", got.Proxy, err)
+	}
+	if entries, _ := os.ReadDir(filepath.Dir(path)); len(entries) != 1 {
+		t.Fatalf("temp files left: %v", entries)
+	}
+	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o644 {
+		t.Fatalf("mode %v", fi.Mode().Perm())
+	}
+
+	cfg.Proxy.Enabled = true
+	cfg.VM.CAFile = "/etc/firerunner/ca.pem"
+	cfg.Network.EgressDeny = []string{"192.168.0.0/16"}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(path)
+	for _, key := range []string{"proxy:", "ca_file:", "egress_deny:"} {
+		if !strings.Contains(string(data), key) {
+			t.Errorf("used %s not written", key)
+		}
+	}
+	if got, err := Load(path); err != nil || !got.Proxy.Enabled || got.Network.EgressDeny[0] != "192.168.0.0/16" {
+		t.Fatalf("reload with proxy: %+v %v", got, err)
+	}
+}
+
+// Values end up in systemd units (where %h expands), shell scripts, TOML and
+// nft: only plain host, domain, CIDR and port characters are accepted.
+func TestCorporateValuesAllowList(t *testing.T) {
+	for name, mutate := range map[string]func(*Config){
+		"systemd specifier in no_proxy": func(c *Config) { c.Proxy.NoProxy = "a%h.corp" },
+		"hash in no_proxy":              func(c *Config) { c.Proxy.NoProxy = "a#b" },
+		"pipe in no_proxy":              func(c *Config) { c.Proxy.NoProxy = "a|b&c" },
+		"control char in registry":      func(c *Config) { c.VM.InsecureRegistries = []string{"harbor\x01:443"} },
+		"bad egress_deny":               func(c *Config) { c.Network.EgressDeny = []string{"10.0.0.0/33"} },
+		"proxy port other than 3128":    func(c *Config) { c.Proxy.Enabled = true; c.Proxy.Listen = "10.200.0.1:3129" },
+		"connect port 0":                func(c *Config) { c.Proxy.Enabled = true; c.Proxy.ConnectPorts = []int{0} },
+	} {
+		c := Default()
+		mutate(&c)
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	ok := Default()
+	ok.Proxy.NoProxy = "gitlab.corp,.corp,*.corp,10.0.0.0/8,fd00::/8,host_1"
+	ok.VM.InsecureRegistries = []string{"harbor.corp:443", "http://10.0.0.5:5000", "registry"}
+	ok.Network.EgressDeny = []string{"192.168.0.0/16", "10.1.2.3"}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("valid values refused: %v", err)
 	}
 }

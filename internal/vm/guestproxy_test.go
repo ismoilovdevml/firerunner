@@ -226,3 +226,19 @@ func TestInsecureRegistries(t *testing.T) {
 		t.Fatalf("insecure-registries = %s", got)
 	}
 }
+
+// Only certificates from vm.ca_file reach microVMs: a key concatenated into
+// the same file by mistake stays on the host.
+func TestReadCAKeepsOnlyCertificates(t *testing.T) {
+	cfg := config.Default()
+	cfg.VM.CAFile = filepath.Join(t.TempDir(), "bundle.pem")
+	pemCA := testCA(t)
+	key := "-----BEGIN PRIVATE KEY-----\nc2VjcmV0\n-----END PRIVATE KEY-----\n"
+	if err := os.WriteFile(cfg.VM.CAFile, []byte("comment\n"+key+pemCA), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ca, err := ReadCA(cfg)
+	if err != nil || strings.Contains(ca, "PRIVATE KEY") || strings.Contains(ca, "comment") || !strings.Contains(ca, "BEGIN CERTIFICATE") {
+		t.Fatalf("ReadCA = %q, %v", ca, err)
+	}
+}

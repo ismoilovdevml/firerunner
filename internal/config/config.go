@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -38,7 +39,8 @@ type Config struct {
 
 // Proxy sends the internet traffic of microVMs through a corporate HTTP proxy.
 // microVMs never see the corporate proxy or its password: they use a small
-// forwarder the daemon runs on the bridge address, which adds the credentials.
+// forwarder on the bridge address (the firerunner-proxy service, `firerunner
+// proxy`), which adds the credentials.
 type Proxy struct {
 	// Enabled turns the forwarder on and points microVMs and builders at it.
 	Enabled bool `yaml:"enabled"`
@@ -52,7 +54,12 @@ type Proxy struct {
 	// microVMs reach directly, comma-separated: an internal GitLab or registry.
 	// Local addresses (the bridge, Docker networks in the VM, localhost) are always added.
 	NoProxy string `yaml:"no_proxy"`
+	// ConnectPorts are the ports CONNECT tunnels (https) may go to.
+	ConnectPorts []int `yaml:"connect_ports"`
 }
+
+// ProxyPort is the forwarder's port; install.sh opens it in the firewall.
+const ProxyPort = "3128"
 
 // Builder is a long-lived microVM per GitLab project that runs BuildKit, so
 // `docker build` in jobs of that project reuses the layer cache of earlier jobs
@@ -61,7 +68,8 @@ type Builder struct {
 	Enabled  bool `yaml:"enabled"`
 	VCPU     int  `yaml:"vcpu"`
 	MemoryMB int  `yaml:"memory_mb"`
-	// Max builders kept at once; the least recently used one is replaced.
+	// Max builders kept at once. A new project's builder takes the slot of the
+	// least recently used one that no job uses and that was idle 10 minutes.
 	Max int `yaml:"max"`
 	// IdleTTL deletes a builder after this long without a job.
 	IdleTTL time.Duration `yaml:"idle_ttl"`
@@ -128,6 +136,9 @@ type VM struct {
 type Network struct {
 	LeasesFile string `yaml:"leases_file"`
 	SSHKey     string `yaml:"ssh_key"`
+	// EgressDeny are networks (CIDRs) jobs must not reach, directly or through
+	// the proxy forwarder; install.sh (FR_EGRESS_DENY) also puts them in the firewall.
+	EgressDeny []string `yaml:"egress_deny"`
 }
 
 func Default() Config {
@@ -160,8 +171,9 @@ func Default() Config {
 			SSHKey:     "/etc/firerunner/executor/id_ed25519",
 		},
 		Proxy: Proxy{
-			Listen:       "10.200.0.1:3128",
+			Listen:       "10.200.0.1:" + ProxyPort,
 			UpstreamFile: "/etc/firerunner/proxy-upstream",
+			ConnectPorts: []int{443},
 		},
 		Builder: Builder{
 			Enabled:      true,
@@ -249,8 +261,13 @@ func (c Config) Validate() error {
 		errs = append(errs, "vm.docker_address_pool must be a CIDR like 10.202.0.0/16")
 	}
 	for _, r := range c.VM.InsecureRegistries {
-		if h := strings.TrimPrefix(r, "http://"); h == "" || strings.ContainsAny(h, "/ \t\r\n'\"\\$`;[]=") {
+		if !registryEntry.MatchString(r) {
 			errs = append(errs, fmt.Sprintf("vm.insecure_registries entry %q must be host:port or http://host:port", r))
+		}
+	}
+	for _, d := range c.Network.EgressDeny {
+		if _, err := ParseNet(d); err != nil {
+			errs = append(errs, fmt.Sprintf("network.egress_deny entry %q is not an IP address or CIDR", d))
 		}
 	}
 	if c.VM.HostReserveMB < 0 {
@@ -290,16 +307,21 @@ func (c Config) Validate() error {
 		errs = append(errs, "builder.cache_mb must be at least 1000")
 	}
 	if c.Proxy.Enabled {
-		if host, port, err := net.SplitHostPort(c.Proxy.Listen); err != nil || net.ParseIP(host).To4() == nil || port == "" {
-			errs = append(errs, "proxy.listen must be the bridge address and a port, like 10.200.0.1:3128")
+		if host, port, err := net.SplitHostPort(c.Proxy.Listen); err != nil || net.ParseIP(host).To4() == nil || port != ProxyPort {
+			errs = append(errs, "proxy.listen must be the bridge address and port "+ProxyPort+", like 10.200.0.1:"+ProxyPort)
 		}
 		if c.Proxy.UpstreamFile == "" {
 			errs = append(errs, "proxy.upstream_file is required when the proxy is enabled")
 		}
-		for _, e := range SplitNoProxy(c.Proxy.NoProxy) {
-			if strings.ContainsAny(e, " \t\r\n'\"\\$`;=") {
-				errs = append(errs, fmt.Sprintf("proxy.no_proxy entry %q is not a host, domain or CIDR", e))
+		for _, p := range c.Proxy.ConnectPorts {
+			if p < 1 || p > 65535 {
+				errs = append(errs, fmt.Sprintf("proxy.connect_ports entry %d is not a port", p))
 			}
+		}
+	}
+	for _, e := range SplitNoProxy(c.Proxy.NoProxy) {
+		if !noProxyEntry.MatchString(e) {
+			errs = append(errs, fmt.Sprintf("proxy.no_proxy entry %q is not a host, .domain or CIDR", e))
 		}
 	}
 	if c.Builder.SavedCacheGB < 0 {
@@ -319,18 +341,93 @@ func Save(path string, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	data, err := yaml.Marshal(cfg)
+	m, err := toMap(cfg)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	pruneUnused(m, cfg)
+	data, err := yaml.Marshal(m)
+	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	// A crash leaves either the old or the new file, never a torn one.
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(f.Name(), 0o644)
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), path)
+	}
+	if err != nil {
+		return err
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
+}
+
+// pruneUnused leaves out settings added after v0.1.0 while they are unused,
+// so a host can still roll back to an older binary, which refuses keys it
+// does not know. Loading fills them from the defaults again.
+func pruneUnused(m map[string]any, cfg Config) {
+	def := Default().Proxy
+	p := cfg.Proxy
+	if !p.Enabled && p.Listen == def.Listen && p.UpstreamFile == def.UpstreamFile && p.NoProxy == "" &&
+		fmt.Sprint(p.ConnectPorts) == fmt.Sprint(def.ConnectPorts) {
+		delete(m, "proxy")
+	}
+	if vm, ok := m["vm"].(map[string]any); ok {
+		if cfg.VM.CAFile == "" {
+			delete(vm, "ca_file")
+		}
+		if len(cfg.VM.InsecureRegistries) == 0 {
+			delete(vm, "insecure_registries")
+		}
+	}
+	if nw, ok := m["network"].(map[string]any); ok && len(cfg.Network.EgressDeny) == 0 {
+		delete(nw, "egress_deny")
+	}
+}
+
+var (
+	// noProxyEntry: host, .domain, *.domain, IP, CIDR (no characters systemd,
+	// the shell or TOML would read specially).
+	noProxyEntry = regexp.MustCompile(`^[A-Za-z0-9*][A-Za-z0-9.*:_-]*(/[0-9]{1,3})?$|^\.[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	// registryEntry: host[:port] or http://host[:port].
+	registryEntry = regexp.MustCompile(`^(http://)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`)
+)
+
+// ParseNet reads a CIDR or a single IP address.
+func ParseNet(s string) (*net.IPNet, error) {
+	if _, n, err := net.ParseCIDR(s); err == nil {
+		return n, nil
+	}
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return nil, fmt.Errorf("%q is not an IP address or CIDR", s)
+	}
+	bits := 128
+	if ip.To4() != nil {
+		ip, bits = ip.To4(), 32
+	}
+	return &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}, nil
 }
 
 // Keys lists every settable key in dotted form, e.g. "vm.vcpu".
