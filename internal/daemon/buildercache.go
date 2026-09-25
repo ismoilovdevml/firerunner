@@ -276,10 +276,10 @@ func (d *Daemon) makeRoomForCache(project string, size, limit, reserved int64) e
 
 // restoreBuilderCache loads the project's saved cache into a new builder VM
 // before buildkitd starts, and reports whether it did. A copy that tar or the
-// completeness check refuses is deleted, so it is not tried again; one that
-// failed on the way (the SSH connection) is kept. After a failed load the
-// volume is removed, so buildkitd starts empty; err means the VM may still
-// hold part of a cache and must not be used.
+// completeness check refuses is deleted, so it is not tried again, and the
+// volume is removed so buildkitd starts empty. A load that failed on the way
+// (the SSH connection, a timeout) keeps the copy and returns an error: the VM
+// may hold part of a cache and is not used, and the next builder retries.
 func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, project string, inst *vm.Instance) (bool, error) {
 	file := builderCacheFile(project)
 	f, err := os.Open(file)
@@ -301,15 +301,13 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 		d.metrics.builderCache.WithLabelValues("restore", "failed").Inc()
 		// Only the VM's own verdict (tar or the marker check: exit 1..254) says the
 		// copy is bad. 255 is ssh failing, -1 ssh killed (e.g. by the OOM killer).
-		if code := exitCode(err); lctx.Err() == nil && code > 0 && code != 255 {
-			_ = os.Remove(file)
-			d.log.Warn("saved builder cache refused and deleted, starting empty", "project", project, "err", err)
-		} else {
-			d.log.Warn("saved builder cache not restored (kept for the next builder)", "project", project, "err", err)
+		if code := exitCode(err); lctx.Err() != nil || code <= 0 || code == 255 {
+			// The copy may be fine. A builder started empty would, once deleted,
+			// save its empty cache over it: fail this boot, the next one retries.
+			return false, fmt.Errorf("saved builder cache not restored (kept, the next builder retries it): %w", err)
 		}
-		if ctx.Err() != nil {
-			return false, ctx.Err()
-		}
+		_ = os.Remove(file)
+		d.log.Warn("saved builder cache refused and deleted, starting empty", "project", project, "err", err)
 		wctx, wcancel := context.WithTimeout(ctx, time.Minute)
 		defer wcancel()
 		if werr := builderCacheWipe(wctx, cfg, inst); werr != nil {

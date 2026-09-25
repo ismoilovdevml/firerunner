@@ -486,24 +486,26 @@ func TestRestoreFailures(t *testing.T) {
 
 	writeFile(t, file, "copy", time.Hour)
 	loadErr = fmt.Errorf("stream: %w", exitErr(t, 255))
-	if ok, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", inst); ok || err != nil {
-		t.Fatalf("ssh drop: %v, %v", ok, err)
+	if ok, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", inst); ok || err == nil {
+		t.Fatalf("ssh drop: %v, %v; want an error, so the boot fails and the next one retries", ok, err)
 	}
-	if readFile(t, file) != "copy" || wipes != 1 {
-		t.Fatalf("ssh drop: copy %q, wipes %d; want the copy kept and the volume wiped", readFile(t, file), wipes)
+	if readFile(t, file) != "copy" {
+		t.Fatalf("ssh drop: copy %q, want it kept", readFile(t, file))
 	}
 
+	// tar or the marker check refused it: deleted, volume wiped, start empty.
+	loadErr = fmt.Errorf("stream: %w", exitErr(t, 1))
 	wipeErr = errors.New("ssh: no route")
 	if _, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", inst); err == nil {
 		t.Fatal("volume could not be wiped, but the builder was declared usable")
 	}
-
-	wipeErr, loadErr = nil, fmt.Errorf("stream: %w", exitErr(t, 1)) // tar or marker refused it
-	if _, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", inst); err != nil {
-		t.Fatal(err)
+	writeFile(t, file, "copy", time.Hour)
+	wipeErr = nil
+	if ok, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", inst); ok || err != nil {
+		t.Fatalf("refused copy: %v, %v; want false, nil (start empty)", ok, err)
 	}
-	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("refused copy kept")
+	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) || wipes != 2 {
+		t.Fatalf("refused copy kept or volume not wiped (wipes %d)", wipes)
 	}
 }
 
