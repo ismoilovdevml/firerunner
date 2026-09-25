@@ -348,6 +348,87 @@ func TestRunStoppedByCancelIsRecordedAsCanceled(t *testing.T) {
 	}
 }
 
+// ssh passes on the remote exit code, so 255 is also a script whose last
+// command was a failed `ssh deploy@host`. Only a microVM that no longer
+// answers makes it a lost connection (a system failure GitLab may retry).
+func TestRunExit255IsLostOnlyWhenTheVMIsGone(t *testing.T) {
+	oldProbe := probeTimeout
+	probeTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { probeTimeout = oldProbe })
+	for _, c := range []struct {
+		name, stage, probe string
+		code               int // exit code Run returns
+		result, reason     string
+		probed             bool
+	}{
+		{"script exits 255, VM answers", "step_script", "exit 0", 1, daemon.ResultScriptFailure, "", true},
+		{"build_script exits 255, VM answers", "build_script", "exit 0", 1, daemon.ResultScriptFailure, "", true},
+		{"VM gone", "step_script", "exit 255", 2, daemon.ResultSystemFailure, "ssh_lost", true},
+		{"VM hangs", "step_script", "exec sleep 30", 2, daemon.ResultSystemFailure, "ssh_lost", true},
+		{"after_script exits 255, VM answers", "after_script", "exit 0", 1, daemon.ResultSuccess, "", true},
+		{"helper stage: no probe", "get_sources", "exit 0", 2, daemon.ResultSystemFailure, "ssh_lost", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			probes := filepath.Join(t.TempDir(), "probes")
+			cfg, script := runFixture(t, `for last; do :; done
+if [ "$last" = true ]; then
+    echo probe >> `+probes+`
+    `+c.probe+`
+fi
+cat >/dev/null
+exit 255
+`)
+			start := time.Now()
+			err := Run(context.Background(), cfg, script, c.stage)
+			var e *ExitError
+			if !errors.As(err, &e) || e.Code != c.code {
+				t.Fatalf("Run = %v, want exit %d", err, c.code)
+			}
+			if took := time.Since(start); took > 5*time.Second {
+				t.Fatalf("Run took %s: the probe is not bounded", took)
+			}
+			if r, why := jobResult(t); r != c.result || why != c.reason {
+				t.Fatalf("recorded %s/%s, want %s/%s", r, why, c.result, c.reason)
+			}
+			if _, err := os.Stat(probes); (err == nil) != c.probed {
+				t.Fatalf("probed = %v, want %v", err == nil, c.probed)
+			}
+		})
+	}
+}
+
+// gitlab-runner's SIGTERM also ends the stage's ssh with 255; a cancel that
+// arrives while the VM is probed is still a cancel, not a lost VM that pages.
+func TestRunCancelledWhileProbingIsCanceled(t *testing.T) {
+	probes := filepath.Join(t.TempDir(), "probes")
+	cfg, script := runFixture(t, `for last; do :; done
+if [ "$last" = true ]; then
+    echo probe >> `+probes+`
+    exec sleep 30
+fi
+cat >/dev/null
+exit 255
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for ctx.Err() == nil {
+			if _, err := os.Stat(probes); err == nil {
+				cancel()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	var e *ExitError
+	if err := Run(ctx, cfg, script, "step_script"); !errors.As(err, &e) || e.Code != 2 {
+		t.Fatalf("Run = %v, want a system failure exit", err)
+	}
+	if r, why := jobResult(t); r != daemon.ResultSystemFailure || why != "canceled" {
+		t.Fatalf("recorded %s/%s, want system_failure/canceled", r, why)
+	}
+}
+
 // A job cancelled before its stage started runs nothing in the VM.
 func TestRunAfterCancelStartsNoSession(t *testing.T) {
 	ran := filepath.Join(t.TempDir(), "ran")

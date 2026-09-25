@@ -26,22 +26,25 @@ func TestStageOutcome(t *testing.T) {
 	for _, c := range []struct {
 		stage          string
 		code           int
+		lost           bool
 		err            error
 		result, reason string
 	}{
-		{"build_script", 0, nil, daemon.ResultSuccess, ""},
-		{"step_script", 1, nil, daemon.ResultScriptFailure, ""},
-		{"build_script", 2, nil, daemon.ResultScriptFailure, ""},
-		{"after_script", 1, nil, daemon.ResultSuccess, ""}, // GitLab ignores it
-		{"build_script", 255, nil, daemon.ResultSystemFailure, "ssh_lost"},
-		{"get_sources", 255, nil, daemon.ResultSystemFailure, "ssh_lost"},
-		{"get_sources", 128, nil, daemon.ResultSystemFailure, "helper_stage"},
-		{"upload_artifacts_on_success", 1, nil, daemon.ResultSystemFailure, "helper_stage"},
-		{"build_script", -1, errors.New("exec: ssh not found"), daemon.ResultSystemFailure, "other"},
+		{"build_script", 0, false, nil, daemon.ResultSuccess, ""},
+		{"step_script", 1, false, nil, daemon.ResultScriptFailure, ""},
+		{"build_script", 2, false, nil, daemon.ResultScriptFailure, ""},
+		{"after_script", 1, false, nil, daemon.ResultSuccess, ""}, // GitLab ignores it
+		{"build_script", 255, true, nil, daemon.ResultSystemFailure, "ssh_lost"},
+		{"step_script", 255, false, nil, daemon.ResultScriptFailure, ""}, // the script's own 255
+		{"after_script", 255, false, nil, daemon.ResultSuccess, ""},
+		{"get_sources", 255, true, nil, daemon.ResultSystemFailure, "ssh_lost"},
+		{"get_sources", 128, false, nil, daemon.ResultSystemFailure, "helper_stage"},
+		{"upload_artifacts_on_success", 1, false, nil, daemon.ResultSystemFailure, "helper_stage"},
+		{"build_script", -1, false, errors.New("exec: ssh not found"), daemon.ResultSystemFailure, "other"},
 	} {
-		result, reason := stageOutcome(c.stage, c.code, c.err)
+		result, reason := stageOutcome(c.stage, c.code, c.lost, c.err)
 		if result != c.result || reason != c.reason {
-			t.Errorf("stageOutcome(%s, %d, %v) = %s/%s, want %s/%s", c.stage, c.code, c.err, result, reason, c.result, c.reason)
+			t.Errorf("stageOutcome(%s, %d, lost %v, %v) = %s/%s, want %s/%s", c.stage, c.code, c.lost, c.err, result, reason, c.result, c.reason)
 		}
 	}
 }

@@ -398,6 +398,11 @@ func Run(ctx context.Context, cfg config.Config, script, stage string) error {
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = script, os.Stdout, os.Stderr
 		code, err = runSSH(ctx, cmd)
 	}
+	// ssh exits 255 when the connection fails, but it also passes on a script's
+	// own 255 (e.g. its last command was a failed `ssh deploy@host`). For the
+	// job's own stages the microVM is asked whether it still answers; any other
+	// stage that fails is a system failure either way.
+	lost := err == nil && code == 255 && (!isUserStage(stage) || !vmAnswers(ctx, cfg, &st.Instance))
 	if ctx.Err() != nil {
 		// Neither the script's failure nor FireRunner's: the alerts leave
 		// "canceled" out. Without it cleanup would report a success.
@@ -405,7 +410,7 @@ func Run(ctx context.Context, cfg config.Config, script, stage string) error {
 		_ = vm.SaveJobState(statePath(id), st)
 		return systemFailure(fmt.Errorf("stage %s stopped: the job was cancelled or timed out", stage))
 	}
-	if result, reason := stageOutcome(stage, code, err); result != daemon.ResultSuccess && st.Result == "" {
+	if result, reason := stageOutcome(stage, code, lost, err); result != daemon.ResultSuccess && st.Result == "" {
 		recordFailure(st, result, reason)
 		_ = vm.SaveJobState(statePath(id), st)
 	}
@@ -414,7 +419,7 @@ func Run(ctx context.Context, cfg config.Config, script, stage string) error {
 		return systemFailure(err)
 	case code == 0:
 		return nil
-	case code == 255: // ssh itself failed: the microVM is gone or unreachable
+	case lost: // ssh itself failed: the microVM is gone or unreachable
 		return systemFailure(fmt.Errorf("lost SSH connection to microVM %s", id))
 	case isUserStage(stage):
 		return buildFailure(fmt.Errorf("stage %s exited with %d", stage, code))
@@ -446,6 +451,19 @@ func runInContainer(ctx context.Context, cfg config.Config, inst *vm.Instance, i
 	cmd := vm.SSH(cfg, inst, ContainerCommand(image, network, extra...))
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = script, os.Stdout, os.Stderr
 	return runSSH(ctx, cmd)
+}
+
+// probeTimeout bounds vmAnswers (a variable for tests). ConnectTimeout does not
+// cover it: through the job's shared connection, a dead VM is only noticed by
+// the master's keepalives (ServerAliveInterval).
+var probeTimeout = 10 * time.Second
+
+// vmAnswers reports whether the microVM still runs commands over SSH.
+func vmAnswers(ctx context.Context, cfg config.Config, inst *vm.Instance) bool {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	code, err := runSSH(ctx, vm.SSH(cfg, inst, "true"))
+	return err == nil && code == 0
 }
 
 // sshStopGrace is how long a stopped session's ssh may take to exit before it

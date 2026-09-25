@@ -16,14 +16,15 @@ var errNoMemory = errors.New("no host memory")
 
 // stageOutcome classifies a finished stage for the daemon's job metrics: did
 // the job's own commands fail, or did FireRunner (or the host) fail the job?
-func stageOutcome(stage string, code int, err error) (result, reason string) {
+// lost is an exit code 255 that came from ssh itself, not from the script.
+func stageOutcome(stage string, code int, lost bool, err error) (result, reason string) {
 	switch {
 	case err != nil:
 		return daemon.ResultSystemFailure, "other" // ssh could not even start
+	case lost:
+		return daemon.ResultSystemFailure, "ssh_lost" // the VM is gone or unreachable
 	case code == 0:
 		return daemon.ResultSuccess, ""
-	case code == 255:
-		return daemon.ResultSystemFailure, "ssh_lost" // the VM is gone or unreachable
 	case stage == "after_script":
 		// GitLab ignores after_script's exit code; so do the metrics.
 		return daemon.ResultSuccess, ""
