@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"net"
@@ -173,7 +174,8 @@ func TestBuilderRequest(t *testing.T) {
 		}
 	}
 	// First request starts a builder on the first port and already hands out its
-	// port and client credentials; later ones see it booting with the same ones.
+	// port and client credentials; later ones see it booting with the same port
+	// and CA, each with a client certificate of its own.
 	first := d.Builder("7", true)
 	if first.State != BuilderBooting || first.Port != d.cfg.Builder.PortBase+1 || first.Key == "" || first.CA == "" {
 		t.Fatalf("first request = %+v", first)
@@ -181,10 +183,11 @@ func TestBuilderRequest(t *testing.T) {
 	if b := d.builders["7"]; b == nil || b.Port != d.cfg.Builder.PortBase+1 || b.ready {
 		t.Fatalf("builder entry = %+v", b)
 	}
-	if got := d.Builder("7", true); got.State != BuilderBooting || got.Key != first.Key {
+	if got := d.Builder("7", true); got.State != BuilderBooting || got.Port != first.Port || got.CA != first.CA || got.Key == first.Key {
 		t.Fatalf("second request = %+v", got)
 	}
-	// Once ready the job gets the port and the client credentials.
+	// Once ready the job gets the port and the client credentials (a builder
+	// recorded without its CA key: its one shared certificate).
 	d.builders["7"] = readyBuilder("7", d.cfg.Builder.PortBase+1, 0, builderSpec(d.cfg))
 	if got := d.Builder("7", true); got.State != BuilderReady || got.Port != d.cfg.Builder.PortBase+1 || got.Key != "key" {
 		t.Fatalf("ready request = %+v", got)
@@ -1334,5 +1337,98 @@ func TestBuilderSweepWithoutTheMapIsQuiet(t *testing.T) {
 	}
 	if err := d.mapBuilderPorts(builder{Project: "1", Port: 20001, Instance: vm.Instance{IP: "10.200.0.1"}}); err == nil {
 		t.Fatal("a builder that needs its mapping got no error")
+	}
+}
+
+// Each job gets its own client certificate, signed by its project's builder
+// CA and valid only about as long as a job may run: a job that copies it
+// cannot use the builder later. It is accepted by that builder, not by
+// another project's.
+func TestEachJobGetsItsOwnShortLivedClientCert(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	d, _ := newTestDaemon(t)
+	a, b := d.Builder("7", true), d.Builder("7", true)
+	other := d.Builder("8", true)
+	if a.Cert == "" || a.Cert == b.Cert || a.Key == b.Key {
+		t.Fatalf("two jobs share a client certificate")
+	}
+	pair, err := tls.X509KeyPair([]byte(a.Cert), []byte(a.Key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	maxAge := d.cfg.Daemon.JobMaxAge + jobCertSlack
+	if left := time.Until(leaf.NotAfter); left > maxAge || left < maxAge-time.Minute {
+		t.Fatalf("client certificate valid for %s more, want about %s", left, maxAge)
+	}
+
+	// A TLS connection to project 7's builder server certificate, over
+	// loopback TCP (a synchronous net.Pipe deadlocks on TLS 1.3 alerts). The
+	// server says "ok" once it accepted the client certificate.
+	handshake := func(serverProject string, client BuilderInfo) error {
+		creds := d.builders[serverProject].creds
+		srvPair, err := tls.X509KeyPair([]byte(creds.serverCert), []byte(creds.serverKey))
+		if err != nil {
+			return err
+		}
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM([]byte(creds.caPEM))
+		cPair, err := tls.X509KeyPair([]byte(client.Cert), []byte(client.Key))
+		if err != nil {
+			return err
+		}
+		l, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{srvPair},
+			ClientCAs: pool, ClientAuth: tls.RequireAndVerifyClientCert, SessionTicketsDisabled: true})
+		if err != nil {
+			return err
+		}
+		defer l.Close()
+		go func() {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			if c.(*tls.Conn).Handshake() == nil {
+				_, _ = c.Write([]byte("ok"))
+			}
+		}()
+		c, err := tls.Dial("tcp", l.Addr().String(), &tls.Config{Certificates: []tls.Certificate{cPair}, RootCAs: pool, ServerName: BuilderServerName})
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, 2)
+		if _, err := io.ReadFull(c, buf); err != nil {
+			return err
+		}
+		if string(buf) != "ok" {
+			return fmt.Errorf("server said %q", buf)
+		}
+		return nil
+	}
+	if err := handshake("7", a); err != nil {
+		t.Fatalf("project 7's builder refused its job's certificate: %v", err)
+	}
+	if err := handshake("7", other); err == nil {
+		t.Fatal("project 7's builder accepted a certificate of project 8's builder")
+	}
+
+	// Recorded with its CA key, so a restarted daemon signs for its jobs too.
+	d.mu.Lock()
+	d.buildersAdopted = true
+	d.builders["7"].ready = true
+	d.saveBuildersLocked()
+	d.mu.Unlock()
+	data, err := os.ReadFile(d.buildersFile())
+	if err != nil || !strings.Contains(string(data), `"ca_key"`) {
+		t.Fatalf("builders.json lacks the CA key: %v", err)
+	}
+	if fi, err := os.Stat(d.buildersFile()); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("builders.json mode: %v %v", fi, err)
 	}
 }

@@ -70,9 +70,13 @@ type builder struct {
 	CA       string      `json:"ca"`
 	Cert     string      `json:"cert"`
 	Key      string      `json:"key"`
-	SpecID   string      `json:"spec_id"`
-	BornAt   time.Time   `json:"born_at"`
-	LastUsed time.Time   `json:"last_used"`
+	// CAKey signs a client certificate for each job (jobCredsLocked). Cert
+	// and Key are the one client certificate of builders recorded before
+	// that; such a builder hands it to every job until it is replaced.
+	CAKey    string    `json:"ca_key,omitempty"`
+	SpecID   string    `json:"spec_id"`
+	BornAt   time.Time `json:"born_at"`
+	LastUsed time.Time `json:"last_used"`
 	// Unsaved marks a record of a removed builder whose cache copy the
 	// daemon's stop cut off: its VM was kept, and the next run copies the
 	// cache and deletes it. It is when the builder was removed.
@@ -178,15 +182,16 @@ func (d *Daemon) Builder(project string, start bool) BuilderInfo {
 		// minute instead of writing builders.json for every job.
 		persist := time.Since(b.LastUsed) > time.Minute
 		b.LastUsed = time.Now()
+		cert, key := d.jobCredsLocked(b)
 		if !b.ready {
 			d.metrics.builderRequests.WithLabelValues(BuilderBooting).Inc()
-			return BuilderInfo{State: BuilderBooting, Port: b.Port, CA: b.CA, Cert: b.Cert, Key: b.Key}
+			return BuilderInfo{State: BuilderBooting, Port: b.Port, CA: b.CA, Cert: cert, Key: key}
 		}
 		if persist {
 			d.saveBuildersLocked()
 		}
 		d.metrics.builderRequests.WithLabelValues(BuilderReady).Inc()
-		return BuilderInfo{State: BuilderReady, Port: b.Port, CA: b.CA, Cert: b.Cert, Key: b.Key}
+		return BuilderInfo{State: BuilderReady, Port: b.Port, CA: b.CA, Cert: cert, Key: key}
 	}
 	if len(d.builders) >= cfg.Builder.Max && !d.evictLRULocked() {
 		d.metrics.builderRequests.WithLabelValues(BuilderBusy).Inc()
@@ -203,7 +208,7 @@ func (d *Daemon) Builder(project string, start bool) BuilderInfo {
 		return BuilderInfo{State: BuilderBusy}
 	}
 	b := &builder{Project: project, Port: port, LastUsed: time.Now(),
-		CA: creds.caPEM, Cert: creds.clientCert, Key: creds.clientKey, creds: creds}
+		CA: creds.caPEM, Cert: creds.clientCert, Key: creds.clientKey, CAKey: creds.caKey, creds: creds}
 	d.builders[project] = b
 	d.builderGaugesLocked()
 	d.metrics.builderRequests.WithLabelValues(BuilderBooting).Inc()
@@ -211,8 +216,31 @@ func (d *Daemon) Builder(project string, start bool) BuilderInfo {
 	d.spawn(func() { boot(d, ctx, cfg, project) })
 	// The job gets the port and credentials now; its `docker build` waits for
 	// the builder, so jobs that do not build never wait.
-	return BuilderInfo{State: BuilderBooting, Port: b.Port, CA: b.CA, Cert: b.Cert, Key: b.Key}
+	cert, key := d.jobCredsLocked(b)
+	return BuilderInfo{State: BuilderBooting, Port: b.Port, CA: b.CA, Cert: cert, Key: key}
 }
+
+// jobCredsLocked returns a client certificate for one job: signed by the
+// builder's CA, valid for as long as a job may run (daemon.job_max_age, after
+// which reconcile deletes the job's VM). A job that copies it can use the
+// builder only that long, not for the builder's lifetime (up to its max
+// age). Builders recorded without their CA key hand out their one shared
+// certificate, as before.
+func (d *Daemon) jobCredsLocked(b *builder) (cert, key string) {
+	if b.CAKey == "" {
+		return b.Cert, b.Key
+	}
+	cert, key, err := issueClientCert(b.CA, b.CAKey, d.cfg.Daemon.JobMaxAge+jobCertSlack)
+	if err != nil {
+		d.log.Error("builder client certificate for a job", "project", b.Project, "err", err)
+		return b.Cert, b.Key
+	}
+	return cert, key
+}
+
+// jobCertSlack is added to daemon.job_max_age for a job's client certificate:
+// clocks and the time between prepare and the job's first build.
+const jobCertSlack = 10 * time.Minute
 
 // builderBoot is a variable so tests can skip real VM boots.
 var builderBoot = (*Daemon).bootBuilder
@@ -1065,7 +1093,7 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 // certificates
 
 type builderCreds struct {
-	caPEM, serverCert, serverKey, clientCert, clientKey string
+	caPEM, caKey, serverCert, serverKey, clientCert, clientKey string
 }
 
 // newBuilderCreds creates a fresh CA with one server and one client
@@ -1115,7 +1143,12 @@ func newBuilderCreds() (*builderCreds, error) {
 		return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
 			string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})), nil
 	}
-	c := &builderCreds{caPEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}))}
+	caKeyDER, err := x509.MarshalECPrivateKey(caKey)
+	if err != nil {
+		return nil, err
+	}
+	c := &builderCreds{caPEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})),
+		caKey: string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: caKeyDER}))}
 	if c.serverCert, c.serverKey, err = leaf(BuilderServerName, x509.ExtKeyUsageServerAuth, []string{BuilderServerName}); err != nil {
 		return nil, err
 	}
@@ -1123,6 +1156,46 @@ func newBuilderCreds() (*builderCreds, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// issueClientCert signs a new client certificate (and key) with the builder
+// CA given in PEM, valid for ttl.
+func issueClientCert(caPEM, caKeyPEM string, ttl time.Duration) (cert, key string, err error) {
+	cb, _ := pem.Decode([]byte(caPEM))
+	kb, _ := pem.Decode([]byte(caKeyPEM))
+	if cb == nil || kb == nil {
+		return "", "", errors.New("builder CA or its key is not PEM")
+	}
+	ca, err := x509.ParseCertificate(cb.Bytes)
+	if err != nil {
+		return "", "", err
+	}
+	caKey, err := x509.ParseECPrivateKey(kb.Bytes)
+	if err != nil {
+		return "", "", err
+	}
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+	now := time.Now()
+	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: serial(),
+		Subject:      pkix.Name{CommonName: "firerunner job"},
+		NotBefore:    now.Add(-5 * time.Minute),
+		NotAfter:     now.Add(ttl),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}, ca, &k.PublicKey, caKey)
+	if err != nil {
+		return "", "", err
+	}
+	keyDER, err := x509.MarshalECPrivateKey(k)
+	if err != nil {
+		return "", "", err
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})), nil
 }
 
 func serial() *big.Int {
