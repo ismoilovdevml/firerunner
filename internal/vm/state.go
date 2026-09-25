@@ -24,6 +24,10 @@ type JobState struct {
 	// BuilderProject is the project whose BuildKit builder `docker build` in
 	// this job uses; the daemon never deletes a builder a running job uses.
 	BuilderProject string `json:"builder_project,omitempty"`
+	// BuilderState is the builder's state when the job attached it (ready or
+	// booting), for the build event; BuildCounted: that event was sent.
+	BuilderState string `json:"builder_state,omitempty"`
+	BuildCounted bool   `json:"build_counted,omitempty"`
 }
 
 func SaveJobState(path string, st *JobState) error {

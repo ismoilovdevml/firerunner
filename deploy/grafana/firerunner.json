@@ -1198,7 +1198,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 24,
+        "w": 12,
         "x": 0,
         "y": 34
       },
@@ -1243,6 +1243,63 @@
             "spanNulls": true,
             "stacking": {
               "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "Seconds per job by stage",
+      "description": "Where a job's time goes: the average seconds a job spends in each gitlab-runner stage (script: the job's own steps). Compare with the old runners stage by stage: get_sources, restore_cache and the uploads are FireRunner's cost around the job's own work.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 34
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{stage}}",
+          "expr": "sum by (stage) (rate(firerunner_stage_duration_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / scalar(clamp_min(sum(rate(firerunner_job_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval])), 1e-9))"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
               "group": "A"
             }
           },
@@ -1540,8 +1597,8 @@
     {
       "id": 29,
       "type": "timeseries",
-      "title": "Builder requests by answer per minute",
-      "description": "What the daemon answered when a shell job asked for its project's builder: at prepare, for every shell job of a project that has one, and when a stage runs docker build. ready: warm cache. booting: the builder is starting; the job's docker build waits for it (up to 150 s). busy: no free slot, or the project's builder just failed; that job builds without the layer cache.",
+      "title": "Docker builds by builder per minute",
+      "description": "Jobs that ran docker build, by what their project's builder was when they got it. ready: warm layer cache. booting: the builder was starting (its cache is restored if one was saved). busy: all builder slots were in use, the job built without the cache. none: no builder (the daemon did not answer). Many busy: raise builder.max or lower builder.memory_mb.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1555,12 +1612,12 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (state) (rate(firerunner_builder_requests_total{instance=~\"$instance\",state!=\"disabled\"}[$__rate_interval])) * 60",
-          "legendFormat": "{{state}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
-          }
+          },
+          "legendFormat": "{{builder}}",
+          "expr": "sum by (builder) (rate(firerunner_builds_total{instance=~\"$instance\",builder!=\"disabled\"}[$__rate_interval])) * 60"
         }
       ],
       "options": {

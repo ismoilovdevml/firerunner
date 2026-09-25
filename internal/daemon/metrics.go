@@ -23,6 +23,8 @@ type Metrics struct {
 	prepareSeconds                     *prometheus.HistogramVec
 	jobs                               *prometheus.CounterVec
 	jobSeconds                         prometheus.Histogram
+	stageSeconds                       *prometheus.HistogramVec
+	builds                             *prometheus.CounterVec
 	microvms                           *prometheus.GaugeVec
 	orphansDeleted                     *prometheus.CounterVec
 	admissionWaits                     prometheus.Counter
@@ -146,12 +148,24 @@ func NewMetrics() *Metrics {
 	}
 	m.builderCache.WithLabelValues("restore", "ok")
 	m.builderCache.WithLabelValues("restore", "failed")
+	// Where a job's time goes, to compare with other runners stage by stage.
+	m.stageSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "firerunner_stage_duration_seconds",
+		Help:    "Time of each gitlab-runner stage of a job, by stage (script: the job's own steps; archive_cache and upload_artifacts: any of their variants).",
+		Buckets: []float64{0.25, 0.5, 1, 2, 3, 5, 8, 13, 20, 30, 45, 60, 90, 120, 180, 300, 600, 1200, 1800, 3600}}, []string{"stage"})
+	for _, s := range StageLabels {
+		m.stageSeconds.WithLabelValues(s)
+	}
+	m.builds = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_builds_total",
+		Help: "Jobs that ran docker build, by the state of the project's builder they got: ready (warm cache), booting, busy (all builder slots in use: no cache), disabled, none."}, []string{"builder"})
+	for _, b := range BuildLabels {
+		m.builds.WithLabelValues(b)
+	}
 
 	info := prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_build_info", Help: "Build version.",
 		ConstLabels: prometheus.Labels{"version": Version}})
 	info.Set(1)
 	m.reg.MustRegister(m.poolTarget, m.poolReady, m.poolBooting, m.claims, m.bootSeconds, m.preloadSeconds, m.bootFailures,
-		m.prepareSeconds, m.jobs, m.jobSeconds, m.microvms, m.orphansDeleted, m.admissionWaits,
+		m.prepareSeconds, m.jobs, m.jobSeconds, m.stageSeconds, m.builds, m.microvms, m.orphansDeleted, m.admissionWaits,
 		m.flintlockUp, m.serviceUp, m.thinPool, m.memAvailable, m.runnerConcurrent, m.builderRequests, m.builderCache, info,
 		m.admissionWait, m.memCommitted, m.memCapacity, m.dhcpLeases, m.dhcpCapacity, m.hostOOMKills, m.loopTick,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))

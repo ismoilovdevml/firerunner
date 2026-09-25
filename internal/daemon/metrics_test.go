@@ -425,3 +425,41 @@ func TestFlintlockErrorsCounted(t *testing.T) {
 		t.Errorf("%d error series, want 3", n)
 	}
 }
+
+// Stage and build events become metrics with bounded labels: gitlab-runner's
+// stage names map to StageLabels, unknown values to "other" and "none".
+func TestStageAndBuildEvents(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	for _, e := range []Event{
+		{Kind: "stage", Stage: "step_script", Seconds: 12},
+		{Kind: "stage", Stage: "build_script", Seconds: 3},
+		{Kind: "stage", Stage: "archive_cache_on_failure", Seconds: 1},
+		{Kind: "stage", Stage: "get_sources", Seconds: 2},
+		{Kind: "stage", Stage: "step_\nevil\"label", Seconds: 1},
+		{Kind: "stage", Stage: "made_up", Seconds: 1},
+		{Kind: "build", Builder: BuilderReady},
+		{Kind: "build", Builder: BuilderBusy},
+		{Kind: "build", Builder: "warm; drop table"},
+	} {
+		d.record(e)
+	}
+	for label, want := range map[string]histo{"script": {3, 16}, "archive_cache": {1, 1}, "get_sources": {1, 2}, "other": {1, 1}} {
+		if got := sampleSum(t, d, "firerunner_stage_duration_seconds", label); got != want {
+			t.Errorf("stage %s = %+v, want %+v", label, got, want)
+		}
+	}
+	for label, want := range map[string]float64{"ready": 1, "busy": 1, "none": 1, "booting": 0} {
+		if got := metricValue(t, d, "firerunner_builds_total", label); got != want {
+			t.Errorf("builds{builder=%s} = %v, want %v", label, got, want)
+		}
+	}
+	mfs, _ := d.metrics.reg.Gather()
+	for _, mf := range mfs {
+		if mf.GetName() != "firerunner_stage_duration_seconds" {
+			continue
+		}
+		if n := len(mf.GetMetric()); n != len(StageLabels) {
+			t.Errorf("%d stage series, want the %d fixed labels", n, len(StageLabels))
+		}
+	}
+}

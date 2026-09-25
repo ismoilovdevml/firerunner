@@ -44,6 +44,24 @@ func (c *Client) Claim(job string) (*vm.Instance, error) {
 }
 
 // Send reports a job event; errors are ignored by callers on purpose.
+// SendWithin reports a job event, waiting at most d: for events on a job's
+// critical path, where a slow daemon must cost little.
+func (c *Client) SendWithin(e Event, d time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	body, _ := json.Marshal(e)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://daemon/event", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
 func (c *Client) Send(e Event) error {
 	body, _ := json.Marshal(e)
 	resp, err := c.http.Post("http://daemon/event", "application/json", bytes.NewReader(body))

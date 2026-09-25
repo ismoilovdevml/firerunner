@@ -272,9 +272,11 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	// has; Run starts one when a stage actually builds. A failure here only costs
 	// the cache, never the job.
 	if os.Getenv("CUSTOM_ENV_CI_JOB_IMAGE") == "" {
-		if j, err := currentJob(); err == nil && j.Project != "" && useBuilder(cfg, dc, inst, j.Project, false) {
-			st.BuilderProject = j.Project
-			_ = vm.SaveJobState(statePath(id), st)
+		if j, err := currentJob(); err == nil && j.Project != "" {
+			if state, ok := useBuilder(cfg, dc, inst, j.Project, false); ok {
+				st.BuilderProject, st.BuilderState = j.Project, state
+				_ = vm.SaveJobState(statePath(id), st)
+			}
 		}
 	}
 	_ = dc.Send(daemon.Event{Kind: "prepare", Source: source, Seconds: ready.Seconds(), OK: true,
@@ -409,28 +411,61 @@ const BuilderName = "firerunner"
 // starting. Nothing waits here: jobs that never build (checks, deploys) start at
 // once, and the docker wrapper (BuilderScript) waits for a starting builder only
 // when the job actually builds.
-func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project string, start bool) bool {
+// buildWith gives a stage that builds images the project's builder (its
+// docker wrapper waits while the builder starts), unless prepare already
+// did, and reports the job's first build with the builder's state.
+func buildWith(cfg config.Config, id string, st *vm.JobState) {
+	dc := daemon.NewClient(cfg.Daemon.Socket)
+	state, project := st.BuilderState, ""
+	if j, err := currentJob(); err == nil {
+		project = j.Project
+	}
+	if st.BuilderProject == "" {
+		state = daemon.BuilderNone
+		if project != "" {
+			var attached bool
+			if state, attached = useBuilder(cfg, dc, &st.Instance, project, true); attached {
+				st.BuilderProject, st.BuilderState = project, state
+			}
+		}
+	}
+	if !st.BuildCounted {
+		st.BuildCounted = true
+		_ = dc.SendWithin(daemon.Event{Kind: "build", Builder: state, Job: jobNumber(id), Project: project, VM: st.ID}, eventWait)
+	}
+	_ = vm.SaveJobState(statePath(id), st)
+}
+
+// eventWait bounds a job event sent while the job runs: a slow daemon costs
+// each stage at most this.
+const eventWait = 500 * time.Millisecond
+
+// state is the builder's state (for the build event): ready or booting when
+// attached, else busy, disabled or none.
+func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project string, start bool) (state string, attached bool) {
 	info, err := dc.Builder(project, start)
 	switch {
-	case err != nil || info.State == daemon.BuilderDisabled || info.State == daemon.BuilderNone:
-		return false
+	case err != nil:
+		return daemon.BuilderNone, false
+	case info.State == daemon.BuilderDisabled || info.State == daemon.BuilderNone:
+		return info.State, false
 	case (info.State == daemon.BuilderReady || info.State == daemon.BuilderBooting) && info.Port > 0 && info.Key != "":
 	default:
 		fmt.Println("Docker layer cache: all builders are busy; this job builds without it")
-		return false
+		return daemon.BuilderBusy, false
 	}
 	cmd := vm.SSH(cfg, inst, "bash")
 	cmd.Stdin = strings.NewReader(BuilderScript(info))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		fmt.Printf("Docker layer cache: could not attach the builder (%v): %s\n", err, strings.TrimSpace(string(out)))
-		return false
+		return daemon.BuilderNone, false
 	}
 	if info.State == daemon.BuilderReady {
 		fmt.Println("Docker layer cache: using this project's builder (warm cache)")
 	} else {
 		fmt.Println("Docker layer cache: this project's builder is starting; docker build will wait for it")
 	}
-	return true
+	return info.State, true
 }
 
 // buildCommand matches a command in a stage script that builds images.
@@ -506,6 +541,12 @@ func Run(ctx context.Context, cfg config.Config, script, stage string) error {
 	if err != nil {
 		return systemFailure(fmt.Errorf("no microVM recorded for %s: %w", id, err))
 	}
+	// Every stage's time goes to the daemon, to see where jobs spend it.
+	start := time.Now()
+	defer func() {
+		_ = daemon.NewClient(cfg.Daemon.Socket).SendWithin(daemon.Event{Kind: "stage", Stage: stage,
+			Seconds: time.Since(start).Seconds(), Job: jobNumber(id), VM: st.ID}, eventWait)
+	}()
 	f, err := os.Open(script)
 	if err != nil {
 		return systemFailure(err)
@@ -520,21 +561,15 @@ func Run(ctx context.Context, cfg config.Config, script, stage string) error {
 		code, err = runInContainer(ctx, cfg, &st.Instance, image, st.Network, f, vm.ContainerArgs(cfg, st.ServiceAliases)...)
 	} else {
 		var script io.Reader = f
-		if st.BuilderProject == "" && isUserStage(stage) {
-			// The stage builds images: give the project a builder now (its
-			// docker wrapper waits while the builder starts). Reading drains f,
-			// so from here on the script is body.
+		if isUserStage(stage) {
+			// Reading drains f: from here on the script is body.
 			body, rerr := io.ReadAll(f)
 			if rerr != nil {
 				return systemFailure(fmt.Errorf("reading stage script: %w", rerr))
 			}
 			script = bytes.NewReader(body)
 			if BuildsImages(body) {
-				if j, jerr := currentJob(); jerr == nil && j.Project != "" &&
-					useBuilder(cfg, daemon.NewClient(cfg.Daemon.Socket), &st.Instance, j.Project, true) {
-					st.BuilderProject = j.Project
-					_ = vm.SaveJobState(statePath(id), st)
-				}
+				buildWith(cfg, id, st)
 			}
 		}
 		if st.BuilderProject != "" && isUserStage(stage) {

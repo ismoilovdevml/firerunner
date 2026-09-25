@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 )
 
 // Event is sent by `firerunner executor` so job metrics live in the daemon.
 type Event struct {
-	Kind   string `json:"kind"`   // prepare | finish
+	Kind   string `json:"kind"`   // prepare | finish | stage | build | pool_vm_dead
 	Source string `json:"source"` // pool | cold (prepare)
 	// Result of a finished job: success, script_failure (the job's own
 	// commands failed) or system_failure (FireRunner or the host failed it).
@@ -23,6 +24,11 @@ type Event struct {
 	WaitSeconds float64 `json:"wait_seconds,omitempty"` // prepare: time spent waiting for host memory
 	BootSeconds float64 `json:"boot_seconds,omitempty"` // prepare, cold: microVM create to SSH ready
 	OK          bool    `json:"ok"`
+	// Stage is the gitlab-runner stage a stage event timed (label: stageLabel).
+	Stage string `json:"stage,omitempty"`
+	// Builder is, for a build event (a job's first docker build), the state of
+	// the project's builder the job got: ready, booting, busy, disabled, none.
+	Builder string `json:"builder,omitempty"`
 
 	// Only logged, never metric labels.
 	Job     string `json:"job,omitempty"`     // numeric GitLab job id
@@ -169,6 +175,17 @@ func (d *Daemon) record(e Event) {
 		}
 	case "pool_vm_dead":
 		d.metrics.bootFailures.WithLabelValues("pool_dead").Inc()
+	case "stage":
+		e.Stage = stageLabel(e.Stage)
+		d.metrics.stageSeconds.WithLabelValues(e.Stage).Observe(e.Seconds)
+		// Several per job: only for debugging.
+		d.log.Debug("job event", "kind", e.Kind, "job", e.Job, "vm", e.VM, "stage", e.Stage, "seconds", e.Seconds)
+		return
+	case "build":
+		if !slices.Contains(BuildLabels, e.Builder) {
+			e.Builder = BuilderNone
+		}
+		d.metrics.builds.WithLabelValues(e.Builder).Inc()
 	case "finish":
 		result, reason := normalizeResult(e.Result, e.Reason)
 		d.metrics.jobs.WithLabelValues(result, reason).Inc()
@@ -181,6 +198,9 @@ func (d *Daemon) record(e Event) {
 	// tells a job's story on the host.
 	attrs := []any{"kind", e.Kind, "job", e.Job, "project", e.Project, "vm", e.VM, "source", e.Source,
 		"result", e.Result, "reason", e.Reason, "seconds", e.Seconds, "wait_seconds", e.WaitSeconds, "boot_seconds", e.BootSeconds}
+	if e.Builder != "" {
+		attrs = append(attrs, "builder", e.Builder)
+	}
 	if e.Err != "" {
 		attrs = append(attrs, "err", e.Err)
 	}
@@ -189,6 +209,30 @@ func (d *Daemon) record(e Event) {
 	} else {
 		d.log.Info("job event", attrs...)
 	}
+}
+
+// StageLabels are the values of firerunner_stage_duration_seconds{stage}:
+// the gitlab-runner stages of a job, with the job's own script steps as
+// "script" and the variants of the cache and artifact uploads merged.
+var StageLabels = []string{"prepare_script", "get_sources", "restore_cache", "download_artifacts", "script",
+	"after_script", "archive_cache", "upload_artifacts", "cleanup_file_variables", "other"}
+
+// BuildLabels are the values of firerunner_builds_total{builder}.
+var BuildLabels = []string{BuilderReady, BuilderBooting, BuilderBusy, BuilderDisabled, BuilderNone}
+
+// stageLabel maps a gitlab-runner stage name to one of StageLabels.
+func stageLabel(stage string) string {
+	switch {
+	case stage == "build_script" || strings.HasPrefix(stage, "step_"):
+		return "script"
+	case strings.HasPrefix(stage, "archive_cache"):
+		return "archive_cache"
+	case strings.HasPrefix(stage, "upload_artifacts"):
+		return "upload_artifacts"
+	case slices.Contains(StageLabels, stage):
+		return stage
+	}
+	return "other"
 }
 
 // normalizeResult maps a finish event's result and reason to label values.

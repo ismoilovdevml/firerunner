@@ -307,6 +307,12 @@ func claimFixture(t *testing.T, code int) (config.Config, *daemon.Client, *flint
 		switch r.URL.Path {
 		case "/claim":
 			_ = json.NewEncoder(w).Encode(vm.Instance{ID: "pool-abc", UID: "u9", IP: "10.200.0.9", HostKey: "ssh-ed25519 AAAA"})
+		case "/builder":
+			if r.URL.Query().Get("start") != "1" {
+				w.WriteHeader(http.StatusNoContent) // the project has no builder yet
+				return
+			}
+			_ = json.NewEncoder(w).Encode(daemon.BuilderInfo{State: daemon.BuilderBooting, Port: 20001, CA: "CA", Cert: "CERT", Key: "KEY"})
 		case "/event":
 			var e daemon.Event
 			if json.NewDecoder(r.Body).Decode(&e) == nil {
@@ -1053,5 +1059,50 @@ func TestPrepareBootsTheSizeTheJobAskedFor(t *testing.T) {
 				t.Errorf("booted a %d MB microVM, want %d (0 = none)", got, c.wantBootMB)
 			}
 		})
+	}
+}
+
+// Every stage reports its time; the job's first docker build reports the
+// state of the builder it got, once, whatever later stages build.
+func TestRunReportsStagesAndTheFirstBuild(t *testing.T) {
+	cfg, _, _, _, events := claimFixture(t, 0)
+	st := &vm.JobState{Instance: vm.Instance{ID: "job-555", UID: "u1", IP: "10.200.0.55", HostKey: "ssh-ed25519 AAAA"}}
+	if err := vm.SaveJobState(statePath("job-555"), st); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CUSTOM_ENV_CI_JOB_IMAGE", "")
+	for _, c := range []struct{ stage, body string }{
+		{"get_sources", "git fetch\n"},
+		{"step_script", "docker build -t app .\n"},
+		{"after_script", "docker compose -f ci.yml build\n"},
+	} {
+		script := filepath.Join(t.TempDir(), c.stage)
+		if err := os.WriteFile(script, []byte(c.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := Run(context.Background(), cfg, script, c.stage); err != nil {
+			t.Fatalf("Run(%s) = %v", c.stage, err)
+		}
+	}
+	var stages, builds []string
+	for _, e := range events() {
+		switch e.Kind {
+		case "stage":
+			if e.Job != "555" || e.VM != "job-555" {
+				t.Errorf("stage event %+v", e)
+			}
+			stages = append(stages, e.Stage)
+		case "build":
+			builds = append(builds, e.Builder)
+		}
+	}
+	if strings.Join(stages, ",") != "get_sources,step_script,after_script" {
+		t.Errorf("stage events %v", stages)
+	}
+	if strings.Join(builds, ",") != daemon.BuilderBooting {
+		t.Errorf("build events %v, want one: booting", builds)
+	}
+	if got, err := vm.LoadJobState(statePath("job-555")); err != nil || !got.BuildCounted || got.BuilderState != daemon.BuilderBooting {
+		t.Errorf("job state %+v, %v", got, err)
 	}
 }
