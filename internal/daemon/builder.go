@@ -620,6 +620,9 @@ var nftRun = func(script string, args ...string) (string, error) {
 // missing and wrong ones change in one nft transaction, so a wrong mapping is
 // replaced without a moment in which the port maps to nothing.
 func mapBuilderPorts(bs ...builder) error {
+	if len(bs) == 0 {
+		return nil
+	}
 	out, err := nftRun("", "list", "map", "inet", "firerunner", "builders")
 	if err != nil {
 		return err
@@ -705,11 +708,21 @@ func (d *Daemon) expireBuilders() {
 	}
 }
 
-// checkBuilders restores port mappings (restarting firerunner-net clears them)
+// checkBuilders adopts the previous run's builders if that has not happened
+// yet, restores port mappings (restarting firerunner-net clears them)
 // and drops builders whose VM is gone, or whose buildkitd missed builderStrikes
 // probes in a row while no job uses it. present is the flintlock listing taken
 // at listedAt; a builder that became ready after that is not in it yet.
 func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
+	d.mu.Lock()
+	adopted := d.buildersAdopted
+	d.mu.Unlock()
+	if !adopted {
+		// The startup listing failed, so builders.json was not read then. This
+		// listing worked, and reconcile has not deleted any of those builders
+		// yet: they are first seen now, far younger than the orphan age.
+		d.adoptBuilders(present)
+	}
 	busy := busyBuilders()
 	d.mu.Lock()
 	var check []builder
@@ -800,8 +813,12 @@ func (d *Daemon) buildersFile() string {
 }
 
 // saveBuildersLocked records ready builders (with their client keys, 0600) so a
-// restarted daemon keeps them and their caches.
+// restarted daemon keeps them and their caches. Before adoptBuilders has read
+// the file it holds the previous run's builders, and is left alone.
 func (d *Daemon) saveBuildersLocked() {
+	if !d.buildersAdopted {
+		return
+	}
 	var list []*builder
 	for _, b := range d.builders {
 		if b.ready {
@@ -819,15 +836,18 @@ func (d *Daemon) saveBuildersLocked() {
 	}
 }
 
-// adoptBuilders takes over builders recorded by a previous daemon run.
+// adoptBuilders takes over builders recorded by a previous daemon run; live
+// is the set of microVM uids flintlock lists. Run calls it after the startup
+// listing, or checkBuilders at the first listing that works.
 func (d *Daemon) adoptBuilders(live map[string]bool) {
-	data, err := os.ReadFile(d.buildersFile())
-	if err != nil {
-		return
-	}
 	var list []*builder
-	if json.Unmarshal(data, &list) != nil {
-		return
+	data, err := os.ReadFile(d.buildersFile())
+	if err == nil {
+		err = json.Unmarshal(data, &list)
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		d.log.Warn("builders of the previous run not adopted", "err", err)
+		list = nil
 	}
 	var keep []*builder
 	for _, b := range list {
@@ -867,6 +887,7 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 		adopted = append(adopted, *b)
 		d.log.Info("adopted builder from previous run", "project", b.Project, "id", b.Instance.ID)
 	}
+	d.buildersAdopted = true
 	d.saveBuildersLocked()
 	d.metrics.builders.Set(float64(len(d.builders)))
 	d.mu.Unlock()

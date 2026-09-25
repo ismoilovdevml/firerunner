@@ -225,6 +225,9 @@ type Daemon struct {
 	// poolAdopted: adoptPool read the previous run's pool.json (at startup,
 	// or at the first reconcile that could list); savePoolLocked waits for it.
 	poolAdopted bool
+	// buildersAdopted: adoptBuilders has read builders.json. Until then the
+	// file holds the previous run's builders and is not written (builder.go).
+	buildersAdopted bool
 	// warned: when warnLimited last logged each problem at Warn.
 	warnMu sync.Mutex
 	warned map[string]time.Time

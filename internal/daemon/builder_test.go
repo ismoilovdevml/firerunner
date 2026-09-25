@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/liquidmetal-dev/flintlock/api/types"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -142,6 +144,15 @@ func stubNft(t *testing.T) *fakeNft {
 	nftRun = f.run
 	t.Cleanup(func() { nftRun = old })
 	return f
+}
+
+// recordBuilders writes builders.json the way a daemon that has adopted its
+// previous run's builders does.
+func recordBuilders(d *Daemon) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.buildersAdopted = true
+	d.saveBuildersLocked()
 }
 
 func readyBuilder(project string, port int, lastUsed time.Duration, spec string) *builder {
@@ -302,9 +313,7 @@ func TestAdoptBuildersProbesTwice(t *testing.T) {
 	stubBuilders(t, func(string) bool { return probes.Add(1) > 1 }) // first probe misses
 	d, _ := newTestDaemon(t)
 	d.builders["1"] = readyBuilder("1", 20001, 0, builderSpec(d.cfg))
-	d.mu.Lock()
-	d.saveBuildersLocked()
-	d.mu.Unlock()
+	recordBuilders(d)
 	d.builders = map[string]*builder{}
 	d.adoptBuilders(map[string]bool{"uid-1": true})
 	if d.builders["1"] == nil {
@@ -318,9 +327,7 @@ func TestBuildersSurviveRestart(t *testing.T) {
 	d.builders["1"] = readyBuilder("1", 20001, 0, builderSpec(d.cfg))
 	d.builders["2"] = readyBuilder("2", 20002, 0, builderSpec(d.cfg))
 	d.builders["3"] = &builder{Project: "3", Port: 20003} // booting: not recorded
-	d.mu.Lock()
-	d.saveBuildersLocked()
-	d.mu.Unlock()
+	recordBuilders(d)
 
 	d2, _ := newTestDaemon(t)
 	d2.cfg.Daemon.Socket = d.cfg.Daemon.Socket
@@ -334,9 +341,7 @@ func TestAdoptMigratesLegacySpec(t *testing.T) {
 	stubBuilders(t, func(string) bool { return true })
 	d, _ := newTestDaemon(t)
 	d.builders["1"] = readyBuilder("1", 20001, 0, legacyBuilderSpec(d.cfg))
-	d.mu.Lock()
-	d.saveBuildersLocked()
-	d.mu.Unlock()
+	recordBuilders(d)
 	d.builders = map[string]*builder{}
 	d.adoptBuilders(map[string]bool{"uid-1": true})
 	if d.builders["1"] == nil || d.builders["1"].SpecID != builderSpec(d.cfg) {
@@ -602,6 +607,7 @@ func TestBuilderPortMappedBeforeReady(t *testing.T) {
 func TestBuilderPersistsLastUsedAtMostOncePerMinute(t *testing.T) {
 	stubBuilders(t, func(string) bool { return true })
 	d, _ := newTestDaemon(t)
+	d.buildersAdopted = true
 	d.builders["1"] = readyBuilder("1", d.cfg.Builder.PortBase+1, 0, builderSpec(d.cfg))
 	_ = os.Remove(d.buildersFile())
 	if d.Builder("1", false).State != BuilderReady {
@@ -721,9 +727,7 @@ func TestAdoptAfterNewBuildersStarted(t *testing.T) {
 	base := d.cfg.Builder.PortBase
 	d.builders["1"] = readyBuilder("1", base+1, 0, builderSpec(d.cfg))
 	d.builders["2"] = readyBuilder("2", base+2, 0, builderSpec(d.cfg))
-	d.mu.Lock()
-	d.saveBuildersLocked()
-	d.mu.Unlock()
+	recordBuilders(d)
 
 	d2, _ := newTestDaemon(t)
 	d2.cfg.Daemon.Socket = d.cfg.Daemon.Socket
@@ -888,9 +892,7 @@ func TestAdoptBuildersOfBothIDForms(t *testing.T) {
 	cur := readyBuilder("8", 20002, 0, builderSpec(d.cfg))
 	cur.Instance.ID = "bld-8-0a1b2c3d"
 	d.builders = map[string]*builder{"7": old, "8": cur}
-	d.mu.Lock()
-	d.saveBuildersLocked()
-	d.mu.Unlock()
+	recordBuilders(d)
 
 	d2, _ := newTestDaemon(t)
 	d2.cfg.Daemon.Socket = d.cfg.Daemon.Socket
@@ -991,5 +993,86 @@ func TestBuilderBootCutByShutdownUnmapsPort(t *testing.T) {
 	}
 	if d.builders["3"].ready {
 		t.Fatal("builder marked ready while shutting down")
+	}
+}
+
+// When the startup listing fails, builders.json is not read then. Until it is,
+// the file keeps the previous run's builders (a new builder does not overwrite
+// it), and the first listing that works adopts them: otherwise reconcile would
+// delete them as orphans, without saving their caches.
+func TestBuildersFileKeptUntilAdopted(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	stubBoot(t, nil)
+	d, _ := newTestDaemon(t)
+	d.builders["1"] = readyBuilder("1", 20001, 0, builderSpec(d.cfg))
+	recordBuilders(d)
+
+	d2, _ := newTestDaemon(t) // its startup listing failed: no adoption yet
+	d2.cfg.Daemon.Socket = d.cfg.Daemon.Socket
+	d2.Builder("9", true)
+	d2.bootBuilder(context.Background(), d2.cfg, "9") // ready: would write builders.json
+	projects := func() []string {
+		var list []*builder
+		data, _ := os.ReadFile(d2.buildersFile())
+		_ = json.Unmarshal(data, &list)
+		var out []string
+		for _, b := range list {
+			out = append(out, b.Project)
+		}
+		sort.Strings(out)
+		return out
+	}
+	if got := projects(); strings.Join(got, ",") != "1" {
+		t.Fatalf("builders.json before adoption = %v, want the previous run's [1]", got)
+	}
+	d2.checkBuilders(map[string]bool{"uid-1": true, "uid-" + d2.builders["9"].Instance.ID: true}, time.Now())
+	if b := d2.builders["1"]; b == nil || !b.ready {
+		t.Fatalf("previous run's builder not adopted at the first listing: %+v", b)
+	}
+	if got := projects(); strings.Join(got, ",") != "1,9" {
+		t.Fatalf("builders.json after adoption = %v, want [1 9]", got)
+	}
+}
+
+// The same through Run: flintlockd does not answer the startup listing but
+// answers reconcile's; the previous run's builder is adopted, not deleted.
+func TestRunAdoptsBuildersAfterFailedStartupListing(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	oldFor, oldRetry := startupListFor, startupRetry
+	startupListFor, startupRetry = 0, 10*time.Millisecond
+	t.Cleanup(func() { startupListFor, startupRetry = oldFor, oldRetry })
+	d, srv := newTestDaemon(t)
+	d.builders["7"] = readyBuilder("7", 20001, 0, builderSpec(d.cfg))
+	recordBuilders(d)
+	d.builders, d.buildersAdopted = map[string]*builder{}, false
+	uid := "uid-7"
+	srv.SetVMs(&types.MicroVM{Spec: &types.MicroVMSpec{Id: "bld-7", Uid: &uid},
+		Status: &types.MicroVMStatus{State: types.MicroVMStatus_CREATED}})
+	srv.FailList(status.Error(codes.Unavailable, "down")) // only the startup listing fails
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		d.mu.Lock()
+		b := d.builders["7"]
+		d.mu.Unlock()
+		if b != nil && b.ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("builder of the previous run never adopted")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	if got := srv.Deleted(); len(got) != 0 {
+		t.Fatalf("deleted %v", got)
 	}
 }
