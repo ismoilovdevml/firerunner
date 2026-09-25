@@ -576,6 +576,13 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config, id string) {
 	}
 	if err == nil {
 		d.metrics.bootSeconds.WithLabelValues("pool").Observe(time.Since(start).Seconds())
+		if len(cfg.Pool.PreloadImages) == 0 {
+			// Docker starts on its socket's first use: that would be the job's
+			// first docker command. Start it while the VM waits in the pool.
+			if werr := warmDocker(cfg, inst); werr != nil {
+				d.log.Debug("could not start Docker ahead of the job", "vm", id, "err", werr)
+			}
+		}
 		if len(cfg.Pool.PreloadImages) > 0 {
 			pctx, cancel := context.WithCancel(ctx)
 			d.mu.Lock()
@@ -623,6 +630,12 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config, id string) {
 		d.savePoolLocked()
 		d.log.Info("pool VM ready", "vm", id, "ip", inst.IP, "took", time.Since(start).Round(100*time.Millisecond).String())
 	}
+}
+
+// warmDocker starts a pool VM's Docker without waiting for it (a variable
+// for tests). A preload starts it anyway.
+var warmDocker = func(cfg config.Config, inst *vm.Instance) error {
+	return vm.SSH(cfg, inst, "systemctl start --no-block docker.service").Run()
 }
 
 // preload pulls pool.preload_images into the VM's Docker.

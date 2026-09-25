@@ -38,6 +38,7 @@ func TestMain(m *testing.M) {
 	}
 	nftRun = func(...string) error { return errors.New("nft is not run in tests") }
 	alive = func(config.Config, *vm.Instance) bool { return false }
+	warmDocker = func(config.Config, *vm.Instance) error { return nil }
 	serviceActive = func(context.Context, string) bool { return false }
 	thinPoolUsage = func(context.Context) (float64, float64, error) { return 0, 0, errors.New("no lvs in tests") }
 	tcpOpen = func(string, int) bool { return false }

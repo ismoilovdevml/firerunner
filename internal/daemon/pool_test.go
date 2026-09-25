@@ -785,3 +785,58 @@ func TestClaimRefillsWithoutWaitingForTheTick(t *testing.T) {
 		t.Fatal("no replacement boot within 1 s of the claim (the refill tick is 2 s)")
 	}
 }
+
+// A booted pool VM gets its Docker started while it waits in the pool, so a
+// job's first docker command does not start it. A failure only costs that;
+// with a preload (which starts Docker itself) nothing extra is run.
+func TestPoolVMStartsDockerAhead(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		preload []string
+		warmErr error
+		want    int
+	}{
+		{"started", nil, nil, 1},
+		{"failure keeps the VM", nil, errors.New("ssh: exit 255"), 1},
+		{"preload starts it", []string{"alpine:3"}, nil, 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			d, _ := newTestDaemon(t)
+			bin := t.TempDir()
+			if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			oldBoot, oldWarm := poolBoot, warmDocker
+			t.Cleanup(func() { poolBoot, warmDocker = oldBoot, oldWarm })
+			poolBoot = func(_ context.Context, _ config.Config, _ *flintlock.Client, id string, _ map[string]string) (*vm.Instance, error) {
+				return &vm.Instance{ID: id, UID: "u-" + id, IP: "10.200.0.5"}, nil
+			}
+			var mu sync.Mutex
+			var warmed []string
+			warmDocker = func(_ config.Config, inst *vm.Instance) error {
+				mu.Lock()
+				defer mu.Unlock()
+				warmed = append(warmed, inst.ID)
+				return c.warmErr
+			}
+			cfg := d.cfgSnapshot()
+			cfg.Pool.PreloadImages = c.preload
+			d.mu.Lock()
+			d.booting++
+			d.mu.Unlock()
+			d.bootOne(context.Background(), cfg, "pool-x")
+			mu.Lock()
+			got := len(warmed)
+			mu.Unlock()
+			if got != c.want {
+				t.Errorf("Docker started %d times, want %d", got, c.want)
+			}
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			if len(d.ready) != 1 || d.ready[0].inst.ID != "pool-x" {
+				t.Errorf("pool after boot: %d ready, want pool-x", len(d.ready))
+			}
+		})
+	}
+}
