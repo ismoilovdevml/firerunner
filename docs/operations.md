@@ -47,11 +47,16 @@ Import the Grafana dashboard and the alert rules from
 [`deploy/`](https://github.com/ismoilovdevml/firerunner/tree/main/deploy). Alerts page only for
 failures FireRunner or the host caused, never for failing project scripts. Watch:
 
-- **FireRunner failure rate** and **system failures by reason**.
-- **Pool hit rate**: below 80 %, raise `pool.size`.
-- **Committed memory** and **wait for host memory**: jobs queue when memory is full.
-- **DHCP leases**: at capacity no VM gets an address.
-- **Thin pool**: at 100 % no VM can start.
+- **FireRunner failure rate** and **System failures by reason**.
+- **Cold boots**: above 20 %, raise `pool.size` (if memory allows).
+- **Host resources used**: the fullest host for thin pool, committed memory, DHCP leases and disk.
+  A full thin pool or DHCP range stops every new microVM; full memory makes them wait.
+- **Committed microVM memory** and **Jobs that waited over 30 s for memory**: jobs queue when
+  memory is full.
+- **Docker layer cache** row: builders against their slots, why builders were removed, and cache
+  copies that fail or are skipped for lack of room.
+- **Disk free**: the saved builder caches and flintlock's microVM state.
+- **Flintlock errors**: failed flintlock calls by RPC and gRPC code.
 
 The daemon logs one line per job (`journalctl -u firerunner | grep '"job":"<id>"'`).
 
