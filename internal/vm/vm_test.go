@@ -30,26 +30,35 @@ func TestMACIsStableAndLocal(t *testing.T) {
 	}
 }
 
+// A MAC's lease is its newest unexpired one. dnsmasq writes its newest lease
+// first, and the other way round after a restart: the newest is the one with
+// the latest expiry, whatever its line (0 is an infinite lease).
 func TestLeaseIP(t *testing.T) {
 	dir := t.TempDir()
 	if ip, err := LeaseIP(filepath.Join(dir, "missing"), "aa:fc:00:00:00:01"); ip != "" || err != nil {
 		t.Fatalf("missing file: %q %v", ip, err)
 	}
-	p := filepath.Join(dir, "leases")
-	body := "1790224115 aa:fc:00:00:00:01 10.200.0.10 * 01:aa\n" +
-		"1790224116 AA:FC:00:00:00:02 10.200.0.11 * 01:bb\n" +
-		"1790224117 aa:fc:00:00:00:01 10.200.0.12 * 01:aa\n"
-	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if ip, _ := LeaseIP(p, "aa:fc:00:00:00:01"); ip != "10.200.0.12" {
-		t.Fatalf("want latest lease, got %q", ip)
-	}
-	if ip, _ := LeaseIP(p, "aa:fc:00:00:00:02"); ip != "10.200.0.11" {
-		t.Fatalf("case-insensitive match failed: %q", ip)
-	}
-	if ip, _ := LeaseIP(p, "aa:fc:00:00:00:03"); ip != "" {
-		t.Fatalf("unexpected lease %q", ip)
+	now := time.Now().Unix()
+	line := func(exp int64, mac, ip string) string { return fmt.Sprintf("%d %s %s * 01:%s\n", exp, mac, ip, mac) }
+	const a, b = "aa:fc:00:00:00:01", "aa:fc:00:00:00:02"
+	for _, tc := range []struct {
+		name, leases, mac, want string
+	}{
+		{"newest on the first line", line(now+900, a, "10.200.0.10") + line(now+300, a, "10.200.0.12"), a, "10.200.0.10"},
+		{"newest on the last line", line(now+300, a, "10.200.0.10") + line(now+900, a, "10.200.0.12"), a, "10.200.0.12"},
+		{"expired lease ignored", line(now+300, a, "10.200.0.10") + line(now-1, a, "10.200.0.12"), a, "10.200.0.10"},
+		{"only expired leases", line(now-60, a, "10.200.0.10") + line(now, a, "10.200.0.12"), a, ""},
+		{"infinite lease is the newest", line(0, a, "10.200.0.10") + line(now+900, a, "10.200.0.12"), a, "10.200.0.10"},
+		{"case-insensitive MAC", line(now+300, strings.ToUpper(b), "10.200.0.11"), b, "10.200.0.11"},
+		{"another MAC's lease", line(now+300, b, "10.200.0.11"), a, ""},
+	} {
+		p := filepath.Join(dir, "leases")
+		if err := os.WriteFile(p, []byte(tc.leases), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if ip, err := LeaseIP(p, tc.mac); ip != tc.want || err != nil {
+			t.Errorf("%s: LeaseIP = %q, %v; want %q", tc.name, ip, err, tc.want)
+		}
 	}
 }
 
@@ -194,8 +203,9 @@ func TestForgetReleasesLease(t *testing.T) {
 	cfg := config.Default()
 	cfg.Network.LeasesFile = filepath.Join(dir, "leases")
 	mac := MAC("job-42")
-	leases := "1790286904 aa:fc:00:00:00:01 10.200.0.9 * *\n" +
-		"1790286905 " + mac + " 10.200.0.77 * 01:" + mac + "\n"
+	exp := time.Now().Add(15 * time.Minute).Unix()
+	leases := fmt.Sprintf("%d aa:fc:00:00:00:01 10.200.0.9 * *\n", exp) +
+		fmt.Sprintf("%d %s 10.200.0.77 * 01:%s\n", exp+1, mac, mac)
 	if err := os.WriteFile(cfg.Network.LeasesFile, []byte(leases), 0o644); err != nil {
 		t.Fatal(err)
 	}

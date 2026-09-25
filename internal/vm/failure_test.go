@@ -24,11 +24,13 @@ import (
 
 func TestLeaseIPMalformedLines(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "leases")
+	exp := time.Now().Add(15 * time.Minute).Unix()
 	body := "\n" +
 		"garbage\n" +
-		"1790224115 aa:fc:00:00:00:01\n" + // no ip field
+		fmt.Sprintf("%d aa:fc:00:00:00:01\n", exp) + // no ip field
 		"   \t  \n" +
-		"1790224116 aa:fc:00:00:00:01 10.200.0.20 * 01:aa\n" +
+		fmt.Sprintf("%d aa:fc:00:00:00:01 10.200.0.20 * 01:aa\n", exp) +
+		"soon aa:fc:00:00:00:01 10.200.0.21 * 01:aa\n" + // no expiry
 		"only-two fields\n"
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
@@ -300,11 +302,15 @@ func TestBootIgnoresLeasesFromBeforeCreate(t *testing.T) {
 }
 
 // A VM whose address is known releases the lease of that address only, even
-// when another VM holds a newer lease for the same MAC.
+// when another VM holds a newer lease for the same MAC. Without an address the
+// newest lease goes: the one with the latest expiry, which dnsmasq writes
+// first (not last), and never an expired one.
 func TestForgetInstanceReleasesOnlyItsLease(t *testing.T) {
 	cfg, _, _, released := bootEnv(t, "")
 	mac := MAC("bld-7")
-	leases := fmt.Sprintf("1790286904 %s 10.200.0.50 * 01:a\n1790286905 %s 10.200.0.77 * 01:b\n", mac, mac)
+	now := time.Now().Unix()
+	leases := fmt.Sprintf("%d %s 10.200.0.77 * 01:b\n%d %s 10.200.0.50 * 01:a\n%d %s 10.200.0.66 * 01:c\n",
+		now+900, mac, now+300, mac, now-60, mac)
 	if err := os.WriteFile(cfg.Network.LeasesFile, []byte(leases), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -312,6 +318,7 @@ func TestForgetInstanceReleasesOnlyItsLease(t *testing.T) {
 		{"10.200.0.50", "br-fc 10.200.0.50 " + mac + " 01:a"},
 		{"10.200.0.77", "br-fc 10.200.0.77 " + mac + " 01:b"},
 		{"10.200.0.99", ""},                        // its lease is gone: nothing to release
+		{"10.200.0.66", ""},                        // its lease expired: dnsmasq dropped it
 		{"", "br-fc 10.200.0.77 " + mac + " 01:b"}, // address unknown: the newest lease
 	} {
 		*released = nil

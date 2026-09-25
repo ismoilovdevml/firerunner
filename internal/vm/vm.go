@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -277,7 +278,8 @@ func MAC(id string) string {
 	return fmt.Sprintf("aa:fc:%02x:%02x:%02x:%02x", h[0], h[1], h[2], h[3])
 }
 
-// LeaseIP returns the address dnsmasq leased to mac, or "" if there is none yet.
+// LeaseIP returns the address of mac's newest lease (see findLease), or "" if
+// there is none yet.
 func LeaseIP(leasesFile, mac string) (string, error) {
 	l, err := findLease(leasesFile, mac, nil)
 	if l == nil {
@@ -293,7 +295,47 @@ func leasedIPs(leasesFile, mac string) (map[string]bool, error) {
 	return ips, err
 }
 
-type lease struct{ mac, ip, clientID string }
+// lease is one line of the dnsmasq leases file.
+type lease struct {
+	mac, ip, clientID string
+	expires           int64 // unix time; 0: never (an infinite lease)
+}
+
+// parseLease reads a line of the leases file:
+// <expiry> <mac> <ip> <hostname> <client-id>.
+func parseLease(line string) (lease, bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 3 {
+		return lease{}, false
+	}
+	exp, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil {
+		return lease{}, false
+	}
+	l := lease{mac: fields[1], ip: fields[2], expires: exp}
+	if len(fields) >= 5 && fields[4] != "*" {
+		l.clientID = fields[4]
+	}
+	return l, true
+}
+
+// expired reports whether dnsmasq may hand l's address to another client:
+// the line stays in the file until dnsmasq next rewrites it.
+func (l lease) expired(now time.Time) bool { return l.expires != 0 && l.expires <= now.Unix() }
+
+// newerThan reports whether l was granted or last renewed after o. dnsmasq
+// writes its newest lease first, and the other way round after a restart, so
+// the line order says nothing; every lease lasts the dhcp-range's lease time,
+// so the later expiry is the newer lease.
+func (l lease) newerThan(o lease) bool {
+	rank := func(exp int64) int64 {
+		if exp == 0 {
+			return math.MaxInt64
+		}
+		return exp
+	}
+	return rank(l.expires) > rank(o.expires)
+}
 
 // Lease is one line of the dnsmasq leases file.
 type Lease struct {
@@ -329,9 +371,8 @@ func Leases(leasesFile string) ([]Lease, error) {
 	return out, sc.Err()
 }
 
-// findLease returns the last lease for mac in the leases file that match
-// accepts (nil: any), or nil.
-func findLease(leasesFile, mac string, match func(lease) bool) (*lease, error) {
+// macLeases returns the unexpired leases of mac in the leases file.
+func macLeases(leasesFile, mac string) ([]lease, error) {
 	f, err := os.Open(leasesFile)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -340,23 +381,28 @@ func findLease(leasesFile, mac string, match func(lease) bool) (*lease, error) {
 		return nil, err
 	}
 	defer f.Close()
-	var found *lease
+	now := time.Now()
+	var out []lease
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		// <expiry> <mac> <ip> <hostname> <client-id>
-		fields := strings.Fields(sc.Text())
-		if len(fields) < 3 || !strings.EqualFold(fields[1], mac) {
-			continue
-		}
-		l := lease{mac: fields[1], ip: fields[2]}
-		if len(fields) >= 5 && fields[4] != "*" {
-			l.clientID = fields[4]
-		}
-		if match == nil || match(l) {
-			found = &l
+		if l, ok := parseLease(sc.Text()); ok && strings.EqualFold(l.mac, mac) && !l.expired(now) {
+			out = append(out, l)
 		}
 	}
-	return found, sc.Err()
+	return out, sc.Err()
+}
+
+// findLease returns the newest unexpired lease of mac (see newerThan; of two
+// with one expiry, the later line) that match accepts (nil: any), or nil.
+func findLease(leasesFile, mac string, match func(lease) bool) (*lease, error) {
+	leases, err := macLeases(leasesFile, mac)
+	var found *lease
+	for i, l := range leases {
+		if (match == nil || match(l)) && (found == nil || !found.newerThan(l)) {
+			found = &leases[i]
+		}
+	}
+	return found, err
 }
 
 // Destroy deletes a microVM and, once flintlock took the delete, forgets its
@@ -373,8 +419,8 @@ func Destroy(ctx context.Context, cfg config.Config, fl *flintlock.Client, id, u
 // Forget drops what the host keeps about a deleted microVM: its pinned host
 // key and its DHCP lease. Releasing the lease frees the address at once;
 // without it every VM holds an address until the lease expires. Without the
-// VM's address the newest lease of its MAC is released; ForgetInstance
-// releases the lease of a known address only.
+// VM's address the newest lease of its MAC (the latest expiry) is released;
+// ForgetInstance releases the lease of a known address only.
 func Forget(cfg config.Config, id string) { forget(cfg, id, nil) }
 
 // ForgetInstance is Forget for a VM whose address may be known: then only
@@ -384,7 +430,8 @@ func ForgetInstance(cfg config.Config, inst *Instance) {
 	forget(cfg, inst.ID, func(l lease) bool { return inst.IP == "" || l.ip == inst.IP })
 }
 
-// forget releases the newest lease of the VM's MAC that match accepts.
+// forget releases the newest lease of the VM's MAC (see findLease) that match
+// accepts.
 func forget(cfg config.Config, id string, match func(lease) bool) {
 	RemoveKnownHosts(id)
 	_ = os.Remove(muxPath(id)) // a master exits by itself when its VM is gone
