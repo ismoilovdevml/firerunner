@@ -49,7 +49,7 @@ var FailureReasons = []string{
 	"state_file",        // the job state file could not be written or read
 	"ssh_lost",          // SSH to the microVM broke during a stage (VM gone or killed)
 	"helper_stage",      // a FireRunner-run stage (sources, cache, artifacts) failed
-	"canceled",          // the job was cancelled during prepare
+	"canceled",          // cancelled or timed out: during prepare, or gitlab-runner stopped a stage (SIGTERM)
 	"other",
 }
 
