@@ -89,7 +89,7 @@ without TLS are set up on the host: see [Corporate networks](corporate-network.m
 ## When a job fails
 
 The *Preparing* section shows where the job ran:
-`microVM pool-551bf7 ready at 10.200.0.236 in 400ms (pool, 2 vCPU, 2048 MB)`.
+`microVM pool-551bf7 ready at 10.200.0.236 in 300ms (pool, 2 vCPU, 2048 MB)`.
 
 | Log | Meaning |
 |---|---|

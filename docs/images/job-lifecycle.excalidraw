@@ -146,7 +146,7 @@
       "backgroundColor": "#b2f2bb",
       "strokeColor": "#2f9e44",
       "label": {
-        "text": "claim it from the daemon\n~0.4 s"
+        "text": "claim it from the daemon\n~0.3 s"
       },
       "fontSize": 18,
       "fontFamily": 5,
