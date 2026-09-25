@@ -26,6 +26,11 @@ type Client struct {
 	// failed call, each failed try of a retried listing included (the daemon
 	// counts them). Set it before the first call.
 	OnError func(op string, err error)
+
+	// listed, when given, is what every listing answers instead of a call:
+	// see Listed. A flag, because an empty listing is a listing too.
+	listed []*types.MicroVM
+	given  bool
 }
 
 func (c *Client) failed(op string, err error) {
@@ -93,12 +98,10 @@ func (c *Client) Delete(ctx context.Context, uid string) error {
 func (c *Client) List(ctx context.Context) ([]*types.MicroVM, error) {
 	var err error
 	for attempt := 0; attempt < 6; attempt++ {
-		var resp *mvmv1.ListMicroVMsResponse
-		resp, err = c.api.ListMicroVMs(ctx, &mvmv1.ListMicroVMsRequest{Namespace: c.namespace})
-		if err == nil {
-			return resp.GetMicrovm(), nil
+		var vms []*types.MicroVM
+		if vms, err = c.ListOnce(ctx); err == nil {
+			return vms, nil
 		}
-		c.failed("ListMicroVMs", err)
 		if !IsTransient(err) {
 			return nil, err
 		}
@@ -109,6 +112,32 @@ func (c *Client) List(ctx context.Context) ([]*types.MicroVM, error) {
 		}
 	}
 	return nil, err
+}
+
+// ListOnce is one try of List: a transient error is returned, not waited out.
+// It is for callers holding a lock that other processes wait for (the memory
+// admission): they give the lock back and ask again later instead.
+func (c *Client) ListOnce(ctx context.Context) ([]*types.MicroVM, error) {
+	if c.given {
+		return c.listed, nil
+	}
+	resp, err := c.api.ListMicroVMs(ctx, &mvmv1.ListMicroVMsRequest{Namespace: c.namespace})
+	if err != nil {
+		c.failed("ListMicroVMs", err)
+		return nil, err
+	}
+	return resp.GetMicrovm(), nil
+}
+
+// Listed returns a client whose List, ListOnce and Find answer vms, a listing
+// the caller already took, without asking flintlockd again. Its other calls go
+// to flintlockd over c's connection, which only c closes. The memory
+// admission hands it to a caller's fits check, which must not list a second
+// time while the admission lock is held.
+func (c *Client) Listed(vms []*types.MicroVM) *Client {
+	given := *c
+	given.listed, given.given = vms, true
+	return &given
 }
 
 // IsTransient reports errors flintlockd returns while a concurrent delete is in progress.

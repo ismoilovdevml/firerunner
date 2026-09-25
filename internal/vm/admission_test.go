@@ -375,6 +375,96 @@ func TestAdmitFailurePaths(t *testing.T) {
 	})
 }
 
+// errTransient is what flintlockd answers a listing while it deletes a microVM.
+var errTransient = status.Error(codes.Unknown, "getting microvm spec: failed reading from content store")
+
+// admitOne admits the microVM "vm-1" through Admit or through AdmitFits with
+// the builders' production check, Fits.
+type admitOne func(context.Context, config.Config, *flintlock.Client) (bool, error)
+
+var admitOnes = []struct {
+	name  string
+	admit admitOne
+}{
+	{"Admit", func(ctx context.Context, cfg config.Config, fl *flintlock.Client) (bool, error) {
+		n, _, err := Admit(ctx, cfg, fl, "vm-1")
+		return n == 1, err
+	}},
+	{"AdmitFits with Fits", func(ctx context.Context, cfg config.Config, fl *flintlock.Client) (bool, error) {
+		ok, _, err := AdmitFits(ctx, cfg, fl, "vm-1", Fits)
+		return ok, err
+	}},
+}
+
+// The lock is held for exactly one flintlock listing: the builders' check
+// (Fits) decides on the listing the admission took, it does not list again,
+// and it still counts the microVMs that listing holds.
+func TestAdmitListsFlintlockOnce(t *testing.T) {
+	for _, a := range admitOnes {
+		for _, c := range []struct {
+			name    string
+			totalMB int
+			want    bool
+		}{
+			{"room next to the listed microVM", 2100, true},
+			{"the listed microVM leaves no room", 2099, false},
+		} {
+			t.Run(a.name+"/"+c.name, func(t *testing.T) {
+				tempAdmission(t)
+				pinMemTotal(t, c.totalMB, nil)
+				srv := flintlocktest.NewServer("")
+				srv.SetVMs(listedVM("pool-x", "ux", 1000)) // 1050 with overhead
+				fl := dialFake(t, srv)
+				ok, err := a.admit(context.Background(), admitCfg(), fl)
+				if ok != c.want || err != nil {
+					t.Fatalf("admitted %v, %v; want %v", ok, err, c.want)
+				}
+				if n := srv.ListCalls(); n != 1 {
+					t.Fatalf("one admission listed flintlock %d times, want 1", n)
+				}
+			})
+		}
+	}
+}
+
+// A transient listing error (flintlockd deleting a microVM) is not retried
+// while the lock is held, where every other admission of the host waits: the
+// admission returns at once with nothing admitted and nothing reserved, the
+// lock is free, and the caller's own wait loop asks again.
+func TestAdmitTransientListingErrorReleasesTheLock(t *testing.T) {
+	for _, a := range admitOnes {
+		t.Run(a.name, func(t *testing.T) {
+			file := tempAdmission(t)
+			pinMemTotal(t, 1050, nil) // room for one
+			srv := flintlocktest.NewServer("")
+			srv.FailList(errTransient)
+			fl := dialFake(t, srv)
+			start := time.Now()
+			ok, err := a.admit(context.Background(), admitCfg(), fl)
+			took := time.Since(start)
+			if ok || !flintlock.IsTransient(err) {
+				t.Fatalf("admitted %v, %v; want nothing with the transient error", ok, err)
+			}
+			// flintlock.List would wait 300 ms before its first retry.
+			if n := srv.ListCalls(); n != 1 || took > 250*time.Millisecond {
+				t.Fatalf("%d listings in %s under the lock; want 1, no retry wait", n, took)
+			}
+			lock, err := os.OpenFile(file+".lock", os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Close()
+			if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+				t.Fatalf("the admission lock is still held after the error: %v", err)
+			}
+			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+			if ok, err := a.admit(context.Background(), admitCfg(), fl); !ok || err != nil {
+				t.Fatalf("next admission = %v, %v; want admitted (nothing reserved by the failed one)", ok, err)
+			}
+		})
+	}
+}
+
 // AdmitFits lets a caller decide with its own check (builders), given the
 // memory other admissions reserved.
 func TestAdmitFits(t *testing.T) {

@@ -84,9 +84,11 @@ func WithOverhead(mb int) int { return mb * (100 + overheadPct) / 100 }
 // the same free memory, and the host over-commits; the guest RAM is allocated
 // lazily, so the kernel OOM-kills a microVM later. A variable for tests.
 //
-// AdmissionFile + ".lock" serializes admissions. The lock is held for one
-// flintlock listing and a small file write, never while a caller waits for
-// room or creates its microVM: from then on the reservation stands for it.
+// AdmissionFile + ".lock" serializes admissions. The lock is held for exactly
+// one flintlock call, a single try, and a small file write: never while a
+// caller waits for room or creates its microVM (from then on the reservation
+// stands for it), and never while a failed listing is retried, which waits
+// seconds exactly when flintlockd is busy deleting microVMs.
 var AdmissionFile = "/run/firerunner/admission.json"
 
 // admissionTimeout bounds one admission, the wait for the lock included, and
@@ -115,14 +117,18 @@ type reservation struct {
 }
 
 // FitsFunc has Fits's signature. AdmitFits calls it with the memory that other
-// admissions reserved as extraMB.
+// admissions reserved as extraMB and with a client that answers the listing
+// the admission took (flintlock.Client.Listed), so the check does not list
+// flintlock again while the admission lock is held.
 type FitsFunc func(ctx context.Context, cfg config.Config, fl *flintlock.Client, extraMB int) (bool, string, error)
 
 // Admit decides, host-wide, how many of the microVMs ids (of cfg's size) may be
 // created now, with a single flintlock listing, and reserves memory for them:
 // the first n of ids may be created. Call Unreserve(id) for each once its boot
-// returned. Errors (flintlock down, the lock busy for admissionTimeout) admit
-// nothing; unknown host memory admits everything, like Fits.
+// returned. Errors admit nothing: flintlock down, the lock busy for
+// admissionTimeout, and a transient listing error, which is not retried under
+// the lock (the caller asks again, as when there is no room). Unknown host
+// memory admits everything, like Fits.
 func Admit(ctx context.Context, cfg config.Config, fl *flintlock.Client, ids ...string) (int, string, error) {
 	return admit(ctx, cfg, fl, ids, nil)
 }
@@ -145,7 +151,7 @@ func admit(ctx context.Context, cfg config.Config, fl *flintlock.Client, ids []s
 		return 0, "", err
 	}
 	defer unlock()
-	vms, err := fl.List(ctx)
+	vms, err := fl.ListOnce(ctx)
 	if err != nil {
 		return 0, "", err
 	}
@@ -159,7 +165,7 @@ func admit(ctx context.Context, cfg config.Config, fl *flintlock.Client, ids []s
 	n, why := 0, ""
 	switch capacity, cerr := Capacity(cfg); {
 	case fits != nil:
-		ok, w, err := fits(ctx, cfg, fl, reserved)
+		ok, w, err := fits(ctx, cfg, fl.Listed(vms), reserved)
 		if err != nil {
 			return 0, w, err
 		}

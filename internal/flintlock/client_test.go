@@ -114,6 +114,72 @@ func TestListHonoursContext(t *testing.T) {
 	}
 }
 
+// ListOnce is one try: its caller holds a lock others wait for, so a
+// transient error comes back at once instead of being waited out.
+func TestListOnce(t *testing.T) {
+	cases := []struct {
+		name    string
+		errs    []error
+		wantErr error
+	}{
+		{"success", nil, nil},
+		{"transient error is returned, not retried", []error{errTransient}, errTransient},
+		{"other error is returned", []error{status.Error(codes.Unavailable, "down")}, status.Error(codes.Unavailable, "down")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := flintlocktest.NewServer("")
+			srv.SetVMs(mvm("pool-a", "u1"))
+			srv.FailList(c.errs...)
+			fl := testClient(t, srv)
+			var failed int
+			fl.OnError = func(string, error) { failed++ }
+			start := time.Now()
+			vms, err := fl.ListOnce(context.Background())
+			if status.Code(err) != status.Code(c.wantErr) || (err == nil) != (c.wantErr == nil) {
+				t.Fatalf("ListOnce err = %v, want %v", err, c.wantErr)
+			}
+			if c.wantErr == nil && (len(vms) != 1 || vms[0].GetSpec().GetUid() != "u1") {
+				t.Fatalf("ListOnce = %v", vms)
+			}
+			if n := srv.ListCalls(); n != 1 || time.Since(start) > 250*time.Millisecond {
+				t.Fatalf("ListMicroVMs called %d times in %s, want once without a retry wait", n, time.Since(start))
+			}
+			if want := len(c.errs); failed != want {
+				t.Fatalf("OnError called %d times, want %d", failed, want)
+			}
+		})
+	}
+}
+
+// A client made by Listed answers List, ListOnce and Find with the listing it
+// was given, an empty one included, and never asks flintlockd for another.
+func TestListed(t *testing.T) {
+	srv := flintlocktest.NewServer("")
+	srv.SetVMs(mvm("pool-live", "u-live"))
+	srv.FailList(status.Error(codes.Unavailable, "down"))
+	fl := testClient(t, srv)
+	given := fl.Listed([]*types.MicroVM{mvm("job-7", "u7")})
+	for _, list := range []func(context.Context) ([]*types.MicroVM, error){given.List, given.ListOnce} {
+		if vms, err := list(context.Background()); err != nil || len(vms) != 1 || vms[0].GetSpec().GetUid() != "u7" {
+			t.Fatalf("listing = %v, %v; want the given job-7", vms, err)
+		}
+	}
+	if v, err := given.Find(context.Background(), "job-7"); err != nil || v.GetSpec().GetUid() != "u7" {
+		t.Fatalf("Find = %v, %v; want the given job-7", v, err)
+	}
+	if vms, err := fl.Listed(nil).List(context.Background()); err != nil || len(vms) != 0 {
+		t.Fatalf("an empty listing = %v, %v; want empty, not a call", vms, err)
+	}
+	if n := srv.ListCalls(); n != 0 {
+		t.Fatalf("ListMicroVMs called %d times, want 0", n)
+	}
+	// The client it came from still asks flintlockd.
+	if _, err := fl.List(context.Background()); status.Code(err) != codes.Unavailable {
+		t.Fatalf("List of the original client = %v, want flintlockd's Unavailable", err)
+	}
+}
+
 func TestFind(t *testing.T) {
 	srv := flintlocktest.NewServer("")
 	srv.SetVMs(mvm("pool-a", "u1"), mvm("job-7", "u2"))

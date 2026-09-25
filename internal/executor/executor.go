@@ -285,8 +285,9 @@ func coldBoot(ctx context.Context, cfg config.Config, id string, fromPool func()
 			return nil, "cold", t, fmt.Errorf("%w for another microVM within %s (%s); lower runner concurrent or pool.size", errNoMemory, cfg.VM.BootTimeout, why)
 		}
 		if err != nil {
-			// flintlockd restarting, or another admission holding the lock:
-			// like no room yet, until the deadline.
+			// flintlockd restarting or busy deleting (the admission does not
+			// retry a listing under its lock), or another admission holding
+			// the lock: like no room yet, until the deadline.
 			fmt.Printf("cannot check host memory yet (%v), retrying...\n", err)
 		} else {
 			fmt.Printf("waiting for host memory (%s)...\n", why)
