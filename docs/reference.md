@@ -65,7 +65,7 @@ passed for 2 minutes.
 | `firerunner_flintlock_errors_total` | counter | `op`: `CreateMicroVM`, `DeleteMicroVM`, `ListMicroVMs`; `code`: the gRPC code | failed flintlock calls of the daemon; every failed try of a retried listing counts |
 
 System failure reasons in `firerunner_jobs_total`: `admission_timeout` (no host memory for a
-microVM within `vm.boot_timeout`), `flintlock_error`, `vm_boot` (no DHCP lease or no SSH in time),
+microVM within `vm.boot_timeout`, or other admissions held the admission lock that long), `flintlock_error`, `vm_boot` (no DHCP lease or no SSH in time),
 `services` (`services:` containers did not start), `docker_auth`, `state_file`, `ssh_lost` (the VM
 died or was killed during a stage), `helper_stage` (sources, cache or artifacts), `canceled`
 (cancelled or timed out, in prepare or a stage gitlab-runner stopped; leave it out of failure

@@ -116,7 +116,7 @@ the host. Failing project scripts and cancelled jobs do not count.
 - Check the `reason` in *System failures by reason*: `ssh_lost` a microVM died, usually a host OOM
   kill (see [FireRunnerHostOOMKill](#firerunnerhostoomkill)); `vm_boot` DHCP or the guest boot
   (`firerunner vm logs <id>`); `flintlock_error` flintlockd or the thin pool; `admission_timeout` no
-  host memory within `vm.boot_timeout`; `services`, `docker_auth`, `helper_stage` the job log says
+  host memory (or a busy admission lock) within `vm.boot_timeout`; `services`, `docker_auth`, `helper_stage` the job log says
   which step. Per job: `journalctl -u firerunner | grep '"result":"system_failure"'`.
 - Recovered: the alert resolves once fewer than 3 such failures are left in the last 30 minutes.
 
