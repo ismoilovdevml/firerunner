@@ -180,7 +180,7 @@ func (d *Daemon) adoptPool(vms []*types.MicroVM) {
 		d.mu.Lock()
 		d.ready = append(d.ready, &pooled{inst: &inst, bornAt: r.BornAt, specID: r.SpecID})
 		d.mu.Unlock()
-		d.log.Info("adopted pool VM from previous run", "id", inst.ID)
+		d.log.Info("adopted pool VM from previous run", "vm", inst.ID)
 	}
 	d.mu.Lock()
 	d.metrics.poolReady.Set(float64(len(d.ready)))
@@ -287,10 +287,12 @@ func (d *Daemon) startupList(ctx context.Context) (vms []*types.MicroVM, ok bool
 		vms, err := d.fl.List(lctx)
 		cancel()
 		if err == nil {
+			d.metrics.flintlockUp.Set(1)
 			return vms, true
 		}
 		if ctx.Err() != nil || time.Now().After(deadline) {
-			d.log.Error("listing microVMs at startup failed; nothing adopted from the previous run", "err", err)
+			d.metrics.flintlockUp.Set(0)
+			d.log.Error("listing microVMs at startup failed; the first reconcile that lists adopts the previous run's pool", "err", err)
 			return nil, false
 		}
 		d.log.Warn("flintlock not answering yet, retrying", "err", err)
@@ -516,7 +518,7 @@ func (d *Daemon) refill(ctx context.Context) {
 	}
 	room, why, err := vm.Admit(ctx, cfg, d.fl, ids...)
 	if err != nil {
-		d.log.Debug("pool refill waits", "why", why, "err", err)
+		d.warnLimited("refill", "pool refill cannot check host memory", "err", err)
 		d.metrics.admissionWaits.Inc()
 		return
 	}
@@ -590,7 +592,7 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config, id string) {
 	switch {
 	case err != nil:
 		d.metrics.bootFailures.WithLabelValues("pool").Inc()
-		d.log.Error("pool boot failed", "id", id, "err", err)
+		d.log.Error("pool boot failed", "vm", id, "err", err)
 	case ctx.Err() != nil:
 		// Shutting down: do not hand out a VM nobody will drain.
 		d.spawn(func() { d.delete(context.Background(), inst, "shutdown") })
@@ -598,7 +600,7 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config, id string) {
 		d.ready = append(d.ready, &pooled{inst: inst, bornAt: time.Now(), specID: fingerprint(cfg)})
 		d.metrics.poolReady.Set(float64(len(d.ready)))
 		d.savePoolLocked()
-		d.log.Info("pool VM ready", "id", id, "ip", inst.IP, "took", time.Since(start).Round(100*time.Millisecond).String())
+		d.log.Info("pool VM ready", "vm", id, "ip", inst.IP, "took", time.Since(start).Round(100*time.Millisecond).String())
 	}
 }
 
@@ -694,7 +696,7 @@ func (d *Daemon) delete(ctx context.Context, inst *vm.Instance, reason string) b
 		return false
 	}
 	vm.Forget(d.cfgSnapshot(), inst.ID)
-	d.log.Info("deleted microVM", "id", inst.ID, "reason", reason)
+	d.log.Info("deleted microVM", "vm", inst.ID, "reason", reason)
 	return true
 }
 

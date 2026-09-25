@@ -16,6 +16,8 @@ import (
 	"github.com/liquidmetal-dev/flintlock/api/types"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
@@ -259,5 +261,50 @@ func TestOrphanReasonsAreSlugs(t *testing.T) {
 	d, _ := newTestDaemon(t)
 	if n := series(t, d.metrics.orphansDeleted); n != len(orphanReasons) {
 		t.Errorf("orphans_deleted_total has %d series before any delete, want %d", n, len(orphanReasons))
+	}
+}
+
+// firerunner_flintlock_up says what the startup listing found, instead of 0
+// until the first reconcile a minute later.
+func TestFlintlockUpFromTheStartupListing(t *testing.T) {
+	oldFor, oldRetry := startupListFor, startupRetry
+	startupListFor, startupRetry = 0, time.Millisecond
+	t.Cleanup(func() { startupListFor, startupRetry = oldFor, oldRetry })
+	d, srv := newTestDaemon(t)
+	if _, ok := d.startupList(context.Background()); !ok || value(t, d.metrics.flintlockUp) != 1 {
+		t.Fatalf("flintlock_up = %v after a startup listing that worked", value(t, d.metrics.flintlockUp))
+	}
+	srv.FailList(errors.New("down"))
+	d.metrics.flintlockUp.Set(1)
+	if _, ok := d.startupList(context.Background()); ok || value(t, d.metrics.flintlockUp) != 0 {
+		t.Fatalf("flintlock_up = %v after a failed startup listing", value(t, d.metrics.flintlockUp))
+	}
+}
+
+// A refill that cannot ask flintlock for memory is a Warn (once per
+// warnEvery), not a Debug line nobody sees.
+func TestRefillFlintlockErrorIsAWarning(t *testing.T) {
+	d, srv := newTestDaemon(t)
+	logs := captureLog(d)
+	down := status.Error(codes.Unavailable, "connection refused")
+	srv.FailList(down, down)
+	d.refill(context.Background())
+	d.refill(context.Background())
+	if n := strings.Count(logs.String(), "level=WARN"); n != 1 {
+		t.Fatalf("%d warnings for two failed refills, want 1:\n%s", n, logs)
+	}
+	if got := value(t, d.metrics.admissionWaits); got != 2 {
+		t.Fatalf("admission waits = %v, want 2", got)
+	}
+}
+
+// Daemon log lines name microVMs with the key "vm", like the job events, so
+// one grep finds a VM's whole story.
+func TestLogLinesUseTheVMKey(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	logs := captureLog(d)
+	d.delete(context.Background(), &vm.Instance{ID: "pool-abc123", UID: "u1"}, "expired")
+	if out := logs.String(); !strings.Contains(out, "vm=pool-abc123") || strings.Contains(out, " id=") {
+		t.Fatalf("delete log line: %s", out)
 	}
 }
