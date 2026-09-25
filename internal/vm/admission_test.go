@@ -27,9 +27,10 @@ import (
 // tempAdmission points AdmissionFile at a temporary directory for one test.
 func tempAdmission(t *testing.T) string {
 	t.Helper()
-	old := AdmissionFile
+	old, oldPool := AdmissionFile, ThinPoolFile
 	AdmissionFile = filepath.Join(t.TempDir(), "run", "admission.json")
-	t.Cleanup(func() { AdmissionFile = old })
+	ThinPoolFile = filepath.Join(filepath.Dir(AdmissionFile), "thinpool.json")
+	t.Cleanup(func() { AdmissionFile, ThinPoolFile = old, oldPool })
 	return AdmissionFile
 }
 
@@ -534,5 +535,51 @@ func TestAdmitCountsTheSizeAJobAskedFor(t *testing.T) {
 	}
 	if n, _, err := Admit(context.Background(), admitCfg(), fl, "job-9"); err != nil || n != 1 {
 		t.Fatalf("Admit(1000 MB) = %d, %v; want room for the configured size", n, err)
+	}
+}
+
+// A (nearly) full thin pool holds new microVMs back, whatever memory is
+// free: it would fail the disk writes of every microVM on the host. Usage
+// that is unknown, stale or unreadable does not hold them back.
+func TestAdmitWaitsForAFullThinPool(t *testing.T) {
+	now := time.Now()
+	for _, c := range []struct {
+		name  string
+		usage *ThinPoolUsage
+		raw   string
+		room  int
+	}{
+		{"no usage recorded", nil, "", 1},
+		{"data nearly full", &ThinPoolUsage{Data: 0.96, Meta: 0.1, At: now}, "", 0},
+		{"metadata nearly full", &ThinPoolUsage{Data: 0.2, Meta: 0.91, At: now}, "", 0},
+		{"room left", &ThinPoolUsage{Data: 0.94, Meta: 0.89, At: now}, "", 1},
+		{"stale", &ThinPoolUsage{Data: 0.99, Meta: 0.99, At: now.Add(-5 * time.Minute)}, "", 1},
+		{"unreadable", nil, "{not json", 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tempAdmission(t)
+			pinMemTotal(t, 100000, nil)
+			switch {
+			case c.usage != nil:
+				if err := WriteThinPoolUsage(*c.usage); err != nil {
+					t.Fatal(err)
+				}
+			case c.raw != "":
+				if err := os.MkdirAll(filepath.Dir(ThinPoolFile), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(ThinPoolFile, []byte(c.raw), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fl := dialFake(t, flintlocktest.NewServer(""))
+			n, why, err := Admit(context.Background(), admitCfg(), fl, "job-1")
+			if err != nil || n != c.room {
+				t.Fatalf("Admit = %d, %q, %v; want %d", n, why, err, c.room)
+			}
+			if c.room == 0 && !strings.Contains(why, "thin pool") {
+				t.Fatalf("why = %q, want the thin pool named", why)
+			}
+		})
 	}
 }

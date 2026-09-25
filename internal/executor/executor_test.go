@@ -785,8 +785,9 @@ func coldBootFixture(t *testing.T, bootTimeout time.Duration) (config.Config, *f
 	cfg := config.Default()
 	cfg.Flintlock = flintlocktest.StartUnix(t, srv)
 	cfg.VM.BootTimeout = bootTimeout
-	oldAdmission, oldPoll, oldBoot := vm.AdmissionFile, admissionPoll, bootVM
+	oldAdmission, oldPool, oldPoll, oldBoot := vm.AdmissionFile, vm.ThinPoolFile, admissionPoll, bootVM
 	vm.AdmissionFile, admissionPoll = filepath.Join(t.TempDir(), "admission.json"), 10*time.Millisecond
+	vm.ThinPoolFile = filepath.Join(t.TempDir(), "thinpool.json")
 	var boots atomic.Int32
 	bootVM = func(ctx context.Context, cfg config.Config, _ *flintlock.Client, id string, _ map[string]string) (*vm.Instance, error) {
 		boots.Add(1)
@@ -796,7 +797,9 @@ func coldBootFixture(t *testing.T, bootTimeout time.Duration) (config.Config, *f
 		}
 		return &vm.Instance{ID: id, UID: "u1"}, nil
 	}
-	t.Cleanup(func() { vm.AdmissionFile, admissionPoll, bootVM = oldAdmission, oldPoll, oldBoot })
+	t.Cleanup(func() {
+		vm.AdmissionFile, vm.ThinPoolFile, admissionPoll, bootVM = oldAdmission, oldPool, oldPoll, oldBoot
+	})
 	return cfg, srv, &boots
 }
 

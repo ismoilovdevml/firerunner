@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -461,5 +462,25 @@ func TestStageAndBuildEvents(t *testing.T) {
 		if n := len(mf.GetMetric()); n != len(StageLabels) {
 			t.Errorf("%d stage series, want the %d fixed labels", n, len(StageLabels))
 		}
+	}
+}
+
+// collectHost records the thin pool usage for admissions, and removes it
+// when lvs fails: unknown usage must not hold microVMs back on old numbers.
+func TestCollectHostRecordsThinPoolForAdmissions(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	old := thinPoolUsage
+	t.Cleanup(func() { thinPoolUsage = old })
+	thinPoolUsage = func(context.Context) (float64, float64, error) { return 96, 12, nil }
+	d.collectHost(context.Background())
+	data, err := os.ReadFile(vm.ThinPoolFile)
+	var u vm.ThinPoolUsage
+	if err != nil || json.Unmarshal(data, &u) != nil || u.Data != 0.96 || u.Meta != 0.12 || time.Since(u.At) > time.Minute {
+		t.Fatalf("recorded usage %s, %v", data, err)
+	}
+	thinPoolUsage = func(context.Context) (float64, float64, error) { return 0, 0, errors.New("lvs: timeout") }
+	d.collectHost(context.Background())
+	if _, err := os.Stat(vm.ThinPoolFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("usage kept after lvs failed: %v", err)
 	}
 }

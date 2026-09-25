@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -988,6 +989,43 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 	if err := tidyVMDirs(filepath.Join(flintlockVMDir, cfg.Flintlock.Namespace), live); err != nil {
 		d.log.Warn("cannot remove leftover microVM state dirs", "err", err)
 	}
+	for _, f := range capVMFiles(filepath.Join(flintlockVMDir, cfg.Flintlock.Namespace), vmFileMax) {
+		d.log.Warn("microVM file over its size bound, emptied", "file", f, "bytes", vmFileMax)
+	}
+}
+
+// vmFileMax bounds each file firecracker appends to in a microVM's state dir:
+// the guest console, which the job's code writes, and Firecracker's own log
+// and metrics (a builder lives for days). A variable for tests.
+var vmFileMax int64 = 64 << 20
+
+// vmFiles are the files firecracker opens with O_APPEND (flintlock
+// infrastructure/firecracker/create.go), so emptying one loses only what it
+// held: the next write starts at the new end.
+var vmFiles = []string{"firecracker.stdout", "firecracker.stderr", "firecracker.log", "firecracker.metrics"}
+
+// capVMFiles empties the vmFiles of root/<id>/<uid>/ larger than limit, leaving
+// a line that says so. It returns the files it emptied.
+func capVMFiles(root string, limit int64) []string {
+	paths, _ := filepath.Glob(filepath.Join(root, "*", "*", "firecracker.*"))
+	var emptied []string
+	for _, p := range paths {
+		if !slices.Contains(vmFiles, filepath.Base(p)) {
+			continue
+		}
+		fi, err := os.Lstat(p)
+		if err != nil || !fi.Mode().IsRegular() || fi.Size() <= limit {
+			continue
+		}
+		f, err := os.OpenFile(p, os.O_WRONLY|os.O_TRUNC|os.O_APPEND, 0)
+		if err != nil {
+			continue
+		}
+		_, _ = fmt.Fprintf(f, "[firerunner: this file passed %d MiB; everything before this line was dropped]\n", limit>>20)
+		_ = f.Close()
+		emptied = append(emptied, p)
+	}
+	return emptied
 }
 
 // flintlockVMDir is where flintlockd keeps per-VM state (a variable for tests).
@@ -1166,9 +1204,14 @@ func (d *Daemon) collectHost(ctx context.Context) {
 	if data, meta, err := thinPoolUsage(ctx); err == nil {
 		d.metrics.thinPool.WithLabelValues("data").Set(data / 100)
 		d.metrics.thinPool.WithLabelValues("metadata").Set(meta / 100)
+		// Admissions hold new microVMs back while the pool is nearly full.
+		if werr := vm.WriteThinPoolUsage(vm.ThinPoolUsage{Data: data / 100, Meta: meta / 100, At: time.Now()}); werr != nil {
+			d.warnLimited("thinpool-file", "cannot record the thin pool usage for admissions", "err", werr)
+		}
 	} else {
 		// Unknown, not the last value read: that would hide a filling pool.
 		d.metrics.thinPool.Reset()
+		vm.RemoveThinPoolUsage()
 		d.warnLimited("thinpool", "cannot read the thin pool usage; firerunner_thinpool_usage_ratio is absent until lvs answers", "err", err)
 	}
 	for _, dir := range []string{builderCacheDir, flintlockVMDir} {

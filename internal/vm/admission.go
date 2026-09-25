@@ -122,6 +122,64 @@ type reservation struct {
 	Seen []string `json:"seen,omitempty"`
 }
 
+// ThinPoolFile is where the daemon records the thin pool's usage every 15 s,
+// for admissions (a variable for tests).
+var ThinPoolFile = "/run/firerunner/thinpool.json"
+
+// ThinPoolUsage is the content of ThinPoolFile: used shares, 0 to 1.
+type ThinPoolUsage struct {
+	Data float64   `json:"data"`
+	Meta float64   `json:"meta"`
+	At   time.Time `json:"at"`
+}
+
+// Past these a new microVM waits for room: a full thin pool fails the disk
+// writes of every microVM on the host, not only of the new one.
+const (
+	thinPoolDataMax = 0.95
+	thinPoolMetaMax = 0.90
+)
+
+// WriteThinPoolUsage records u for admissions; RemoveThinPoolUsage says the
+// usage is unknown.
+func WriteThinPoolUsage(u ThinPoolUsage) error {
+	data, err := json.Marshal(u)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(ThinPoolFile), 0o700); err != nil {
+		return err
+	}
+	tmp := ThinPoolFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, ThinPoolFile)
+}
+
+func RemoveThinPoolUsage() { _ = os.Remove(ThinPoolFile) }
+
+// thinPoolFull says why no microVM may start while the thin pool is (nearly)
+// full, or "". Usage that is unknown or older than two minutes (the daemon
+// is down, lvs fails) does not hold microVMs back.
+func thinPoolFull(now time.Time) string {
+	data, err := os.ReadFile(ThinPoolFile)
+	if err != nil {
+		return ""
+	}
+	var u ThinPoolUsage
+	if json.Unmarshal(data, &u) != nil || now.Sub(u.At) > 2*time.Minute {
+		return ""
+	}
+	switch {
+	case u.Data >= thinPoolDataMax:
+		return fmt.Sprintf("thin pool data %.0f%% full; microVMs start again once deletes free it", u.Data*100)
+	case u.Meta >= thinPoolMetaMax:
+		return fmt.Sprintf("thin pool metadata %.0f%% full; microVMs start again once deletes free it", u.Meta*100)
+	}
+	return ""
+}
+
 // FitsFunc has Fits's signature. AdmitFits calls it with the memory that other
 // admissions reserved as extraMB and with a client that answers the listing
 // the admission took (flintlock.Client.Listed), so the check does not list
@@ -149,6 +207,9 @@ func AdmitFits(ctx context.Context, cfg config.Config, fl *flintlock.Client, id 
 func admit(ctx context.Context, cfg config.Config, fl *flintlock.Client, ids []string, fits FitsFunc) (int, string, error) {
 	if len(ids) == 0 {
 		return 0, "", nil
+	}
+	if why := thinPoolFull(time.Now()); why != "" {
+		return 0, why, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, admissionTimeout)
 	defer cancel()

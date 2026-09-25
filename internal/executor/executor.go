@@ -366,7 +366,7 @@ func coldBoot(ctx context.Context, cfg config.Config, id string, fromPool func()
 			// the lock: like no room yet, until the deadline.
 			fmt.Printf("cannot check host memory yet (%v), retrying...\n", err)
 		} else {
-			fmt.Printf("waiting for host memory (%s)...\n", why)
+			fmt.Printf("waiting for room on the host (%s)...\n", why)
 		}
 		select {
 		case <-ctx.Done():

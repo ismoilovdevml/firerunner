@@ -29,7 +29,7 @@ version refuses keys it does not know.
 
 ```bash
 sudo firerunner vm list            # role: job, pool, builder or run
-sudo firerunner vm logs <id>       # guest console, for boot problems
+sudo firerunner vm logs <id>       # guest console, for boot problems (emptied past 64 MiB)
 sudo firerunner vm rm <id>
 sudo firerunner builder list
 ```
@@ -146,8 +146,10 @@ its job failed with `ssh_lost`, or its builder died.
 ### FireRunnerThinPoolFull
 
 Warning. The devmapper thin pool that holds every microVM disk was over 85 % (data) or 75 %
-(metadata) full at a reading in the last 15 minutes. At 100 % every microVM create fails; full
-metadata can damage the pool.
+(metadata) full at a reading in the last 15 minutes. From 95 % data or 90 % metadata no new
+microVM starts (jobs, pool VMs and builders wait for room, then fail as `admission_timeout`):
+running microVMs keep writing to their disks, and at 100 % every one of them fails; full metadata
+can damage the pool.
 
 - Check: `sudo lvs flintlock`; `firerunner vm list` for VMs that should be gone.
 - Fix now: `sudo firerunner builder rm --all` frees the builder VMs' disks, but also deletes every

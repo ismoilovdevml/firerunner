@@ -33,6 +33,7 @@ func TestMain(m *testing.M) {
 	vm.KnownHostsDir = filepath.Join(root, "known_hosts")
 	vm.MuxDir = filepath.Join(root, "ssh-mux")
 	vm.AdmissionFile = filepath.Join(root, "admission.json")
+	vm.ThinPoolFile = filepath.Join(root, "thinpool.json")
 	poolBoot = func(context.Context, config.Config, *flintlock.Client, string, map[string]string) (*vm.Instance, error) {
 		return nil, errors.New("no microVMs in tests")
 	}
@@ -183,6 +184,7 @@ func TestHostPathsAreIsolated(t *testing.T) {
 		"vm.KnownHostsDir":    vm.KnownHostsDir,
 		"vm.MuxDir":           vm.MuxDir,
 		"vm.AdmissionFile":    vm.AdmissionFile,
+		"vm.ThinPoolFile":     vm.ThinPoolFile,
 		"network.leases_file": d.cfgSnapshot().Network.LeasesFile,
 		"daemon.socket":       d.cfgSnapshot().Daemon.Socket,
 	} {
@@ -200,5 +202,65 @@ func TestHostPathsAreIsolated(t *testing.T) {
 	}
 	if _, err := nftRun("", "list", "ruleset"); err == nil {
 		t.Error("nft ran: tests must never touch the host firewall")
+	}
+}
+
+// A guest that floods its console (or a builder living for days) cannot fill
+// the host disk: firecracker's appended files over the bound are emptied with
+// a line saying so. Nothing else in the state dir is touched, and a symlink
+// is never followed.
+func TestCapVMFiles(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "job-1", "u1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	size := func(name string, n int64) string {
+		p := filepath.Join(dir, name)
+		f, err := os.Create(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Truncate(n); err != nil { // sparse: no real disk needed
+			t.Fatal(err)
+		}
+		_ = f.Close()
+		return p
+	}
+	const limit = 1 << 20
+	console := size("firecracker.stdout", limit+1)
+	metrics := size("firecracker.metrics", limit)
+	metadata := size("metadata.json", limit+1)
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, make([]byte, limit+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "firecracker.log")); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := capVMFiles(root, limit); len(got) != 1 || got[0] != console {
+		t.Fatalf("emptied %v, want only the console", got)
+	}
+	if data, _ := os.ReadFile(console); !strings.Contains(string(data), "everything before this line was dropped") || len(data) > 200 {
+		t.Fatalf("console after the bound: %d bytes %q", len(data), data)
+	}
+	for _, p := range []string{metrics, metadata, outside} {
+		if fi, err := os.Stat(p); err != nil || fi.Size() < limit {
+			t.Errorf("%s changed: %v %v", p, fi.Size(), err)
+		}
+	}
+	// Firecracker keeps appending after the file was emptied (O_APPEND).
+	f, err := os.OpenFile(console, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.WriteString("boot ok\n")
+	_ = f.Close()
+	if data, _ := os.ReadFile(console); !strings.HasSuffix(string(data), "dropped]\nboot ok\n") {
+		t.Fatalf("console after more output: %q", data)
+	}
+	if got := capVMFiles(filepath.Join(root, "missing"), limit); len(got) != 0 {
+		t.Fatalf("missing root: %v", got)
 	}
 }
