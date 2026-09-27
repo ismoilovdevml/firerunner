@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -97,6 +98,24 @@ func tlsConfig(cfg config.Flintlock) (*tls.Config, error) {
 		tc.Certificates = []tls.Certificate{pair}
 	}
 	return tc, nil
+}
+
+// ServerCertificate returns the certificate flintlockd presents over TLS,
+// checked against flintlock.tls_ca_file (for doctor: when it expires).
+func ServerCertificate(cfg config.Flintlock) (*x509.Certificate, error) {
+	if cfg.TLSCAFile == "" {
+		return nil, errors.New("flintlock.tls_ca_file is not set")
+	}
+	tc, err := tlsConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", cfg.Endpoint, tc)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return conn.ConnectionState().PeerCertificates[0], nil
 }
 
 // newClient wraps an established connection; split from Dial so tests can

@@ -29,7 +29,16 @@ one upgrade, run the installer instead (`FR_VERSION=<version>`), which checks it
 After a new guest image is published, replace the idle VMs: `sudo firerunner pool refresh`.
 
 To roll back, restore the previous binary and the `config.yaml` saved before the upgrade: an older
-version refuses keys it does not know.
+version refuses keys it does not know. v0.1.1 and older cannot talk to flintlockd over TLS: in
+`/etc/opt/flintlockd/config.yaml` set `insecure: true`, delete the `tls-` lines and
+`systemctl restart flintlockd` when no job runs.
+
+The installer turns on mutual TLS for flintlockd's API in a run when no job runs: flintlockd
+restarts with TLS, and firerunner gets the client certificate only once it could list the microVMs
+with it; otherwise flintlockd goes back to no TLS. While jobs run it leaves TLS for a later run and
+says so. `sudo firerunner doctor` warns while the API runs without TLS and when a certificate
+(also the one flintlockd serves) expires within 90 days; a run of the installer renews them and
+restarts flintlockd when no job runs.
 
 ## microVMs
 

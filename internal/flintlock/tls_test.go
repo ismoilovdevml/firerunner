@@ -179,3 +179,39 @@ func TestDialOverMutualTLS(t *testing.T) {
 		}
 	})
 }
+
+// doctor reads the certificate flintlockd presents; a flintlockd with a
+// certificate of another CA, or none listening, is an error.
+func TestServerCertificate(t *testing.T) {
+	flintlockCA, clientCA, strangerCA := newTestCA(t), newTestCA(t), newTestCA(t)
+	dir := t.TempDir()
+	certPEM, keyPEM := clientCA.leaf(t, false)
+	cfg := config.Flintlock{
+		TLSCAFile:   writeFile(t, dir, "ca.pem", flintlockCA.pem),
+		TLSCertFile: writeFile(t, dir, "client.pem", certPEM),
+		TLSKeyFile:  writeFile(t, dir, "client.key", keyPEM),
+	}
+	cfg.Endpoint, _ = tlsFlintlockd(t, flintlockCA, clientCA)
+	c, err := ServerCertificate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Until(c.NotAfter) <= 0 || !c.IPAddresses[0].Equal(net.ParseIP("127.0.0.1")) {
+		t.Fatalf("got a certificate for %v until %v", c.IPAddresses, c.NotAfter)
+	}
+	other := cfg
+	other.Endpoint, _ = tlsFlintlockd(t, strangerCA, clientCA)
+	if _, err := ServerCertificate(other); err == nil {
+		t.Fatal("a certificate of another CA was accepted")
+	}
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	gone := cfg
+	gone.Endpoint = l.Addr().String()
+	l.Close()
+	if _, err := ServerCertificate(gone); err == nil {
+		t.Fatal("nothing listening, yet no error")
+	}
+	if _, err := ServerCertificate(config.Flintlock{Endpoint: cfg.Endpoint}); err == nil {
+		t.Fatal("no CA configured, yet no error")
+	}
+}

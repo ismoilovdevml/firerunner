@@ -7,7 +7,7 @@ All commands need root.
 | Command | |
 |---|---|
 | `firerunner status` · `doctor` | overview · every check with a hint |
-| `firerunner config show` · `keys` · `path` · `get <key>` · `set <key> <value>` | settings; `path` prints the config file |
+| `firerunner config show` · `keys` · `path` · `get <key>` · `set <key> <value> [<key> <value>...]` | settings; `path` prints the config file. Several keys in one `set` are checked and saved together |
 | `firerunner config unset vm.kernel_cmdline.<arg>` | remove a guest kernel argument |
 | `firerunner runner register --url URL --token - [--concurrent N] [--name NAME]` | register this host; the `glrt-...` token is read from stdin (or `FIRERUNNER_RUNNER_TOKEN`), never from the command line; the name shown in GitLab defaults to `firerunner-<hostname>` |
 | `firerunner runner status` · `concurrent N` · `unregister` | the GitLab runner |

@@ -300,3 +300,25 @@ func TestFlintlockTLSKeys(t *testing.T) {
 		t.Fatalf("reload: %+v %v", got.Flintlock, err)
 	}
 }
+
+func TestSetAllValidatesOnce(t *testing.T) {
+	base := Default()
+	if _, err := Set(base, "flintlock.tls_cert_file", "/c.crt"); err == nil {
+		t.Fatal("a client certificate alone was accepted")
+	}
+	got, err := SetAll(base, "flintlock.tls_ca_file", "/ca.crt", "flintlock.tls_cert_file", "/c.crt", "flintlock.tls_key_file", "/c.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Flintlock.TLSCAFile != "/ca.crt" || got.Flintlock.TLSCertFile != "/c.crt" || got.Flintlock.TLSKeyFile != "/c.key" {
+		t.Fatalf("got %+v", got.Flintlock)
+	}
+	if base.Flintlock.TLSCAFile != "" {
+		t.Fatal("SetAll changed its input")
+	}
+	for _, bad := range [][]string{nil, {"pool.size"}, {"pool.size", "2", "no.such_key", "1"}, {"pool.size", "two"}} {
+		if out, err := SetAll(base, bad...); err == nil || out.Pool.Size != base.Pool.Size {
+			t.Errorf("SetAll(%q) = pool %d, %v; want an error and the input back", bad, out.Pool.Size, err)
+		}
+	}
+}

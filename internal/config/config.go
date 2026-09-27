@@ -515,6 +515,28 @@ func Get(cfg Config, key string) (string, error) {
 // Set changes one dotted key; the value is parsed as YAML ("4", "3m", "off").
 // New keys are only accepted under vm.kernel_cmdline.
 func Set(cfg Config, key, value string) (Config, error) {
+	return SetAll(cfg, key, value)
+}
+
+// SetAll sets key/value pairs in order and validates the result once, so keys
+// that are only valid together (flintlock.tls_cert_file and tls_key_file) can
+// be set at the same time.
+func SetAll(cfg Config, pairs ...string) (Config, error) {
+	if len(pairs) == 0 || len(pairs)%2 != 0 {
+		return cfg, errors.New("SetAll needs key/value pairs")
+	}
+	out := cfg
+	for i := 0; i < len(pairs); i += 2 {
+		var err error
+		if out, err = set(out, pairs[i], pairs[i+1]); err != nil {
+			return cfg, err
+		}
+	}
+	return out, out.Validate()
+}
+
+// set is Set without the validation.
+func set(cfg Config, key, value string) (Config, error) {
 	m, err := toMap(cfg)
 	if err != nil {
 		return cfg, err
@@ -555,7 +577,7 @@ func Set(cfg Config, key, value string) (Config, error) {
 	if err := decode(data, &out); err != nil {
 		return cfg, fmt.Errorf("invalid value for %s: %w", key, err)
 	}
-	return out, out.Validate()
+	return out, nil
 }
 
 // Unset removes a vm.kernel_cmdline entry.
