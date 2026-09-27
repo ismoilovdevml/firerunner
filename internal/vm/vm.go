@@ -153,7 +153,7 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 		if fl.Delete(dctx, uid) == nil {
 			UnbindInstance(inst)
 			// Its own lease only: the other VM's lease for the MAC stays.
-			forget(cfg, id, func(l lease) bool { return l.ip == inst.IP || (inst.IP == "" && isNew(l)) })
+			forget(cfg, id, tapLives(inst), func(l lease) bool { return l.ip == inst.IP || (inst.IP == "" && isNew(l)) })
 		}
 		return nil, err
 	}
@@ -448,21 +448,48 @@ func Destroy(ctx context.Context, cfg config.Config, fl *flintlock.Client, id, u
 // without it every VM holds an address until the lease expires. Without the
 // VM's address the newest lease of its MAC (the latest expiry) is released;
 // ForgetInstance releases the lease of a known address only.
-func Forget(cfg config.Config, id string) { forget(cfg, id, nil) }
+func Forget(cfg config.Config, id string) { forget(cfg, id, false, nil) }
 
 // ForgetInstance is Forget for a VM whose address may be known: then only
 // the lease of inst.IP is released, never another VM's lease for the same MAC
 // (dnsmasq would hand that live VM's address to the next one).
+//
+// A VM whose bound tap still exists (flintlock deletes it after Delete
+// returns, see UnbindInstance) keeps its lease too: released now, its address
+// could go to a new VM while this one still sends from it. The daemon
+// releases the leases of VMs flintlock no longer lists (ReleaseLease).
 func ForgetInstance(cfg config.Config, inst *Instance) {
 	UnbindInstance(inst)
-	forget(cfg, inst.ID, func(l lease) bool { return inst.IP == "" || l.ip == inst.IP })
+	forget(cfg, inst.ID, tapLives(inst), func(l lease) bool { return inst.IP == "" || l.ip == inst.IP })
+}
+
+// DestroyInstance deletes a microVM and forgets it (ForgetInstance).
+func DestroyInstance(ctx context.Context, cfg config.Config, fl *flintlock.Client, inst *Instance) error {
+	if err := fl.Delete(ctx, inst.UID); err != nil {
+		return err
+	}
+	ForgetInstance(cfg, inst)
+	return nil
+}
+
+// tapLives reports whether inst's bound tap still exists: its VM may still run.
+func tapLives(inst *Instance) bool { return inst.Tap != "" && linkExists(inst.Tap) }
+
+// ReleaseLease releases the unexpired lease of mac for ip, if there is one.
+func ReleaseLease(cfg config.Config, mac, ip string) {
+	if l, err := findLease(cfg.Network.LeasesFile, mac, func(l lease) bool { return l.ip == ip }); err == nil && l != nil {
+		release(l)
+	}
 }
 
 // forget releases the newest lease of the VM's MAC (see findLease) that match
 // accepts.
-func forget(cfg config.Config, id string, match func(lease) bool) {
+func forget(cfg config.Config, id string, keepLease bool, match func(lease) bool) {
 	RemoveKnownHosts(id)
 	_ = os.Remove(muxPath(id)) // a master exits by itself when its VM is gone
+	if keepLease {
+		return
+	}
 	l, err := findLease(cfg.Network.LeasesFile, MAC(id), match)
 	if err != nil || l == nil {
 		return

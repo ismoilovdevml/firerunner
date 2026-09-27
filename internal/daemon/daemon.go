@@ -210,6 +210,9 @@ type Daemon struct {
 	bootingIDs map[string]bool
 	// booted pool VMs still preloading images, by uid; counted in booting
 	preloading map[string]*preloadingVM
+	// staleLeases are DHCP leases of MACs flintlock does not list, by
+	// "mac ip", with when reconcile first saw them so (releaseStaleLeases).
+	staleLeases map[string]time.Time
 	// refillNow wakes the main loop when a job took a pool VM, so its
 	// replacement starts booting at once instead of at the next refill tick.
 	refillNow chan struct{}
@@ -330,7 +333,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 	}
 	d := &Daemon{cfgPath: cfgPath, log: log, cfg: cfg, fl: fl, metrics: NewMetrics(),
 		claimed: map[string]time.Time{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{},
-		bootingIDs: map[string]bool{}, refillNow: make(chan struct{}, 1),
+		bootingIDs: map[string]bool{}, refillNow: make(chan struct{}, 1), staleLeases: map[string]time.Time{},
 		builders: map[string]*builder{}, builderFailed: map[string]time.Time{},
 		saving: map[string]*cacheSave{}, cacheDropped: map[string]time.Time{}, runCtx: context.Background(),
 		oomKills: -1}
@@ -1130,6 +1133,48 @@ func busyBuilders() map[string]bool {
 	return out
 }
 
+// leaseGrace is how long a lease of a MAC flintlock does not list is kept
+// before reconcile releases it: a VM created after a listing is listed by
+// the next one.
+const leaseGrace = 2 * time.Minute
+
+// releaseLease is vm.ReleaseLease (a variable for tests).
+var releaseLease = vm.ReleaseLease
+
+// releaseStaleLeases releases the leases of microVMs flintlock no longer
+// lists, once they have been seen so for leaseGrace. Deletes leave the lease
+// of a VM whose tap still exists (vm.ForgetInstance): its address must not go
+// to a new VM while it still sends from it. This also frees the leases of
+// VMs whose delete never forgot them (an executor killed in cleanup).
+func (d *Daemon) releaseStaleLeases(cfg config.Config, listed map[string]bool, leases []vm.Lease, now time.Time) {
+	seen := map[string]bool{}
+	for _, l := range leases {
+		if l.Expires.Unix() != 0 && !l.Expires.After(now) {
+			continue // expired: dnsmasq hands the address out again anyway
+		}
+		if listed[l.MAC] {
+			continue
+		}
+		key := l.MAC + " " + l.IP
+		seen[key] = true
+		first, ok := d.staleLeases[key]
+		if !ok {
+			d.staleLeases[key] = now
+			continue
+		}
+		if now.Sub(first) >= leaseGrace {
+			releaseLease(cfg, l.MAC, l.IP)
+			delete(d.staleLeases, key)
+			d.log.Info("released the DHCP lease of a gone microVM", "mac", l.MAC, "ip", l.IP)
+		}
+	}
+	for key := range d.staleLeases {
+		if !seen[key] {
+			delete(d.staleLeases, key)
+		}
+	}
+}
+
 // recordCapacity exports who holds host memory and DHCP addresses, from the
 // listing reconcile already has: the two resources jobs wait for or fail on.
 func (d *Daemon) recordCapacity(cfg config.Config, vms []*types.MicroVM) {
@@ -1168,6 +1213,7 @@ func (d *Daemon) recordCapacity(cfg config.Config, vms []*types.MicroVM) {
 		}
 		d.metrics.dhcpLeases.WithLabelValues("live").Set(live)
 		d.metrics.dhcpLeases.WithLabelValues("stale").Set(stale)
+		d.releaseStaleLeases(cfg, macs, leases, time.Now())
 	}
 	if n, err := host.DHCPRangeSize(host.DnsmasqConfig); err == nil {
 		d.metrics.dhcpCapacity.Set(float64(n))

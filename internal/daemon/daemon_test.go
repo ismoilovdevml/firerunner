@@ -41,6 +41,7 @@ func TestMain(m *testing.M) {
 	}
 	nftRun = func(string, ...string) (string, error) { return "", errors.New("nft is not run in tests") }
 	reconcileBindings = func(context.Context, map[string]vm.Binding) ([]string, []string, error) { return nil, nil, nil }
+	releaseLease = func(config.Config, string, string) {}
 	alive = func(config.Config, *vm.Instance) bool { return false }
 	warmDocker = func(config.Config, *vm.Instance) error { return nil }
 	serviceActive = func(context.Context, string) bool { return false }
@@ -305,5 +306,42 @@ func TestBindAddressesFromTheListing(t *testing.T) {
 	})
 	if len(got) != 1 || got["fltap1"] != (vm.Binding{Tap: "fltap1", MAC: vm.MAC("job-1"), IP: "10.200.0.21"}) {
 		t.Fatalf("bindings wanted: %+v", got)
+	}
+}
+
+// Reconcile releases the lease of a MAC flintlock does not list once it has
+// been seen so for leaseGrace; never a listed VM's, nor one whose VM shows up
+// in a later listing (created after an earlier one), nor an expired one.
+func TestReleaseStaleLeases(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	var got []string
+	old := releaseLease
+	releaseLease = func(_ config.Config, mac, ip string) { got = append(got, mac+" "+ip) }
+	t.Cleanup(func() { releaseLease = old })
+	t0 := time.Now()
+	future := t0.Add(15 * time.Minute)
+	leases := []vm.Lease{
+		{Expires: future, MAC: "aa:fc:00:00:00:01", IP: "10.200.0.1"},               // gone VM
+		{Expires: future, MAC: "aa:fc:00:00:00:02", IP: "10.200.0.2"},               // listed VM
+		{Expires: future, MAC: "aa:fc:00:00:00:03", IP: "10.200.0.3"},               // listed from the second pass on
+		{Expires: t0.Add(-time.Minute), MAC: "aa:fc:00:00:00:04", IP: "10.200.0.4"}, // expired
+	}
+	listed := map[string]bool{"aa:fc:00:00:00:02": true}
+	d.releaseStaleLeases(d.cfg, listed, leases, t0)
+	listed["aa:fc:00:00:00:03"] = true
+	d.releaseStaleLeases(d.cfg, listed, leases, t0.Add(time.Minute))
+	if len(got) != 0 {
+		t.Fatalf("released %v before the grace", got)
+	}
+	d.releaseStaleLeases(d.cfg, listed, leases, t0.Add(leaseGrace))
+	if strings.Join(got, ",") != "aa:fc:00:00:00:01 10.200.0.1" {
+		t.Fatalf("released %v, want only the gone VM's lease", got)
+	}
+	// dnsmasq drops a released lease from its file; one still there (a
+	// release that failed) starts its grace again instead of a release on
+	// every pass.
+	d.releaseStaleLeases(d.cfg, listed, leases, t0.Add(leaseGrace+time.Minute))
+	if len(got) != 1 {
+		t.Fatalf("released %v, want no second release right away", got)
 	}
 }

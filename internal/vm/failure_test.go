@@ -371,3 +371,42 @@ func TestForgetInstanceReleasesOnlyItsLease(t *testing.T) {
 		}
 	}
 }
+
+// A deleted VM whose bound tap still exists (flintlock stops it later) keeps
+// its lease: released now, its address could go to a new VM while it still
+// sends from it. Once the tap is gone, or for a VM that was never bound, the
+// lease goes at once. ReleaseLease frees a given lease (the daemon's pass).
+func TestForgetInstanceKeepsTheLeaseWhileTheTapLives(t *testing.T) {
+	cfg, _, _, released := bootEnv(t, "")
+	mac := MAC("job-12")
+	line := fmt.Sprintf("%d %s 10.200.0.12 * 01:c\n", time.Now().Unix()+900, mac)
+	if err := os.WriteFile(cfg.Network.LeasesFile, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exists := true
+	old := linkExists
+	linkExists = func(string) bool { return exists }
+	t.Cleanup(func() { linkExists = old })
+
+	ForgetInstance(cfg, &Instance{ID: "job-12", IP: "10.200.0.12", Tap: "fltap12"})
+	if len(*released) != 0 {
+		t.Fatalf("released %v while the tap exists", *released)
+	}
+	exists = false
+	ForgetInstance(cfg, &Instance{ID: "job-12", IP: "10.200.0.12", Tap: "fltap12"})
+	if len(*released) != 1 {
+		t.Fatalf("released %v after the tap is gone, want its lease", *released)
+	}
+	exists = true
+	*released = nil
+	ForgetInstance(cfg, &Instance{ID: "job-12", IP: "10.200.0.12"}) // never bound
+	if len(*released) != 1 {
+		t.Fatalf("unbound VM: released %v, want its lease at once", *released)
+	}
+	*released = nil
+	ReleaseLease(cfg, mac, "10.200.0.99")
+	ReleaseLease(cfg, mac, "10.200.0.12")
+	if len(*released) != 1 || (*released)[0][1] != "10.200.0.12" {
+		t.Fatalf("ReleaseLease released %v, want only 10.200.0.12", *released)
+	}
+}

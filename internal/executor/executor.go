@@ -713,9 +713,10 @@ func Cleanup(cfg config.Config) error {
 			fmt.Printf("microVM %s deleted\n", id)
 			// A VM that is still running keeps its lease and pinned key until
 			// the daemon deletes it (Daemon.delete forgets them then).
-			vm.Forget(cfg, vmID)
 			if stErr == nil {
-				vm.UnbindInstance(&st.Instance)
+				vm.ForgetInstance(cfg, &st.Instance)
+			} else {
+				vm.Forget(cfg, vmID)
 			}
 		}
 	}
@@ -776,9 +777,7 @@ func deleteVM(cfg config.Config, inst *vm.Instance) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	vm.StopMux(inst) // prepare may have started one; it would linger until ServerAlive ends it
-	if vm.Destroy(ctx, cfg, fl, inst.ID, inst.UID) == nil {
-		vm.UnbindInstance(inst)
-	}
+	_ = vm.DestroyInstance(ctx, cfg, fl, inst)
 }
 
 // Only failures of the job's own commands count as build failures.
