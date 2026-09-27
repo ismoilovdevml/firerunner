@@ -369,17 +369,27 @@ func TestUnbindStopsWhenTheTapStaysChecked(t *testing.T) {
 	}
 }
 
-// A binding that fails stops the reconcile pass with its error.
-func TestReconcileBindingsStopsOnABindError(t *testing.T) {
+// A binding nft refuses is reported, and the pass still removes the elements
+// of taps that are gone (only reconcile removes them).
+func TestReconcileBindingsReportsBindErrors(t *testing.T) {
 	f := newFakeSets(t)
+	if err := Bind(context.Background(), Binding{Tap: "fltapGone", MAC: "aa:fc:00:00:00:01", IP: "10.200.0.5"}); err != nil {
+		t.Fatal(err)
+	}
+	old := linkExists
+	linkExists = func(name string) bool { return name != "fltapGone" }
+	t.Cleanup(func() { linkExists = old })
 	nftScript = func(ctx context.Context, s string) error {
 		if strings.HasPrefix(s, "add element") {
 			return errors.New("nft: netlink: Operation not permitted")
 		}
 		return f.script(ctx, s)
 	}
-	_, _, err := ReconcileBindings(context.Background(), map[string]Binding{"fltap8": {Tap: "fltap8", MAC: "aa:fc:00:00:00:08", IP: "10.200.0.8"}})
-	if err == nil || f.state() != "" {
-		t.Fatalf("reconcile = %v, sets %s", err, f.state())
+	added, removed, err := ReconcileBindings(context.Background(), map[string]Binding{"fltap8": {Tap: "fltap8", MAC: "aa:fc:00:00:00:08", IP: "10.200.0.8"}})
+	if err == nil || !strings.Contains(err.Error(), "fltap8") || len(added) != 0 || strings.Join(removed, ",") != "fltapGone" {
+		t.Fatalf("reconcile = %v, %v, %v", added, removed, err)
+	}
+	if s := f.state(); s != "" {
+		t.Fatalf("sets %s, want the gone tap removed and nothing bound", s)
 	}
 }

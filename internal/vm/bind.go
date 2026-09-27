@@ -293,11 +293,16 @@ func ReconcileBindings(ctx context.Context, want map[string]Binding) (added, rem
 	if err != nil {
 		return nil, nil, err
 	}
+	// A tap nft refuses does not hold up the others, nor the removals, which
+	// only this pass makes since deletes keep a VM's binding.
+	var errs []error
 	for tap, b := range want {
 		mac := strings.ToLower(b.MAC)
 		if !have.Taps[tap] || !have.MACs[[2]string{tap, mac}] || !have.Addrs[[3]string{tap, mac, b.IP}] {
 			if err := Bind(ctx, b); err != nil {
-				return added, removed, err
+				// This tap stays as it was; the others still get their turn.
+				errs = append(errs, fmt.Errorf("binding %s: %w", tap, err))
+				continue
 			}
 			added = append(added, tap)
 		}
@@ -337,9 +342,10 @@ func ReconcileBindings(ctx context.Context, want map[string]Binding) (added, rem
 			continue
 		}
 		if err := unbindTap(ctx, tap, macs[tap], addrs[tap]); err != nil {
-			return added, removed, err
+			errs = append(errs, fmt.Errorf("unbinding %s: %w", tap, err))
+			continue
 		}
 		removed = append(removed, tap)
 	}
-	return added, removed, nil
+	return added, removed, errors.Join(errs...)
 }

@@ -292,9 +292,6 @@ func TestBindAddressesFromTheListing(t *testing.T) {
 	}
 	exp := time.Now().Add(15 * time.Minute).Unix()
 	leases := fmt.Sprintf("%d %s 10.200.0.21 job-1 *\n%d %s 10.200.0.22 job-2 *\n", exp, vm.MAC("job-1"), exp, vm.MAC("job-2"))
-	if err := os.WriteFile(d.cfg.Network.LeasesFile, []byte(leases), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	leases += fmt.Sprintf("%d %s 10.200.0.24 job-4 *\n", exp, vm.MAC("job-4"))
 	if err := os.WriteFile(d.cfg.Network.LeasesFile, []byte(leases), 0o600); err != nil {
 		t.Fatal(err)
