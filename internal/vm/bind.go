@@ -282,12 +282,24 @@ var linkExists = func(name string) bool {
 	return err == nil
 }
 
+// boundIP is the address tap is bound to with mac, or "" (the smallest of
+// several, which only a hand-made element could leave).
+func boundIP(have Bindings, tap, mac string) string {
+	ip := ""
+	for k := range have.Addrs {
+		if k[0] == tap && k[1] == mac && (ip == "" || k[2] < ip) {
+			ip = k[2]
+		}
+	}
+	return ip
+}
+
 // ReconcileBindings makes the binding sets match want (tap -> binding of the
 // listed microVMs whose address is known): missing bindings are added, and
 // elements of taps that no longer exist on the host are removed. Elements of
 // a tap that exists but is not in want are left alone: that is a microVM
 // booting after the listing was taken, which binds itself. It reports what
-// it added and removed.
+// it added and removed. A listed VM keeps the address it is bound to.
 func ReconcileBindings(ctx context.Context, want map[string]Binding) (added, removed []string, err error) {
 	have, err := ListBindings(ctx)
 	if err != nil {
@@ -298,6 +310,14 @@ func ReconcileBindings(ctx context.Context, want map[string]Binding) (added, rem
 	var errs []error
 	for tap, b := range want {
 		mac := strings.ToLower(b.MAC)
+		// A VM keeps the address it was bound with. The lease file is what
+		// dnsmasq made of the VMs' own DHCP messages: a job can release
+		// another VM's lease (client ids are not secret) and ask for its
+		// address, and following the lease would hand it that address.
+		if ip := boundIP(have, tap, mac); ip != "" && ip != b.IP {
+			errs = append(errs, fmt.Errorf("%s: its lease now names %s; it keeps %s", tap, b.IP, ip))
+			b.IP = ip
+		}
 		if !have.Taps[tap] || !have.MACs[[2]string{tap, mac}] || !have.Addrs[[3]string{tap, mac, b.IP}] {
 			if err := Bind(ctx, b); err != nil {
 				// This tap stays as it was; the others still get their turn.

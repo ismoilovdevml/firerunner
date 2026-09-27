@@ -393,3 +393,40 @@ func TestReconcileBindingsReportsBindErrors(t *testing.T) {
 		t.Fatalf("sets %s, want the gone tap removed and nothing bound", s)
 	}
 }
+
+// A job that makes dnsmasq lease it another VM's address (release that VM's
+// lease, then ask for the address) must not get bound to it: a listed VM keeps
+// the address it was bound with, and the pass says so.
+func TestReconcileKeepsABoundAddress(t *testing.T) {
+	f := newFakeSets(t)
+	oldLink := linkExists
+	linkExists = func(string) bool { return true }
+	t.Cleanup(func() { linkExists = oldLink })
+	ctx := context.Background()
+	attacker := Binding{Tap: "fltapJob", MAC: "aa:fc:00:00:00:01", IP: "10.200.0.21"}
+	victim := Binding{Tap: "fltapVictim", MAC: "aa:fc:00:00:00:02", IP: "10.200.0.22"}
+	for _, b := range []Binding{attacker, victim} {
+		if err := Bind(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := f.state()
+	// The leases now say: the job has the victim's address, the victim none.
+	stolen := attacker
+	stolen.IP = victim.IP
+	added, removed, err := ReconcileBindings(ctx, map[string]Binding{"fltapJob": stolen})
+	if err == nil || !strings.Contains(err.Error(), "fltapJob: its lease now names 10.200.0.22; it keeps 10.200.0.21") {
+		t.Fatalf("err = %v, want the changed lease reported", err)
+	}
+	if len(added)+len(removed) != 0 || f.state() != before {
+		t.Fatalf("added %v removed %v, sets:\n %s\nwant unchanged:\n %s", added, removed, f.state(), before)
+	}
+	// A new VM on a reused tap name (another MAC) still gets its own address.
+	reused := Binding{Tap: "fltapJob", MAC: "aa:fc:00:00:00:03", IP: "10.200.0.23"}
+	if _, _, err := ReconcileBindings(ctx, map[string]Binding{"fltapJob": reused}); err != nil {
+		t.Fatal(err)
+	}
+	if !f.addrs[[3]string{"fltapJob", "aa:fc:00:00:00:03", "10.200.0.23"}] || f.addrs[[3]string{"fltapJob", "aa:fc:00:00:00:01", "10.200.0.21"}] {
+		t.Fatalf("reused tap: %s", f.state())
+	}
+}

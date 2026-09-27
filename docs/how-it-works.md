@@ -44,8 +44,10 @@ Not covered yet:
 - Firecracker runs as root without its jailer, which flintlock does not support: Firecracker's
   seccomp filters and KVM are the barrier between a VM and the host, and an escape from the VMM
   would be root on the host.
-- A VM can send DHCP requests with made-up client ids from its own address and use up the
-  addresses of the microVM network, so other jobs cannot start until those leases expire (15 min).
+- A VM can send DHCP requests for other clients from its own address: use up the addresses of the
+  microVM network with made-up client ids, so other jobs cannot start until those leases expire
+  (15 min), or release another VM's lease, which that VM then cannot renew. Its address binding
+  never moves to another VM's address.
 - A VM runs without its address binding when flintlock does not report its network port or nft
   refuses the binding; the daemon's next pass (every minute) binds it once flintlock reports the
   port. A deleted VM keeps its binding until its port is gone.
