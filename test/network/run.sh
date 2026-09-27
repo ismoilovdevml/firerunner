@@ -8,7 +8,7 @@
 # throwaway container, once with and once without br_netfilter:
 #   docker run --rm --privileged -e BRNF=1 -v "$PWD":/src:ro ubuntu:24.04 bash /src/test/network/run.sh
 set -uo pipefail
-apt-get update -qq >/dev/null && apt-get install -y -qq nftables iproute2 netcat-openbsd iputils-ping iputils-arping busybox >/dev/null || exit 99
+apt-get update -qq >/dev/null && apt-get install -y -qq nftables iproute2 netcat-openbsd iputils-ping iputils-arping busybox python3-minimal >/dev/null || exit 99
 
 WORK=/work; mkdir -p $WORK
 # BRNF=1: br_netfilter active (bridged IPv4 also passes the inet hooks); 0: pure bridging.
@@ -164,7 +164,19 @@ check "...and bridge table entry of vmB kept"      ok      bridge_port_of_macb_i
 ip netns exec vmA busybox udhcpc -i eth0 -n -q -t 2 -T 1 -s /bin/true >/dev/null 2>&1
 check "checked VM DHCP from 0.0.0.0 reaches host"  ok      dhcp_seen
 nft delete table inet probe
-check "checked VM ARP probe (0.0.0.0) is answered" ok      bash -c "! ip netns exec vmA arping -q -D -c1 -w2 -I eth0 10.200.0.1"
+# arping -D exits 1 when the address is in use (answered), 2 on its own errors.
+check "checked VM ARP probe (0.0.0.0) is answered" ok      bash -c "ip netns exec vmA arping -q -D -c1 -w2 -I eth0 10.200.0.1; [[ \$? -eq 1 ]]"
+# Gratuitous ARP from vmA's own MAC and address, but naming vmB's MAC as the
+# sender: the host would send vmA's traffic to vmB.
+garp() { ip netns exec vmA python3 -c '
+import socket, sys
+src, sha = (bytes.fromhex(m.replace(":", "")) for m in sys.argv[1:3])
+ip = socket.inet_aton("10.200.0.11")
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW); s.bind(("eth0", 0))
+s.send(b"\xff" * 6 + src + b"\x08\x06" + bytes.fromhex("0001080006040001") + sha + ip + b"\x00" * 6 + ip)
+' "$MACA" "$MACB"; }
+ping -c1 -W1 10.200.0.11 >/dev/null; garp
+check "checked VM: ARP naming another MAC dropped"  ok      bash -c "ip neigh show 10.200.0.11 dev br-fc | grep -qi $MACA"
 
 # reload keeps the daemon's builder mapping and microVM bindings
 $NETUP || { echo "reload failed"; fail=$((fail+1)); }

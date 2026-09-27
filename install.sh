@@ -725,13 +725,25 @@ sysctl -qw net.ipv6.conf.${FR_BRIDGE}.disable_ipv6=1 2>/dev/null || true
 ip link set ${FR_BRIDGE} up
 sysctl -qw net.ipv4.ip_forward=1
 # Keep what the daemon added (builder port mappings, microVM bindings) across a
-# reload of these rules.
-elements() { nft list "\$1" "\$2" firerunner "\$3" 2>/dev/null | tr -d '\n\t' | sed -n 's/.*elements = {\([^}]*\)}.*/\1/p' || true; }
-builders=\$(elements map inet builders)
-vm_taps=\$(elements set bridge vm_taps)
-vm_macs=\$(elements set bridge vm_macs)
-vm_addrs=\$(elements set bridge vm_addrs)
-nft -f - <<'NFT'
+# reload of these rules: they go back in the transaction that re-creates the
+# tables, so no microVM is unchecked in between. One listing per table.
+elements() { sed -n "s/.*\$1 {[^}]*elements = {\([^}]*\)}.*/\1/p"; }
+inet=\$(nft list table inet firerunner 2>/dev/null | tr -d '\n\t' || true)
+bridge=\$(nft list table bridge firerunner 2>/dev/null | tr -d '\n\t' || true)
+builders=\$(elements "map builders" <<<"\$inet")
+vm_taps=\$(elements "set vm_taps" <<<"\$bridge")
+vm_macs=\$(elements "set vm_macs" <<<"\$bridge")
+vm_addrs=\$(elements "set vm_addrs" <<<"\$bridge")
+restore=""
+if [[ -n \$builders ]]; then
+    restore+="add element inet firerunner builders { \$builders }"\$'\n'
+fi
+if [[ -n \$vm_taps && -n \$vm_macs && -n \$vm_addrs ]]; then
+    restore+="add element bridge firerunner vm_macs { \$vm_macs }"\$'\n'
+    restore+="add element bridge firerunner vm_addrs { \$vm_addrs }"\$'\n'
+    restore+="add element bridge firerunner vm_taps { \$vm_taps }"\$'\n'
+fi
+rules=\$(cat <<'NFT'
 table ip firerunner
 delete table ip firerunner
 table inet firerunner
@@ -831,16 +843,12 @@ table bridge firerunner {
   }
 }
 NFT
-if [[ -n \$builders ]]; then
-    nft add element inet firerunner builders "{ \$builders }" || true
-fi
-# One transaction: a tap is checked only together with its MAC and address.
-if [[ -n \$vm_taps ]]; then
-    nft -f - <<NFT || true
-add element bridge firerunner vm_macs { \${vm_macs:-} }
-add element bridge firerunner vm_addrs { \${vm_addrs:-} }
-add element bridge firerunner vm_taps { \$vm_taps }
-NFT
+)
+if ! printf '%s\n%s' "\$rules" "\$restore" | nft -f -; then
+    [[ -n \$restore ]] || exit 1
+    # The daemon adds them again on its next pass.
+    echo "net-up.sh: could not restore the builder ports and microVM bindings; loading the rules without them" >&2
+    printf '%s\n' "\$rules" | nft -f -
 fi
 EOF
 
