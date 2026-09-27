@@ -69,8 +69,8 @@ func (f *fakeSets) script(_ context.Context, s string) error {
 		case "vm_addrs":
 			missing = !f.addrs[[3]string{c.parts[0], c.parts[1], c.parts[2]}]
 		}
-		if missing {
-			return errors.New("Error: Could not process rule: No such file or directory")
+		if missing { // what nftScript makes of nft's answer
+			return fmt.Errorf("%w: Error: Could not process rule: No such file or directory", ErrNoBindingSets)
 		}
 	}
 	for _, c := range changes {
@@ -179,7 +179,9 @@ func TestUnbindOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.scripts = nil
-	Unbind(context.Background(), b)
+	if err := Unbind(context.Background(), b); err != nil {
+		t.Fatalf("Unbind = %v", err)
+	}
 	if len(f.scripts) != 3 || !strings.HasPrefix(f.scripts[0], "delete element bridge firerunner vm_taps") ||
 		!strings.Contains(f.scripts[1], "vm_addrs") || !strings.Contains(f.scripts[2], "vm_macs") {
 		t.Fatalf("unbind scripts %q", f.scripts)
@@ -187,7 +189,9 @@ func TestUnbindOrder(t *testing.T) {
 	if s := f.state(); s != "" {
 		t.Fatalf("left %s", s)
 	}
-	Unbind(context.Background(), b) // nothing left: no panic, nothing to undo
+	if err := Unbind(context.Background(), b); err != nil { // nothing left: no panic, nothing to undo
+		t.Fatalf("Unbind = %v", err)
+	}
 }
 
 // The JSON of `nft -j list set` for the three set types (nft 1.0.9).
@@ -257,15 +261,14 @@ func TestReconcileBindings(t *testing.T) {
 	}
 }
 
-// Boot binds the new VM's tap to its MAC and address before it waits for
-// SSH, and a boot that fails removes the binding with the VM.
-func TestBootBindsItsTap(t *testing.T) {
-	const id = "job-9"
+// bootListedWithTap boots id against a fake flintlock that, once the VM is
+// created, lists it with tap and leases it 127.0.0.1 (no sshd there: the boot
+// ends at the SSH wait).
+func bootListedWithTap(t *testing.T, ctx context.Context, id, tap string) (*Instance, error) {
+	t.Helper()
 	mac := MAC(id)
 	exp := time.Now().Add(15 * time.Minute).Unix()
 	cfg, srv, fl, _ := bootEnv(t, "")
-	f := newFakeSets(t)
-	// Once created, flintlock lists the VM with its tap, and dnsmasq leases it.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -275,19 +278,108 @@ func TestBootBindsItsTap(t *testing.T) {
 		uid := "uid-new"
 		srv.SetVMs(&types.MicroVM{Spec: &types.MicroVMSpec{Id: id, Uid: &uid},
 			Status: &types.MicroVMStatus{State: types.MicroVMStatus_CREATED,
-				NetworkInterfaces: map[string]*types.NetworkInterfaceStatus{bridgedDevice: {HostDeviceName: "fltap9"}}}})
+				NetworkInterfaces: map[string]*types.NetworkInterfaceStatus{bridgedDevice: {HostDeviceName: tap}}}})
 		_ = os.WriteFile(cfg.Network.LeasesFile, []byte(fmt.Sprintf("%d %s 127.0.0.1 %s 01:%s\n", exp, mac, id, mac)), 0o600)
 	}()
-	inst, err := Boot(context.Background(), cfg, fl, id, nil)
+	inst, err := Boot(ctx, cfg, fl, id, nil)
 	<-done
-	if inst != nil || err == nil {
+	return inst, err
+}
+
+// Boot binds the new VM's tap to its MAC and address before it waits for
+// SSH. A failed boot keeps the binding while the tap exists: flintlock
+// deletes the VM later, and it must not send as another VM meanwhile.
+func TestBootBindsItsTap(t *testing.T) {
+	f := newFakeSets(t)
+	if inst, err := bootListedWithTap(t, context.Background(), "job-9", "fltap9"); inst != nil || !errors.Is(err, ErrNotReady) {
 		t.Fatalf("Boot = %v, %v; want a failure at the SSH wait (no sshd in tests)", inst, err)
 	}
-	if len(f.scripts) < 2 || !strings.Contains(f.scripts[0], `vm_addrs { "fltap9" . `+mac+` . 127.0.0.1 }`) ||
-		!strings.HasPrefix(f.scripts[1], `delete element bridge firerunner vm_taps { "fltap9" }`) {
-		t.Fatalf("nft scripts %q: want the binding, then its removal", f.scripts)
+	if len(f.scripts) != 1 || !strings.Contains(f.scripts[0], `vm_addrs { "fltap9" . `+MAC("job-9")+` . 127.0.0.1 }`) {
+		t.Fatalf("nft scripts %q: want the binding only", f.scripts)
 	}
+	if !f.taps["fltap9"] {
+		t.Fatal("binding removed while the tap still exists")
+	}
+}
+
+// A binding nft refuses does not fail the boot: the VM runs unchecked.
+func TestBootRunsUncheckedWhenBindingFails(t *testing.T) {
+	old := nftScript
+	nftScript = func(context.Context, string) error { return errors.New("nft: netlink: Operation not permitted") }
+	t.Cleanup(func() { nftScript = old })
+	if inst, err := bootListedWithTap(t, context.Background(), "job-10", "fltap10"); !errors.Is(err, ErrNotReady) || inst != nil {
+		t.Fatalf("Boot = %v, %v; want it to go on to the SSH wait", inst, err)
+	}
+}
+
+// A job cancelled while its VM is being bound ends the boot as cancelled.
+func TestBootCancelledWhileBinding(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	old := nftScript
+	nftScript = func(context.Context, string) error { cancel(); return context.Canceled }
+	t.Cleanup(func() { nftScript = old })
+	if _, err := bootListedWithTap(t, ctx, "job-11", "fltap11"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Boot = %v, want context.Canceled", err)
+	}
+}
+
+// A deleted VM keeps its binding until its tap is gone; then it goes.
+func TestUnbindInstanceWaitsForTheTapToGo(t *testing.T) {
+	f := newFakeSets(t)
+	exists := true
+	old := linkExists
+	linkExists = func(string) bool { return exists }
+	t.Cleanup(func() { linkExists = old })
+	inst := &Instance{ID: "job-5", IP: "10.200.0.5", Tap: "fltap5"}
+	if err := Bind(context.Background(), Binding{Tap: inst.Tap, MAC: MAC(inst.ID), IP: inst.IP}); err != nil {
+		t.Fatal(err)
+	}
+	UnbindInstance(inst)
+	if !f.taps["fltap5"] || len(f.addrs) != 1 {
+		t.Fatalf("unbound while the tap exists: %s", f.state())
+	}
+	exists = false
+	UnbindInstance(inst)
 	if s := f.state(); s != "" {
-		t.Fatalf("binding left after the failed boot: %s", s)
+		t.Fatalf("left after the tap is gone: %s", s)
+	}
+	UnbindInstance(&Instance{ID: "job-6"}) // never bound: nothing to do
+}
+
+// A tap still in vm_taps keeps its addresses: when its delete fails, Unbind
+// removes nothing else (the VM would be cut off).
+func TestUnbindStopsWhenTheTapStaysChecked(t *testing.T) {
+	f := newFakeSets(t)
+	b := Binding{Tap: "fltap7", MAC: "aa:fc:00:00:00:07", IP: "10.200.0.7"}
+	if err := Bind(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	nftScript = func(ctx context.Context, s string) error {
+		if strings.Contains(s, "delete element bridge firerunner vm_taps") {
+			return errors.New("nft: signal: killed")
+		}
+		return f.script(ctx, s)
+	}
+	if err := Unbind(context.Background(), b); err == nil {
+		t.Fatal("Unbind hid the failed vm_taps delete")
+	}
+	if !f.taps["fltap7"] || len(f.macs) != 1 || len(f.addrs) != 1 {
+		t.Fatalf("addresses removed from a tap still checked: %s", f.state())
+	}
+}
+
+// A binding that fails stops the reconcile pass with its error.
+func TestReconcileBindingsStopsOnABindError(t *testing.T) {
+	f := newFakeSets(t)
+	nftScript = func(ctx context.Context, s string) error {
+		if strings.HasPrefix(s, "add element") {
+			return errors.New("nft: netlink: Operation not permitted")
+		}
+		return f.script(ctx, s)
+	}
+	_, _, err := ReconcileBindings(context.Background(), map[string]Binding{"fltap8": {Tap: "fltap8", MAC: "aa:fc:00:00:00:08", IP: "10.200.0.8"}})
+	if err == nil || f.state() != "" {
+		t.Fatalf("reconcile = %v, sets %s", err, f.state())
 	}
 }

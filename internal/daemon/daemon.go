@@ -1003,9 +1003,16 @@ var reconcileBindings = vm.ReconcileBindings
 // failed at boot, sets a firewall reload emptied, taps that are gone.
 func (d *Daemon) bindAddresses(ctx context.Context, cfg config.Config, vms []*types.MicroVM) {
 	want := map[string]vm.Binding{}
+	// Two listed VMs with one id (a prepare retried while the earlier VM's
+	// delete is still queued) share a MAC, and the lease says which address
+	// is whose only for one of them: leave both to their own boot's binding.
+	macs := map[string]int{}
+	for _, v := range vms {
+		macs[strings.ToLower(vm.GuestMAC(v))]++
+	}
 	for _, v := range vms {
 		tap, mac := vm.Tap(v), vm.GuestMAC(v)
-		if tap == "" || mac == "" {
+		if tap == "" || mac == "" || macs[strings.ToLower(mac)] > 1 {
 			continue
 		}
 		if ip, err := vm.LeaseIP(cfg.Network.LeasesFile, mac); err == nil && ip != "" {

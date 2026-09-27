@@ -77,27 +77,58 @@ func Bind(ctx context.Context, b Binding) error {
 		"add element bridge firerunner vm_taps { %q }\n", b.Tap, mac, b.Tap, mac, b.IP, b.Tap))
 }
 
-// Unbind removes a binding: vm_taps first and on its own, so the tap is
-// unchecked from then on whatever follows (a failing delete aborts its whole
-// transaction). Missing elements are fine.
-func Unbind(ctx context.Context, b Binding) {
-	if !tapName.MatchString(b.Tap) {
-		return
+// Unbind removes a binding (see unbindTap).
+func Unbind(ctx context.Context, b Binding) error {
+	var macs []string
+	var addrs [][2]string
+	if b.MAC != "" {
+		macs = []string{b.MAC}
+		if b.IP != "" {
+			addrs = [][2]string{{b.MAC, b.IP}}
+		}
 	}
-	_ = nftScript(ctx, fmt.Sprintf("delete element bridge firerunner vm_taps { %q }\n", b.Tap))
-	mac := strings.ToLower(b.MAC)
-	if b.valid() == nil {
-		_ = nftScript(ctx, fmt.Sprintf("delete element bridge firerunner vm_addrs { %q . %s . %s }\n", b.Tap, mac, b.IP))
+	return unbindTap(ctx, b.Tap, macs, addrs)
+}
+
+// unbindTap removes a tap from vm_taps first and on its own, so it is
+// unchecked before its addresses go. If that delete fails for any reason but
+// a missing element, nothing more is removed: a tap in vm_taps keeps its
+// addresses, or its VM would be cut off.
+func unbindTap(ctx context.Context, tap string, macs []string, addrs [][2]string) error {
+	if !tapName.MatchString(tap) {
+		return fmt.Errorf("not unbinding: tap name %q", tap)
 	}
-	if hw, err := net.ParseMAC(b.MAC); err == nil && len(hw) == 6 {
-		_ = nftScript(ctx, fmt.Sprintf("delete element bridge firerunner vm_macs { %q . %s }\n", b.Tap, mac))
+	if err := nftScript(ctx, fmt.Sprintf("delete element bridge firerunner vm_taps { %q }\n", tap)); err != nil &&
+		!errors.Is(err, ErrNoBindingSets) {
+		return err
+	}
+	deleteTuples(ctx, tap, macs, addrs)
+	return nil
+}
+
+// deleteTuples removes addresses of a tap from vm_macs and vm_addrs, each on
+// its own (a missing one would abort a transaction). Values that are not a
+// MAC and an IPv4 address never reach nft.
+func deleteTuples(ctx context.Context, tap string, macs []string, addrs [][2]string) {
+	for _, a := range addrs {
+		if (Binding{Tap: tap, MAC: a[0], IP: a[1]}).valid() == nil {
+			_ = nftScript(ctx, fmt.Sprintf("delete element bridge firerunner vm_addrs { %q . %s . %s }\n", tap, strings.ToLower(a[0]), a[1]))
+		}
+	}
+	for _, m := range macs {
+		if hw, err := net.ParseMAC(m); err == nil && len(hw) == 6 && tapName.MatchString(tap) {
+			_ = nftScript(ctx, fmt.Sprintf("delete element bridge firerunner vm_macs { %q . %s }\n", tap, strings.ToLower(m)))
+		}
 	}
 }
 
-// UnbindInstance removes the binding of a deleted microVM, if it had one.
+// UnbindInstance removes the binding of a deleted microVM once its tap is
+// gone. flintlock deletes a VM after Delete returns (its one worker may run
+// other plans first), and a VM still running must not send from any address
+// meanwhile; reconcile removes the binding once the tap is gone.
 func UnbindInstance(inst *Instance) {
-	if inst.Tap != "" {
-		Unbind(context.Background(), Binding{Tap: inst.Tap, MAC: MAC(inst.ID), IP: inst.IP})
+	if inst.Tap != "" && !linkExists(inst.Tap) {
+		_ = Unbind(context.Background(), Binding{Tap: inst.Tap, MAC: MAC(inst.ID), IP: inst.IP})
 	}
 }
 
@@ -117,12 +148,14 @@ func GuestMAC(v *types.MicroVM) string {
 	return ""
 }
 
-// bindTries and bindPoll bound how long Boot asks flintlock for the new VM's
-// tap (variables for tests). Once the VM has a lease its tap exists, and
-// flintlock reports it with the VM's status.
+// bindTries, bindPoll and bindCallTimeout bound how long Boot asks flintlock
+// for the new VM's tap (variables for tests): a few seconds at most, since
+// the time comes out of the boot's wait for SSH. Once the VM has a lease its
+// tap exists, and flintlock reports it with the VM's status.
 var (
-	bindTries = 5
-	bindPoll  = 200 * time.Millisecond
+	bindTries       = 5
+	bindPoll        = 200 * time.Millisecond
+	bindCallTimeout = 2 * time.Second
 )
 
 // bind binds inst's tap (set in inst.Tap) to its MAC and leased address.
@@ -134,8 +167,16 @@ func bind(ctx context.Context, fl *flintlock.Client, inst *Instance, mac string)
 				return err
 			}
 		}
-		if v, err := fl.Find(ctx, inst.UID); err == nil {
-			tap = Tap(v)
+		lctx, cancel := context.WithTimeout(ctx, bindCallTimeout)
+		vms, err := fl.ListOnce(lctx)
+		cancel()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		for _, v := range vms {
+			if err == nil && v.GetSpec().GetUid() == inst.UID {
+				tap = Tap(v)
+			}
 		}
 	}
 	if tap == "" {
@@ -263,42 +304,40 @@ func ReconcileBindings(ctx context.Context, want map[string]Binding) (added, rem
 		// Addresses a tap had before (a tap name used again by a new VM): the
 		// new VM must not send as the old one. Its own binding is in place,
 		// so it stays reachable.
+		var macs []string
+		var addrs [][2]string
 		for k := range have.MACs {
 			if k[0] == tap && k[1] != mac {
-				_ = nftScript(ctx, fmt.Sprintf("delete element bridge firerunner vm_macs { %q . %s }\n", tap, k[1]))
+				macs = append(macs, k[1])
 			}
 		}
 		for k := range have.Addrs {
 			if k[0] == tap && (k[1] != mac || k[2] != b.IP) {
-				_ = nftScript(ctx, fmt.Sprintf("delete element bridge firerunner vm_addrs { %q . %s . %s }\n", tap, k[1], k[2]))
+				addrs = append(addrs, [2]string{k[1], k[2]})
 			}
 		}
+		deleteTuples(ctx, tap, macs, addrs)
 	}
-	gone := map[string]Binding{}
+	// Every element of a tap that no longer exists, whatever its addresses.
+	macs, addrs := map[string][]string{}, map[string][][2]string{}
+	taps := map[string]bool{}
 	for tap := range have.Taps {
-		gone[tap] = Binding{Tap: tap}
+		taps[tap] = true
 	}
 	for k := range have.MACs {
-		gone[k[0]] = Binding{Tap: k[0], MAC: k[1]}
+		taps[k[0]] = true
+		macs[k[0]] = append(macs[k[0]], k[1])
 	}
 	for k := range have.Addrs {
-		gone[k[0]] = Binding{Tap: k[0], MAC: k[1], IP: k[2]}
+		taps[k[0]] = true
+		addrs[k[0]] = append(addrs[k[0]], [2]string{k[1], k[2]})
 	}
-	for tap := range gone {
+	for tap := range taps {
 		if _, live := want[tap]; live || linkExists(tap) {
 			continue
 		}
-		// Every element of this tap, whatever its addresses.
-		Unbind(ctx, Binding{Tap: tap})
-		for k := range have.MACs {
-			if k[0] == tap {
-				Unbind(ctx, Binding{Tap: tap, MAC: k[1]})
-			}
-		}
-		for k := range have.Addrs {
-			if k[0] == tap {
-				Unbind(ctx, Binding{Tap: tap, MAC: k[1], IP: k[2]})
-			}
+		if err := unbindTap(ctx, tap, macs[tap], addrs[tap]); err != nil {
+			return added, removed, err
 		}
 		removed = append(removed, tap)
 	}

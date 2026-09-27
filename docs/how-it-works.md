@@ -46,8 +46,9 @@ Not covered yet:
   would be root on the host.
 - A VM can send DHCP requests with made-up client ids from its own address and use up the
   addresses of the microVM network, so other jobs cannot start until those leases expire (15 min).
-- A VM whose network port flintlock does not report runs without its address binding (the
-  daemon binds it at its next pass, within a minute).
+- A VM runs without its address binding when flintlock does not report its network port or nft
+  refuses the binding; the daemon's next pass (every minute) binds it once flintlock reports the
+  port. A deleted VM keeps its binding until its port is gone.
 - The signature does not say which build of `edge` a release is: an older signed `edge` build can
   be served in place of the newest one. Tagged releases are checked (`v1.2.0` must say `v1.2.0`).
 

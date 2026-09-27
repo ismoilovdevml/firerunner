@@ -78,8 +78,12 @@ func TestBindingsAgainstRealNft(t *testing.T) {
 		t.Fatalf("after reconcile %+v", have)
 	}
 
-	Unbind(ctx, Binding{Tap: "fltapA", MAC: "aa:fc:00:00:00:0a", IP: "10.200.0.10"})
-	Unbind(ctx, Binding{Tap: "fltapA", MAC: "aa:fc:00:00:00:0a", IP: "10.200.0.10"}) // already gone: fine
+	if err := Unbind(ctx, Binding{Tap: "fltapA", MAC: "aa:fc:00:00:00:0a", IP: "10.200.0.10"}); err != nil {
+		t.Fatalf("Unbind = %v", err)
+	}
+	if err := Unbind(ctx, Binding{Tap: "fltapA", MAC: "aa:fc:00:00:00:0a", IP: "10.200.0.10"}); err != nil { // already gone: fine
+		t.Fatalf("Unbind = %v", err)
+	}
 	have, _ = ListBindings(ctx)
 	if have.Taps["fltapA"] || len(have.MACs) != 1 || len(have.Addrs) != 1 {
 		t.Fatalf("after unbind %+v", have)

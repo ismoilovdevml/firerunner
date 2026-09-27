@@ -295,10 +295,16 @@ func TestBindAddressesFromTheListing(t *testing.T) {
 	if err := os.WriteFile(d.cfg.Network.LeasesFile, []byte(leases), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	leases += fmt.Sprintf("%d %s 10.200.0.24 job-4 *\n", exp, vm.MAC("job-4"))
+	if err := os.WriteFile(d.cfg.Network.LeasesFile, []byte(leases), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	d.bindAddresses(context.Background(), d.cfg, []*types.MicroVM{
-		listed("job-1", "fltap1"), // bound
-		listed("job-2", ""),       // flintlock reports no tap: unchecked
-		listed("job-3", "fltap3"), // no lease yet: unchecked
+		listed("job-1", "fltap1"),  // bound
+		listed("job-2", ""),        // flintlock reports no tap: unchecked
+		listed("job-3", "fltap3"),  // no lease yet: unchecked
+		listed("job-4", "fltap4a"), // a retried prepare: two VMs, one MAC,
+		listed("job-4", "fltap4b"), // one lease; each binds at its own boot
 	})
 	if len(got) != 1 || got["fltap1"] != (vm.Binding{Tap: "fltap1", MAC: vm.MAC("job-1"), IP: "10.200.0.21"}) {
 		t.Fatalf("bindings wanted: %+v", got)
