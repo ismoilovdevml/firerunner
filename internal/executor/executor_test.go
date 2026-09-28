@@ -254,7 +254,7 @@ func TestBuilderScript(t *testing.T) {
 		"servername=builder,default-load=true",
 		`"tcp://$gw:20003"`,
 		"cat > /usr/local/bin/docker <<'FIRERUNNER_EOF'",
-		"end=$((SECONDS + 150))",
+		"end=$((SECONDS + 300))",
 		"exec /usr/bin/docker \"$@\"",
 	} {
 		if !strings.Contains(s, want) {

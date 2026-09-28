@@ -1432,3 +1432,34 @@ func TestEachJobGetsItsOwnShortLivedClientCert(t *testing.T) {
 		t.Fatalf("builders.json mode: %v %v", fi, err)
 	}
 }
+
+// A builder unused for builderEvictIdle may give its slot to another project;
+// one used more recently keeps it (the new project builds without a cache).
+func TestEvictionIdleGuard(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	builderBoot = func(*Daemon, context.Context, config.Config, string) {}
+	d, _ := newTestDaemon(t)
+	d.mu.Lock()
+	d.cfg.Builder.Max = 1
+	d.mu.Unlock()
+	d.builders["8"] = readyBuilder("8", d.cfg.Builder.PortBase+1, builderEvictIdle-time.Minute, builderSpec(d.cfg))
+	if got := d.Builder("9", true).State; got != BuilderBusy {
+		t.Fatalf("builder used %s ago: %s, want busy", builderEvictIdle-time.Minute, got)
+	}
+	d.builders["8"].LastUsed = time.Now().Add(-builderEvictIdle - time.Minute)
+	if got := d.Builder("9", true).State; got != BuilderBooting {
+		t.Fatalf("builder unused for %s: %s, want its slot", builderEvictIdle+time.Minute, got)
+	}
+	if _, ok := d.builders["8"]; ok {
+		t.Fatal("idle builder kept its slot")
+	}
+}
+
+// A builder boot waits for memory at least as long as an evicted builder may
+// hold it while its cache is copied out; shorter, and the boot fails right
+// before the memory comes free (seen on the trial host with 2 minutes).
+func TestBuilderFitWaitCoversTheCacheCopy(t *testing.T) {
+	if builderFitWait < builderSaveWait {
+		t.Fatalf("builderFitWait %s < builderSaveWait %s", builderFitWait, builderSaveWait)
+	}
+}

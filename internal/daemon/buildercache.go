@@ -81,7 +81,7 @@ const (
 // Remote steps are variables so tests run without VMs.
 var (
 	builderCacheSize = func(ctx context.Context, cfg config.Config, inst *vm.Instance) (int64, error) {
-		out, err := runWithContext(ctx, vm.SSH(cfg, inst, builderSizeScript))
+		out, err := runWithContext(ctx, vm.SSHStream(cfg, inst, builderSizeScript))
 		if err != nil {
 			return 0, fmt.Errorf("%w: %s", err, strings.TrimSpace(out))
 		}
@@ -114,7 +114,7 @@ var (
 
 // streamSSH runs script in the VM with stdin and stdout attached.
 func streamSSH(ctx context.Context, cfg config.Config, inst *vm.Instance, script string, in io.Reader, out io.Writer) error {
-	cmd := vm.SSH(cfg, inst, script)
+	cmd := vm.SSHStream(cfg, inst, script)
 	var stderr strings.Builder
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = in, out, &stderr
 	if err := cmd.Start(); err != nil {

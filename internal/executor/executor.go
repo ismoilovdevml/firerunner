@@ -475,8 +475,11 @@ var buildCommand = regexp.MustCompile(`\bdocker(\s+buildx)?\s+build\b|\bdocker\s
 // build/bake, compose build). Only such stages need the project's builder.
 func BuildsImages(script []byte) bool { return buildCommand.Match(script) }
 
-// BuilderWait is how long `docker build` in a job waits for a starting builder.
-const BuilderWait = 150
+// BuilderWait is how long `docker build` in a job waits for a starting builder:
+// a boot restores the project's saved cache first (about 100 MB/s, so up to
+// 4 minutes for a large one). Waiting is cheaper than building without it:
+// a cold build of the same Dockerfile took 2-5 times as long on the trial host.
+const BuilderWait = 300
 
 // BuilderScript creates the buildx builder in the job VM and a docker wrapper
 // that, for build commands, waits until the builder answers (a full mTLS

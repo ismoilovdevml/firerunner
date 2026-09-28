@@ -40,7 +40,7 @@ boot and counts its own size.
 |---|---|---|
 | `builder.enabled` | `true` | one builder VM per project that runs `docker build` |
 | `builder.vcpu`, `builder.memory_mb` | `4`, `8192` | Node.js frontend builds need 4 GB or more |
-| `builder.max` | `4` | the least recently used idle builder makes room for a new one |
+| `builder.max` | `4` | the least recently used builder idle for 5 minutes makes room for a new one; while none is, a build goes without a cache |
 | `builder.idle_ttl` | `24h` | an unused builder is deleted; its cache is saved |
 | `builder.saved_cache_gb` | `100` | host disk for the caches of deleted builders; `0` saves none |
 

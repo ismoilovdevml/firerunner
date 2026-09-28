@@ -277,3 +277,39 @@ func TestWaitTCP(t *testing.T) {
 		}
 	})
 }
+
+// The daemon's long builder transfers keep ssh's own error and a longer
+// keepalive; everything else about the connection, the pinned host key above
+// all, is the same as SSH's.
+func TestSSHStreamArgs(t *testing.T) {
+	old := KnownHostsDir
+	t.Cleanup(func() { KnownHostsDir = old })
+	KnownHostsDir = t.TempDir()
+	cfg := config.Default()
+	inst := &Instance{ID: "bld-7-ab", IP: "10.200.0.9", HostKey: "ssh-ed25519 AAAAHOST"}
+	short := strings.Join(SSH(cfg, inst, "true").Args, " ")
+	long := strings.Join(SSHStream(cfg, inst, "true").Args, " ")
+	for _, want := range []string{"ServerAliveCountMax=12", "LogLevel=INFO", "StrictHostKeyChecking=yes", "HostKeyAlias=" + inst.ID, "ConnectTimeout=3"} {
+		if !strings.Contains(long, want) {
+			t.Errorf("SSHStream lacks %q: %s", want, long)
+		}
+	}
+	if strings.Contains(long, " -q ") || strings.Contains(long, "LogLevel=ERROR") {
+		t.Errorf("SSHStream hides ssh's reason: %s", long)
+	}
+	if !strings.Contains(short, " -q ") || !strings.Contains(short, "LogLevel=ERROR") || strings.Contains(short, "ServerAliveCountMax") {
+		t.Errorf("SSH changed: %s", short)
+	}
+	if !strings.HasSuffix(long, "root@"+inst.IP+" true") {
+		t.Errorf("host or command out of place: %s", long)
+	}
+	// It fails closed like SSH when the recorded key cannot be pinned.
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	KnownHostsDir = filepath.Join(file, "known_hosts")
+	if err := SSHStream(cfg, inst, "true").Run(); err == nil || !strings.Contains(err.Error(), "host key of bld-7-ab") {
+		t.Fatalf("Run = %v; want it to fail on the host key", err)
+	}
+}

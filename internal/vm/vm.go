@@ -552,7 +552,22 @@ var routeDev = func(ip string) string {
 // pinned (its known_hosts file cannot be written), the command's Run and
 // Start fail without connecting.
 func SSH(cfg config.Config, inst *Instance, args ...string) *exec.Cmd {
-	base := []string{"-q", "-i", cfg.Network.SSHKey, "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=3", "-o", "ServerAliveInterval=15"}
+	return sshCommand(cfg, inst, []string{"-q", "-o", "LogLevel=ERROR"}, args)
+}
+
+// SSHStream is SSH for the daemon's long transfers into and out of a builder
+// (its cache, buildkitd's start): the guest may stall for a while writing
+// gigabytes, so the connection survives 3 minutes without an answer instead
+// of 45 seconds, and ssh's own reason for giving up (a timeout, a reset) ends
+// up on stderr, where the caller's error reports it.
+func SSHStream(cfg config.Config, inst *Instance, args ...string) *exec.Cmd {
+	return sshCommand(cfg, inst, []string{"-o", "LogLevel=INFO", "-o", "ServerAliveCountMax=12"}, args)
+}
+
+func sshCommand(cfg config.Config, inst *Instance, opts, args []string) *exec.Cmd {
+	base := make([]string, 0, len(opts)+16)
+	base = append(base, opts...)
+	base = append(base, "-i", cfg.Network.SSHKey, "-o", "ConnectTimeout=3", "-o", "ServerAliveInterval=15")
 	file, pinErr := knownHosts(inst)
 	if inst.HostKey != "" {
 		base = append(base, "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile="+file, "-o", "HostKeyAlias="+inst.ID)
