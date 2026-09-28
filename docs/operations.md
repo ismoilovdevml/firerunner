@@ -72,6 +72,12 @@ failures FireRunner or the host caused, never for failing project scripts. Watch
   copies that fail or are skipped for lack of room.
 - **Disk free**: the saved builder caches and flintlock's microVM state.
 - **Flintlock errors**: failed flintlock calls by RPC and gRPC code.
+- **Speed**: *Warm builds* and *Builder boot* (a build that finds its builder booting waits
+  for it), *Stage duration p95 by stage* (which part of a job grew).
+- **Node (node_exporter)** row: the host under the microVMs. *CPU steal* (the hypervisor, on a
+  host that is itself a VM), *IO wait* and *Pressure stall* show a saturated host before jobs
+  fail. It needs node_exporter on the host, with the same `instance` label in both scrape jobs
+  (relabel both to the host name): the *Node exporter* variable follows the selected hosts.
 
 The daemon logs one line per job (`journalctl -u firerunner | grep '"job":"<id>"'`).
 

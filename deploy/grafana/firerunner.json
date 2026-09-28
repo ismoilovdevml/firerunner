@@ -7,7 +7,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "30s",
   "time": {
     "from": "now-6h",
@@ -39,13 +39,34 @@
         "definition": "label_values(firerunner_build_info, instance)",
         "includeAll": true,
         "multi": true,
-        "allValue": ".*",
         "current": {
           "text": "All",
           "value": "$__all"
         },
         "refresh": 2,
         "label": "Host"
+      },
+      {
+        "name": "node",
+        "type": "query",
+        "label": "Node exporter",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(node_uname_info{instance=~\"$instance\"}, instance)",
+          "refId": "n"
+        },
+        "definition": "label_values(node_uname_info{instance=~\"$instance\"}, instance)",
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 2,
+        "description": "node_exporter of the same hosts: relabel both jobs' instance to the host name."
       }
     ]
   },
@@ -366,6 +387,102 @@
       }
     },
     {
+      "id": 37,
+      "type": "bargauge",
+      "title": "Host resources used",
+      "description": "The fullest host for each resource jobs wait for or fail on when it runs out. Thin pool: microVM disks (alerts at 85 % data, 75 % metadata). Memory committed: guest memory promised to microVMs against the admission limit; at 100 % new microVMs wait. DHCP leases: at 100 % new microVMs get no address (alert at 80 %). Disk: saved builder caches and flintlock's microVM state (alert at 85 %). A missing bar: the value is unknown (thin pool: lvs fails).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 9,
+        "x": 15,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (type) (firerunner_thinpool_usage_ratio{instance=~\"$instance\"})",
+          "legendFormat": "thin pool {{type}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max(sum by (instance) (firerunner_memory_committed_bytes{instance=~\"$instance\"}) / sum by (instance) (firerunner_memory_capacity_bytes{instance=~\"$instance\"}))",
+          "legendFormat": "memory committed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "max(sum by (instance) (firerunner_dhcp_leases{instance=~\"$instance\"}) / sum by (instance) (firerunner_dhcp_leases_capacity{instance=~\"$instance\"} > 0))",
+          "legendFormat": "DHCP leases",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "max by (dir) (1 - firerunner_disk_free_bytes{instance=~\"$instance\"} / firerunner_disk_size_bytes{instance=~\"$instance\"})",
+          "legendFormat": "disk {{dir}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "valueMode": "color",
+        "namePlacement": "top",
+        "sizing": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 0,
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.75
+              },
+              {
+                "color": "red",
+                "value": 0.85
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
       "id": 2,
       "type": "stat",
       "title": "Pool ready",
@@ -624,56 +741,28 @@
       }
     },
     {
-      "id": 37,
-      "type": "bargauge",
-      "title": "Host resources used",
-      "description": "The fullest host for each resource jobs wait for or fail on when it runs out. Thin pool: microVM disks (alerts at 85 % data, 75 % metadata). Memory committed: guest memory promised to microVMs against the admission limit; at 100 % new microVMs wait. DHCP leases: at 100 % new microVMs get no address (alert at 80 %). Disk: saved builder caches and flintlock's microVM state (alert at 85 %). A missing bar: the value is unknown (thin pool: lvs fails).",
+      "id": 45,
+      "type": "stat",
+      "title": "Warm builds",
+      "description": "Share of jobs running docker build that got their project's builder warm (ready) over the last 24 h. The rest waited for it to boot and restore its cache, or built without it. Low: raise builder.max or keep builders longer (builder.idle_ttl).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 8,
-        "w": 9,
-        "x": 15,
-        "y": 1
+        "h": 4,
+        "w": 3,
+        "x": 0,
+        "y": 9
       },
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (type) (firerunner_thinpool_usage_ratio{instance=~\"$instance\"})",
-          "legendFormat": "thin pool {{type}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
-          }
-        },
-        {
-          "refId": "B",
-          "expr": "max(sum by (instance) (firerunner_memory_committed_bytes{instance=~\"$instance\"}) / sum by (instance) (firerunner_memory_capacity_bytes{instance=~\"$instance\"}))",
-          "legendFormat": "memory committed",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          }
-        },
-        {
-          "refId": "C",
-          "expr": "max(sum by (instance) (firerunner_dhcp_leases{instance=~\"$instance\"}) / sum by (instance) (firerunner_dhcp_leases_capacity{instance=~\"$instance\"} > 0))",
-          "legendFormat": "DHCP leases",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          }
-        },
-        {
-          "refId": "D",
-          "expr": "max by (dir) (1 - firerunner_disk_free_bytes{instance=~\"$instance\"} / firerunner_disk_size_bytes{instance=~\"$instance\"})",
-          "legendFormat": "disk {{dir}}",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          }
+          },
+          "expr": "sum(increase(firerunner_builds_total{instance=~\"$instance\",builder=\"ready\"}[24h])) / clamp_min(sum(increase(firerunner_builds_total{instance=~\"$instance\",builder!=\"disabled\"}[24h])), 1)"
         }
       ],
       "options": {
@@ -682,19 +771,230 @@
             "lastNotNull"
           ]
         },
-        "orientation": "horizontal",
-        "displayMode": "gradient",
-        "showUnfilled": true,
-        "valueMode": "color",
-        "namePlacement": "top",
-        "sizing": "auto"
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
       },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
           "decimals": 0,
-          "min": 0,
-          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.7
+              },
+              {
+                "color": "green",
+                "value": 0.9
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 46,
+      "type": "stat",
+      "title": "Builder boot",
+      "description": "Median time from creating a builder to it answering, over 24 h: VM boot plus the restore of its saved layer cache. A build that finds its builder booting waits for this.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 3,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(firerunner_vm_boot_seconds_bucket{instance=~\"$instance\",kind=\"builder\"}[24h])))"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 47,
+      "type": "stat",
+      "title": "Job p50",
+      "description": "Median job duration, prepare to cleanup, over the last 24 h.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 6,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(firerunner_job_duration_seconds_bucket{instance=~\"$instance\"}[24h])))"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 48,
+      "type": "stat",
+      "title": "Job p95",
+      "description": "95th percentile of job duration over the last 24 h.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 9,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(firerunner_job_duration_seconds_bucket{instance=~\"$instance\"}[24h])))"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 49,
+      "type": "stat",
+      "title": "CPU steal",
+      "description": "Share of CPU time the hypervisor gave to other VMs while this host wanted it, over 1 h (node_exporter). Only on a host that is itself a VM; above a few percent jobs run slower than the CPU count suggests.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 12,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(node_cpu_seconds_total{instance=~\"$node\",mode=\"steal\"}[1h])) / clamp_min(count(node_cpu_seconds_total{instance=~\"$node\",mode=\"idle\"}), 1)"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -704,16 +1004,13 @@
               },
               {
                 "color": "orange",
-                "value": 0.75
+                "value": 0.03
               },
               {
                 "color": "red",
-                "value": 0.85
+                "value": 0.1
               }
             ]
-          },
-          "color": {
-            "mode": "thresholds"
           }
         },
         "overrides": []
@@ -728,7 +1025,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 9
+        "y": 13
       },
       "panels": []
     },
@@ -745,7 +1042,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 10
+        "y": 14
       },
       "targets": [
         {
@@ -858,7 +1155,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 10
+        "y": 14
       },
       "targets": [
         {
@@ -961,7 +1258,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 18
+        "y": 22
       },
       "targets": [
         {
@@ -1027,7 +1324,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 18
+        "y": 22
       },
       "targets": [
         {
@@ -1086,7 +1383,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 26
+        "y": 30
       },
       "targets": [
         {
@@ -1144,7 +1441,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 26
+        "y": 30
       },
       "targets": [
         {
@@ -1200,7 +1497,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 34
+        "y": 38
       },
       "targets": [
         {
@@ -1266,7 +1563,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 34
+        "y": 38
       },
       "targets": [
         {
@@ -1311,6 +1608,63 @@
       }
     },
     {
+      "id": 50,
+      "type": "timeseries",
+      "title": "Stage duration p95 by stage",
+      "description": "95th percentile of each gitlab-runner stage. script: the job's own commands, docker build included; get_sources: the git clone; restore_cache / archive_cache: the cache: store. A stage that grows alone points at its cause.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 46
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(firerunner_stage_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
       "id": 19,
       "type": "row",
       "title": "microVMs and pool",
@@ -1319,7 +1673,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 42
+        "y": 54
       },
       "panels": []
     },
@@ -1336,7 +1690,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 43
+        "y": 55
       },
       "targets": [
         {
@@ -1412,7 +1766,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 43
+        "y": 55
       },
       "targets": [
         {
@@ -1470,7 +1824,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 51
+        "y": 63
       },
       "targets": [
         {
@@ -1527,7 +1881,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 51
+        "y": 63
       },
       "targets": [
         {
@@ -1590,7 +1944,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 59
+        "y": 71
       },
       "panels": []
     },
@@ -1607,7 +1961,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 60
+        "y": 72
       },
       "targets": [
         {
@@ -1664,7 +2018,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 60
+        "y": 72
       },
       "targets": [
         {
@@ -1767,7 +2121,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 68
+        "y": 80
       },
       "targets": [
         {
@@ -1825,7 +2179,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 68
+        "y": 80
       },
       "targets": [
         {
@@ -1871,6 +2225,131 @@
       }
     },
     {
+      "id": 51,
+      "type": "timeseries",
+      "title": "Builds on a warm builder",
+      "description": "Share of jobs running docker build that got a warm builder, over the past hour at each point. Each drop is builds that waited for a booting builder or built without the cache.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 88
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(firerunner_builds_total{instance=~\"$instance\",builder=\"ready\"}[1h])) / sum(rate(firerunner_builds_total{instance=~\"$instance\",builder!=\"disabled\"}[1h]))",
+          "legendFormat": "warm"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 52,
+      "type": "timeseries",
+      "title": "Builder ready time p50 / p95",
+      "description": "Time from creating a builder to it answering: VM boot plus the restore of its saved layer cache (about 100 MB/s on the trial host). Large caches restore slowly; builder.cache_mb caps them.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 88
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(firerunner_vm_boot_seconds_bucket{instance=~\"$instance\",kind=\"builder\"}[1h])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(firerunner_vm_boot_seconds_bucket{instance=~\"$instance\",kind=\"builder\"}[1h])))",
+          "legendFormat": "p95"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
       "id": 24,
       "type": "row",
       "title": "Host",
@@ -1879,7 +2358,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 76
+        "y": 96
       },
       "panels": []
     },
@@ -1896,7 +2375,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 77
+        "y": 97
       },
       "targets": [
         {
@@ -1955,7 +2434,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 77
+        "y": 97
       },
       "targets": [
         {
@@ -2013,7 +2492,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 85
+        "y": 105
       },
       "targets": [
         {
@@ -2080,7 +2559,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 85
+        "y": 105
       },
       "targets": [
         {
@@ -2147,7 +2626,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 93
+        "y": 113
       },
       "targets": [
         {
@@ -2205,7 +2684,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 93
+        "y": 113
       },
       "targets": [
         {
@@ -2264,7 +2743,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 101
+        "y": 121
       },
       "targets": [
         {
@@ -2330,7 +2809,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 101
+        "y": 121
       },
       "targets": [
         {
@@ -2397,6 +2876,865 @@
         "overrides": []
       },
       "description": "systemd services the daemon checks every 15 s, and the flintlock API."
+    },
+    {
+      "id": 53,
+      "type": "row",
+      "title": "Node (node_exporter)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 129
+      },
+      "panels": []
+    },
+    {
+      "id": 54,
+      "type": "stat",
+      "title": "Uptime",
+      "description": "Time since the host booted.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 130
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "time() - node_boot_time_seconds{instance=~\"$node\"}"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 55,
+      "type": "stat",
+      "title": "CPUs",
+      "description": "CPU threads of the host.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 130
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "count by (instance) (node_cpu_seconds_total{instance=~\"$node\",mode=\"idle\"})"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 56,
+      "type": "stat",
+      "title": "Memory",
+      "description": "Total memory of the host.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 130
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "node_memory_MemTotal_bytes{instance=~\"$node\"}"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 57,
+      "type": "stat",
+      "title": "Load 5m per CPU",
+      "description": "5-minute load average per CPU thread. Above 1: runnable tasks wait for a CPU.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 130
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (instance) (node_load5{instance=~\"$node\"}) / count by (instance) (node_cpu_seconds_total{instance=~\"$node\",mode=\"idle\"})"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 58,
+      "type": "stat",
+      "title": "IO wait",
+      "description": "Share of CPU time spent waiting for disk, over the last hour. High: the disk under the thin pool and the caches is the bottleneck.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 130
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(node_cpu_seconds_total{instance=~\"$node\",mode=\"iowait\"}[1h])) / clamp_min(count(node_cpu_seconds_total{instance=~\"$node\",mode=\"idle\"}), 1)"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 59,
+      "type": "stat",
+      "title": "Swap used",
+      "description": "Swap in use. microVM memory that swaps makes every job on the host slow.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 130
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "node_memory_SwapTotal_bytes{instance=~\"$node\"} - node_memory_SwapFree_bytes{instance=~\"$node\"}"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 60,
+      "type": "timeseries",
+      "title": "CPU by mode",
+      "description": "Share of all CPU threads by mode. user/system: jobs and Firecracker; iowait: waiting for disk; steal: the hypervisor running other VMs (nested virtualization shows here).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 134
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (mode) (rate(node_cpu_seconds_total{instance=~\"$node\",mode!=\"idle\"}[$__rate_interval])) / scalar(count(node_cpu_seconds_total{instance=~\"$node\",mode=\"idle\"}))",
+          "legendFormat": "{{mode}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 61,
+      "type": "timeseries",
+      "title": "Pressure stall (PSI)",
+      "description": "Share of time some tasks waited for CPU, memory or IO. The earliest sign that the host is saturated and jobs slow down, before utilization reaches 100 %.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 134
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(node_pressure_cpu_waiting_seconds_total{instance=~\"$node\"}[$__rate_interval])",
+          "legendFormat": "cpu"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(node_pressure_memory_waiting_seconds_total{instance=~\"$node\"}[$__rate_interval])",
+          "legendFormat": "memory"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(node_pressure_io_waiting_seconds_total{instance=~\"$node\"}[$__rate_interval])",
+          "legendFormat": "io"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 62,
+      "type": "timeseries",
+      "title": "Memory",
+      "description": "Host memory. microVMs keep the memory their guests touched, so used memory grows with builders and stays; available is what new microVMs can still get.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 142
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "node_memory_MemTotal_bytes{instance=~\"$node\"}",
+          "legendFormat": "total"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "node_memory_MemTotal_bytes{instance=~\"$node\"} - node_memory_MemAvailable_bytes{instance=~\"$node\"}",
+          "legendFormat": "used"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "node_memory_MemAvailable_bytes{instance=~\"$node\"}",
+          "legendFormat": "available"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "node_memory_Cached_bytes{instance=~\"$node\"}",
+          "legendFormat": "page cache"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 63,
+      "type": "timeseries",
+      "title": "Disk throughput",
+      "description": "Bytes read and written per second by disk. Builder cache copies and image pulls show here.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 142
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (device) (rate(node_disk_read_bytes_total{instance=~\"$node\",device!~\"dm-.*|loop.*|sr.*|ram.*|nbd.*\"}[$__rate_interval]))",
+          "legendFormat": "{{device}} read"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (device) (rate(node_disk_written_bytes_total{instance=~\"$node\",device!~\"dm-.*|loop.*|sr.*|ram.*|nbd.*\"}[$__rate_interval]))",
+          "legendFormat": "{{device}} write"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 64,
+      "type": "timeseries",
+      "title": "Disk latency per operation",
+      "description": "Average time per read and write by disk. Tens of milliseconds while jobs run: the storage under the host is slow or shared.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 150
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (device) (rate(node_disk_read_time_seconds_total{instance=~\"$node\",device!~\"dm-.*|loop.*|sr.*|ram.*|nbd.*\"}[$__rate_interval])) / sum by (device) (rate(node_disk_reads_completed_total{instance=~\"$node\",device!~\"dm-.*|loop.*|sr.*|ram.*|nbd.*\"}[$__rate_interval]))",
+          "legendFormat": "{{device}} read"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (device) (rate(node_disk_write_time_seconds_total{instance=~\"$node\",device!~\"dm-.*|loop.*|sr.*|ram.*|nbd.*\"}[$__rate_interval])) / sum by (device) (rate(node_disk_writes_completed_total{instance=~\"$node\",device!~\"dm-.*|loop.*|sr.*|ram.*|nbd.*\"}[$__rate_interval]))",
+          "legendFormat": "{{device}} write"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 65,
+      "type": "timeseries",
+      "title": "Disk busy",
+      "description": "Share of time each disk had IO in flight. Near 100 %: the disk is the limit.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 150
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (device) (rate(node_disk_io_time_seconds_total{instance=~\"$node\",device!~\"dm-.*|loop.*|sr.*|ram.*|nbd.*\"}[$__rate_interval]))",
+          "legendFormat": "{{device}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 66,
+      "type": "timeseries",
+      "title": "Network",
+      "description": "Bytes per second by interface: the uplink (NAT, registry pushes, git) and the microVM bridge.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 158
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (device) (rate(node_network_receive_bytes_total{instance=~\"$node\",device!~\"lo|fltap.*|tap.*|veth.*|docker.*|erspan.*|gre.*|gretap.*|ip6.*|ip_vti.*|sit.*|tunl.*|vxlan.*\"}[$__rate_interval]))",
+          "legendFormat": "{{device}} in"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (device) (rate(node_network_transmit_bytes_total{instance=~\"$node\",device!~\"lo|fltap.*|tap.*|veth.*|docker.*|erspan.*|gre.*|gretap.*|ip6.*|ip_vti.*|sit.*|tunl.*|vxlan.*\"}[$__rate_interval]))",
+          "legendFormat": "{{device}} out"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 67,
+      "type": "timeseries",
+      "title": "File systems used",
+      "description": "Share used of each mounted file system (the thin pool is in the Host row above).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 158
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "1 - node_filesystem_avail_bytes{instance=~\"$node\",fstype!~\"tmpfs|overlay|squashfs|ramfs|nsfs\",mountpoint!~\"/etc/.*\"} / node_filesystem_size_bytes{instance=~\"$node\",fstype!~\"tmpfs|overlay|squashfs|ramfs|nsfs\",mountpoint!~\"/etc/.*\"}",
+          "legendFormat": "{{mountpoint}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      }
     }
   ]
 }
