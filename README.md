@@ -13,8 +13,8 @@ the next one.
 It plugs into GitLab as a [custom executor](https://docs.gitlab.com/runner/executors/custom/) of
 the standard gitlab-runner, so pipelines keep working as they are: `image:`, `services:`, `cache:`,
 artifacts and `docker build` behave like on the shell and docker executors. A daemon keeps a few
-microVMs booted ahead of time, which lets a job start in about 0.3 seconds, and a per-project build
-cache keeps repeated `docker build` runs close to shared-runner speed.
+microVMs booted ahead of time, and each project gets a builder that keeps its Docker layer cache
+between jobs.
 
 ![Architecture](docs/images/architecture.svg)
 
@@ -25,8 +25,17 @@ with one Docker daemon, so jobs see each other's files, images and processes. Th
 separates jobs into containers, but they share a kernel, and building images needs privileged
 Docker-in-Docker or the host's Docker socket.
 
-FireRunner gives every job a virtual machine boundary while keeping job start and build times close
-to a shared runner.
+FireRunner gives every job a virtual machine boundary instead:
+
+- **Isolation**: every job has its own kernel, file system and Docker daemon. A job cannot see
+  another job's files, processes, images or secrets, and cannot reach another job's microVM on the
+  network.
+- **A clean machine every time**: the microVM is deleted when the job ends, so no job depends on
+  what an earlier one left behind, and none can leave something for the next.
+- **Docker builds without privileges**: `docker build` needs no privileged Docker-in-Docker and no
+  host Docker socket. Each project's layer cache stays with that project.
+- **Your own hardware**: jobs run on your hosts, next to your internal registries and services,
+  including behind a corporate proxy.
 
 ## Getting started
 
@@ -67,15 +76,12 @@ The documentation is at **[ismoilovdevml.github.io/firerunner](https://ismoilovd
 
 ## Status
 
-FireRunner is young. It runs the CI of a team of about 25 projects in a production trial, at a few
-hundred jobs a day. It supports x86_64 hosts running Rocky Linux 9 or Ubuntu 24.04, and Linux jobs.
-Measured next to the existing runners on the same pipelines:
+FireRunner is young. It runs the CI of a team of about 25 projects in a production trial, at up to
+about 600 jobs a day. It supports x86_64 hosts running Rocky Linux 9 or Ubuntu 24.04, and Linux jobs.
 
-| | FireRunner | Existing runner |
-|---|---|---|
-| Time to get a clean machine | 0.3 s (pre-booted) | not isolated (shell) |
-| `dotnet test`, 44 tests | 27.7 s | 31.1 s (docker executor) |
-| `docker build`, warm cache | 4.8 s | 2.0 s (shell executor) |
+Isolation has a cost: jobs take longer than on a shell executor, whose one host keeps every
+project's images and layers at hand. Each job starts from a clean microVM, and a `docker build`
+may wait for its project's builder to start and load its cache.
 
 Prometheus metrics and a Grafana dashboard ([`deploy/`](deploy/)) show pool hits, job start
 times, boots and host health:

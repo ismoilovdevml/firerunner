@@ -15,7 +15,7 @@ sudo firerunner config set vm.memory_mb 3072
 | `vm.vcpu` | `2` | per job VM |
 | `vm.memory_mb` | `2048` | per job VM |
 | `vm.job_max_vcpu`, `vm.job_max_memory_mb` | `0` | the largest VM a job may ask for (see below); `0` = `vm.vcpu` and `vm.memory_mb`, so jobs cannot ask for more |
-| `pool.size` | `2` | pre-booted VMs; a job takes one in 0.3 s instead of a 15 s boot |
+| `pool.size` | `2` | pre-booted VMs; a job that finds one does not wait for a boot (about 10 s) |
 | `pool.max_idle` | `30m` | idle pool VMs are replaced after this |
 | `pool.preload_images` | none | images pulled into pool VMs in advance, e.g. a large SDK |
 | `vm.host_reserve_mb` | `1024` | host memory never given to VMs |

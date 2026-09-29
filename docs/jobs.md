@@ -36,7 +36,7 @@ project's layer cache between jobs. You change nothing; the job log says:
 Docker layer cache: using this project's builder (warm cache)
 ```
 
-The first build of a project starts its builder: about 30 s, plus loading its saved cache (about
+The first build of a project starts its builder: 30 to 45 s, plus loading its saved cache (about
 100 MB/s). `docker build` waits for it up to 5 minutes, then builds without the cache. A builder
 unused for a while is deleted, but its cache is kept on the host and comes back with the
 project's next builder.
@@ -100,7 +100,7 @@ sonar:
 
 The job log shows what it asked for and what it got. It gets at most what the operator allows
 (`vm.job_max_memory_mb`, `vm.job_max_vcpu`); without such a limit it gets the default size. A job
-with its own size does not use the pre-booted VMs, so it starts in a cold boot (about 15 s). A value
+with its own size does not use the pre-booted VMs, so it waits for a boot (about 10 s). A value
 that is not a number fails the job.
 
 ## When a job fails

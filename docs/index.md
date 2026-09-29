@@ -11,7 +11,10 @@ stage in it and deletes it when the job ends.
 | Isolation | none | containers, shared kernel | own VM and kernel per job |
 | Leftovers from earlier jobs | files, processes, images | images, volumes | none |
 | `docker build` | host Docker | privileged DinD or socket | Docker in the VM, not privileged |
-| Start | instant | image pull | 0.3 s from pre-booted VMs |
+| Other projects' files and images | readable | readable with the host socket or privileged DinD | out of reach |
+
+Isolation has a cost: jobs take longer than on a shell executor, whose host keeps every project's
+images and layers at hand.
 
 ## Quick start
 
