@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -224,7 +225,31 @@ func SetConcurrent(n int) error {
 	if !found {
 		lines = append([]string{fmt.Sprintf("concurrent = %d", n)}, lines...)
 	}
-	return os.WriteFile(RunnerConfig, []byte(strings.Join(lines, "\n")), 0o600)
+	return writeRootOnly(RunnerConfig, []byte(strings.Join(lines, "\n")))
+}
+
+// writeRootOnly replaces path atomically with a 0600 file. gitlab-runner
+// reloads config.toml when it changes and must never read half of it (it
+// holds the runner token and the cache keys).
+func writeRootOnly(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if err = f.Chmod(0o600); err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }
 
 func run(name string, args ...string) error {

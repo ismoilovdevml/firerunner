@@ -2,7 +2,9 @@ package host
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -84,5 +86,26 @@ func TestServiceActive(t *testing.T) {
 		if took := time.Since(start); took > 5*time.Second {
 			t.Errorf("%q: took %s", c.script, took)
 		}
+	}
+}
+
+func TestWriteRootOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRootOnly(path, []byte("concurrent = 4\n")); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || string(b) != "concurrent = 4\n" {
+		t.Fatalf("content %q, %v", b, err)
+	}
+	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v, want 0600", fi.Mode().Perm())
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Fatalf("left behind: %v", entries)
 	}
 }
