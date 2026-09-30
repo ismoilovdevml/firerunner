@@ -168,7 +168,32 @@ func (p *Policy) deniedIP(ip net.IP, local []net.IP) string {
 			return "network.egress_deny " + n.String()
 		}
 	}
+	// An IPv4 address written as IPv6 (NAT64, 6to4) reaches that IPv4
+	// address: it is checked like one.
+	if v4 := embeddedIPv4(ip); v4 != nil {
+		return p.deniedIP(v4, local)
+	}
 	return ""
+}
+
+var (
+	nat64  = &net.IPNet{IP: net.ParseIP("64:ff9b::"), Mask: net.CIDRMask(96, 128)}
+	sixTo4 = &net.IPNet{IP: net.ParseIP("2002::"), Mask: net.CIDRMask(16, 128)}
+)
+
+// embeddedIPv4 is the IPv4 address a NAT64 (64:ff9b::/96) or 6to4
+// (2002::/16) address stands for, nil for any other address.
+func embeddedIPv4(ip net.IP) net.IP {
+	if ip.To4() != nil || len(ip) != net.IPv6len {
+		return nil
+	}
+	switch {
+	case nat64.Contains(ip):
+		return net.IPv4(ip[12], ip[13], ip[14], ip[15])
+	case sixTo4.Contains(ip):
+		return net.IPv4(ip[2], ip[3], ip[4], ip[5])
+	}
+	return nil
 }
 
 func isNumeric(s string) bool {
