@@ -16,6 +16,9 @@
 #   FR_BRIDGE               bridge for microVM taps          (default: br-fc)
 #   FR_SUBNET               /24 prefix for microVMs           (default: 10.200.0)
 #   FR_VM_DISK              root disk of every microVM, thin-provisioned (default: 40GB)
+#   FR_THIN_CHUNK           thin pool chunk size, only for a new pool (default: 512K). Every
+#                           first write to a chunk of a VM's disk copies or zeroes the whole
+#                           chunk; 64K costs less per small write, more pool metadata
 #   CONTAINERD_VERSION      (default: 1.7.35)
 #   FIRECRACKER_VERSION     (default: 1.17.0)
 #   FLINTLOCK_VERSION       (default: 0.15.2)
@@ -78,6 +81,7 @@ FR_DISK="${FR_DISK:-}"
 FR_BRIDGE="${FR_BRIDGE:-br-fc}"
 FR_SUBNET="${FR_SUBNET:-10.200.0}"
 FR_VM_DISK="${FR_VM_DISK:-40GB}"
+FR_THIN_CHUNK="${FR_THIN_CHUNK:-512K}"
 
 FR_GITLAB_URL="${FR_GITLAB_URL:-}"
 FR_RUNNER_TOKEN="${FR_RUNNER_TOKEN:-}"
@@ -168,6 +172,7 @@ preflight() {
 # preflight_settings checks the FR_* settings that end up in firewall rules,
 # systemd units and the microVM config, before anything is changed.
 preflight_settings() {
+    [[ $FR_THIN_CHUNK =~ ^(64|128|256|512|1024)[Kk]$ ]] || die "FR_THIN_CHUNK must be 64K, 128K, 256K, 512K or 1024K"
     if [[ -n $FR_METRICS_ALLOW ]]; then
         is_ipv4_cidr "$FR_METRICS_ALLOW" || die "FR_METRICS_ALLOW=$FR_METRICS_ALLOW is not an IPv4 address or CIDR"
     fi
@@ -645,7 +650,7 @@ setup_thinpool() {
         # --zero y: a chunk freed by a deleted VM may be handed to a VM of
         # another project; zeroing on first use means it never reads the old
         # data (discards do not guarantee zeros on every disk).
-        lvconvert -qy --zero y -c 512K --thinpool "$VG/thinpool" --poolmetadata "$VG/thinpoolmeta"
+        lvconvert -qy --zero y -c "$FR_THIN_CHUNK" --thinpool "$VG/thinpool" --poolmetadata "$VG/thinpoolmeta"
     fi
     if [[ $(lvs --noheadings -o zero "$VG/thinpool" 2>/dev/null | tr -d ' ') != zero ]]; then
         warn "thin pool $VG/thinpool does not zero new chunks: a microVM may read data a deleted
@@ -911,6 +916,9 @@ dhcp-leasefile=/var/lib/misc/firerunner-dnsmasq.leases
 # Do not ping an address before offering it: dnsmasq stops answering DHCP for
 # ~3 s per ping, which serialises boots. Only VMs on this bridge use the range.
 no-ping
+# Every microVM starts with an empty resolver cache: keep the answers here
+# (the default holds 150 names).
+cache-size=10000
 # Hostnames sent by guests are not published in DNS.
 dhcp-ignore-names
 no-hosts
@@ -1225,6 +1233,8 @@ install_registry_mirror() {
         installed "$BIN_DIR/registry"
     fi
     mkdir -p /var/lib/firerunner/registry
+    # Images of private projects' pulls: root only (the mirror runs as root).
+    chmod 0700 /var/lib/firerunner/registry
     put "$CONF_DIR/registry.yml" <<EOF
 version: 0.1
 log:
@@ -1278,6 +1288,8 @@ install_cache_server() {
     fi
     # The top-level directory is the S3 root; each sub-directory is a bucket.
     mkdir -p /var/lib/firerunner/cache/runner-cache
+    # Every project's cache: archives, which may hold secrets: root only.
+    chmod 0700 /var/lib/firerunner/cache
     local key secret
     key=$(sed -n 's/^ROOT_ACCESS_KEY_ID=//p' "$CONF_DIR/cache.env" 2>/dev/null || true)
     secret=$(sed -n 's/^ROOT_SECRET_ACCESS_KEY=//p' "$CONF_DIR/cache.env" 2>/dev/null || true)

@@ -38,6 +38,7 @@ Options go before `bash`, for example `sudo FR_DISK=/dev/sdb bash`:
 |---|---|---|
 | `FR_DISK` | first blank disk | disk for microVM disks, wiped |
 | `FR_VM_DISK` | `40GB` | root disk of each microVM, thin-provisioned |
+| `FR_THIN_CHUNK` | `512K` | chunk size of a new thin pool; `64K` makes the first write to each chunk of a VM disk cheaper (measure with `test/perf/job-bench.sh`) |
 | `FR_POOL_SIZE` | `2` | pre-booted microVMs |
 | `FR_VERSION` | `edge` | firerunner release to install: `edge` (the latest `main`) or a version tag |
 | `FR_ALLOW_UNSIGNED` | none | `1` installs v0.1.0 or v0.1.1, published before releases were signed. Every other release needs a valid signature |
