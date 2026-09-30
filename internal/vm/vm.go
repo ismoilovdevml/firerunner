@@ -196,11 +196,13 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 	if err := waitTCP(ctx, net.JoinHostPort(inst.IP, "22"), deadline); err != nil {
 		return fail(notReady{fmt.Sprintf("microVM %s at %s did not open SSH within %s: %v", id, inst.IP, cfg.VM.BootTimeout, err)})
 	}
+	// sshd may accept connections a moment before it authenticates: retry at
+	// bootPoll, not once a second (up to 0.75 s more per boot).
 	for SSH(cfg, inst, "true").Run() != nil {
 		if time.Now().After(deadline) {
 			return fail(notReady{fmt.Sprintf("microVM %s at %s did not answer SSH within %s", id, inst.IP, cfg.VM.BootTimeout)})
 		}
-		if err := sleep(ctx, time.Second); err != nil {
+		if err := sleep(ctx, bootPoll); err != nil {
 			return fail(err)
 		}
 	}
