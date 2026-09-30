@@ -431,6 +431,11 @@ func TestPolicy(t *testing.T) {
 		{"2130706433", 443, true, true}, // 127.0.0.1 as one number
 		{"0x7f000001", 443, true, true},
 		{"127.1", 443, true, true},
+		{"64:ff9b::c0a8:10a", 443, true, true},   // 192.168.1.10 through NAT64
+		{"2002:c0a8:10a::1", 443, true, true},    // 192.168.1.10 as 6to4
+		{"64:ff9b::7f00:1", 443, true, true},     // 127.0.0.1 through NAT64
+		{"64:ff9b::a9fe:a9fe", 80, false, true},  // 169.254.169.254 through NAT64
+		{"64:ff9b::8c52:7904", 443, true, false}, // 140.82.121.4 through NAT64
 		{"", 443, true, true},
 	} {
 		why := p.Check(context.Background(), tc.host, tc.port, tc.connect)
