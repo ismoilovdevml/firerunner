@@ -186,6 +186,29 @@ func TestExpireIdleStaggers(t *testing.T) {
 	}
 }
 
+// A VM whose delete still runs (a slow flintlockd) is not deleted again by
+// the next pass.
+func TestDeleteInBackgroundOnce(t *testing.T) {
+	old := deleteTimeout
+	deleteTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { deleteTimeout = old })
+	d, srv := newTestDaemon(t)
+	srv.HangDeletes()
+	inst := &vm.Instance{ID: "pool-slow", UID: "slow"}
+	d.deleteInBackground(context.Background(), inst, "orphan", nil)
+	d.deleteInBackground(context.Background(), inst, "orphan", nil)
+	d.bg.Wait()
+	if n := srv.DeleteCalls(); n != 1 {
+		t.Fatalf("%d delete calls while one was running, want 1", n)
+	}
+	// Done (failed here): the next pass may try again.
+	d.deleteInBackground(context.Background(), inst, "orphan", nil)
+	d.bg.Wait()
+	if n := srv.DeleteCalls(); n != 2 {
+		t.Fatalf("%d delete calls, want a retry after the first ended", n)
+	}
+}
+
 func TestClaimTakesPreloadingVM(t *testing.T) {
 	d, _ := newTestDaemon(t)
 	fp := fingerprint(d.cfg)
@@ -434,6 +457,7 @@ func TestReconcileReclaimsOrphanWhileBooting(t *testing.T) {
 	d.booting, d.bootingIDs["pool-b00t"] = 1, true
 
 	d.reconcile(context.Background(), false)
+	d.bg.Wait()
 	srv.WaitDeleted(t, "o", 2*time.Second)
 	if got := srv.Deleted(); len(got) != 1 {
 		t.Fatalf("deleted %v, want only the orphan [o]", got)
@@ -543,6 +567,7 @@ func TestJobMaxAgeCountsFromTheJobStart(t *testing.T) {
 			}
 			d.firstSee[uid] = time.Now().Add(-c.firstSeen)
 			d.reconcile(context.Background(), false)
+			d.bg.Wait()
 			if got := len(srv.Deleted()) == 1; got != c.deleted {
 				t.Fatalf("deleted = %v (%v), want %v", got, srv.Deleted(), c.deleted)
 			}
