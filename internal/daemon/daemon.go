@@ -1099,7 +1099,8 @@ func capVMFiles(root string, limit int64) []string {
 		if err != nil || !fi.Mode().IsRegular() || fi.Size() <= limit {
 			continue
 		}
-		f, err := os.OpenFile(p, os.O_WRONLY|os.O_TRUNC|os.O_APPEND, 0)
+		// O_NOFOLLOW: a symlink put there after the Lstat is not followed.
+		f, err := os.OpenFile(p, os.O_WRONLY|os.O_TRUNC|os.O_APPEND|syscall.O_NOFOLLOW, 0)
 		if err != nil {
 			continue
 		}
