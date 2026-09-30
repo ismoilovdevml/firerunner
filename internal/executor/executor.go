@@ -279,9 +279,10 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 			}
 		}
 	}
-	_ = dc.Send(daemon.Event{Kind: "prepare", Source: source, Seconds: ready.Seconds(), OK: true,
+	// The VM is ready: a slow daemon must not hold the job's start for dc's 3 s.
+	_ = dc.SendWithin(daemon.Event{Kind: "prepare", Source: source, Seconds: ready.Seconds(), OK: true,
 		WaitSeconds: times.wait.Seconds(), BootSeconds: times.boot.Seconds(),
-		Job: jobNumber(id), Project: j.Project, VM: inst.ID})
+		Job: jobNumber(id), Project: j.Project, VM: inst.ID}, eventWait)
 	fmt.Printf("microVM %s ready at %s in %s (%s, %d vCPU, %d MB)\n",
 		inst.ID, inst.IP, ready.Round(100*time.Millisecond), source, cfg.VM.VCPU, cfg.VM.MemoryMB)
 	return nil
