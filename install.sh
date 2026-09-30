@@ -1444,6 +1444,10 @@ ProtectSystem=strict
 ProtectHome=read-only
 RuntimeDirectory=firerunner
 RuntimeDirectoryPreserve=yes
+# The daemon's socket, job states, pinned host keys and SSH control sockets:
+# root only, also in the moment before the socket is chmod 0600.
+RuntimeDirectoryMode=0700
+UMask=0077
 # /var/lib/flintlock/vm: reconcile removes the state dirs flintlockd leaves for deleted VMs.
 # builder-cache: layer caches of deleted builders, restored into the project's next one.
 ReadWritePaths=/run/firerunner -/run/lock -/run/lvm -/var/lib/flintlock/vm /var/lib/firerunner/builder-cache
