@@ -253,6 +253,8 @@ func (c Config) Validate() error {
 	var errs []string
 	if c.Flintlock.Endpoint == "" {
 		errs = append(errs, "flintlock.endpoint is required")
+	} else if c.Flintlock.TLSCAFile == "" && !localEndpoint(c.Flintlock.Endpoint) {
+		errs = append(errs, "flintlock.endpoint "+c.Flintlock.Endpoint+" is not on this host: set flintlock.tls_ca_file, or the API token crosses the network in plaintext")
 	}
 	if c.Flintlock.Namespace == "" {
 		errs = append(errs, "flintlock.namespace is required")
@@ -621,6 +623,23 @@ func SplitNoProxy(s string) []string {
 		}
 	}
 	return out
+}
+
+// localEndpoint reports whether a gRPC endpoint is a unix socket or a
+// loopback address, where plaintext never leaves the host.
+func localEndpoint(endpoint string) bool {
+	if strings.HasPrefix(endpoint, "unix:") {
+		return true
+	}
+	host := strings.TrimPrefix(endpoint, "dns:///")
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // RegistryHost is an insecure_registries entry without its http:// prefix.
