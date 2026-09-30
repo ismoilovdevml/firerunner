@@ -12,7 +12,7 @@ GOLANGCI_LINT_VERSION=v2.13.2
 GOVULNCHECK_VERSION=v1.8.0
 
 # The shell scripts CI runs shellcheck on (.github/workflows/ci.yml).
-SHELL_SCRIPTS=install.sh images/rootfs/firerunner-netfilter test/network/run.sh test/installer/proxy.sh
+SHELL_SCRIPTS=install.sh images/rootfs/firerunner-netfilter test/network/run.sh test/installer/proxy.sh test/perf/job-bench.sh
 
 # Local tag for the microVM rootfs image; CI publishes to ghcr.io (images.yml).
 ROOTFS_IMAGE?=firerunner-rootfs:local
