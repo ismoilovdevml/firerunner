@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
@@ -52,6 +54,11 @@ func NoProxy(cfg config.Config, extra ...string) string {
 	}
 	if u, err := url.Parse(cfg.VM.RegistryMirror); err == nil {
 		add(u.Hostname())
+	}
+	for _, host := range slices.Sorted(maps.Keys(cfg.VM.RegistryMirrors)) {
+		if u, err := url.Parse(cfg.VM.RegistryMirrors[host]); err == nil {
+			add(u.Hostname())
+		}
 	}
 	for _, c := range []string{cfg.VM.DockerBIP, cfg.VM.DockerAddressPool} {
 		if _, n, err := net.ParseCIDR(c); err == nil {

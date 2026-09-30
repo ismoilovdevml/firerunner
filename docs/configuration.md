@@ -87,6 +87,21 @@ CPU is shared, not reserved: give VMs more vCPUs than the host has cores.
 | `daemon.metrics_listen` | `127.0.0.1:9477` | Prometheus endpoint |
 | `daemon.job_max_age` | `3h` | VMs of jobs older than this are deleted |
 | `vm.docker_bip`, `vm.docker_address_pool` | `10.201.0.1/24`, `10.202.0.0/16` | Docker networks in the VM; change them if they clash with your LAN |
+| `vm.registry_mirror` | `http://<bridge>:5000` | Docker Hub's pull-through mirror on the host |
+| `vm.registry_mirrors` | one per registry in `FR_REGISTRY_MIRRORS` | pull-through mirrors of other registries, e.g. `{"ghcr.io": "http://10.200.0.1:5001"}`; the installer writes it on every run |
+
+## Registry mirrors
+
+Every job starts with an empty image store, so each `image:`, `services:` and `docker pull`
+downloads its image again. The host keeps a pull-through mirror of Docker Hub and, by default, of
+`ghcr.io`, `quay.io`, `registry.k8s.io` and `mcr.microsoft.com` (`FR_REGISTRY_MIRRORS` at install
+time), so a layer crosses the internet once per host instead of once per job. Job VMs and builders
+use them without any change to `.gitlab-ci.yml`.
+
+A pull the mirror cannot serve goes to the registry itself: private images (the mirror has no
+credentials, so it never holds another project's private image), a registry the mirror cannot
+reach, or a mirror that is down. Other registries' mirrors need the guest's Docker to use the
+containerd image store, the default of Docker 29 in the FireRunner image.
 
 ## Corporate networks
 

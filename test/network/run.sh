@@ -28,6 +28,10 @@ sed '$d' "$INSTALL_SH" > $WORK/install-lib.sh
     # A corporate proxy is configured: microVMs may use the forwarder on .1:3128.
     PROXY_FILE=$WORK/conf/proxy-upstream
     mkdir -p "$WORK/conf"; echo "http://proxy.corp:3128" > "$PROXY_FILE"
+    # A mirror of ghcr.io besides Docker Hub's: port 5001 on the bridge address.
+    # shellcheck disable=SC2034  # read by the install.sh functions
+    FR_REGISTRY_MIRRORS=ghcr.io MIRRORS_FILE=$WORK/conf/registry-mirrors MIRROR_PORTS_FILE=$WORK/conf/registry-mirror-ports
+    assign_mirror_ports
     systemctl() { return 1; }      # no firewalld
     put() { local f=$1 mode=${2:-0644}; mkdir -p "$(dirname "$f")"; cat >"$f"; chmod "$mode" "$f"; }
     setup_network >/dev/null
@@ -76,6 +80,8 @@ listen ip netns exec bld nc 10.200.0.13 1234
 listen nc 10.200.0.1 53
 listen nc 10.200.0.1 22
 listen nc 10.200.0.1 5000
+listen nc 10.200.0.1 5001
+listen nc 10.200.0.1 5002
 listen nc 10.200.0.1 3128
 listen nc 10.200.0.1 3129
 listen nc 0.0.0.0 9477
@@ -93,6 +99,8 @@ check "VM->VM tap without fltap name"             blocked $A ping -c1 -W1 10.200
 check "VM->host DNS tcp/53 on .1"                 ok      $A nc -z -w2 10.200.0.1 53
 check "VM->host sshd tcp/22"                      blocked $A nc -z -w2 10.200.0.1 22
 check "VM->host registry tcp/5000"                ok      $A nc -z -w2 10.200.0.1 5000
+check "VM->host ghcr.io mirror tcp/5001"          ok      $A nc -z -w2 10.200.0.1 5001
+check "VM->host port no mirror uses tcp/5002"     blocked $A nc -z -w2 10.200.0.1 5002
 check "VM->host metrics tcp/9477"                 blocked $A nc -z -w2 10.200.0.1 9477
 check "VM->builder through DNAT .1:20001"         ok      $A nc -z -w2 10.200.0.1 20001
 ip -n vmA route add 10.200.0.13/32 via 10.200.0.1
@@ -195,6 +203,7 @@ ip -n out route add 10.200.0.0/24 via 192.0.2.1
 L="ip netns exec out"
 check "LAN->VM tcp/1234 (forwarded into the subnet)" blocked $L nc -z -w2 10.200.0.12 1234
 check "LAN->bridge address registry .1:5000"        blocked $L nc -z -w2 10.200.0.1 5000
+check "LAN->bridge address mirror .1:5001"          blocked $L nc -z -w2 10.200.0.1 5001
 check "LAN->bridge address DNS tcp .1:53"           blocked $L nc -z -w2 10.200.0.1 53
 check "host itself->bridge address .1:5000"         ok      nc -z -w2 10.200.0.1 5000
 check "host->VM (how the executor reaches sshd)"   ok      nc -z -w2 10.200.0.12 1234

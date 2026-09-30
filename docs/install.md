@@ -40,6 +40,7 @@ Options go before `bash`, for example `sudo FR_DISK=/dev/sdb bash`:
 | `FR_VM_DISK` | `40GB` | root disk of each microVM, thin-provisioned |
 | `FR_THIN_CHUNK` | `512K` | chunk size of a new thin pool; `64K` makes the first write to each chunk of a VM disk cheaper (measure with `test/perf/job-bench.sh`) |
 | `FR_POOL_SIZE` | `FR_RUNNER_CONCURRENT` | pre-booted microVMs; given on a re-run, it replaces `pool.size` |
+| `FR_REGISTRY_MIRRORS` | `ghcr.io,quay.io,registry.k8s.io,mcr.microsoft.com` | registries mirrored on the host besides Docker Hub; remembered for later runs, `none` for none |
 | `FR_VM_VCPU` | host CPUs / `FR_RUNNER_CONCURRENT`, 2 to 16 | vCPUs of each job microVM; given on a re-run, it replaces `vm.vcpu` |
 | `FR_VERSION` | `edge` | firerunner release to install: `edge` (the latest `main`) or a version tag |
 | `FR_ALLOW_UNSIGNED` | none | `1` installs v0.1.0 or v0.1.1, published before releases were signed. Every other release needs a valid signature |

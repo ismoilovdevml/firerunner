@@ -13,11 +13,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -215,6 +217,10 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 func Spec(cfg config.Config, id, mac, sshPubKey string, hostKey HostKey, labels map[string]string, ca string) *types.MicroVMSpec {
 	daemonJSON, _ := json.Marshal(DockerDaemonConfig(cfg))
 	files := []map[string]any{{"path": "/etc/docker/daemon.json", "content": string(daemonJSON)}}
+	for _, host := range slices.Sorted(maps.Keys(cfg.VM.RegistryMirrors)) {
+		files = append(files, map[string]any{"path": "/etc/docker/certs.d/" + host + "/hosts.toml",
+			"content": HostsTOML(host, cfg.VM.RegistryMirrors[host])})
+	}
 	if cfg.Proxy.Enabled {
 		np := NoProxy(cfg)
 		cli, _ := json.Marshal(map[string]any{"proxies": DockerCLIProxies(cfg, np)})
@@ -281,6 +287,15 @@ func Spec(cfg config.Config, id, mac, sshPubKey string, hostKey HostKey, labels 
 			"vendor-data": base64.StdEncoding.EncodeToString([]byte("#cloud-config\n{}\n")),
 		},
 	}
+}
+
+// HostsTOML is the guest's /etc/docker/certs.d/<host>/hosts.toml: Docker's
+// containerd image store pulls host's images from mirror first and, when the
+// mirror cannot serve one (not found, unauthorized, down), from host itself.
+// Validate keeps both free of quotes and newlines.
+func HostsTOML(host, mirror string) string {
+	return fmt.Sprintf("server = %q\n\n[host.%q]\n  capabilities = [\"pull\", \"resolve\"]\n",
+		"https://"+host, strings.TrimSuffix(mirror, "/"))
 }
 
 // DockerDaemonConfig is the guest's /etc/docker/daemon.json.

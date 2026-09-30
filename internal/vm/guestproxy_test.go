@@ -242,3 +242,25 @@ func TestReadCAKeepsOnlyCertificates(t *testing.T) {
 		t.Fatalf("ReadCA = %q, %v", ca, err)
 	}
 }
+
+// Mirrors of other registries reach the guest as hosts.toml files, and their
+// address is left out of the proxy.
+func TestRegistryMirrorsInGuest(t *testing.T) {
+	cfg := proxyCfg()
+	cfg.VM.RegistryMirrors = map[string]string{"quay.io": "http://10.200.0.1:5002", "ghcr.io": "http://10.200.0.1:5001"}
+	got := map[string]string{}
+	for _, f := range userData(t, cfg, "").WriteFiles {
+		got[f.Path] = f.Content
+	}
+	want := "server = \"https://ghcr.io\"\n\n[host.\"http://10.200.0.1:5001\"]\n  capabilities = [\"pull\", \"resolve\"]\n"
+	if got["/etc/docker/certs.d/ghcr.io/hosts.toml"] != want {
+		t.Fatalf("ghcr.io hosts.toml:\n%s", got["/etc/docker/certs.d/ghcr.io/hosts.toml"])
+	}
+	if !strings.Contains(got["/etc/docker/certs.d/quay.io/hosts.toml"], `[host."http://10.200.0.1:5002"]`) {
+		t.Fatalf("quay.io hosts.toml: %v", got)
+	}
+	cfg.VM.RegistryMirrors = map[string]string{"ghcr.io": "http://mirror.corp:5001"}
+	if np := NoProxy(cfg); !strings.Contains(np, ",mirror.corp,") {
+		t.Fatalf("mirror host not in no_proxy: %s", np)
+	}
+}
