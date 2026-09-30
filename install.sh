@@ -26,7 +26,10 @@
 #   FR_VERSION              firerunner release to install (default: edge = latest main)
 #   FR_ALLOW_UNSIGNED=1     install a release without a signature (published before releases were
 #                           signed); a signature that does not verify is never accepted
-#   FR_POOL_SIZE            pre-booted microVMs kept ready (default: 2)
+#   FR_POOL_SIZE            pre-booted microVMs kept ready (default: FR_RUNNER_CONCURRENT, so a
+#                           burst of that many jobs starts without a boot)
+#   FR_VM_VCPU              vCPUs of each job microVM (default: host CPUs / FR_RUNNER_CONCURRENT,
+#                           at least 2, at most 16)
 #   FR_METRICS_ALLOW        source IPv4/CIDR allowed to scrape :9477/metrics (default: none, localhost only;
 #                           remembered for later re-runs)
 #   FR_EGRESS_DENY          comma-separated IPv4 CIDRs jobs must not reach, e.g. 192.168.0.0/16,
@@ -86,7 +89,11 @@ FR_THIN_CHUNK="${FR_THIN_CHUNK:-512K}"
 FR_GITLAB_URL="${FR_GITLAB_URL:-}"
 FR_RUNNER_TOKEN="${FR_RUNNER_TOKEN:-}"
 FR_RUNNER_CONCURRENT="${FR_RUNNER_CONCURRENT:-4}"
-FR_POOL_SIZE="${FR_POOL_SIZE:-2}"
+# Set on the command line: applied to an existing config too (else only to a new one).
+FR_POOL_SIZE_GIVEN="${FR_POOL_SIZE:+1}"
+FR_POOL_SIZE="${FR_POOL_SIZE:-$FR_RUNNER_CONCURRENT}"
+FR_VM_VCPU_GIVEN="${FR_VM_VCPU:+1}"
+FR_VM_VCPU="${FR_VM_VCPU:-}"
 FR_METRICS_ALLOW="${FR_METRICS_ALLOW:-}"
 FR_EGRESS_DENY="${FR_EGRESS_DENY:-}"
 FR_PROXY="${FR_PROXY:-}"
@@ -169,10 +176,25 @@ preflight() {
     fi
 }
 
+# default_vcpu: the host's CPUs shared by the jobs that run at once (a shell
+# executor's job gets every CPU of the host), at least 2 and at most 16. vCPUs
+# are threads on the host: an idle one costs nothing, so they are not reserved.
+default_vcpu() {
+    local n=$(( $(nproc) / FR_RUNNER_CONCURRENT ))
+    ((n < 2)) && n=2
+    ((n > 16)) && n=16
+    echo "$n"
+}
+
 # preflight_settings checks the FR_* settings that end up in firewall rules,
 # systemd units and the microVM config, before anything is changed.
 preflight_settings() {
     [[ $FR_THIN_CHUNK =~ ^(64|128|256|512|1024)[Kk]$ ]] || die "FR_THIN_CHUNK must be 64K, 128K, 256K, 512K or 1024K"
+    [[ $FR_RUNNER_CONCURRENT =~ ^[1-9][0-9]{0,2}$ ]] || die "FR_RUNNER_CONCURRENT must be a whole number from 1"
+    [[ -n $FR_POOL_SIZE_GIVEN ]] || ((FR_POOL_SIZE <= 32)) || FR_POOL_SIZE=32
+    [[ $FR_POOL_SIZE =~ ^[0-9]+$ ]] && ((FR_POOL_SIZE <= 32)) || die "FR_POOL_SIZE must be a whole number from 0 to 32"
+    [[ -n $FR_VM_VCPU ]] || FR_VM_VCPU=$(default_vcpu)
+    [[ $FR_VM_VCPU =~ ^[0-9]+$ ]] && ((FR_VM_VCPU >= 1 && FR_VM_VCPU <= 32)) || die "FR_VM_VCPU must be a whole number from 1 to 32"
     if [[ -n $FR_METRICS_ALLOW ]]; then
         is_ipv4_cidr "$FR_METRICS_ALLOW" || die "FR_METRICS_ALLOW=$FR_METRICS_ALLOW is not an IPv4 address or CIDR"
     fi
@@ -1425,7 +1447,13 @@ install_firerunner() {
     # Write the default config once so it is visible and editable.
     if [[ ! -f $CONF_DIR/config.yaml ]]; then
         $BIN_DIR/firerunner config set pool.size "$FR_POOL_SIZE" >/dev/null
+        $BIN_DIR/firerunner config set vm.vcpu "$FR_VM_VCPU" >/dev/null
         $BIN_DIR/firerunner config set vm.registry_mirror "http://${FR_SUBNET}.1:5000" >/dev/null
+        log "  microVMs: $FR_VM_VCPU vCPU each, $FR_POOL_SIZE kept booted"
+    else
+        # A re-run keeps the operator's settings, unless they are given again.
+        [[ -z $FR_POOL_SIZE_GIVEN ]] || $BIN_DIR/firerunner config set pool.size "$FR_POOL_SIZE" >/dev/null
+        [[ -z $FR_VM_VCPU_GIVEN ]] || $BIN_DIR/firerunner config set vm.vcpu "$FR_VM_VCPU" >/dev/null
     fi
 
     put /etc/systemd/system/firerunner.service <<EOF

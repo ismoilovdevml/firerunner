@@ -12,15 +12,19 @@ sudo firerunner config set vm.memory_mb 3072
 
 | Key | Default | |
 |---|---|---|
-| `vm.vcpu` | `2` | per job VM |
+| `vm.vcpu` | host CPUs / runner `concurrent` (2 to 16), set by the installer | per job VM |
 | `vm.memory_mb` | `2048` | per job VM |
 | `vm.job_max_vcpu`, `vm.job_max_memory_mb` | `0` | the largest VM a job may ask for (see below); `0` = `vm.vcpu` and `vm.memory_mb`, so jobs cannot ask for more |
-| `pool.size` | `2` | pre-booted VMs; a job that finds one does not wait for a boot (about 10 s) |
+| `pool.size` | runner `concurrent`, set by the installer | pre-booted VMs; a job that finds one does not wait for a boot (about 10 s) |
 | `pool.max_idle` | `30m` | idle pool VMs are replaced after this |
 | `pool.preload_images` | none | images pulled into pool VMs in advance, e.g. a large SDK |
 | `vm.host_reserve_mb` | `1024` | host memory never given to VMs |
 
-Set `pool.size` to the number of jobs that usually start at once.
+Set `pool.size` to the number of jobs that usually start at once: a job that finds the pool empty
+waits for a boot. Each pool VM holds `vm.memory_mb` of host memory while it waits.
+
+A shell executor's job gets every CPU of the host. vCPUs are threads on the host and an idle one
+costs nothing, so the installer gives each VM the host's CPUs divided by the jobs that run at once.
 
 Keep `vm.vcpu` and `vm.memory_mb` at what most jobs need and let the few heavy jobs (static analysis,
 large test suites) ask for more with job variables, up to `vm.job_max_vcpu` and
