@@ -464,6 +464,9 @@ func proxySpec(c config.Config) string {
 	if len(c.VM.InsecureRegistries) > 0 {
 		s += fmt.Sprintf("|insecure:%v", c.VM.InsecureRegistries)
 	}
+	if len(c.VM.RegistryMirrors) > 0 {
+		s += fmt.Sprintf("|mirrors:%v", c.VM.RegistryMirrors) // fmt sorts map keys
+	}
 	return s
 }
 

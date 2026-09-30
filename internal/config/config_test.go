@@ -339,3 +339,29 @@ func TestFlintlockPlaintextOnlyOnThisHost(t *testing.T) {
 		}
 	}
 }
+
+func TestRegistryMirrors(t *testing.T) {
+	for _, c := range []struct {
+		host, mirror string
+		ok           bool
+	}{
+		{"ghcr.io", "http://10.200.0.1:5001", true},
+		{"registry.example.com:5050", "https://mirror.corp", true},
+		{"docker.io", "http://10.200.0.1:5001", false}, // vm.registry_mirror
+		{"../etc", "http://10.200.0.1:5001", false},
+		{"ghcr.io/x", "http://10.200.0.1:5001", false},
+		{"ghcr.io", "10.200.0.1:5001", false},
+		{"ghcr.io", "http://10.200.0.1:5001/path", false},
+		{"ghcr.io", "http://a\"b:1", false},
+	} {
+		cfg := Default()
+		cfg.VM.RegistryMirrors = map[string]string{c.host: c.mirror}
+		if err := cfg.Validate(); (err == nil) != c.ok {
+			t.Errorf("%s -> %s: err = %v, want ok=%v", c.host, c.mirror, err, c.ok)
+		}
+	}
+	cfg, err := Set(Default(), "vm.registry_mirrors", `{"ghcr.io": "http://10.200.0.1:5001"}`)
+	if err != nil || cfg.VM.RegistryMirrors["ghcr.io"] != "http://10.200.0.1:5001" {
+		t.Fatalf("config set: %v %v", err, cfg.VM.RegistryMirrors)
+	}
+}

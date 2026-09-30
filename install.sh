@@ -36,6 +36,10 @@
 #                           directly or through the proxy (default: none; remembered for later
 #                           re-runs, FR_EGRESS_DENY=none clears it; link-local is always blocked)
 #   REGISTRY_VERSION        Docker Hub pull-through mirror for microVMs (default: 3.1.1)
+#   FR_REGISTRY_MIRRORS     comma-separated registries mirrored on the host besides Docker Hub
+#                           (default: ghcr.io,quay.io,registry.k8s.io,mcr.microsoft.com; remembered
+#                           for later re-runs, none for no others). A pull the mirror cannot serve
+#                           (a private image) goes to the registry itself
 #   VERSITYGW_VERSION       S3 server for the runner's cache: (default: 1.8.0)
 #   FR_CACHE_DAYS           delete cache: archives not written for this many days (default: 14)
 #   GITLAB_RUNNER_VERSION   (default: 19.4.0)
@@ -100,6 +104,7 @@ FR_PROXY="${FR_PROXY:-}"
 FR_NO_PROXY="${FR_NO_PROXY:-}"
 FR_CA_FILE="${FR_CA_FILE:-}"
 FR_INSECURE_REGISTRIES="${FR_INSECURE_REGISTRIES:-}"
+FR_REGISTRY_MIRRORS="${FR_REGISTRY_MIRRORS:-}"
 PROXY_PORT=3128                       # the forwarder (proxy.listen); opened on the bridge
 FR_REPO=ismoilovdevml/firerunner
 
@@ -222,6 +227,12 @@ preflight_settings() {
         grep -q -- "-----BEGIN CERTIFICATE-----" "$FR_CA_FILE" 2>/dev/null ||
             die "FR_CA_FILE=$FR_CA_FILE is not a PEM file with a certificate"
     fi
+    [[ -n $FR_REGISTRY_MIRRORS ]] || FR_REGISTRY_MIRRORS=$(cat "$MIRRORS_FILE" 2>/dev/null || echo "$DEFAULT_REGISTRY_MIRRORS")
+    local host
+    for host in $(mirror_hosts); do
+        [[ $host =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ && $host == *.* && $host != docker.io ]] ||
+            die "FR_REGISTRY_MIRRORS: $host is not a registry host name (Docker Hub has its own mirror)"
+    done
     if [[ -n $FR_INSECURE_REGISTRIES && ! $FR_INSECURE_REGISTRIES =~ ^(http://)?[A-Za-z0-9.:-]+(,(http://)?[A-Za-z0-9.:-]+)*$ ]]; then
         die "FR_INSECURE_REGISTRIES: host:port or http://host:port entries, comma-separated"
     fi
@@ -383,6 +394,8 @@ configure_proxy() {
     elif [[ $FR_CA_FILE == none ]]; then
         $fr config set vm.ca_file '""' >/dev/null
     fi
+    # Written every run: the ports are the ones this run's mirrors listen on.
+    $fr config set vm.registry_mirrors "$(mirrors_json)" >/dev/null
     if [[ -n $FR_INSECURE_REGISTRIES ]]; then
         $fr config set vm.insecure_registries "[${FR_INSECURE_REGISTRIES}]" >/dev/null
     fi
@@ -816,7 +829,7 @@ table inet firerunner {
     iifname "fltap*" drop
     iifname "${FR_BRIDGE}" udp dport 67 accept
     iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 udp dport 53 accept
-    iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport { 53, 5000, 9000 } accept
+    iifname "${FR_BRIDGE}" ip daddr ${FR_SUBNET}.1 tcp dport { 53, $(registry_ports), 9000 } accept
 $(proxy_input_rules)
     iifname "${FR_BRIDGE}" ct state established,related accept
     iifname "${FR_BRIDGE}" drop
@@ -1237,8 +1250,60 @@ EOF
 }
 
 # --------------------------------------------------------------------------
-# Shared services for microVMs: Docker Hub mirror, S3 store for cache:
+# Shared services for microVMs: registry mirrors, S3 store for cache:
 # --------------------------------------------------------------------------
+
+DEFAULT_REGISTRY_MIRRORS=ghcr.io,quay.io,registry.k8s.io,mcr.microsoft.com
+MIRRORS_FILE=$CONF_DIR/registry-mirrors          # FR_REGISTRY_MIRRORS of the last run
+MIRROR_PORTS_FILE=$CONF_DIR/registry-mirror-ports # "host port" lines, see assign_mirror_ports
+MIRROR_CONF_DIR=$CONF_DIR/registry-mirrors.d
+MIRROR_DATA_DIR=/var/lib/firerunner/registry-mirrors
+declare -A MIRROR_PORT=()
+
+# mirror_hosts: the registries mirrored besides Docker Hub, one per line.
+mirror_hosts() {
+    [[ $FR_REGISTRY_MIRRORS == none ]] && return 0
+    tr ',' '\n' <<<"$FR_REGISTRY_MIRRORS" | sed '/^$/d' | sort -u
+}
+
+# assign_mirror_ports gives every mirrored registry its port on the bridge
+# address (5001-5099). A port is never given to another registry: a microVM
+# still booted with the old mapping would get that registry's image of the
+# same name.
+assign_mirror_ports() {
+    local host port next=5001
+    mkdir -p "$CONF_DIR"
+    [[ -f $MIRROR_PORTS_FILE ]] || : >"$MIRROR_PORTS_FILE"
+    while read -r host port; do
+        [[ -n $host ]] || continue
+        MIRROR_PORT[$host]=$port
+        ((port >= next)) && next=$((port + 1))
+    done <"$MIRROR_PORTS_FILE"
+    for host in $(mirror_hosts); do
+        [[ -n ${MIRROR_PORT[$host]:-} ]] && continue
+        ((next <= 5099)) || die "no port left for the mirror of $host (5001-5099 were all given out; see $MIRROR_PORTS_FILE)"
+        MIRROR_PORT[$host]=$next
+        echo "$host $next" >>"$MIRROR_PORTS_FILE"
+        next=$((next + 1))
+    done
+    echo "$FR_REGISTRY_MIRRORS" >"$MIRRORS_FILE"
+}
+
+# registry_ports: the mirrors' ports on the bridge address, for the firewall.
+registry_ports() {
+    local ports="5000" host
+    for host in $(mirror_hosts); do ports+=", ${MIRROR_PORT[$host]}"; done
+    echo "$ports"
+}
+
+# mirrors_json: vm.registry_mirrors for the firerunner config.
+mirrors_json() {
+    local out="" host
+    for host in $(mirror_hosts); do
+        out+="${out:+, }\"$host\": \"http://${FR_SUBNET}.1:${MIRROR_PORT[$host]}\""
+    done
+    echo "{$out}"
+}
 
 install_registry_mirror() {
     local have=""
@@ -1272,19 +1337,56 @@ proxy:
   remoteurl: https://registry-1.docker.io
   ttl: 168h
 EOF
+    # One more pull-through registry per mirrored registry, each on its own port.
+    mkdir -p "$MIRROR_CONF_DIR" "$MIRROR_DATA_DIR"
+    chmod 0700 "$MIRROR_DATA_DIR"
+    local host f keep=" "
+    for host in $(mirror_hosts); do
+        keep+="$host.yml "
+        put "$MIRROR_CONF_DIR/$host.yml" <<EOF
+version: 0.1
+log:
+  level: warn
+storage:
+  filesystem:
+    rootdirectory: $MIRROR_DATA_DIR/$host
+  delete:
+    enabled: false
+http:
+  addr: ${FR_SUBNET}.1:${MIRROR_PORT[$host]}
+proxy:
+  remoteurl: https://$host
+  ttl: 168h
+EOF
+    done
+    for f in "$MIRROR_CONF_DIR"/*.yml; do
+        [[ -f $f && $keep != *" $(basename "$f") "* ]] || continue
+        rm -f "$f"
+        CHANGED+="$MIRROR_CONF_DIR "
+    done
+    put "$LIB_DIR/registries.sh" 0755 <<EOF
+#!/bin/bash
+# The Docker Hub mirror and one mirror per registry in $MIRROR_CONF_DIR.
+# One that exits ends the service; systemd restarts them all.
+for c in $CONF_DIR/registry.yml $MIRROR_CONF_DIR/*.yml; do
+    [[ -f \$c ]] && $BIN_DIR/registry serve "\$c" &
+done
+wait -n
+exit 1
+EOF
     put /etc/systemd/system/firerunner-registry.service <<EOF
 [Unit]
-Description=FireRunner Docker Hub pull-through mirror for microVMs
+Description=FireRunner pull-through registry mirrors for microVMs
 Requires=firerunner-net.service
 After=firerunner-net.service
 
 [Service]
-ExecStart=${BIN_DIR}/registry serve ${CONF_DIR}/registry.yml
+ExecStart=${LIB_DIR}/registries.sh
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/firerunner/registry
+ReadWritePaths=/var/lib/firerunner/registry ${MIRROR_DATA_DIR}
 PrivateTmp=yes
 
 [Install]
@@ -1526,14 +1628,16 @@ register_runner() {
 
 start_services() {
     systemctl daemon-reload
-    local svc files
+    local svc files f
     for svc in containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd; do
         systemctl enable -q "$svc"
         case $svc in
             containerd-flintlock) files="$CONF_DIR/containerd.toml $BIN_DIR/containerd" ;;
             firerunner-net)       files="$LIB_DIR/net-up.sh" ;;
             firerunner-dnsmasq)   files="$CONF_DIR/dnsmasq.conf" ;;
-            firerunner-registry)  files="$CONF_DIR/registry.yml $BIN_DIR/registry" ;;
+            firerunner-registry)
+                files="$CONF_DIR/registry.yml $BIN_DIR/registry $LIB_DIR/registries.sh $MIRROR_CONF_DIR"
+                for f in "$MIRROR_CONF_DIR"/*.yml; do files+=" $f"; done ;;
             firerunner-cache)     files="$CONF_DIR/cache.env $BIN_DIR/versitygw" ;;
             flintlockd)
                 files="/etc/opt/flintlockd/config.yaml $BIN_DIR/flintlockd $BIN_DIR/firecracker"
@@ -1664,6 +1768,7 @@ main() {
     install_containerd
     setup_thinpool
     install_firecracker
+    assign_mirror_ports
     setup_network
     install_flintlock
     install_registry_mirror

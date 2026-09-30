@@ -1241,6 +1241,14 @@ func buildkitdTOML(cfg config.Config) string {
 			table(mirror, true)
 		}
 	}
+	for _, host := range slices.Sorted(maps.Keys(cfg.VM.RegistryMirrors)) {
+		m := cfg.VM.RegistryMirrors[host]
+		addr := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(m, "http://"), "https://"), "/")
+		fmt.Fprintf(&b, "[registry.%q]\n  mirrors = [%q]\n", host, addr)
+		if strings.HasPrefix(m, "http://") {
+			table(addr, true)
+		}
+	}
 	for _, r := range cfg.VM.InsecureRegistries {
 		table(config.RegistryHost(r), strings.HasPrefix(r, "http://"))
 	}

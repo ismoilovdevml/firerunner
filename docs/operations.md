@@ -233,7 +233,7 @@ Those projects' `docker build` runs without the layer cache, or fails when its b
 | `firerunner` | daemon: pool, builders, cleanup, metrics |
 | `flintlockd`, `containerd-flintlock` | start and stop microVMs; store their images |
 | `firerunner-net`, `firerunner-dnsmasq` | microVM network, DHCP and DNS |
-| `firerunner-registry` | Docker Hub cache for the VMs |
+| `firerunner-registry` | registry mirrors for the VMs (Docker Hub and `FR_REGISTRY_MIRRORS`) |
 | `firerunner-cache` | storage for `cache:` |
 | `gitlab-runner` | takes jobs from GitLab |
 

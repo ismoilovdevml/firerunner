@@ -151,5 +151,25 @@ BIN_DIR=$WORK/bin link_on_sudo_path
 expect "an existing /usr/bin/firerunner is not replaced" grep -q "not ours" /usr/bin/firerunner
 rm -f /usr/bin/firerunner
 
+# ---- registry mirrors: each registry keeps its port for good
+MIRRORS_FILE=$WORK/conf/registry-mirrors MIRROR_PORTS_FILE=$WORK/conf/registry-mirror-ports
+check_mirrors() { ( FR_REGISTRY_MIRRORS=$1; die() { exit 1; }; log() { :; }; EUID=0 preflight_settings ) >/dev/null 2>&1; }
+expect "registry hosts allowed" check_mirrors ghcr.io,registry.k8s.io
+expect "a registry with a path refused" ! check_mirrors ghcr.io/x
+expect "docker.io refused (it has its own mirror)" ! check_mirrors docker.io
+MIRROR_PORT=(); FR_REGISTRY_MIRRORS=ghcr.io,quay.io
+assign_mirror_ports
+expect "mirrors get ports from 5001" test "$(mirrors_json)" = '{"ghcr.io": "http://10.200.0.1:5001", "quay.io": "http://10.200.0.1:5002"}'
+expect "firewall opens the mirror ports" test "$(registry_ports)" = "5000, 5001, 5002"
+MIRROR_PORT=(); FR_REGISTRY_MIRRORS=quay.io,mcr.microsoft.com
+assign_mirror_ports
+expect "a dropped registry's port is not given to another" test "$(mirrors_json)" = '{"mcr.microsoft.com": "http://10.200.0.1:5003", "quay.io": "http://10.200.0.1:5002"}'
+MIRROR_PORT=(); FR_REGISTRY_MIRRORS=''
+FR_REGISTRY_MIRRORS=$(cat "$MIRRORS_FILE")
+expect "the list is remembered for a re-run" test "$FR_REGISTRY_MIRRORS" = quay.io,mcr.microsoft.com
+MIRROR_PORT=(); FR_REGISTRY_MIRRORS=none
+assign_mirror_ports
+expect "none: no mirrors, only Docker Hub's port" test "$(mirrors_json) $(registry_ports)" = "{} 5000"
+
 echo "RESULT pass=$pass fail=$fail"
 [[ $fail -eq 0 ]]

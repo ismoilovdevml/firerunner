@@ -126,6 +126,11 @@ type VM struct {
 	BootTimeout   time.Duration     `yaml:"boot_timeout"`
 	// RegistryMirror is written to the guest's Docker daemon.json (empty = none).
 	RegistryMirror string `yaml:"registry_mirror"`
+	// RegistryMirrors are pull-through mirrors of other registries, by the
+	// registry's host ("ghcr.io": "http://10.200.0.1:5001"). Docker's
+	// registry_mirror covers docker.io only. A pull the mirror cannot serve
+	// (a private image, the mirror down) goes to the registry itself.
+	RegistryMirrors map[string]string `yaml:"registry_mirrors"`
 	// HostReserveMB is memory kept free on the host; microVMs wait for it.
 	HostReserveMB int `yaml:"host_reserve_mb"`
 	// DockerBIP and DockerAddressPool keep the guest's Docker networks away from
@@ -289,6 +294,14 @@ func (c Config) Validate() error {
 	if _, _, err := net.ParseCIDR(c.VM.DockerAddressPool); err != nil {
 		errs = append(errs, "vm.docker_address_pool must be a CIDR like 10.202.0.0/16")
 	}
+	for host, mirror := range c.VM.RegistryMirrors {
+		if !mirrorHost.MatchString(host) || host == "docker.io" {
+			errs = append(errs, fmt.Sprintf("vm.registry_mirrors key %q must be a registry host[:port] other than docker.io (that is vm.registry_mirror)", host))
+		}
+		if !mirrorURL.MatchString(mirror) {
+			errs = append(errs, fmt.Sprintf("vm.registry_mirrors[%s] %q must be http://host:port or https://host[:port]", host, mirror))
+		}
+	}
 	for _, r := range c.VM.InsecureRegistries {
 		if !registryEntry.MatchString(r) {
 			errs = append(errs, fmt.Sprintf("vm.insecure_registries entry %q must be host:port or http://host:port", r))
@@ -431,6 +444,9 @@ func pruneUnused(m map[string]any, cfg Config) {
 		if len(cfg.VM.InsecureRegistries) == 0 {
 			delete(vm, "insecure_registries")
 		}
+		if len(cfg.VM.RegistryMirrors) == 0 {
+			delete(vm, "registry_mirrors")
+		}
 		if cfg.VM.JobMaxVCPU == 0 {
 			delete(vm, "job_max_vcpu")
 		}
@@ -455,6 +471,10 @@ var (
 	// noProxyEntry: host, .domain, *.domain, IP, CIDR (no characters systemd,
 	// the shell or TOML would read specially).
 	noProxyEntry = regexp.MustCompile(`^[A-Za-z0-9*:][A-Za-z0-9.*:_-]*(/[0-9]{1,3})?$|^\.[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	// mirrorHost: a registry host[:port]; it names a directory in the guest.
+	mirrorHost = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$`)
+	// mirrorURL: a mirror's http(s)://host[:port], nothing after it.
+	mirrorURL = regexp.MustCompile(`^https?://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?/?$`)
 	// registryEntry: host[:port] or http://host[:port].
 	registryEntry = regexp.MustCompile(`^(http://)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`)
 )

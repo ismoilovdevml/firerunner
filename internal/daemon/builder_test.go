@@ -812,6 +812,30 @@ func TestBuildkitdTOMLHTTPSMirror(t *testing.T) {
 	}
 }
 
+// Mirrors of other registries: one table each, a plain-HTTP one marked so,
+// and pool VMs and builders follow a change.
+func TestBuildkitdTOMLRegistryMirrors(t *testing.T) {
+	cfg := config.Default()
+	before, bspec := fingerprint(cfg), builderSpec(cfg)
+	cfg.VM.RegistryMirrors = map[string]string{"ghcr.io": "http://10.200.0.1:5001", "quay.io": "https://quay-mirror.corp"}
+	s := buildkitdTOML(cfg)
+	for _, want := range []string{
+		"[registry.\"ghcr.io\"]\n  mirrors = [\"10.200.0.1:5001\"]\n",
+		"[registry.\"10.200.0.1:5001\"]\n  http = true\n",
+		"[registry.\"quay.io\"]\n  mirrors = [\"quay-mirror.corp\"]\n",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("buildkitd.toml lacks %q:\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, `[registry."quay-mirror.corp"]`) {
+		t.Fatalf("an https mirror got a table:\n%s", s)
+	}
+	if fingerprint(cfg) == before || builderSpec(cfg) == bspec {
+		t.Fatal("pool VMs and builders keep booting without the new mirrors")
+	}
+}
+
 // A CA rotated in place changes the fingerprint, so pool VMs and builders
 // with the old CA are replaced.
 func TestFingerprintFollowsCAContent(t *testing.T) {
