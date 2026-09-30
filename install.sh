@@ -16,9 +16,9 @@
 #   FR_BRIDGE               bridge for microVM taps          (default: br-fc)
 #   FR_SUBNET               /24 prefix for microVMs           (default: 10.200.0)
 #   FR_VM_DISK              root disk of every microVM, thin-provisioned (default: 40GB)
-#   FR_THIN_CHUNK           thin pool chunk size, only for a new pool (default: 512K). Every
+#   FR_THIN_CHUNK           thin pool chunk size, only for a new pool (default: 64K). Every
 #                           first write to a chunk of a VM's disk copies or zeroes the whole
-#                           chunk; 64K costs less per small write, more pool metadata
+#                           chunk: a larger one costs more per small write, less pool metadata
 #   CONTAINERD_VERSION      (default: 1.7.35)
 #   FIRECRACKER_VERSION     (default: 1.17.0)
 #   FLINTLOCK_VERSION       (default: 0.15.2)
@@ -88,7 +88,7 @@ FR_DISK="${FR_DISK:-}"
 FR_BRIDGE="${FR_BRIDGE:-br-fc}"
 FR_SUBNET="${FR_SUBNET:-10.200.0}"
 FR_VM_DISK="${FR_VM_DISK:-40GB}"
-FR_THIN_CHUNK="${FR_THIN_CHUNK:-512K}"
+FR_THIN_CHUNK="${FR_THIN_CHUNK:-64K}"
 
 FR_GITLAB_URL="${FR_GITLAB_URL:-}"
 FR_RUNNER_TOKEN="${FR_RUNNER_TOKEN:-}"
@@ -685,6 +685,10 @@ setup_thinpool() {
         # --zero y: a chunk freed by a deleted VM may be handed to a VM of
         # another project; zeroing on first use means it never reads the old
         # data (discards do not guarantee zeros on every disk).
+        # -c: a VM's first write to a chunk copies it from the image or zeroes
+        # it whole. 64K chunks copy 8x less than 512K for the small scattered
+        # writes of jobs (package installs, layer extraction, git checkouts);
+        # their metadata still fits the 1% above (8 TB: 3.8 GiB, thin_metadata_size).
         lvconvert -qy --zero y -c "$FR_THIN_CHUNK" --thinpool "$VG/thinpool" --poolmetadata "$VG/thinpoolmeta"
     fi
     if [[ $(lvs --noheadings -o zero "$VG/thinpool" 2>/dev/null | tr -d ' ') != zero ]]; then
