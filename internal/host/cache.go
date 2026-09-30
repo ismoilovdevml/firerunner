@@ -72,7 +72,7 @@ func SetCache(c *Cache) error {
 	if c != nil {
 		out = ensureRunnerEnv(out, cacheEnv...)
 	}
-	return os.WriteFile(RunnerConfig, []byte(out), 0o600)
+	return writeRootOnly(RunnerConfig, []byte(out))
 }
 
 // cacheEnv makes gitlab-runner zip and unzip cache: with its fast archiver
