@@ -138,6 +138,7 @@ func TestExpireIdle(t *testing.T) {
 		pooledVM("stale", "old-config", time.Minute),
 	}
 	d.expireIdle(context.Background())
+	d.bg.Wait()
 
 	if len(d.ready) != 1 || d.ready[0].inst.UID != "fresh" {
 		t.Fatalf("ready after expire: %v", d.ready)
@@ -149,6 +150,39 @@ func TestExpireIdle(t *testing.T) {
 	sort.Strings(got)
 	if len(got) != 2 || got[0] != "idle" || got[1] != "stale" {
 		t.Fatalf("deleted %v, want [idle stale]", got)
+	}
+}
+
+// VMs that reached pool.max_idle together are recycled one at a time, each
+// once the previous one's replacement has booted: the pool never empties.
+func TestExpireIdleStaggers(t *testing.T) {
+	d, srv := newTestDaemon(t)
+	fp, maxIdle := fingerprint(d.cfg), d.cfg.Pool.MaxIdle
+	d.ready = []*pooled{
+		pooledVM("older", fp, maxIdle+2*time.Minute),
+		pooledVM("old", fp, maxIdle+time.Minute),
+	}
+	d.expireIdle(context.Background())
+	d.bg.Wait()
+	if got := srv.Deleted(); len(got) != 1 || got[0] != "older" {
+		t.Fatalf("deleted %v, want [older]", got)
+	}
+	if len(d.ready) != 1 || d.ready[0].inst.UID != "old" {
+		t.Fatalf("ready after expire: %v", d.ready)
+	}
+
+	// Its replacement is booting: the other old VM waits for it.
+	d.booting = 1
+	d.expireIdle(context.Background())
+	d.bg.Wait()
+	if got := srv.Deleted(); len(got) != 1 {
+		t.Fatalf("deleted %v while a replacement boots, want only [older]", got)
+	}
+	d.booting = 0
+	d.expireIdle(context.Background())
+	d.bg.Wait()
+	if got := srv.Deleted(); len(got) != 2 {
+		t.Fatalf("deleted %v, want [older old]", got)
 	}
 }
 
@@ -189,6 +223,7 @@ func TestExpireIdleTrimsToPoolSize(t *testing.T) {
 	d.cfg.Pool.Size = 1
 	d.ready = []*pooled{pooledVM("old", fp, 3*time.Minute), pooledVM("new", fp, time.Minute)}
 	d.expireIdle(context.Background())
+	d.bg.Wait()
 
 	if len(d.ready) != 1 || d.ready[0].inst.UID != "new" {
 		t.Fatalf("ready after trim: %v", d.ready)

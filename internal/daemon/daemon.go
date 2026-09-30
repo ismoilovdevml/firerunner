@@ -688,16 +688,32 @@ func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''
 
 // expireIdle recycles pool VMs that sat idle too long or were booted with an
 // old config, and the oldest ones above pool.size (after the size was lowered).
+//
+// VMs booted together reach pool.max_idle together: recycled at once, the
+// pool would be empty until their replacements booted, and jobs arriving then
+// would cold-boot. So only one VM that is merely old goes at a time, and only
+// while no pool VM is booting (its replacement ready first). The deletes run
+// in the background: the loop goes on to refill at once.
 func (d *Daemon) expireIdle(ctx context.Context) {
 	d.mu.Lock()
 	fp, maxIdle, size := fingerprint(d.cfg), d.cfg.Pool.MaxIdle, d.cfg.Pool.Size
 	var keep, drop []*pooled
+	var oldest *pooled
 	for _, p := range d.ready {
-		if p.specID != fp || time.Since(p.bornAt) > maxIdle {
+		switch {
+		case p.specID != fp:
 			drop = append(drop, p)
-		} else {
+		case time.Since(p.bornAt) > maxIdle && d.booting == 0 && (oldest == nil || p.bornAt.Before(oldest.bornAt)):
+			if oldest != nil {
+				keep = append(keep, oldest)
+			}
+			oldest = p
+		default:
 			keep = append(keep, p)
 		}
+	}
+	if oldest != nil {
+		drop = append(drop, oldest)
 	}
 	sort.Slice(keep, func(i, j int) bool { return keep[i].bornAt.After(keep[j].bornAt) })
 	if len(keep) > size {
@@ -709,7 +725,8 @@ func (d *Daemon) expireIdle(ctx context.Context) {
 	d.savePoolLocked()
 	d.mu.Unlock()
 	for _, p := range drop {
-		d.delete(ctx, p.inst, "expired")
+		inst := p.inst
+		d.spawn(func() { d.delete(ctx, inst, "expired") })
 	}
 }
 
