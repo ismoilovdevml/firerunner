@@ -322,3 +322,20 @@ func TestSetAllValidatesOnce(t *testing.T) {
 		}
 	}
 }
+
+func TestFlintlockPlaintextOnlyOnThisHost(t *testing.T) {
+	for endpoint, ok := range map[string]bool{
+		"127.0.0.1:9090": true, "localhost:9090": true, "[::1]:9090": true, "unix:///run/flintlock.sock": true,
+		"10.0.0.5:9090": false, "flintlock.corp:9090": false, "dns:///flintlock.corp:9090": false,
+	} {
+		cfg := Default()
+		cfg.Flintlock.Endpoint = endpoint
+		if err := cfg.Validate(); (err == nil) != ok {
+			t.Errorf("%s without TLS: err = %v, want ok=%v", endpoint, err, ok)
+		}
+		cfg.Flintlock.TLSCAFile = "/etc/firerunner/flintlock-tls/ca.crt"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("%s with TLS: %v", endpoint, err)
+		}
+	}
+}
