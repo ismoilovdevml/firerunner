@@ -217,8 +217,11 @@ type Daemon struct {
 	// replacement starts booting at once instead of at the next refill tick.
 	refillNow chan struct{}
 	claimed   map[string]time.Time // uid -> claim time; protects it until the job writes its state
-	firstSee  map[string]time.Time // uid -> first time reconcile saw it
-	builders  map[string]*builder  // project id -> BuildKit builder
+	// deleting is the uids whose delete runs in the background
+	// (deleteInBackground): the next pass must not delete them again.
+	deleting map[string]bool
+	firstSee map[string]time.Time // uid -> first time reconcile saw it
+	builders map[string]*builder  // project id -> BuildKit builder
 	// project id -> last failed builder boot (see builderRetryAfter)
 	builderFailed map[string]time.Time
 	runCtx        context.Context // cancelled on shutdown; builders boot under it
@@ -332,7 +335,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 		return nil, err
 	}
 	d := &Daemon{cfgPath: cfgPath, log: log, cfg: cfg, fl: fl, metrics: NewMetrics(),
-		claimed: map[string]time.Time{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{},
+		claimed: map[string]time.Time{}, deleting: map[string]bool{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{},
 		bootingIDs: map[string]bool{}, refillNow: make(chan struct{}, 1), staleLeases: map[string]time.Time{},
 		builders: map[string]*builder{}, builderFailed: map[string]time.Time{},
 		saving: map[string]*cacheSave{}, cacheDropped: map[string]time.Time{}, runCtx: context.Background(),
@@ -725,8 +728,7 @@ func (d *Daemon) expireIdle(ctx context.Context) {
 	d.savePoolLocked()
 	d.mu.Unlock()
 	for _, p := range drop {
-		inst := p.inst
-		d.spawn(func() { d.delete(ctx, inst, "expired") })
+		d.deleteInBackground(ctx, p.inst, "expired", nil)
 	}
 }
 
@@ -763,6 +765,29 @@ func (d *Daemon) delete(ctx context.Context, inst *vm.Instance, reason string) b
 	vm.ForgetInstance(d.cfgSnapshot(), inst)
 	d.log.Info("deleted microVM", "vm", inst.ID, "reason", reason)
 	return true
+}
+
+// deleteInBackground deletes inst off the main loop, so a slow delete (up to
+// deleteTimeout) holds up neither refill nor the next pass. A VM whose delete
+// is still running is not deleted twice. deleted runs once flintlock took the
+// delete; nil for nothing.
+func (d *Daemon) deleteInBackground(ctx context.Context, inst *vm.Instance, reason string, deleted func()) {
+	d.mu.Lock()
+	if d.deleting[inst.UID] {
+		d.mu.Unlock()
+		return
+	}
+	d.deleting[inst.UID] = true
+	d.mu.Unlock()
+	d.spawn(func() {
+		ok := d.delete(ctx, inst, reason)
+		d.mu.Lock()
+		delete(d.deleting, inst.UID)
+		d.mu.Unlock()
+		if ok && deleted != nil {
+			deleted()
+		}
+	})
 }
 
 // stopping reports whether the daemon is shutting down (Run's context is done).
@@ -984,9 +1009,10 @@ func (d *Daemon) reconcile(ctx context.Context, startup bool) {
 				f.JobAge = f.Age // a state file without a start time
 			}
 		}
-		reason := decide(f, cfg)
-		if reason != "" && d.delete(ctx, &vm.Instance{ID: v.GetSpec().GetId(), UID: uid}, reason) {
-			d.metrics.orphansDeleted.WithLabelValues(reason).Inc()
+		if reason := decide(f, cfg); reason != "" {
+			d.deleteInBackground(ctx, &vm.Instance{ID: v.GetSpec().GetId(), UID: uid}, reason, func() {
+				d.metrics.orphansDeleted.WithLabelValues(reason).Inc()
+			})
 		}
 	}
 	d.mu.Lock()
