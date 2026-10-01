@@ -583,8 +583,9 @@ func stubBoot(t *testing.T, setupErr error) *bootStub {
 	return boots
 }
 
-// The next builder of a project waits for its previous builder's copy, then
-// boots, and reconcile knows its VM from the moment it exists.
+// The next builder of a project boots while its previous builder's copy is
+// written, restores that copy once it is done, and reconcile knows its VM
+// from the moment it exists.
 func TestBootBuilderWaitsForSaveAndRestores(t *testing.T) {
 	stubBuilders(t, func(string) bool { return true })
 	var loaded, uidDuringRestore string
@@ -606,8 +607,8 @@ func TestBootBuilderWaitsForSaveAndRestores(t *testing.T) {
 	done := make(chan struct{})
 	go func() { d.bootBuilder(context.Background(), d.cfg, "7"); close(done) }()
 	time.Sleep(100 * time.Millisecond)
-	if boots.Load() != 0 {
-		t.Fatal("booted before the previous builder's cache was saved")
+	if loaded != "" {
+		t.Fatal("restored before the previous builder's cache was saved")
 	}
 	writeFile(t, filepath.Join(dir, "7.tar"), saved("warm"), time.Minute)
 	d.mu.Lock()
@@ -718,6 +719,55 @@ func TestSlowSaveDoesNotStallOthers(t *testing.T) {
 		t.Fatalf("boots = %d", boots.Load())
 	}
 	free()
+}
+
+// The project's next builder boots while its previous cache is still being
+// copied out; only the restore waits for the copy.
+func TestBuilderBootsWhileCacheIsSaved(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	release := make(chan struct{})
+	var loaded string
+	stubBuilderCache(t, sizeOf(1), func(_ context.Context, _ config.Config, _ *vm.Instance, w io.Writer) error {
+		<-release
+		_, err := io.WriteString(w, "x")
+		return err
+	}, func(_ context.Context, _ config.Config, _ *vm.Instance, r io.Reader) error {
+		b, err := io.ReadAll(r)
+		loaded = string(b)
+		return err
+	})
+	d, _ := newTestDaemon(t)
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(free)
+	d.builders = map[string]*builder{"1": readyBuilder("1", 20001, d.cfg.Builder.IdleTTL+time.Hour, builderSpec(d.cfg))}
+	d.expireBuilders() // the old builder's save hangs on release
+
+	boots := stubBoot(t, nil)
+	d.Builder("1", true)
+	done := make(chan struct{})
+	go func() { d.bootBuilder(context.Background(), d.cfg, "1"); close(done) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for boots.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the new builder did not boot while the old cache was being saved")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-done:
+		t.Fatal("the boot finished before the save it must restore from")
+	case <-time.After(100 * time.Millisecond):
+	}
+	free()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the boot did not finish after the save")
+	}
+	if loaded != "x" {
+		t.Fatalf("restored %q, want the cache the old builder just saved", loaded)
+	}
 }
 
 // Measured on the trial host: a builder booting right after a daemon restart
