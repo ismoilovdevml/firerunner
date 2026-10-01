@@ -463,20 +463,6 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 			d.delete(context.Background(), inst, "builder setup failed")
 		}
 	}
-	// The project's previous builder may still be copying its cache out.
-	d.mu.Lock()
-	saving := d.saving[project]
-	d.mu.Unlock()
-	if saving != nil {
-		// A slow save must not keep the project without a builder: after
-		// builderSaveWait the new builder starts from the older copy, if any.
-		select {
-		case <-saving.done:
-		case <-time.After(builderSaveWait):
-			d.log.Warn("builder boots before its previous cache copy finished", "project", project)
-		case <-ctx.Done():
-		}
-	}
 	// Host memory is reserved under the VM's own id until flintlock lists it.
 	id := builderVMID(project)
 	release, err := d.admitBuilder(ctx, bcfg, id)
@@ -513,6 +499,9 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		d.spawn(func() { d.delete(context.Background(), inst, "builder no longer needed") })
 		return
 	}
+	// The project's previous builder may still be copying its cache out. The
+	// new one booted meanwhile; only the restore needs the copy.
+	d.waitForSave(ctx, project, start)
 	restored, err := d.restoreBuilderCache(ctx, bcfg, project, inst)
 	if err != nil {
 		fail(inst, err) // the VM may hold part of a cache: start over in a new one
@@ -613,6 +602,24 @@ var errBuildkitDown = errors.New("buildkitd did not start listening")
 // builderSaveWait bounds how long a builder boot waits for the project's
 // previous builder to finish copying its cache out.
 var builderSaveWait = 5 * time.Minute
+
+// waitForSave waits until the project's previous builder has copied its cache
+// out, at most until builderSaveWait after start: a slow save must not keep
+// the project without a builder, which then starts from the older copy, if any.
+func (d *Daemon) waitForSave(ctx context.Context, project string, start time.Time) {
+	d.mu.Lock()
+	saving := d.saving[project]
+	d.mu.Unlock()
+	if saving == nil {
+		return
+	}
+	select {
+	case <-saving.done:
+	case <-time.After(time.Until(start.Add(builderSaveWait))):
+		d.log.Warn("builder starts before its previous cache copy finished", "project", project)
+	case <-ctx.Done():
+	}
+}
 
 // builderFitWait is how long a builder boot waits for host memory: a builder
 // deleted to free its slot holds its memory until its cache is copied out,
