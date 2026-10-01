@@ -99,14 +99,24 @@ itself. It refuses, with `403`, requests to:
 - cloud metadata and other link-local addresses;
 - the networks in `FR_EGRESS_DENY` (config `network.egress_deny`);
 - `localhost` names and IP addresses written in other forms, such as `2130706433`;
-- host names that resolve to any of these.
+- host names that resolve to any of these; an IPv4 address written as IPv6 (NAT64 `64:ff9b::/96`,
+  6to4 `2002::/16`) counts as that IPv4 address.
 
 HTTPS tunnels (`CONNECT`) go only to port 443. Allow more with
 `sudo firerunner config set proxy.connect_ports '[443, 8443]'`.
 
 The forwarder checks a host name when it resolves it, and the corporate proxy resolves it again,
-so a name whose DNS answer changes in between can still get through. Restrict the runner's
-account on the corporate proxy as well.
+so a name whose DNS answer changes in between can still get through. A name the host cannot
+resolve at all is passed on for the corporate proxy to resolve, so it is not checked: where the
+host resolves outside names itself, refuse such names too, then restart the forwarder:
+
+```bash
+sudo firerunner config set proxy.egress_strict true
+sudo systemctl restart firerunner-proxy
+```
+
+Leave it off where only the corporate proxy resolves outside names: every such request would be
+refused. Restrict the runner's account on the corporate proxy as well.
 
 Each microVM address can hold 256 connections through the forwarder, all microVMs together 4096;
 host services have a budget of their own, so busy jobs cannot cut containerd or gitlab-runner off.

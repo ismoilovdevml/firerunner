@@ -56,6 +56,11 @@ type Proxy struct {
 	NoProxy string `yaml:"no_proxy"`
 	// ConnectPorts are the ports CONNECT tunnels (https) may go to.
 	ConnectPorts []int `yaml:"connect_ports"`
+	// EgressStrict refuses a name the host cannot resolve, instead of passing
+	// it on for the upstream proxy to resolve: such a name could stand for an
+	// address in network.egress_deny. Off by default, since it breaks networks
+	// where only the corporate proxy resolves outside names.
+	EgressStrict bool `yaml:"egress_strict"`
 }
 
 // ProxyPort is the forwarder's port; install.sh opens it in the firewall.
@@ -432,10 +437,15 @@ func pruneUnused(m map[string]any, cfg Config) {
 	def := Default().Proxy
 	p := cfg.Proxy
 	defaultPorts := fmt.Sprint(p.ConnectPorts) == fmt.Sprint(def.ConnectPorts)
-	if !p.Enabled && p.Listen == def.Listen && p.UpstreamFile == def.UpstreamFile && p.NoProxy == "" && defaultPorts {
+	if !p.Enabled && p.Listen == def.Listen && p.UpstreamFile == def.UpstreamFile && p.NoProxy == "" && defaultPorts && !p.EgressStrict {
 		delete(m, "proxy")
-	} else if pm, ok := m["proxy"].(map[string]any); ok && defaultPorts {
-		delete(pm, "connect_ports") // unknown to v0.1.0
+	} else if pm, ok := m["proxy"].(map[string]any); ok {
+		if defaultPorts {
+			delete(pm, "connect_ports") // unknown to v0.1.0
+		}
+		if !p.EgressStrict {
+			delete(pm, "egress_strict")
+		}
 	}
 	if vm, ok := m["vm"].(map[string]any); ok {
 		if cfg.VM.CAFile == "" {
