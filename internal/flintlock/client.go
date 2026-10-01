@@ -183,7 +183,27 @@ func (c *Client) ListOnce(ctx context.Context) ([]*types.MicroVM, error) {
 	return resp.GetMicrovm(), nil
 }
 
-// Listed returns a client whose List, ListOnce and Find answer vms, a listing
+// Get returns the microVM with this uid. flintlockd reads only that VM's
+// spec, so unlike a listing it does not fail while another VM is deleted
+// (IsTransient), and its cost does not grow with the number of VMs.
+func (c *Client) Get(ctx context.Context, uid string) (*types.MicroVM, error) {
+	if c.given {
+		for _, vm := range c.listed {
+			if vm.GetSpec().GetUid() == uid {
+				return vm, nil
+			}
+		}
+		return nil, fmt.Errorf("no microVM with uid %q in namespace %s", uid, c.namespace)
+	}
+	resp, err := c.api.GetMicroVM(ctx, &mvmv1.GetMicroVMRequest{Uid: uid})
+	if err != nil {
+		c.failed("GetMicroVM", err)
+		return nil, err
+	}
+	return resp.GetMicrovm(), nil
+}
+
+// Listed returns a client whose List, ListOnce, Get and Find answer vms, a listing
 // the caller already took, without asking flintlockd again. Its other calls go
 // to flintlockd over c's connection, which only c closes. The memory
 // admission hands it to a caller's fits check, which must not list a second

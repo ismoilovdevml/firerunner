@@ -168,15 +168,13 @@ func bind(ctx context.Context, fl *flintlock.Client, inst *Instance, mac string)
 			}
 		}
 		lctx, cancel := context.WithTimeout(ctx, bindCallTimeout)
-		vms, err := fl.ListOnce(lctx)
+		v, err := fl.Get(lctx, inst.UID)
 		cancel()
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		for _, v := range vms {
-			if err == nil && v.GetSpec().GetUid() == inst.UID {
-				tap = Tap(v)
-			}
+		if err == nil {
+			tap = Tap(v)
 		}
 	}
 	if tap == "" {
