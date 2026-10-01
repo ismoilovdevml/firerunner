@@ -217,6 +217,8 @@ type Daemon struct {
 	// replacement starts booting at once instead of at the next refill tick.
 	refillNow chan struct{}
 	claimed   map[string]time.Time // uid -> claim time; protects it until the job writes its state
+	// images are the recent jobs' images, for pool.preload_top.
+	images imageStats
 	// deleting is the uids whose delete runs in the background
 	// (deleteInBackground): the next pass must not delete them again.
 	deleting map[string]bool
@@ -596,21 +598,25 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config, id string) {
 	}
 	if err == nil {
 		d.metrics.bootSeconds.WithLabelValues("pool").Observe(time.Since(start).Seconds())
-		if len(cfg.Pool.PreloadImages) == 0 {
+		static, auto := d.preloadImages(cfg)
+		if len(static)+len(auto) == 0 {
 			// Docker starts on its socket's first use: that would be the job's
 			// first docker command. Start it while the VM waits in the pool.
 			if werr := warmDocker(cfg, inst); werr != nil {
 				d.log.Debug("could not start Docker ahead of the job", "vm", id, "err", werr)
 			}
-		}
-		if len(cfg.Pool.PreloadImages) > 0 {
+		} else {
 			pctx, cancel := context.WithCancel(ctx)
 			d.mu.Lock()
 			d.preloading[inst.UID] = &preloadingVM{inst: inst, specID: fingerprint(cfg), cancel: cancel}
 			d.mu.Unlock()
 			pullStart := time.Now()
-			perr := preload(pctx, cfg, inst)
+			failed, perr := preload(pctx, cfg, inst, static, auto)
 			cancel()
+			for _, img := range failed {
+				d.images.pullFailed(img, time.Now())
+				d.log.Info("preload by use: pool VMs cannot pull this image, skipped for a day", "image", img)
+			}
 			d.mu.Lock()
 			_, stillOurs := d.preloading[inst.UID]
 			delete(d.preloading, inst.UID)
@@ -658,19 +664,17 @@ var warmDocker = func(cfg config.Config, inst *vm.Instance) error {
 	return vm.SSH(cfg, inst, "systemctl start --no-block docker.service").Run()
 }
 
-// preload pulls pool.preload_images into the VM's Docker.
-func preload(ctx context.Context, cfg config.Config, inst *vm.Instance) error {
+// preload pulls pool.preload_images (static) and the images chosen by use
+// (auto) into the VM's Docker. It returns the auto images the VM could not
+// pull; only a static one failing is an error.
+func preload(ctx context.Context, cfg config.Config, inst *vm.Instance, static, auto []string) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
-	args := "set -e"
-	for _, img := range cfg.Pool.PreloadImages {
-		args += "; docker pull -q " + shellQuote(img)
-	}
-	cmd := vm.SSH(cfg, inst, args)
+	cmd := vm.SSH(cfg, inst, preloadScript(static, auto))
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Start(); err != nil {
-		return err
+		return nil, err
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -682,12 +686,12 @@ func preload(ctx context.Context, cfg config.Config, inst *vm.Instance) error {
 		// pull when its client goes away).
 		_ = cmd.Process.Kill()
 		<-done
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(out.String()))
+		return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(out.String()))
 	}
-	return nil
+	return failedPulls(out.String()), nil
 }
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }

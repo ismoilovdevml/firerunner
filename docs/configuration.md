@@ -18,6 +18,7 @@ sudo firerunner config set vm.memory_mb 3072
 | `pool.size` | runner `concurrent`, set by the installer | pre-booted VMs; a job that finds one does not wait for a boot (about 10 s) |
 | `pool.max_idle` | `30m` | idle pool VMs are replaced after this |
 | `pool.preload_images` | none | images pulled into pool VMs in advance, e.g. a large SDK |
+| `pool.preload_top` | `0` (off) | also pull the N images the recent jobs used most (at least 2 of the last 200 jobs), see below |
 | `vm.host_reserve_mb` | `1024` | host memory never given to VMs |
 
 Set `pool.size` to the number of jobs that usually start at once: a job that finds the pool empty
@@ -25,6 +26,19 @@ waits for a boot. Each pool VM holds `vm.memory_mb` of host memory while it wait
 
 A shell executor's job gets every CPU of the host. vCPUs are threads on the host and an idle one
 costs nothing, so the installer gives each VM the host's CPUs divided by the jobs that run at once.
+
+A job whose `image:` is already in its pool VM skips the pull (10 to 20 s for a large image).
+`pool.preload_top` picks those images from what the recent jobs ran in, so they need no list:
+
+```bash
+sudo firerunner config set pool.preload_top 3
+```
+
+Pool VMs pull without the jobs' credentials, so an image that needs a login is never preloaded
+(it is skipped for a day after its first failed pull), and a job gets no image it could not pull
+itself. A job can see the names of the public images other projects use, though: leave it off
+where that matters. Preloading uses the pool VM's disk and makes its boot longer; a job that
+arrives meanwhile takes the VM and the preload stops.
 
 Keep `vm.vcpu` and `vm.memory_mb` at what most jobs need and let the few heavy jobs (static analysis,
 large test suites) ask for more with job variables, up to `vm.job_max_vcpu` and

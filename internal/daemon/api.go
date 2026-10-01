@@ -29,6 +29,9 @@ type Event struct {
 	// Builder is, for a build event (a job's first docker build), the state of
 	// the project's builder the job got: ready, booting, busy, disabled, none.
 	Builder string `json:"builder,omitempty"`
+	// Image is the job's `image:` (prepare), for pool.preload_top; never a
+	// metric label.
+	Image string `json:"image,omitempty"`
 
 	// Only logged, never metric labels.
 	Job     string `json:"job,omitempty"`     // numeric GitLab job id
@@ -159,6 +162,9 @@ func (d *Daemon) record(e Event) {
 			d.metrics.admissionWait.Observe(e.WaitSeconds)
 		}
 		if e.OK {
+			if e.Image != "" {
+				d.images.note(e.Image)
+			}
 			d.metrics.prepareSeconds.WithLabelValues(e.Source).Observe(e.Seconds)
 			switch {
 			case e.Source != "cold":
