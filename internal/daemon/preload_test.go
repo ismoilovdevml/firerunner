@@ -118,7 +118,8 @@ func TestPoolVMPreloadsByUse(t *testing.T) {
 	d.bootOne(context.Background(), cfg, "pool-x")
 
 	log, _ := os.ReadFile(filepath.Join(bin, "ssh.log"))
-	if !strings.Contains(string(log), "docker pull -q 'node:22'") || !strings.Contains(string(log), "docker pull -q 'private.corp/app:1'") {
+	want := preloadCommand(nil, []string{"node:22", "private.corp/app:1"})
+	if !strings.Contains(string(log), want) {
 		t.Fatalf("pool VM did not pull the most used images:\n%s", log)
 	}
 	if got := d.images.top(5, nil, time.Now()); !slices.Equal(got, []string{"node:22"}) {
@@ -128,5 +129,52 @@ func TestPoolVMPreloadsByUse(t *testing.T) {
 	defer d.mu.Unlock()
 	if len(d.ready) != 1 {
 		t.Fatalf("pool after the preload: %d ready, want 1", len(d.ready))
+	}
+}
+
+// The preload runs in a unit of its own, so that it can be stopped whole.
+func TestPreloadCommand(t *testing.T) {
+	c := preloadCommand([]string{"sdk:1"}, nil)
+	if !strings.HasPrefix(c, "systemd-run --unit="+preloadUnit+" ") || !strings.Contains(c, " --pipe --wait ") {
+		t.Fatalf("preload not in a transient unit: %s", c)
+	}
+	if !strings.HasSuffix(c, " sh -c "+shellQuote(preloadScript([]string{"sdk:1"}, nil))) {
+		t.Fatalf("unit does not run the script: %s", c)
+	}
+}
+
+// A job claiming the VM mid-preload stops the pulls in the VM, not only ssh:
+// they would go on taking the job's network.
+func TestPreloadCancelStopsPulls(t *testing.T) {
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stopped := 0
+	old := stopPreload
+	t.Cleanup(func() { stopPreload = old })
+	stopPreload = func(config.Config, *vm.Instance) error { stopped++; return nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	inst := &vm.Instance{ID: "pool-x", UID: "u", IP: "10.200.0.5", HostKey: "ssh-ed25519 AAAA"}
+	start := time.Now()
+	if _, err := preload(ctx, config.Config{}, inst, []string{"sdk:1"}, nil); err == nil {
+		t.Fatal("cancelled preload reported success")
+	}
+	if time.Since(start) > 10*time.Second {
+		t.Fatal("cancel did not end the preload")
+	}
+	if stopped != 1 {
+		t.Fatalf("stopPreload called %d times, want 1", stopped)
+	}
+
+	// A preload that finishes on its own leaves nothing to stop.
+	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := preload(context.Background(), config.Config{}, inst, []string{"sdk:1"}, nil); err != nil || stopped != 1 {
+		t.Fatalf("finished preload: err %v, stopPreload called %d times", err, stopped)
 	}
 }

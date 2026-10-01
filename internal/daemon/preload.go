@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
+	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
 // Image preload by use (pool.preload_top): the daemon remembers the `image:`
@@ -115,6 +116,28 @@ func preloadScript(static, auto []string) string {
 }
 
 const preloadFailedMark = "firerunner-preload-failed "
+
+// preloadUnit runs the preload in the VM, so that it can be stopped as a whole.
+const preloadUnit = "firerunner-preload"
+
+// preloadCommand runs preloadScript in a transient unit of the VM's systemd,
+// passing its output and exit status through.
+func preloadCommand(static, auto []string) string {
+	return "systemd-run --unit=" + preloadUnit + " --collect --quiet --pipe --wait --setenv=HOME=/root sh -c " +
+		shellQuote(preloadScript(static, auto))
+}
+
+// stopPreload stops a preload a job interrupted, together with its pulls
+// (a variable for tests).
+var stopPreload = func(cfg config.Config, inst *vm.Instance) error {
+	cmd := vm.SSH(cfg, inst, "systemctl stop "+preloadUnit+" 2>/dev/null || true")
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	t := time.AfterFunc(30*time.Second, func() { _ = cmd.Process.Kill() })
+	defer t.Stop()
+	return cmd.Wait()
+}
 
 // failedPulls reads the images preloadScript reported as not pulled.
 func failedPulls(out string) []string {
