@@ -265,12 +265,17 @@ func TestRunShutdownKeepsAndRecordsPool(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- d.Run(ctx) }()
+	// Wait for the startup listing's answer, not only its arrival at
+	// flintlockd: cancelled before the answer, Run adopts and records nothing.
 	deadline := time.Now().Add(5 * time.Second)
-	for srv.ListCalls() == 0 {
+	for adopted := false; !adopted; {
 		if time.Now().After(deadline) {
-			t.Fatal("daemon never reconciled")
+			t.Fatal("daemon never adopted the pool")
 		}
 		time.Sleep(10 * time.Millisecond)
+		d.mu.Lock()
+		adopted = d.poolAdopted
+		d.mu.Unlock()
 	}
 	cancel()
 	select {
