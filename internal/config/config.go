@@ -98,6 +98,11 @@ type Pool struct {
 	// PreloadImages are pulled into each pool VM's Docker before it is handed
 	// out, so jobs using these images skip the pull. Each VM still serves one job.
 	PreloadImages []string `yaml:"preload_images"`
+	// PreloadTop also pulls the PreloadTop images the most recent jobs ran in
+	// (at least two of the last 200 jobs) into pool VMs; 0 is off. Pool VMs
+	// pull without credentials, so private images are never preloaded, but a
+	// job can list the public images other projects use.
+	PreloadTop int `yaml:"preload_top"`
 }
 
 type Daemon struct {
@@ -323,6 +328,9 @@ func (c Config) Validate() error {
 	if c.Pool.Size < 0 || c.Pool.Size > 32 {
 		errs = append(errs, "pool.size must be between 0 and 32")
 	}
+	if c.Pool.PreloadTop < 0 || c.Pool.PreloadTop > 10 {
+		errs = append(errs, "pool.preload_top must be between 0 (off) and 10")
+	}
 	if c.Pool.MaxIdle < time.Minute {
 		errs = append(errs, "pool.max_idle must be at least 1m")
 	}
@@ -471,6 +479,9 @@ func pruneUnused(m map[string]any, cfg Config) {
 				delete(fl, key)
 			}
 		}
+	}
+	if pl, ok := m["pool"].(map[string]any); ok && cfg.Pool.PreloadTop == 0 {
+		delete(pl, "preload_top")
 	}
 	if nw, ok := m["network"].(map[string]any); ok && len(cfg.Network.EgressDeny) == 0 {
 		delete(nw, "egress_deny")
