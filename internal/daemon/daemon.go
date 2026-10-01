@@ -670,7 +670,7 @@ var warmDocker = func(cfg config.Config, inst *vm.Instance) error {
 func preload(ctx context.Context, cfg config.Config, inst *vm.Instance, static, auto []string) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
-	cmd := vm.SSH(cfg, inst, preloadScript(static, auto))
+	cmd := vm.SSH(cfg, inst, preloadCommand(static, auto))
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Start(); err != nil {
@@ -682,10 +682,15 @@ func preload(ctx context.Context, cfg config.Config, inst *vm.Instance, static, 
 	select {
 	case err = <-done:
 	case <-ctx.Done():
-		// Timeout or a job claimed the VM: stop pulling (docker cancels the
-		// pull when its client goes away).
+		// Timeout or a job claimed the VM. Killing ssh does not stop the
+		// pulls: sshd gives a command without a terminal no signal, so they
+		// would go on taking the job's network and CPU. Stop the unit: systemd
+		// kills all of it, and dockerd cancels a pull whose client is gone.
 		_ = cmd.Process.Kill()
 		<-done
+		if serr := stopPreload(cfg, inst); serr != nil {
+			return nil, fmt.Errorf("%w (stopping the pulls in the VM: %v)", ctx.Err(), serr)
+		}
 		return nil, ctx.Err()
 	}
 	if err != nil {
