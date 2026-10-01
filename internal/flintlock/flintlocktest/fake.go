@@ -15,8 +15,10 @@ import (
 	mvmv1 "github.com/liquidmetal-dev/flintlock/api/services/microvm/v1alpha1"
 	"github.com/liquidmetal-dev/flintlock/api/types"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -43,6 +45,7 @@ type Server struct {
 	hangDel   bool
 	delErrs   []error
 	delCalls  int
+	getCalls  int
 }
 
 // NewServer returns a server whose CreateMicroVM answers with createUID.
@@ -181,6 +184,27 @@ func (s *Server) ListMicroVMs(_ context.Context, _ *mvmv1.ListMicroVMsRequest) (
 		return nil, err
 	}
 	return &mvmv1.ListMicroVMsResponse{Microvm: s.vms}, nil
+}
+
+// GetMicroVM returns the configured VM with the uid, or NotFound. It does
+// not fail with ListMicroVMs (FailList): flintlockd reads only that VM.
+func (s *Server) GetMicroVM(_ context.Context, req *mvmv1.GetMicroVMRequest) (*mvmv1.GetMicroVMResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getCalls++
+	for _, vm := range s.vms {
+		if vm.GetSpec().GetUid() == req.GetUid() {
+			return &mvmv1.GetMicroVMResponse{Microvm: vm}, nil
+		}
+	}
+	return nil, status.Errorf(codes.NotFound, "microvm %s not found", req.GetUid())
+}
+
+// GetCalls is how many GetMicroVM calls arrived.
+func (s *Server) GetCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getCalls
 }
 
 func (s *Server) recordAuth(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {

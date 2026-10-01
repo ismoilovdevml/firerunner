@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/liquidmetal-dev/flintlock/api/types"
+
+	"github.com/ismoilovdevml/firerunner/internal/flintlock/flintlocktest"
 )
 
 // fakeSets is the bridge's three binding sets, changed by the scripts Bind
@@ -428,5 +430,31 @@ func TestReconcileKeepsABoundAddress(t *testing.T) {
 	}
 	if !f.addrs[[3]string{"fltapJob", "aa:fc:00:00:00:03", "10.200.0.23"}] || f.addrs[[3]string{"fltapJob", "aa:fc:00:00:00:01", "10.200.0.21"}] {
 		t.Fatalf("reused tap: %s", f.state())
+	}
+}
+
+// bind asks flintlock for its own VM only: a listing, which fails while
+// flintlockd deletes another VM, is not needed to find the tap.
+func TestBindGetsItsOwnVM(t *testing.T) {
+	f := newFakeSets(t)
+	srv := flintlocktest.NewServer("")
+	uid := "uid-new"
+	srv.SetVMs(&types.MicroVM{
+		Spec:   &types.MicroVMSpec{Id: "job-1", Uid: &uid},
+		Status: &types.MicroVMStatus{NetworkInterfaces: map[string]*types.NetworkInterfaceStatus{bridgedDevice: {HostDeviceName: "fltap1a2b"}}},
+	})
+	srv.FailList(errors.New("failed reading from content store"))
+	fl := dialFake(t, srv)
+	inst := &Instance{ID: "job-1", UID: uid, IP: "10.200.0.23"}
+	if err := bind(context.Background(), fl, inst, "aa:fc:01:02:03:04"); err != nil {
+		t.Fatalf("bind = %v", err)
+	}
+	if inst.Tap != "fltap1a2b" || len(f.scripts) != 1 || srv.ListCalls() != 0 || srv.GetCalls() != 1 {
+		t.Fatalf("tap %q, nft %q, %d lists, %d gets", inst.Tap, f.scripts, srv.ListCalls(), srv.GetCalls())
+	}
+
+	other := &Instance{ID: "job-2", UID: "uid-gone", IP: "10.200.0.24"}
+	if err := bind(context.Background(), fl, other, "aa:fc:01:02:03:05"); err == nil {
+		t.Fatal("bind of a VM flintlock does not know succeeded")
 	}
 }
