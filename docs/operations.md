@@ -53,6 +53,64 @@ VMs that no job owns are deleted automatically every minute.
 
 To drain a host, pause the runner in GitLab and wait until `vm list` shows no `job` VMs.
 
+## Rebuilding the thin pool
+
+A thin pool keeps the chunk size it was created with. A new install uses 64K chunks (`FR_THIN_CHUNK`);
+a pool from an older install keeps 512K until it is rebuilt. Check yours with
+`sudo lvs -o lv_name,chunk_size,zero flintlock/thinpool`.
+
+A rebuild deletes every microVM disk and the images flintlock pulled; the host pulls the kernel
+and root filesystem again on the first boot. It keeps the registry mirrors, the `cache:` store and
+the saved builder caches (`/var/lib/firerunner`, on the root disk). Running builders lose what they
+cached since their last save. The host takes no jobs while it runs.
+
+1. Drain the host: pause the runner in GitLab and wait until `sudo firerunner vm list` shows no
+   `job` VMs.
+2. Stop taking jobs and refilling the pool, then delete the remaining microVMs. flintlockd deletes
+   in the background: repeat `vm list` until it is empty.
+
+   ```bash
+   sudo systemctl stop gitlab-runner firerunner
+   sudo firerunner vm rm --all
+   sudo firerunner vm list
+   ```
+
+3. Stop the microVM stack and check that no Firecracker process is left:
+
+   ```bash
+   sudo systemctl stop flintlockd containerd-flintlock
+   pgrep -x firecracker || echo "none left"
+   ```
+
+4. Note the pool's disk, then remove containerd's thin devices, the volume group and the old
+   state. containerd creates its devices with device-mapper directly, so LVM does not remove them:
+
+   ```bash
+   sudo pvs -S vg_name=flintlock -o pv_name --noheadings     # e.g. /dev/sdb
+   sudo dmsetup ls --target thin | awk '$1 ~ /^flintlock-thinpool-snap-/ {print $1}' |
+       xargs -r -n1 sudo dmsetup remove
+   sudo vgremove -y flintlock
+   sudo pvremove -y /dev/sdb && sudo wipefs -a /dev/sdb
+   sudo rm -rf /var/lib/containerd-flintlock /var/lib/flintlock /run/firerunner/pool.json
+   ```
+
+5. Run the installer with that disk; it creates the pool and starts the stack again:
+
+   ```bash
+   curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo FR_DISK=/dev/sdb bash
+   ```
+
+6. Check the new pool, start gitlab-runner and resume the runner in GitLab:
+
+   ```bash
+   sudo lvs -o lv_name,chunk_size,zero flintlock/thinpool   # 64.00k, zero
+   sudo systemctl start gitlab-runner
+   sudo firerunner doctor
+   ```
+
+A volume group on more than one disk is rebuilt on the first one; add the others afterwards with
+`vgextend flintlock /dev/sdX` and grow the pool with `lvextend -L +<size> flintlock/thinpool`.
+
 ## Monitoring
 
 Prometheus metrics are on `127.0.0.1:9477/metrics`. To scrape from elsewhere, install with
