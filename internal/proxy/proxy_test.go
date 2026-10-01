@@ -841,3 +841,22 @@ func TestForwardHalfClose(t *testing.T) {
 		t.Fatalf("half-closed client got %d %q", resp.StatusCode, body)
 	}
 }
+
+// With proxy.egress_strict a name the host cannot resolve is refused: it could
+// stand for an address in network.egress_deny that only the upstream resolves.
+func TestPolicyStrict(t *testing.T) {
+	p := testPolicy()
+	if why := p.Check(context.Background(), "unresolvable.corp", 443, true); why != "" {
+		t.Fatalf("lenient policy refused an unresolvable name: %s", why)
+	}
+	p.Strict = true
+	if why := p.Check(context.Background(), "unresolvable.corp", 443, true); why == "" {
+		t.Fatal("strict policy passed a name the host cannot resolve")
+	}
+	if why := p.Check(context.Background(), "github.com", 443, true); why != "" {
+		t.Fatalf("strict policy refused a resolvable name: %s", why)
+	}
+	if why := p.Check(context.Background(), "140.82.121.4", 443, true); why != "" {
+		t.Fatalf("strict policy refused an IP address: %s", why)
+	}
+}

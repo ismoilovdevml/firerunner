@@ -957,7 +957,7 @@ func cmdProxy(cfg config.Config) error {
 		Upstream: upstream,
 		Allowed:  proxy.AllowNets(bridge),
 		Policy: &proxy.Policy{Bridge: bridge, Deny: deny, ConnectPorts: cfg.Proxy.ConnectPorts,
-			LocalAddrs: localAddrs},
+			LocalAddrs: localAddrs, Strict: cfg.Proxy.EgressStrict},
 		Limits:      proxy.DefaultLimits,
 		Log:         log,
 		DialTimeout: 15 * time.Second,

@@ -91,8 +91,12 @@ type Policy struct {
 	// ConnectPorts are the ports CONNECT tunnels may go to.
 	ConnectPorts []int
 	// Resolve looks up a host name; nil uses the system resolver. A name that
-	// does not resolve here is passed on: the upstream resolves it itself.
+	// does not resolve here is passed on, the upstream resolves it itself,
+	// unless Strict is set.
 	Resolve func(ctx context.Context, host string) ([]net.IP, error)
+	// Strict refuses a name that does not resolve here (proxy.egress_strict):
+	// only the addresses the host sees are checked against Deny.
+	Strict bool
 	// LocalAddrs are the host's own addresses; nil lists the interfaces.
 	LocalAddrs func() []net.IP
 }
@@ -128,8 +132,12 @@ func (p *Policy) Check(ctx context.Context, host string, port int, connect bool)
 			}
 		}
 		rctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		ips, _ = resolve(rctx, host)
+		var err error
+		ips, err = resolve(rctx, host)
 		cancel()
+		if p.Strict && (err != nil || len(ips) == 0) {
+			return "the name does not resolve on this host (proxy.egress_strict)"
+		}
 	}
 	var local []net.IP
 	if p.LocalAddrs != nil {
