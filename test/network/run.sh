@@ -8,7 +8,7 @@
 # throwaway container, once with and once without br_netfilter:
 #   docker run --rm --privileged -e BRNF=1 -v "$PWD":/src:ro ubuntu:24.04 bash /src/test/network/run.sh
 set -uo pipefail
-apt-get update -qq >/dev/null && apt-get install -y -qq nftables iproute2 netcat-openbsd iputils-ping iputils-arping busybox python3-minimal >/dev/null || exit 99
+apt-get update -qq >/dev/null && apt-get install -y -qq nftables iproute2 netcat-openbsd iputils-ping iputils-arping busybox python3-minimal dnsmasq-base >/dev/null || exit 99
 
 WORK=/work; mkdir -p $WORK
 # BRNF=1: br_netfilter active (bridged IPv4 also passes the inet hooks); 0: pure bridging.
@@ -112,6 +112,10 @@ check "VM->internet-like 192.0.2.50 (NAT)"        ok      $A nc -z -w2 192.0.2.5
 check "metrics from allowed 192.0.2.10"           ok      ip netns exec out nc -z -w2 -s 192.0.2.10 192.0.2.1 9477
 check "metrics from other 192.0.2.50"             blocked ip netns exec out nc -z -w2 -s 192.0.2.50 192.0.2.1 9477
 check "metrics from localhost"                    ok      nc -z -w2 127.0.0.1 9477
+# microVM DNS: dnsmasq accepts the rendered config, asks every upstream at once
+# and keeps no negative answers.
+check "dnsmasq.conf is valid"                     ok      dnsmasq --test -C $WORK/conf/dnsmasq.conf
+check "dnsmasq asks all upstreams, no negcache"   ok      bash -c "grep -qx all-servers $WORK/conf/dnsmasq.conf && grep -qx no-negcache $WORK/conf/dnsmasq.conf"
 
 # ---- anti-spoof: vmA tries to take over vmB's address and MAC on the host
 mac() { ip -n "$1" -br link show eth0 | awk '{print $3}'; }

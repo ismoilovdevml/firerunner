@@ -958,6 +958,14 @@ no-ping
 # Every microVM starts with an empty resolver cache: keep the answers here
 # (the default holds 150 names).
 cache-size=10000
+# The host's resolvers answer every query at once and the first reply wins: one
+# that is slow or down does not fail lookups in jobs (getaddrinfo EAI_AGAIN).
+all-servers
+# Never keep a negative answer: an upstream that returns a name without an
+# address for a moment would otherwise fail every job's lookups of that name
+# until the answer expires (seen as "No address associated with hostname" for
+# deb.debian.org in builds of several projects at once).
+no-negcache
 # Hostnames sent by guests are not published in DNS.
 dhcp-ignore-names
 no-hosts
