@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -278,30 +279,165 @@ func TestBuilderScript(t *testing.T) {
 	}
 }
 
-// The builder script runs under bash, as on a job VM, with fake docker and ip
-// binaries; the fake ssh moves its absolute paths into a temporary directory.
-// A booting builder gets a bounded create and, if that fails, today's create;
-// a create that still fails costs the job the builder, never the job itself.
+// fakeGuestBin writes the fake ssh, ip, timeout and docker that builder
+// script tests put on PATH. They keep their state and read their replies in
+// $FR_FAKE (one fakeGuest), so each test writes the binaries once.
+//   - ssh runs a builder session (`ssh … bash`) with the guest's paths moved
+//     by $FR_FAKE/rewrite.sed and keeps the script it ran; it only records a
+//     stage session (`ssh … /bin/bash`).
+//   - docker logs each call with the builder it would use ("local": none).
+//     Like buildx, a create fails when the instance exists. It fails a create
+//     with the message in create-bounded (with --timeout) or create, and
+//     answers the wrapper's probe when answers exists.
+func fakeGuestBin(t *testing.T) string {
+	t.Helper()
+	bin := t.TempDir()
+	for name, body := range map[string]string{
+		"ssh": `#!/bin/sh
+for a; do last=$a; done
+if [ "$last" = bash ]; then
+    sed -f "$FR_FAKE/rewrite.sed" > "$FR_FAKE/builder.sh" && exec bash "$FR_FAKE/builder.sh"
+    exit 1
+fi
+{ echo "--- ssh $*"; cat; } >> "$FR_FAKE/sent"
+`,
+		"ip":      "#!/bin/sh\necho 'default via 10.0.0.1 dev eth0 proto dhcp'\n",
+		"timeout": "#!/bin/sh\nshift\nexec \"$@\"\n",
+		"docker": `#!/bin/sh
+echo "${BUILDX_BUILDER:-local} $*" >> "$FR_FAKE/calls"
+case "$1 $2" in
+"buildx create")
+    if [ -e "$FR_FAKE/instance" ]; then
+        echo 'ERROR: existing instance for "firerunner" but no append mode, specify the node name to make changes for existing instances' >&2
+        exit 1
+    fi
+    reply=create
+    case " $* " in *" --timeout "*) reply=create-bounded ;; esac
+    if [ -s "$FR_FAKE/$reply" ]; then
+        cat "$FR_FAKE/$reply" >&2
+        exit 1
+    fi
+    touch "$FR_FAKE/instance" ;;
+"buildx inspect")
+    [ -e "$FR_FAKE/answers" ] || exit 1 ;;
+esac
+exit 0
+`,
+	} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return bin
+}
+
+// fakeGuest is one job VM for the fakes of fakeGuestBin: dir is their
+// $FR_FAKE, root holds the guest paths the builder script writes.
+type fakeGuest struct{ bin, dir, root string }
+
+func newFakeGuest(t *testing.T, bin string) fakeGuest {
+	t.Helper()
+	g := fakeGuest{bin: bin, dir: t.TempDir(), root: t.TempDir()}
+	var sed strings.Builder
+	for i, m := 0, g.moves(); i < len(m); i += 2 {
+		fmt.Fprintf(&sed, "s#%s#%s#g\n", m[i], m[i+1])
+	}
+	g.set(t, "rewrite.sed", sed.String())
+	return g
+}
+
+// moves pairs each guest path of the builder script with its place in the
+// test: files under root, the guest's docker is the fake.
+func (g fakeGuest) moves() []string {
+	return []string{
+		"/etc/firerunner-buildkit", g.root + "/etc",
+		"/usr/local/bin/docker", g.root + "/docker",
+		"/usr/bin/docker", g.bin + "/docker",
+		"/run/firerunner-builder-", g.root + "/builder-",
+	}
+}
+
+func (g fakeGuest) set(t *testing.T, name, data string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(g.dir, name), []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// calls are the fake docker's calls, oldest first.
+func (g fakeGuest) calls() []string {
+	b, _ := os.ReadFile(filepath.Join(g.dir, "calls"))
+	if len(b) == 0 {
+		return nil
+	}
+	return strings.Split(strings.TrimSpace(string(b)), "\n")
+}
+
+// env is the environment of a guest command: the fakes first on PATH and the
+// job's BUILDX_BUILDER ("" for a job without a builder).
+func (g fakeGuest) env(builder string) []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "PATH=") && !strings.HasPrefix(kv, "BUILDX_BUILDER=") && !strings.HasPrefix(kv, "FR_FAKE=") {
+			env = append(env, kv)
+		}
+	}
+	env = append(env, "PATH="+g.bin+string(os.PathListSeparator)+os.Getenv("PATH"), "FR_FAKE="+g.dir)
+	if builder != "" {
+		env = append(env, "BUILDX_BUILDER="+builder)
+	}
+	return env
+}
+
+// absPath finds the absolute paths in a script: a / and a letter after a
+// blank, quote, =, :, !, <, > or ( (so "tcp://$gw" is not one).
+var absPath = regexp.MustCompile(`(?:^|[\s'"=:!<>(])(/[A-Za-z][^\s'"),;|<>]*)`)
+
+// checkHermetic fails the test if the script as run still uses a path outside
+// the test's directories: a new guest path in BuilderScript must be added to
+// moves, not written on the test machine. /dev/null and the wrapper's
+// #!/bin/bash are the machine's own.
+func (g fakeGuest) checkHermetic(t *testing.T, script string) {
+	t.Helper()
+	var outside []string
+	for _, m := range absPath.FindAllStringSubmatch(strings.NewReplacer(g.root, "ROOT", g.bin, "BIN").Replace(script), -1) {
+		if p := m[1]; p != "/dev/null" && p != "/bin/bash" {
+			outside = append(outside, p)
+		}
+	}
+	if len(outside) > 0 {
+		t.Errorf("the builder script uses %v, which the test does not redirect:\n%s", outside, script)
+	}
+}
+
+// The builder script runs under bash, as on a job VM, through the fake ssh.
+// A booting builder gets a bounded create and, if that fails, the unbounded
+// one; a create that still fails costs the job the builder, never the job.
 func TestBuilderScriptAttach(t *testing.T) {
+	bin := fakeGuestBin(t)
 	for _, c := range []struct {
-		name, state string
-		bounded     string // the fake docker's reply to create --timeout 2s
-		plain       string // and to a create without it
-		creates     []bool // each create the script ran: with --timeout?
-		attached    bool
+		name, state    string
+		bounded, plain string // the error of create --timeout 2s, of a create without it; "": it succeeds
+		existing       bool   // an earlier attach in this VM saved the instance
+		creates        []bool // each create the script ran: with --timeout?
+		attached       bool
 	}{
 		{name: "booting, bounded create succeeds", state: daemon.BuilderBooting,
-			bounded: "exit 0", plain: "exit 0", creates: []bool{true}, attached: true},
+			creates: []bool{true}, attached: true},
 		{name: "booting, buildx without --timeout", state: daemon.BuilderBooting,
-			bounded: `echo "unknown flag: --timeout" >&2; exit 1`, plain: "exit 0", creates: []bool{true, false}, attached: true},
+			bounded: "unknown flag: --timeout", creates: []bool{true, false}, attached: true},
 		{name: "booting, bounded create rolled back", state: daemon.BuilderBooting,
-			bounded: `echo "context deadline exceeded" >&2; exit 1`, plain: "exit 0", creates: []bool{true, false}, attached: true},
+			bounded: "context deadline exceeded", creates: []bool{true, false}, attached: true},
 		{name: "booting, both creates fail", state: daemon.BuilderBooting,
-			bounded: "exit 1", plain: `echo "existing instance" >&2; exit 1`, creates: []bool{true, false}},
+			bounded: "context deadline exceeded", plain: "connection refused", creates: []bool{true, false}},
+		{name: "booting, the instance exists", state: daemon.BuilderBooting,
+			existing: true, creates: []bool{true, false}},
 		{name: "ready, create succeeds", state: daemon.BuilderReady,
-			bounded: "exit 0", plain: "exit 0", creates: []bool{false}, attached: true},
+			creates: []bool{false}, attached: true},
 		{name: "ready, create fails", state: daemon.BuilderReady,
-			bounded: "exit 0", plain: "exit 1", creates: []bool{false}},
+			plain: "connection refused", creates: []bool{false}},
+		{name: "ready, the instance exists", state: daemon.BuilderReady,
+			existing: true, creates: []bool{false}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cfg, _ := cleanupFixture(t)
@@ -313,63 +449,15 @@ func TestBuilderScriptAttach(t *testing.T) {
 			vm.MuxDir = t.TempDir()
 			t.Cleanup(func() { vm.MuxDir = oldMux })
 			t.Setenv("CUSTOM_ENV_CI_JOB_IMAGE", "")
+			events := withDaemon(t, &cfg, &daemon.BuilderInfo{State: c.state, Port: 20001, CA: "CA", Cert: "CERT", Key: "KEY"})
 
-			dir, err := os.MkdirTemp("", "fre") // short: unix socket paths are limited
-			if err != nil {
-				t.Fatal(err)
+			g := newFakeGuest(t, bin)
+			g.set(t, "create-bounded", c.bounded)
+			g.set(t, "create", c.plain)
+			if c.existing {
+				g.set(t, "instance", "")
 			}
-			t.Cleanup(func() { _ = os.RemoveAll(dir) })
-			cfg.Daemon.Socket = filepath.Join(dir, "d.sock")
-			l, err := net.Listen("unix", cfg.Daemon.Socket)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var mu sync.Mutex
-			var builds []string
-			srv := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch r.URL.Path {
-				case "/builder":
-					_ = json.NewEncoder(w).Encode(daemon.BuilderInfo{State: c.state, Port: 20001, CA: "CA", Cert: "CERT", Key: "KEY"})
-				case "/event":
-					var e daemon.Event
-					if json.NewDecoder(r.Body).Decode(&e) == nil && e.Kind == "build" {
-						mu.Lock()
-						builds = append(builds, e.Builder)
-						mu.Unlock()
-					}
-					w.WriteHeader(http.StatusNoContent)
-				default:
-					w.WriteHeader(http.StatusNoContent)
-				}
-			})}
-			go func() { _ = srv.Serve(l) }()
-			t.Cleanup(func() { _ = srv.Close() })
-
-			bin, root, tmp := t.TempDir(), t.TempDir(), t.TempDir()
-			calls, sent := filepath.Join(tmp, "docker-calls"), filepath.Join(tmp, "sent")
-			fakes := map[string]string{
-				// The builder session (`ssh … bash`) runs the script; a stage
-				// session (`ssh … /bin/bash`) is only recorded.
-				"ssh": `#!/bin/sh
-for a; do last=$a; done
-if [ "$last" = bash ]; then
-    sed -e 's#/etc/firerunner-buildkit#` + root + `/etc#g' -e 's#/usr/local/bin/docker#` + root + `/docker#g' | bash
-    exit $?
-fi
-{ echo "--- ssh $*"; cat; } >> ` + sent + "\n",
-				"ip": "#!/bin/sh\necho 'default via 10.0.0.1 dev eth0 proto dhcp'\n",
-				"docker": `#!/bin/sh
-echo "$*" >> ` + calls + `
-case " $* " in
-    *" --timeout "*) ` + c.bounded + ` ;;
-esac
-` + c.plain + "\n",
-			}
-			for name, body := range fakes {
-				if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
-					t.Fatal(err)
-				}
-			}
+			t.Setenv("FR_FAKE", g.dir)
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 			body := "docker build -t app .\n"
@@ -381,30 +469,37 @@ esac
 				t.Fatalf("Run = %v", err)
 			}
 
-			b, _ := os.ReadFile(calls)
-			lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-			if len(lines) != len(c.creates) {
-				t.Fatalf("docker calls:\n%s\nwant %d creates", b, len(c.creates))
+			ran, err := os.ReadFile(filepath.Join(g.dir, "builder.sh"))
+			if err != nil {
+				t.Fatalf("no builder session: %v", err)
+			}
+			g.checkHermetic(t, string(ran))
+			calls := g.calls()
+			if len(calls) != len(c.creates) {
+				t.Fatalf("docker calls:\n%s\nwant %d creates", strings.Join(calls, "\n"), len(c.creates))
 			}
 			for i, bounded := range c.creates {
-				if !strings.HasPrefix(lines[i], "buildx create --name firerunner --driver remote ") ||
-					!strings.Contains(lines[i], " tcp://10.0.0.1:20001") {
-					t.Errorf("call %d is %q, want a create of the builder at the gateway", i, lines[i])
+				if !strings.HasPrefix(calls[i], "local buildx create --name firerunner --driver remote ") ||
+					!strings.Contains(calls[i], " tcp://10.0.0.1:20001") {
+					t.Errorf("call %d is %q, want a create of the builder at the gateway", i, calls[i])
 				}
-				if got := strings.HasSuffix(lines[i], " --timeout 2s"); got != bounded {
-					t.Errorf("call %d is %q: bounded %v, want %v", i, lines[i], got, bounded)
+				if got := strings.HasSuffix(calls[i], " --timeout 2s"); got != bounded {
+					t.Errorf("call %d is %q: bounded %v, want %v", i, calls[i], got, bounded)
 				}
 			}
 
-			stage, _ := os.ReadFile(sent)
-			_, werr := os.Stat(filepath.Join(root, "docker"))
-			st, err = vm.LoadJobState(statePath("job-555"))
-			if err != nil {
+			stage, _ := os.ReadFile(filepath.Join(g.dir, "sent"))
+			_, werr := os.Stat(filepath.Join(g.root, "docker"))
+			if st, err = vm.LoadJobState(statePath("job-555")); err != nil {
 				t.Fatal(err)
 			}
-			mu.Lock()
+			var builds []string
+			for _, e := range events() {
+				if e.Kind == "build" {
+					builds = append(builds, e.Builder)
+				}
+			}
 			gotBuilds := strings.Join(builds, ",")
-			mu.Unlock()
 			if c.attached {
 				if !strings.HasSuffix(string(stage), "/bin/bash\nexport BUILDX_BUILDER="+BuilderName+"\n"+body) {
 					t.Errorf("the stage does not use the builder:\n%s", stage)
@@ -429,6 +524,101 @@ esac
 			}
 		})
 	}
+}
+
+// The docker wrapper that the builder script installs waits for a starting
+// builder before a build, docker compose builds included, and builds locally
+// if the builder never answers. Other commands run at once.
+func TestBuilderScriptWrapper(t *testing.T) {
+	bin := fakeGuestBin(t)
+	script := BuilderScript(&daemon.BuilderInfo{State: daemon.BuilderBooting, Port: 20001, CA: "CA", Cert: "CERT", Key: "KEY"})
+	wait := fmt.Sprintf("$((SECONDS + %d))", BuilderWait)
+	if !strings.Contains(script, wait) {
+		t.Fatalf("the wrapper has no %s to shorten:\n%s", wait, script)
+	}
+	// 2 s instead of BuilderWait: time for a probe or two, not five minutes.
+	script = strings.Replace(script, wait, "$((SECONDS + 2))", 1)
+	const remote, local = BuilderName, "local"
+	for _, c := range []struct {
+		name    string
+		args    string
+		builder string // the job's BUILDX_BUILDER; "": no builder attached
+		answers bool   // the builder answers the wrapper's probe
+		earlier string // an earlier build in the job found the builder "ok" or "down"
+		wait    bool   // the wrapper probes the builder first
+		want    string // the builder the command runs with
+	}{
+		{name: "build, the builder answers", args: "build -t app .", builder: remote, answers: true, wait: true, want: remote},
+		{name: "build, the builder never answers", args: "build -t app .", builder: remote, wait: true, want: local},
+		{name: "buildx bake, the builder answers", args: "buildx bake", builder: remote, answers: true, wait: true, want: remote},
+		{name: "compose build, the builder answers", args: "compose build", builder: remote, answers: true, wait: true, want: remote},
+		{name: "compose build with options, the builder never answers", args: "compose -f ci.yml --project-name app --ansi never build web",
+			builder: remote, wait: true, want: local},
+		{name: "compose up --build, the builder never answers", args: "compose --file=ci.yml up -d --build",
+			builder: remote, wait: true, want: local},
+		{name: "compose run --build, the builder answers", args: "compose run --rm --build app make",
+			builder: remote, answers: true, wait: true, want: remote},
+		{name: "compose up of a profile named build", args: "compose --profile build up -d db", builder: remote, want: remote},
+		{name: "compose ps", args: "compose ps", builder: remote, want: remote},
+		{name: "docker run", args: "run --rm alpine true", builder: remote, want: remote},
+		{name: "compose build without a builder", args: "compose build", want: local},
+		{name: "compose build after the builder answered", args: "compose build", builder: remote, earlier: "ok", want: remote},
+		{name: "compose build after the builder was given up", args: "compose build", builder: remote, answers: true,
+			earlier: "down", want: local},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			g := newFakeGuest(t, bin)
+			install := exec.Command("bash")
+			install.Stdin, install.Env = strings.NewReader(g.hermetic(t, script)), g.env("")
+			if out, err := install.CombinedOutput(); err != nil {
+				t.Fatalf("builder script: %v\n%s", err, out)
+			}
+			if err := os.Remove(filepath.Join(g.dir, "calls")); err != nil {
+				t.Fatal(err)
+			}
+			if c.answers {
+				g.set(t, "answers", "")
+			}
+			if c.earlier != "" {
+				if err := os.WriteFile(filepath.Join(g.root, "builder-"+c.earlier), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			args := strings.Fields(c.args)
+			cmd := exec.Command(filepath.Join(g.root, "docker"), args...)
+			cmd.Env = g.env(c.builder)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("docker %s: %v\n%s", c.args, err, out)
+			}
+			calls := g.calls()
+			if len(calls) == 0 || calls[len(calls)-1] != c.want+" "+c.args {
+				t.Fatalf("docker calls:\n%s\nwant last: %s %s", strings.Join(calls, "\n"), c.want, c.args)
+			}
+			for _, p := range calls[:len(calls)-1] {
+				if p != remote+" buildx inspect --bootstrap "+remote {
+					t.Errorf("call %q before the command, want only probes of the builder", p)
+				}
+			}
+			if probed := len(calls) > 1; probed != c.wait {
+				t.Errorf("probed the builder %v, want %v:\n%s", probed, c.wait, strings.Join(calls, "\n"))
+			}
+			if down := strings.Contains(string(out), "builder did not answer"); down != (c.builder != "" && c.want == local) {
+				t.Errorf("output %q: reports building without the cache %v", out, down)
+			}
+		})
+	}
+}
+
+// hermetic is script with its guest paths moved (as the fake ssh does) and
+// checked by checkHermetic.
+func (g fakeGuest) hermetic(t *testing.T, script string) string {
+	t.Helper()
+	script = strings.NewReplacer(g.moves()...).Replace(script)
+	g.checkHermetic(t, script)
+	return script
 }
 
 func TestBuildsImages(t *testing.T) {

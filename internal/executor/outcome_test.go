@@ -111,8 +111,9 @@ func TestErrTextIsOneBoundedLine(t *testing.T) {
 	}
 }
 
-// fakeDaemon records the events the executor sends over the daemon socket.
-func fakeDaemon(t *testing.T, socket string) func() []daemon.Event {
+// fakeDaemon records the events the executor sends over the daemon socket and
+// answers a builder request with builder (nil: the project has none).
+func fakeDaemon(t *testing.T, socket string, builder *daemon.BuilderInfo) func() []daemon.Event {
 	t.Helper()
 	var mu sync.Mutex
 	var events []daemon.Event
@@ -121,6 +122,10 @@ func fakeDaemon(t *testing.T, socket string) func() []daemon.Event {
 		t.Fatal(err)
 	}
 	srv := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/builder" && builder != nil {
+			_ = json.NewEncoder(w).Encode(builder)
+			return
+		}
 		var e daemon.Event
 		if r.URL.Path == "/event" && json.NewDecoder(r.Body).Decode(&e) == nil {
 			mu.Lock()
@@ -171,13 +176,19 @@ func TestCleanupReportsTheRecordedFailure(t *testing.T) {
 // withEvents gives the cleanup fixture a fake daemon and returns what it received.
 func withEvents(t *testing.T, cfg *config.Config) func() []daemon.Event {
 	t.Helper()
+	return withDaemon(t, cfg, nil)
+}
+
+// withDaemon is withEvents with a daemon that answers builder requests with builder.
+func withDaemon(t *testing.T, cfg *config.Config, builder *daemon.BuilderInfo) func() []daemon.Event {
+	t.Helper()
 	dir, err := os.MkdirTemp("", "fre") // short: unix socket paths are limited
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	cfg.Daemon.Socket = filepath.Join(dir, "d.sock")
-	return fakeDaemon(t, cfg.Daemon.Socket)
+	return fakeDaemon(t, cfg.Daemon.Socket, builder)
 }
 
 // The daemon's log is where an operator looks for a job's leaked VM: the
