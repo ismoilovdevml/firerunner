@@ -41,10 +41,10 @@ The first build of a project starts its builder: 30 to 45 s, plus loading its sa
 5 minutes, and then build without the cache: `docker build`, `docker buildx …`,
 `docker image build`, `docker builder build`, `docker compose build`, and `docker compose up`,
 `run` or `create` with `--build`. Commands FireRunner does not recognise as builds run without
-the builder until it has answered once, so a `docker compose up` that builds a missing image
-without `--build` builds without the cache while the builder starts: add `--build`, or run
-`docker compose build` first, to use it. With buildx older than v0.32.0 in the VM image, a job that
-finds its builder starting still waits about 20 s before its script runs.
+the builder only while it is still starting and has not answered yet. So while the builder starts,
+a `docker compose up` that builds a missing image without `--build` builds without the cache: add
+`--build`, or run `docker compose build` first, to use it. With buildx older than v0.32.0 in the VM
+image, a job that finds its builder starting still waits about 20 s before its script runs.
 
 A builder unused for a while is deleted, but its cache is kept on the host and comes back with the
 project's next builder.

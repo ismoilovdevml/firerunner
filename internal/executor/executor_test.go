@@ -252,8 +252,9 @@ func TestBuilderScript(t *testing.T) {
 	for _, c := range []struct {
 		state, createLine string
 	}{
-		// A ready builder answers the probe at once: today's create, unchanged.
-		{daemon.BuilderReady, create + " >/dev/null\n"},
+		// A ready builder answers the probe at once: today's create, unchanged,
+		// and the marker that lets every docker command use it.
+		{daemon.BuilderReady, create + " >/dev/null\ntouch /run/firerunner-builder-ready\n"},
 		// A booting one cannot: the probe is bounded, today's create is the fallback.
 		{daemon.BuilderBooting, create + " --timeout 2s >/dev/null || " + create + " >/dev/null\n"},
 	} {
@@ -274,6 +275,9 @@ func TestBuilderScript(t *testing.T) {
 			}
 			if n := strings.Count(s, "docker buildx create"); n != strings.Count(c.createLine, "docker buildx create") {
 				t.Errorf("%d buildx creates in the script:\n%s", n, s)
+			}
+			if n := strings.Count(s, "touch /run/firerunner-builder-ready"); n != strings.Count(c.createLine, "touch") {
+				t.Errorf("the ready marker is written %d times:\n%s", n, s)
 			}
 		})
 	}
@@ -538,20 +542,25 @@ func TestBuilderScriptAttach(t *testing.T) {
 
 // The docker wrapper that the builder script installs waits for a starting
 // builder before a build, docker compose builds included, and builds locally
-// if the builder never answers. Other commands run at once, without the
-// builder until it has answered: a build the wrapper does not see is local.
+// if the builder never answers. Other commands run at once, without a
+// starting builder until it has answered: a build the wrapper does not see is
+// local. A builder the daemon reported ready serves them all.
 func TestBuilderScriptWrapper(t *testing.T) {
 	bin := fakeGuestBin(t)
-	script := BuilderScript(&daemon.BuilderInfo{State: daemon.BuilderBooting, Port: 20001, CA: "CA", Cert: "CERT", Key: "KEY"})
-	wait := fmt.Sprintf("$((SECONDS + %d))", BuilderWait)
-	if !strings.Contains(script, wait) {
-		t.Fatalf("the wrapper has no %s to shorten:\n%s", wait, script)
+	scripts := map[string]string{}
+	for _, state := range []string{daemon.BuilderBooting, daemon.BuilderReady} {
+		script := BuilderScript(&daemon.BuilderInfo{State: state, Port: 20001, CA: "CA", Cert: "CERT", Key: "KEY"})
+		wait := fmt.Sprintf("$((SECONDS + %d))", BuilderWait)
+		if !strings.Contains(script, wait) {
+			t.Fatalf("the wrapper has no %s to shorten:\n%s", wait, script)
+		}
+		// 2 s instead of BuilderWait: time for a probe or two, not five minutes.
+		scripts[state] = strings.Replace(script, wait, "$((SECONDS + 2))", 1)
 	}
-	// 2 s instead of BuilderWait: time for a probe or two, not five minutes.
-	script = strings.Replace(script, wait, "$((SECONDS + 2))", 1)
 	const remote, local = BuilderName, "local"
 	for _, c := range []struct {
 		name    string
+		ready   bool // the daemon reported the builder ready, not booting
 		args    string
 		builder string // the job's BUILDX_BUILDER; "": no builder attached
 		answers bool   // the builder answers the wrapper's probe
@@ -593,10 +602,24 @@ func TestBuilderScriptWrapper(t *testing.T) {
 		{name: "compose build after the builder was given up", args: "compose build", builder: remote, answers: true,
 			earlier: "down", want: local, warns: true},
 		{name: "compose build without a builder", args: "compose build", want: local},
+		// A builder the daemon reported ready serves every command at once;
+		// builds still probe it, and a given-up builder serves none.
+		{name: "ready, compose up", ready: true, args: "compose up -d", builder: remote, want: remote},
+		{name: "ready, run", ready: true, args: "run --rm alpine true", builder: remote, want: remote},
+		{name: "ready, compose up after the builder was given up", ready: true, args: "compose up -d", builder: remote,
+			answers: true, earlier: "down", want: local},
+		{name: "ready, build, the builder answers", ready: true, args: "build -t app .", builder: remote, answers: true,
+			wait: true, want: remote},
+		{name: "ready, build, the builder went away", ready: true, args: "build -t app .", builder: remote,
+			wait: true, want: local, warns: true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			g := newFakeGuest(t, bin)
+			script := scripts[daemon.BuilderBooting]
+			if c.ready {
+				script = scripts[daemon.BuilderReady]
+			}
 			install := exec.Command("bash")
 			install.Stdin, install.Env = strings.NewReader(g.hermetic(t, script)), g.env("")
 			if out, err := install.CombinedOutput(); err != nil {

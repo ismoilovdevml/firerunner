@@ -488,11 +488,13 @@ const BuilderWait = 300
 const builderCreateTimeout = "2s"
 
 // BuilderScript creates the buildx builder in the job VM and a docker wrapper
-// that, for build commands (docker build, docker buildx, docker compose build
-// and compose up/run/create --build), waits until the builder answers (a full
+// that, for the build commands its fr_builds recognises (docker build, buildx,
+// image build, builder build, compose build and compose up/run/create --build,
+// also after docker's global options), waits until the builder answers (a full
 // mTLS handshake with the job's certificate) and otherwise builds locally.
-// Other docker commands use the builder only once it has answered: compose
-// fails, rather than building locally, on a builder that does not answer.
+// Other docker commands use a builder the daemon reported ready, or one that
+// has answered; while it starts they run without it: compose fails, rather
+// than building locally, on a builder that does not answer.
 // Builders are reached through the bridge address (the VM's default gateway),
 // which forwards the port to the project's builder VM.
 func BuilderScript(info *daemon.BuilderInfo) string {
@@ -513,7 +515,10 @@ func BuilderScript(info *daemon.BuilderInfo) string {
 		// mid-probe rolls the create back), the unbounded create runs.
 		fmt.Fprintf(&b, "%s --timeout %s >/dev/null || %s >/dev/null\n", create, builderCreateTimeout, create)
 	} else {
-		b.WriteString(create + " >/dev/null\n")
+		// Ready when the daemon answered: commands the wrapper does not see as
+		// builds keep the builder (a compose up that builds uses the cache).
+		// Builds still probe it, in case it went away since.
+		b.WriteString(create + " >/dev/null\ntouch /run/firerunner-builder-ready\n")
 	}
 	fmt.Fprintf(&b, `cat > /usr/local/bin/docker <<'FIRERUNNER_EOF'
 #!/bin/bash
@@ -566,8 +571,9 @@ if [ -n "$BUILDX_BUILDER" ]; then
             echo "FireRunner: this project's builder did not answer; building without the layer cache" >&2
             unset BUILDX_BUILDER
         fi
-    elif [ ! -e /run/firerunner-builder-ok ]; then
-        # Not seen as a build, and the builder has not answered yet: run it
+    elif [ -e /run/firerunner-builder-down ] ||
+        { [ ! -e /run/firerunner-builder-ok ] && [ ! -e /run/firerunner-builder-ready ]; }; then
+        # Not seen as a build, and the builder is starting or gave up: run it
         # without the builder. A build it does anyway (compose up of a missing
         # image) is local, where a builder that does not answer would fail it.
         unset BUILDX_BUILDER
