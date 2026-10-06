@@ -37,9 +37,9 @@ Docker layer cache: using this project's builder (warm cache)
 ```
 
 The first build of a project starts its builder: 30 to 45 s, plus loading its saved cache (about
-100 MB/s). `docker build` waits for it up to 5 minutes, then builds without the cache. A builder
-unused for a while is deleted, but its cache is kept on the host and comes back with the
-project's next builder.
+100 MB/s). The job's script does not wait for a starting builder; `docker build` does, up to
+5 minutes, then builds without the cache. A builder unused for a while is deleted, but its cache
+is kept on the host and comes back with the project's next builder.
 
 ## Cache
 

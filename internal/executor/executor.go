@@ -482,6 +482,11 @@ func BuildsImages(script []byte) bool { return buildCommand.Match(script) }
 // a cold build of the same Dockerfile took 2-5 times as long on the trial host.
 const BuilderWait = 300
 
+// builderCreateTimeout bounds buildx create's probe of a booting builder. It
+// leaves room for the mTLS handshake of a builder that turned ready between
+// the daemon's answer and the create.
+const builderCreateTimeout = "2s"
+
 // BuilderScript creates the buildx builder in the job VM and a docker wrapper
 // that, for build commands, waits until the builder answers (a full mTLS
 // handshake with the job's certificate) and otherwise builds locally. Builders
@@ -493,10 +498,20 @@ func BuilderScript(info *daemon.BuilderInfo) string {
 	for _, f := range []struct{ name, data string }{{"ca.pem", info.CA}, {"cert.pem", info.Cert}, {"key.pem", info.Key}} {
 		fmt.Fprintf(&b, "cat > /etc/firerunner-buildkit/%s <<'FIRERUNNER_EOF'\n%s\nFIRERUNNER_EOF\n", f.name, strings.TrimSpace(f.data))
 	}
-	fmt.Fprintf(&b, "gw=$(ip -4 route show default | awk '{print $3; exit}')\n"+
-		"docker buildx create --name %s --driver remote "+
+	create := fmt.Sprintf("docker buildx create --name %s --driver remote "+
 		"--driver-opt cacert=/etc/firerunner-buildkit/ca.pem,cert=/etc/firerunner-buildkit/cert.pem,key=/etc/firerunner-buildkit/key.pem,servername=%s,default-load=true "+
-		"\"tcp://$gw:%d\" >/dev/null\n", BuilderName, daemon.BuilderServerName, info.Port)
+		"\"tcp://$gw:%d\"", BuilderName, daemon.BuilderServerName, info.Port)
+	b.WriteString("gw=$(ip -4 route show default | awk '{print $3; exit}')\n")
+	if info.State == daemon.BuilderBooting {
+		// buildx create probes the builder until its --timeout (default 20 s)
+		// and creates the instance either way; a booting builder never answers
+		// in time, so the probe only held the job's start. If the bounded create
+		// fails (buildx < v0.32.0 has no --timeout; a builder that turned ready
+		// mid-probe rolls the create back), the unbounded create runs.
+		fmt.Fprintf(&b, "%s --timeout %s >/dev/null || %s >/dev/null\n", create, builderCreateTimeout, create)
+	} else {
+		b.WriteString(create + " >/dev/null\n")
+	}
 	fmt.Fprintf(&b, `cat > /usr/local/bin/docker <<'FIRERUNNER_EOF'
 #!/bin/bash
 # FireRunner: docker build uses this project's builder; wait for it while it starts.

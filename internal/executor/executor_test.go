@@ -245,21 +245,189 @@ exit 0
 }
 
 func TestBuilderScript(t *testing.T) {
-	s := BuilderScript(&daemon.BuilderInfo{State: daemon.BuilderReady, Port: 20003,
-		CA: "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n", Cert: "CERT", Key: "KEY"})
-	for _, want := range []string{
-		"umask 077",
-		"cat > /etc/firerunner-buildkit/key.pem <<'FIRERUNNER_EOF'\nKEY\nFIRERUNNER_EOF",
-		"docker buildx create --name firerunner --driver remote",
-		"servername=builder,default-load=true",
-		`"tcp://$gw:20003"`,
-		"cat > /usr/local/bin/docker <<'FIRERUNNER_EOF'",
-		"end=$((SECONDS + 300))",
-		"exec /usr/bin/docker \"$@\"",
+	create := `docker buildx create --name firerunner --driver remote ` +
+		`--driver-opt cacert=/etc/firerunner-buildkit/ca.pem,cert=/etc/firerunner-buildkit/cert.pem,key=/etc/firerunner-buildkit/key.pem,servername=builder,default-load=true ` +
+		`"tcp://$gw:20003"`
+	for _, c := range []struct {
+		state, createLine string
+	}{
+		// A ready builder answers the probe at once: today's create, unchanged.
+		{daemon.BuilderReady, create + " >/dev/null\n"},
+		// A booting one cannot: the probe is bounded, today's create is the fallback.
+		{daemon.BuilderBooting, create + " --timeout 2s >/dev/null || " + create + " >/dev/null\n"},
 	} {
-		if !strings.Contains(s, want) {
-			t.Errorf("builder script lacks %q:\n%s", want, s)
-		}
+		t.Run(c.state, func(t *testing.T) {
+			s := BuilderScript(&daemon.BuilderInfo{State: c.state, Port: 20003,
+				CA: "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n", Cert: "CERT", Key: "KEY"})
+			for _, want := range []string{
+				"umask 077",
+				"cat > /etc/firerunner-buildkit/key.pem <<'FIRERUNNER_EOF'\nKEY\nFIRERUNNER_EOF",
+				"gw=$(ip -4 route show default | awk '{print $3; exit}')\n" + c.createLine,
+				"cat > /usr/local/bin/docker <<'FIRERUNNER_EOF'",
+				"end=$((SECONDS + 300))",
+				"exec /usr/bin/docker \"$@\"",
+			} {
+				if !strings.Contains(s, want) {
+					t.Errorf("builder script lacks %q:\n%s", want, s)
+				}
+			}
+			if n := strings.Count(s, "docker buildx create"); n != strings.Count(c.createLine, "docker buildx create") {
+				t.Errorf("%d buildx creates in the script:\n%s", n, s)
+			}
+		})
+	}
+}
+
+// The builder script runs under bash, as on a job VM, with fake docker and ip
+// binaries; the fake ssh moves its absolute paths into a temporary directory.
+// A booting builder gets a bounded create and, if that fails, today's create;
+// a create that still fails costs the job the builder, never the job itself.
+func TestBuilderScriptAttach(t *testing.T) {
+	for _, c := range []struct {
+		name, state string
+		bounded     string // the fake docker's reply to create --timeout 2s
+		plain       string // and to a create without it
+		creates     []bool // each create the script ran: with --timeout?
+		attached    bool
+	}{
+		{name: "booting, bounded create succeeds", state: daemon.BuilderBooting,
+			bounded: "exit 0", plain: "exit 0", creates: []bool{true}, attached: true},
+		{name: "booting, buildx without --timeout", state: daemon.BuilderBooting,
+			bounded: `echo "unknown flag: --timeout" >&2; exit 1`, plain: "exit 0", creates: []bool{true, false}, attached: true},
+		{name: "booting, bounded create rolled back", state: daemon.BuilderBooting,
+			bounded: `echo "context deadline exceeded" >&2; exit 1`, plain: "exit 0", creates: []bool{true, false}, attached: true},
+		{name: "booting, both creates fail", state: daemon.BuilderBooting,
+			bounded: "exit 1", plain: `echo "existing instance" >&2; exit 1`, creates: []bool{true, false}},
+		{name: "ready, create succeeds", state: daemon.BuilderReady,
+			bounded: "exit 0", plain: "exit 0", creates: []bool{false}, attached: true},
+		{name: "ready, create fails", state: daemon.BuilderReady,
+			bounded: "exit 0", plain: "exit 1", creates: []bool{false}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, _ := cleanupFixture(t)
+			st := &vm.JobState{Instance: vm.Instance{ID: "job-555", UID: "u1", IP: "10.200.0.55", HostKey: "ssh-ed25519 AAAA"}}
+			if err := vm.SaveJobState(statePath("job-555"), st); err != nil {
+				t.Fatal(err)
+			}
+			oldMux := vm.MuxDir
+			vm.MuxDir = t.TempDir()
+			t.Cleanup(func() { vm.MuxDir = oldMux })
+			t.Setenv("CUSTOM_ENV_CI_JOB_IMAGE", "")
+
+			dir, err := os.MkdirTemp("", "fre") // short: unix socket paths are limited
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(dir) })
+			cfg.Daemon.Socket = filepath.Join(dir, "d.sock")
+			l, err := net.Listen("unix", cfg.Daemon.Socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var mu sync.Mutex
+			var builds []string
+			srv := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/builder":
+					_ = json.NewEncoder(w).Encode(daemon.BuilderInfo{State: c.state, Port: 20001, CA: "CA", Cert: "CERT", Key: "KEY"})
+				case "/event":
+					var e daemon.Event
+					if json.NewDecoder(r.Body).Decode(&e) == nil && e.Kind == "build" {
+						mu.Lock()
+						builds = append(builds, e.Builder)
+						mu.Unlock()
+					}
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					w.WriteHeader(http.StatusNoContent)
+				}
+			})}
+			go func() { _ = srv.Serve(l) }()
+			t.Cleanup(func() { _ = srv.Close() })
+
+			bin, root, tmp := t.TempDir(), t.TempDir(), t.TempDir()
+			calls, sent := filepath.Join(tmp, "docker-calls"), filepath.Join(tmp, "sent")
+			fakes := map[string]string{
+				// The builder session (`ssh … bash`) runs the script; a stage
+				// session (`ssh … /bin/bash`) is only recorded.
+				"ssh": `#!/bin/sh
+for a; do last=$a; done
+if [ "$last" = bash ]; then
+    sed -e 's#/etc/firerunner-buildkit#` + root + `/etc#g' -e 's#/usr/local/bin/docker#` + root + `/docker#g' | bash
+    exit $?
+fi
+{ echo "--- ssh $*"; cat; } >> ` + sent + "\n",
+				"ip": "#!/bin/sh\necho 'default via 10.0.0.1 dev eth0 proto dhcp'\n",
+				"docker": `#!/bin/sh
+echo "$*" >> ` + calls + `
+case " $* " in
+    *" --timeout "*) ` + c.bounded + ` ;;
+esac
+` + c.plain + "\n",
+			}
+			for name, body := range fakes {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			body := "docker build -t app .\n"
+			script := filepath.Join(t.TempDir(), "build_script")
+			if err := os.WriteFile(script, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := Run(context.Background(), cfg, script, "build_script"); err != nil {
+				t.Fatalf("Run = %v", err)
+			}
+
+			b, _ := os.ReadFile(calls)
+			lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+			if len(lines) != len(c.creates) {
+				t.Fatalf("docker calls:\n%s\nwant %d creates", b, len(c.creates))
+			}
+			for i, bounded := range c.creates {
+				if !strings.HasPrefix(lines[i], "buildx create --name firerunner --driver remote ") ||
+					!strings.Contains(lines[i], " tcp://10.0.0.1:20001") {
+					t.Errorf("call %d is %q, want a create of the builder at the gateway", i, lines[i])
+				}
+				if got := strings.HasSuffix(lines[i], " --timeout 2s"); got != bounded {
+					t.Errorf("call %d is %q: bounded %v, want %v", i, lines[i], got, bounded)
+				}
+			}
+
+			stage, _ := os.ReadFile(sent)
+			_, werr := os.Stat(filepath.Join(root, "docker"))
+			st, err = vm.LoadJobState(statePath("job-555"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			gotBuilds := strings.Join(builds, ",")
+			mu.Unlock()
+			if c.attached {
+				if !strings.HasSuffix(string(stage), "/bin/bash\nexport BUILDX_BUILDER="+BuilderName+"\n"+body) {
+					t.Errorf("the stage does not use the builder:\n%s", stage)
+				}
+				if werr != nil {
+					t.Errorf("docker wrapper not installed: %v", werr)
+				}
+				if st.BuilderProject != "1" || st.BuilderState != c.state || gotBuilds != c.state {
+					t.Errorf("job state %+v, build events %q; want the builder of project 1, %s", st, gotBuilds, c.state)
+				}
+				return
+			}
+			// The attach failed: the job builds locally, as before this change.
+			if !strings.HasSuffix(string(stage), "/bin/bash\n"+body) || strings.Contains(string(stage), "BUILDX_BUILDER") {
+				t.Errorf("the stage of a failed attach still uses the builder:\n%s", stage)
+			}
+			if werr == nil {
+				t.Error("docker wrapper installed after the create failed")
+			}
+			if st.BuilderProject != "" || gotBuilds != daemon.BuilderNone {
+				t.Errorf("job state %+v, build events %q; want no builder", st, gotBuilds)
+			}
+		})
 	}
 }
 
