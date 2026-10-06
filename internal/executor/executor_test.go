@@ -285,7 +285,8 @@ func TestBuilderScript(t *testing.T) {
 //   - ssh runs a builder session (`ssh … bash`) with the guest's paths moved
 //     by $FR_FAKE/rewrite.sed and keeps the script it ran; it only records a
 //     stage session (`ssh … /bin/bash`).
-//   - docker logs each call with the builder it would use ("local": none).
+//   - docker logs each call with the builder it would use ("local":
+//     BUILDX_BUILDER is unset).
 //     Like buildx, a create fails when the instance exists. It fails a create
 //     with the message in create-bounded (with --timeout) or create, and
 //     answers the wrapper's probe when answers exists.
@@ -304,7 +305,7 @@ fi
 		"ip":      "#!/bin/sh\necho 'default via 10.0.0.1 dev eth0 proto dhcp'\n",
 		"timeout": "#!/bin/sh\nshift\nexec \"$@\"\n",
 		"docker": `#!/bin/sh
-echo "${BUILDX_BUILDER:-local} $*" >> "$FR_FAKE/calls"
+echo "${BUILDX_BUILDER-local} $*" >> "$FR_FAKE/calls"
 case "$1 $2" in
 "buildx create")
     if [ -e "$FR_FAKE/instance" ]; then
@@ -449,7 +450,8 @@ func TestBuilderScriptAttach(t *testing.T) {
 			vm.MuxDir = t.TempDir()
 			t.Cleanup(func() { vm.MuxDir = oldMux })
 			t.Setenv("CUSTOM_ENV_CI_JOB_IMAGE", "")
-			events := withDaemon(t, &cfg, &daemon.BuilderInfo{State: c.state, Port: 20001, CA: "CA", Cert: "CERT", Key: "KEY"})
+			info := &daemon.BuilderInfo{State: c.state, Port: 20001, CA: "CA", Cert: "CERT", Key: "KEY"}
+			events := withDaemon(t, &cfg, info)
 
 			g := newFakeGuest(t, bin)
 			g.set(t, "create-bounded", c.bounded)
@@ -457,8 +459,16 @@ func TestBuilderScriptAttach(t *testing.T) {
 			if c.existing {
 				g.set(t, "instance", "")
 			}
+			// The script the fake ssh will run must not write outside the test.
+			if g.hermetic(t, BuilderScript(info)); t.Failed() {
+				t.FailNow()
+			}
 			t.Setenv("FR_FAKE", g.dir)
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("BUILDX_BUILDER", "") // restored after the test
+			if err := os.Unsetenv("BUILDX_BUILDER"); err != nil {
+				t.Fatal(err)
+			}
 
 			body := "docker build -t app .\n"
 			script := filepath.Join(t.TempDir(), "build_script")
@@ -528,7 +538,8 @@ func TestBuilderScriptAttach(t *testing.T) {
 
 // The docker wrapper that the builder script installs waits for a starting
 // builder before a build, docker compose builds included, and builds locally
-// if the builder never answers. Other commands run at once.
+// if the builder never answers. Other commands run at once, without the
+// builder until it has answered: a build the wrapper does not see is local.
 func TestBuilderScriptWrapper(t *testing.T) {
 	bin := fakeGuestBin(t)
 	script := BuilderScript(&daemon.BuilderInfo{State: daemon.BuilderBooting, Port: 20001, CA: "CA", Cert: "CERT", Key: "KEY"})
@@ -546,25 +557,42 @@ func TestBuilderScriptWrapper(t *testing.T) {
 		answers bool   // the builder answers the wrapper's probe
 		earlier string // an earlier build in the job found the builder "ok" or "down"
 		wait    bool   // the wrapper probes the builder first
-		want    string // the builder the command runs with
+		want    string // the builder the command runs with ("local": BUILDX_BUILDER unset)
+		warns   bool   // it says the build goes without the layer cache
 	}{
+		// Builds wait for the builder, and build locally if it never answers.
 		{name: "build, the builder answers", args: "build -t app .", builder: remote, answers: true, wait: true, want: remote},
-		{name: "build, the builder never answers", args: "build -t app .", builder: remote, wait: true, want: local},
+		{name: "build, the builder never answers", args: "build -t app .", builder: remote, wait: true, want: local, warns: true},
 		{name: "buildx bake, the builder answers", args: "buildx bake", builder: remote, answers: true, wait: true, want: remote},
+		{name: "image build, the builder answers", args: "image build -t app .", builder: remote, answers: true, wait: true, want: remote},
+		{name: "builder build, the builder never answers", args: "builder build .", builder: remote, wait: true, want: local, warns: true},
+		{name: "build after docker options, the builder answers", args: "--debug -l info build .", builder: remote, answers: true, wait: true, want: remote},
 		{name: "compose build, the builder answers", args: "compose build", builder: remote, answers: true, wait: true, want: remote},
+		{name: "compose build after docker options, the builder never answers", args: "--context default compose build",
+			builder: remote, wait: true, want: local, warns: true},
 		{name: "compose build with options, the builder never answers", args: "compose -f ci.yml --project-name app --ansi never build web",
-			builder: remote, wait: true, want: local},
+			builder: remote, wait: true, want: local, warns: true},
+		{name: "compose build in a --workdir, the builder answers", args: "compose --workdir app build",
+			builder: remote, answers: true, wait: true, want: remote},
 		{name: "compose up --build, the builder never answers", args: "compose --file=ci.yml up -d --build",
-			builder: remote, wait: true, want: local},
+			builder: remote, wait: true, want: local, warns: true},
 		{name: "compose run --build, the builder answers", args: "compose run --rm --build app make",
 			builder: remote, answers: true, wait: true, want: remote},
-		{name: "compose up of a profile named build", args: "compose --profile build up -d db", builder: remote, want: remote},
-		{name: "compose ps", args: "compose ps", builder: remote, want: remote},
-		{name: "docker run", args: "run --rm alpine true", builder: remote, want: remote},
-		{name: "compose build without a builder", args: "compose build", want: local},
+		// Anything else runs at once, without a builder that has not answered yet.
+		{name: "compose up while the builder starts", args: "compose up -d", builder: remote, answers: true, want: local},
+		{name: "compose up of a profile named build while the builder starts", args: "compose --profile build up -d db",
+			builder: remote, answers: true, want: local},
+		{name: "compose up in a --workdir named build while the builder starts", args: "compose --workdir build up -d",
+			builder: remote, answers: true, want: local},
+		{name: "push while the builder starts", args: "push registry.example/app:1", builder: remote, answers: true, want: local},
+		{name: "run while the builder starts", args: "run --rm alpine true", builder: remote, answers: true, want: local},
+		{name: "compose up after the builder answered", args: "compose up -d", builder: remote, earlier: "ok", want: remote},
+		{name: "run after the builder was given up", args: "run --rm alpine true", builder: remote, answers: true, earlier: "down", want: local},
+		// A builder found up or given up earlier in the job is not probed again.
 		{name: "compose build after the builder answered", args: "compose build", builder: remote, earlier: "ok", want: remote},
 		{name: "compose build after the builder was given up", args: "compose build", builder: remote, answers: true,
-			earlier: "down", want: local},
+			earlier: "down", want: local, warns: true},
+		{name: "compose build without a builder", args: "compose build", want: local},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -605,8 +633,8 @@ func TestBuilderScriptWrapper(t *testing.T) {
 			if probed := len(calls) > 1; probed != c.wait {
 				t.Errorf("probed the builder %v, want %v:\n%s", probed, c.wait, strings.Join(calls, "\n"))
 			}
-			if down := strings.Contains(string(out), "builder did not answer"); down != (c.builder != "" && c.want == local) {
-				t.Errorf("output %q: reports building without the cache %v", out, down)
+			if warns := strings.Contains(string(out), "builder did not answer"); warns != c.warns {
+				t.Errorf("output %q: says the build goes without the cache %v, want %v", out, warns, c.warns)
 			}
 		})
 	}

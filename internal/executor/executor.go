@@ -491,6 +491,8 @@ const builderCreateTimeout = "2s"
 // that, for build commands (docker build, docker buildx, docker compose build
 // and compose up/run/create --build), waits until the builder answers (a full
 // mTLS handshake with the job's certificate) and otherwise builds locally.
+// Other docker commands use the builder only once it has answered: compose
+// fails, rather than building locally, on a builder that does not answer.
 // Builders are reached through the bridge address (the VM's default gateway),
 // which forwards the port to the project's builder VM.
 func BuilderScript(info *daemon.BuilderInfo) string {
@@ -516,21 +518,29 @@ func BuilderScript(info *daemon.BuilderInfo) string {
 	fmt.Fprintf(&b, `cat > /usr/local/bin/docker <<'FIRERUNNER_EOF'
 #!/bin/bash
 # FireRunner: docker build uses this project's builder; wait for it while it starts.
-# Compose builds wait too: compose fails, rather than building locally, when
-# the builder does not answer. Only an explicit build is seen; compose up that
-# builds a missing image without --build does not wait.
+# fr_builds sees a build: docker [options] build, buildx, image build, builder
+# build, compose build, or compose up/run/create --build.
 fr_builds() {
-    case "$1" in
-    build | buildx) return 0 ;;
-    compose) shift ;;
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        # docker's options that take a value, which is never the command.
+        --config | -c | --context | -H | --host | -l | --log-level | --tlscacert | --tlscert | --tlskey) shift ;;
+        -*) ;;
+        *) break ;;
+        esac
+        shift
+    done
+    case "$1 $2" in
+    "build "* | "buildx "* | "image build" | "builder build") return 0 ;;
+    "compose "*) shift ;;
     *) return 1 ;;
     esac
     local cmd=
     while [ $# -gt 0 ]; do
         case "$1" in
         --build) return 0 ;;
-        # Compose's options that take a value, which is never the command.
-        -f | --file | -p | --project-name | --profile | --env-file | --project-directory | --ansi | --progress | --parallel)
+        # Compose's options that take a value (--workdir is a hidden one).
+        -f | --file | -p | --project-name | --profile | --env-file | --project-directory | --workdir | --ansi | --progress | --parallel)
             [ -n "$cmd" ] || shift ;;
         -*) ;;
         *) [ -n "$cmd" ] || cmd=$1 ;;
@@ -539,20 +549,27 @@ fr_builds() {
     done
     [ "$cmd" = build ]
 }
-if [ -n "$BUILDX_BUILDER" ] && fr_builds "$@"; then
-    if [ ! -e /run/firerunner-builder-ok ] && [ ! -e /run/firerunner-builder-down ]; then
-        end=$((SECONDS + %d))
-        while [ "$SECONDS" -lt "$end" ]; do
-            if timeout 5 /usr/bin/docker buildx inspect --bootstrap "$BUILDX_BUILDER" >/dev/null 2>&1; then
-                touch /run/firerunner-builder-ok
-                break
-            fi
-            sleep 1
-        done
-        [ -e /run/firerunner-builder-ok ] || touch /run/firerunner-builder-down
-    fi
-    if [ -e /run/firerunner-builder-down ]; then
-        echo "FireRunner: this project's builder did not answer; building without the layer cache" >&2
+if [ -n "$BUILDX_BUILDER" ]; then
+    if fr_builds "$@"; then
+        if [ ! -e /run/firerunner-builder-ok ] && [ ! -e /run/firerunner-builder-down ]; then
+            end=$((SECONDS + %d))
+            while [ "$SECONDS" -lt "$end" ]; do
+                if timeout 5 /usr/bin/docker buildx inspect --bootstrap "$BUILDX_BUILDER" >/dev/null 2>&1; then
+                    touch /run/firerunner-builder-ok
+                    break
+                fi
+                sleep 1
+            done
+            [ -e /run/firerunner-builder-ok ] || touch /run/firerunner-builder-down
+        fi
+        if [ -e /run/firerunner-builder-down ]; then
+            echo "FireRunner: this project's builder did not answer; building without the layer cache" >&2
+            unset BUILDX_BUILDER
+        fi
+    elif [ ! -e /run/firerunner-builder-ok ]; then
+        # Not seen as a build, and the builder has not answered yet: run it
+        # without the builder. A build it does anyway (compose up of a missing
+        # image) is local, where a builder that does not answer would fail it.
         unset BUILDX_BUILDER
     fi
 fi
