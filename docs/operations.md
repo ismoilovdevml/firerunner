@@ -132,6 +132,12 @@ failures FireRunner or the host caused, never for failing project scripts. Watch
 - **Flintlock errors**: failed flintlock calls by RPC and gRPC code.
 - **Speed**: *Warm builds* and *Builder boot* (a build that finds its builder booting waits
   for it), *Stage duration p95 by stage* (which part of a job grew).
+- **Builder boot by phase** (Docker layer cache row): which part of a builder boot builds wait
+  for. `admit` is waiting for host memory, `vm` the VM boot, `save_wait` the previous builder's
+  cache copy, `restore` loading the saved cache (it grows with the cache size), `buildkitd` its
+  start. The phases add up to the boot. One boot, failed ones too, is one log line with every
+  phase's seconds and the total:
+  `journalctl -u firerunner | grep 'builder boot phases'`; `failed_phase` names where it failed.
 - **Node (node_exporter)** row: the host under the microVMs. *CPU steal* (the hypervisor, on a
   host that is itself a VM), *IO wait* and *Pressure stall* show a saturated host before jobs
   fail. It needs node_exporter on the host, with the same `instance` label in both scrape jobs

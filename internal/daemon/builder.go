@@ -449,7 +449,14 @@ func (d *Daemon) RemoveBuilders(project string, force bool) Removal {
 func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project string) {
 	start := time.Now()
 	bcfg := builderConfig(cfg)
+	// One line per boot with every phase, whatever the boot's end.
+	phases := newBootPhases(d.now, d.metrics.builderBootPhase)
+	defer func() {
+		phases.finish("abandoned") // removed while booting, or shutting down
+		d.log.Info("builder boot phases", append([]any{"project", project}, phases.logAttrs()...)...)
+	}()
 	fail := func(inst *vm.Instance, err error) {
+		phases.finish("failed")
 		d.metrics.bootFailures.WithLabelValues("builder").Inc()
 		d.log.Error("builder boot failed", "project", project, "err", err)
 		d.mu.Lock()
@@ -467,9 +474,11 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	id := builderVMID(project)
 	release, err := d.admitBuilder(ctx, bcfg, id)
 	if err != nil {
+		phases.end("admit", "failed")
 		fail(nil, err)
 		return
 	}
+	phases.end("admit", "ok")
 	defer release()
 	// A daemon that just started reconciles builder VMs it did not adopt as
 	// left over: this one is ours, though its uid is not known until Boot returns.
@@ -483,9 +492,11 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	}()
 	inst, err := builderVMBoot(ctx, bcfg, d.fl, id, map[string]string{LabelRole: "builder"})
 	if err != nil {
+		phases.end("vm", "failed")
 		fail(nil, err)
 		return
 	}
+	phases.end("vm", "ok")
 	d.mu.Lock()
 	var creds *builderCreds
 	if b, ok := d.builders[project]; ok {
@@ -501,25 +512,30 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	}
 	// The project's previous builder may still be copying its cache out. The
 	// new one booted meanwhile; only the restore needs the copy.
-	d.waitForSave(ctx, project, start)
-	restored, err := d.restoreBuilderCache(ctx, bcfg, project, inst)
+	phases.end("save_wait", d.waitForSave(ctx, project, start))
+	cache, err := d.restoreBuilderCache(ctx, bcfg, project, inst)
 	if err != nil {
+		phases.end("restore", cache)
 		fail(inst, err) // the VM may hold part of a cache: start over in a new one
 		return
 	}
+	restored := cache == "ok" || cache == "legacy"
 	d.mu.Lock()
 	dropped := d.builders[project] != nil && d.builders[project].dropped
 	d.mu.Unlock()
 	if restored && dropped {
 		// `builder rm` threw the saved cache away while it loaded.
 		if err := wipeBuilderCache(ctx, bcfg, inst); err != nil {
+			phases.end("restore", "failed")
 			fail(inst, fmt.Errorf("saved builder cache removed by the operator could not be wiped: %w", err))
 			return
 		}
 		restored = false
 		d.log.Info("builder cache removed by the operator while it loaded: wiped, starting empty", "project", project)
 	}
+	phases.end("restore", cache)
 	if err := builderSetup(ctx, bcfg, inst, creds); err != nil {
+		phases.end("buildkitd", "failed")
 		if restored && errors.Is(err, errBuildkitDown) {
 			// buildkitd ran but did not come up on the restored state: do not
 			// start every later builder of the project from it.
@@ -543,6 +559,8 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 			d.log.Error("builder port mapping failed", "project", project, "err", err)
 		}
 	}
+	// Jobs reach buildkitd through the port: until it is mapped they wait.
+	phases.end("buildkitd", "ok")
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -573,6 +591,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	d.saveBuildersLocked()
 	d.builderGaugesLocked()
 	d.metrics.bootSeconds.WithLabelValues("builder").Observe(time.Since(start).Seconds())
+	phases.finish("ready")
 	d.log.Info("builder ready", "project", project, "vm", inst.ID, "ip", inst.IP, "port", b.Port,
 		"took", time.Since(start).Round(100*time.Millisecond).String())
 }
@@ -606,18 +625,23 @@ var builderSaveWait = 5 * time.Minute
 // waitForSave waits until the project's previous builder has copied its cache
 // out, at most until builderSaveWait after start: a slow save must not keep
 // the project without a builder, which then starts from the older copy, if any.
-func (d *Daemon) waitForSave(ctx context.Context, project string, start time.Time) {
+// It returns how the wait ended, the save_wait phase result: ok (copied, or
+// nothing to wait for), timeout or failed (ctx ended).
+func (d *Daemon) waitForSave(ctx context.Context, project string, start time.Time) string {
 	d.mu.Lock()
 	saving := d.saving[project]
 	d.mu.Unlock()
 	if saving == nil {
-		return
+		return "ok"
 	}
 	select {
 	case <-saving.done:
+		return "ok"
 	case <-time.After(time.Until(start.Add(builderSaveWait))):
 		d.log.Warn("builder starts before its previous cache copy finished", "project", project)
+		return "timeout"
 	case <-ctx.Done():
+		return "failed"
 	}
 }
 

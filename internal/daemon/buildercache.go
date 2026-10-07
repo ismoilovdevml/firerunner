@@ -402,22 +402,25 @@ func (d *Daemon) makeRoomForCache(project string, size, limit, reserved int64) e
 }
 
 // restoreBuilderCache loads the project's saved cache into a new builder VM
-// before buildkitd starts, and reports whether it did. A copy written by
+// before buildkitd starts, and returns the result it counts in
+// firerunner_builder_cache_total: ok or legacy when it loaded the copy,
+// missing, stale or failed when the builder starts empty or the error is not
+// nil (failed also when the copy cannot be opened). A copy written by
 // another builder image than cfg's is deleted unread. A copy that tar or the
 // completeness check refuses is deleted, so it is not tried again, and the
 // volume is removed so buildkitd starts empty. A load that failed on the way
 // (the SSH connection, a timeout) keeps the copy and returns an error: the VM
 // may hold part of a cache and is not used, and the next builder retries.
-func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, project string, inst *vm.Instance) (bool, error) {
+func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, project string, inst *vm.Instance) (string, error) {
 	file := builderCacheFile(project)
 	f, err := os.Open(file)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			d.metrics.builderCache.WithLabelValues("restore", "missing").Inc()
-		} else {
-			d.log.Warn("saved builder cache unreadable", "project", project, "err", err)
+			return "missing", nil
 		}
-		return false, nil
+		d.log.Warn("saved builder cache unreadable", "project", project, "err", err)
+		return "failed", nil
 	}
 	defer f.Close()
 	var size int64
@@ -432,7 +435,7 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 		d.metrics.builderCache.WithLabelValues("restore", "stale").Inc()
 		d.log.Info("saved builder cache dropped: written by another builder image, starting empty",
 			"project", project, "cache_image", image, "image", cfg.Builder.Image)
-		return false, nil
+		return "stale", nil
 	}
 	lctx, cancel := context.WithTimeout(ctx, builderCacheTimeout)
 	defer cancel()
@@ -444,14 +447,14 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 		if code := exitCode(err); lctx.Err() != nil || code <= 0 || code == 255 {
 			// The copy may be fine. A builder started empty would, once deleted,
 			// save its empty cache over it: fail this boot, the next one retries.
-			return false, fmt.Errorf("saved builder cache not restored (kept, the next builder retries it): %w", err)
+			return "failed", fmt.Errorf("saved builder cache not restored (kept, the next builder retries it): %w", err)
 		}
 		_ = os.Remove(file)
 		d.log.Warn("saved builder cache refused and deleted, starting empty", "project", project, "err", err)
 		if werr := wipeBuilderCache(ctx, cfg, inst); werr != nil {
-			return false, fmt.Errorf("partly restored builder cache could not be removed: %w", werr)
+			return "failed", fmt.Errorf("partly restored builder cache could not be removed: %w", werr)
 		}
-		return false, nil
+		return "failed", nil
 	}
 	// The modification time orders caches for makeRoomForCache: this one is in use.
 	now := time.Now()
@@ -463,7 +466,7 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 	d.metrics.builderCache.WithLabelValues("restore", result).Inc()
 	d.log.Info("builder cache restored", "project", project, "bytes", size,
 		"took", time.Since(start).Round(100*time.Millisecond).String())
-	return true, nil
+	return result, nil
 }
 
 // wipeBuilderCache removes the volume a restore loaded (all or part of), so

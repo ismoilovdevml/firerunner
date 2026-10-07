@@ -122,15 +122,15 @@ func TestBuilderCacheSavedOnExpiryAndRestored(t *testing.T) {
 	if d.saving["7"] != nil {
 		t.Fatal("save still marked in progress")
 	}
-	if ok, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", &vm.Instance{ID: "bld-7"}); !ok || err != nil || loaded != "data-7" {
-		t.Fatalf("restore = %v, %v, loaded %q", ok, err, loaded)
+	if res, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", &vm.Instance{ID: "bld-7"}); res != "ok" || err != nil || loaded != "data-7" {
+		t.Fatalf("restore = %v, %v, loaded %q", res, err, loaded)
 	}
 	if n := cacheCount(d, "restore", "ok"); n != 1 {
 		t.Fatalf("restore ok = %v", n)
 	}
 	// A project without a saved cache starts empty, without an error.
-	if ok, err := d.restoreBuilderCache(context.Background(), d.cfg, "8", &vm.Instance{ID: "bld-8"}); ok || err != nil {
-		t.Fatalf("restore of a cache that was never saved = %v, %v", ok, err)
+	if res, err := d.restoreBuilderCache(context.Background(), d.cfg, "8", &vm.Instance{ID: "bld-8"}); res != "missing" || err != nil {
+		t.Fatalf("restore of a cache that was never saved = %v, %v", res, err)
 	}
 }
 
@@ -240,8 +240,8 @@ func TestBuilderCacheFailedRestoreDropsCopy(t *testing.T) {
 		})
 	writeFile(t, filepath.Join(dir, "7.tar"), saved("broken"), time.Hour)
 	d, _ := newTestDaemon(t)
-	if ok, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", &vm.Instance{ID: "bld-7"}); ok || err != nil {
-		t.Fatalf("restore of a refused copy = %v, %v; want false, nil (start empty)", ok, err)
+	if res, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", &vm.Instance{ID: "bld-7"}); res != "failed" || err != nil {
+		t.Fatalf("restore of a refused copy = %v, %v; want failed, nil (start empty)", res, err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "7.tar")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("broken copy kept")
@@ -518,8 +518,8 @@ func TestRestoreFailures(t *testing.T) {
 
 	writeFile(t, file, saved("copy"), time.Hour)
 	loadErr = fmt.Errorf("stream: %w", exitErr(t, 255))
-	if ok, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", inst); ok || err == nil {
-		t.Fatalf("ssh drop: %v, %v; want an error, so the boot fails and the next one retries", ok, err)
+	if res, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", inst); res != "failed" || err == nil {
+		t.Fatalf("ssh drop: %v, %v; want an error, so the boot fails and the next one retries", res, err)
 	}
 	if readFile(t, file) != saved("copy") {
 		t.Fatalf("ssh drop: copy %q, want it kept", readFile(t, file))
@@ -533,8 +533,8 @@ func TestRestoreFailures(t *testing.T) {
 	}
 	writeFile(t, file, saved("copy"), time.Hour)
 	wipeErr = nil
-	if ok, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", inst); ok || err != nil {
-		t.Fatalf("refused copy: %v, %v; want false, nil (start empty)", ok, err)
+	if res, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", inst); res != "failed" || err != nil {
+		t.Fatalf("refused copy: %v, %v; want failed, nil (start empty)", res, err)
 	}
 	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) || wipes != 2 {
 		t.Fatalf("refused copy kept or volume not wiped (wipes %d)", wipes)
@@ -887,7 +887,7 @@ func TestCacheReplaceNeverLeavesTheProjectWithoutACopy(t *testing.T) {
 	file := filepath.Join(dir, "7.tar")
 	writeFile(t, file, saved("old"), time.Hour)
 	d, _ := newTestDaemon(t)
-	var restored bool
+	var restored string
 	var restoreErr error
 	old := renameCache
 	renameCache = func(from, to string) error {
@@ -900,7 +900,7 @@ func TestCacheReplaceNeverLeavesTheProjectWithoutACopy(t *testing.T) {
 	d.builders = map[string]*builder{"7": readyBuilder("7", 20001, d.cfg.Builder.IdleTTL+time.Hour, builderSpec(d.cfg))}
 	d.expireBuilders()
 	d.bg.Wait()
-	if !restored || restoreErr != nil || strings.Join(loaded, ",") != "old" {
+	if restored != "ok" || restoreErr != nil || strings.Join(loaded, ",") != "old" {
 		t.Fatalf("boot during the replace: restored %v, %v, loaded %q; want the previous copy", restored, restoreErr, loaded)
 	}
 	if n := cacheCount(d, "restore", "missing"); n != 0 {
@@ -1116,14 +1116,14 @@ func TestSavedCacheIsTiedToTheBuilderImage(t *testing.T) {
 	inst := &vm.Instance{ID: "bld-7-00000001"}
 
 	same := d.cfg
-	if ok, err := d.restoreBuilderCache(context.Background(), same, "7", inst); !ok || err != nil || strings.Join(loaded, ",") != "warm" {
-		t.Fatalf("same image: restored %v, %v, loaded %q (want exactly the archive)", ok, err, loaded)
+	if res, err := d.restoreBuilderCache(context.Background(), same, "7", inst); res != "ok" || err != nil || strings.Join(loaded, ",") != "warm" {
+		t.Fatalf("same image: restored %v, %v, loaded %q (want exactly the archive)", res, err, loaded)
 	}
 
 	bumped := d.cfg
 	bumped.Builder.Image = "moby/buildkit:v0.99.0"
-	if ok, err := d.restoreBuilderCache(context.Background(), bumped, "7", inst); ok || err != nil {
-		t.Fatalf("new image: restored %v, %v; want an empty start", ok, err)
+	if res, err := d.restoreBuilderCache(context.Background(), bumped, "7", inst); res != "stale" || err != nil {
+		t.Fatalf("new image: restored %v, %v; want an empty start", res, err)
 	}
 	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) || len(loaded) != 1 {
 		t.Fatalf("cache of the old image kept (%v) or loaded (%q)", err, loaded)
@@ -1135,8 +1135,8 @@ func TestSavedCacheIsTiedToTheBuilderImage(t *testing.T) {
 	legacyCfg := d.cfg
 	legacyCfg.Builder.Image = legacyBuilderImage
 	writeFile(t, file, legacyTar, time.Hour)
-	if ok, err := d.restoreBuilderCache(context.Background(), legacyCfg, "7", inst); !ok || err != nil || loaded[len(loaded)-1] != legacyTar {
-		t.Fatalf("cache without an image, legacy builder image: restored %v, %v, loaded %q; want the whole file", ok, err, loaded)
+	if res, err := d.restoreBuilderCache(context.Background(), legacyCfg, "7", inst); res != "legacy" || err != nil || loaded[len(loaded)-1] != legacyTar {
+		t.Fatalf("cache without an image, legacy builder image: restored %v, %v, loaded %q; want the whole file", res, err, loaded)
 	}
 	if _, err := os.Stat(file); err != nil {
 		t.Fatalf("restored legacy cache removed: %v", err)
@@ -1145,16 +1145,16 @@ func TestSavedCacheIsTiedToTheBuilderImage(t *testing.T) {
 		t.Fatalf("restore legacy = %v, want 1", n)
 	}
 	// With another builder image it is dropped like any cache of another image.
-	if ok, err := d.restoreBuilderCache(context.Background(), bumped, "7", inst); ok || err != nil {
-		t.Fatalf("cache without an image, new builder image: restored %v, %v; want an empty start", ok, err)
+	if res, err := d.restoreBuilderCache(context.Background(), bumped, "7", inst); res != "stale" || err != nil {
+		t.Fatalf("cache without an image, new builder image: restored %v, %v; want an empty start", res, err)
 	}
 	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) || len(loaded) != 2 {
 		t.Fatalf("cache without an image kept (%v) or loaded again (%q)", err, loaded)
 	}
 	// A header that is there but broken is never taken for a legacy cache.
 	writeFile(t, file, builderCacheMagic+"not quoted\nwarm", time.Hour)
-	if ok, err := d.restoreBuilderCache(context.Background(), legacyCfg, "7", inst); ok || err != nil {
-		t.Fatalf("broken header: restored %v, %v; want an empty start", ok, err)
+	if res, err := d.restoreBuilderCache(context.Background(), legacyCfg, "7", inst); res != "stale" || err != nil {
+		t.Fatalf("broken header: restored %v, %v; want an empty start", res, err)
 	}
 	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) || len(loaded) != 2 {
 		t.Fatalf("cache with a broken header kept (%v) or loaded (%q)", err, loaded)

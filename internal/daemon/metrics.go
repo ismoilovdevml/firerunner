@@ -50,6 +50,8 @@ type Metrics struct {
 	builders        *prometheus.GaugeVec
 	builderSlots    prometheus.Gauge
 	builderRemovals *prometheus.CounterVec
+	// builderBootPhase: where a builder boot spends its time (bootPhases).
+	builderBootPhase *prometheus.HistogramVec
 }
 
 func NewMetrics() *Metrics {
@@ -206,7 +208,25 @@ func (m *Metrics) addBuilderMetrics() {
 	m.builderCache.WithLabelValues("restore", "stale")
 	m.builderCache.WithLabelValues("restore", "legacy")
 	m.builderCache.WithLabelValues("evict", "ok")
-	m.reg.MustRegister(m.builders, m.builderSlots, m.builderRemovals)
+	// 0.1 tells a phase that did not wait (no previous save, no saved cache)
+	// from one that did; 1-20 s resolves VM boots (cold boots take 10-20 s)
+	// and buildkitd starts; 30-300 s covers restores of about 3-27 GB at
+	// ~90 MB/s and the 5-minute caps on waiting for memory and for a save;
+	// 450 and 600 catch admissions past one cap: admitBuilder's last call of
+	// waitBuilderFits may start just before its own builderFitWait runs out.
+	m.builderBootPhase = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "firerunner_builder_boot_phase_seconds",
+		Help: "Time of each phase of a builder boot, by phase and result. Phases in order: admit (waiting for host memory), " +
+			"vm (create until SSH answers), save_wait (waiting for the project's previous builder to copy its cache out; timeout: it started without that copy), " +
+			"restore (loading the saved cache, with the result firerunner_builder_cache_total counts: ok, legacy, missing, stale, failed), " +
+			"buildkitd (start until it listens and its host port is mapped). A phase ends where the next begins; " +
+			"a failed boot keeps the phases it ran, the last with result failed.",
+		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 450, 600}}, []string{"phase", "result"})
+	for _, p := range builderPhaseResults {
+		for _, r := range p.results {
+			m.builderBootPhase.WithLabelValues(p.phase, r)
+		}
+	}
+	m.reg.MustRegister(m.builders, m.builderSlots, m.builderRemovals, m.builderBootPhase)
 }
 
 // roles are the microVM roles committed memory is reported by.

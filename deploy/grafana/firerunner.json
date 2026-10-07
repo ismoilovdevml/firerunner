@@ -2350,6 +2350,191 @@
       }
     },
     {
+      "id": 68,
+      "type": "table",
+      "title": "Builder boot by phase",
+      "description": "Where builders spend their boot over the selected time range, slowest share first. admit: waiting for host memory; vm: create until SSH answers; save_wait: waiting for the project's previous builder to copy its cache out; restore: loading the saved cache (about 90 MB/s, so it grows with the cache); buildkitd: start until jobs can reach it. Share: the phase's seconds over all builder boot seconds, failed boots included. Boots: how many boots reached the phase; p50 and p90 of a few boots say little. One boot in detail: journalctl -u firerunner | grep 'builder boot phases'.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 96
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, phase) (rate(firerunner_builder_boot_phase_seconds_bucket{instance=~\"$instance\"}[$__range])))",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.9, sum by (le, phase) (rate(firerunner_builder_boot_phase_seconds_bucket{instance=~\"$instance\"}[$__range])))",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (phase) (increase(firerunner_builder_boot_phase_seconds_sum{instance=~\"$instance\"}[$__range])) / scalar(clamp_min(sum(increase(firerunner_builder_boot_phase_seconds_sum{instance=~\"$instance\"}[$__range])), 1e-9))",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (phase) (increase(firerunner_builder_boot_phase_seconds_count{instance=~\"$instance\"}[$__range]))",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "phase": 0,
+              "Value #C": 1,
+              "Value #A": 2,
+              "Value #B": 3,
+              "Value #D": 4
+            },
+            "renameByName": {
+              "phase": "Phase",
+              "Value #A": "p50",
+              "Value #B": "p90",
+              "Value #C": "Share of boot time",
+              "Value #D": "Boots"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Share of boot time",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Share of boot time"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Boots"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "id": 24,
       "type": "row",
       "title": "Host",
@@ -2358,7 +2543,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 96
+        "y": 104
       },
       "panels": []
     },
@@ -2375,7 +2560,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 97
+        "y": 105
       },
       "targets": [
         {
@@ -2434,7 +2619,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 97
+        "y": 105
       },
       "targets": [
         {
@@ -2492,7 +2677,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 105
+        "y": 113
       },
       "targets": [
         {
@@ -2559,7 +2744,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 105
+        "y": 113
       },
       "targets": [
         {
@@ -2626,7 +2811,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 113
+        "y": 121
       },
       "targets": [
         {
@@ -2684,7 +2869,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 113
+        "y": 121
       },
       "targets": [
         {
@@ -2743,7 +2928,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 121
+        "y": 129
       },
       "targets": [
         {
@@ -2809,7 +2994,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 121
+        "y": 129
       },
       "targets": [
         {
@@ -2886,7 +3071,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 129
+        "y": 137
       },
       "panels": []
     },
@@ -2903,7 +3088,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 130
+        "y": 138
       },
       "targets": [
         {
@@ -2955,7 +3140,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 130
+        "y": 138
       },
       "targets": [
         {
@@ -3007,7 +3192,7 @@
         "h": 4,
         "w": 4,
         "x": 8,
-        "y": 130
+        "y": 138
       },
       "targets": [
         {
@@ -3059,7 +3244,7 @@
         "h": 4,
         "w": 4,
         "x": 12,
-        "y": 130
+        "y": 138
       },
       "targets": [
         {
@@ -3111,7 +3296,7 @@
         "h": 4,
         "w": 4,
         "x": 16,
-        "y": 130
+        "y": 138
       },
       "targets": [
         {
@@ -3163,7 +3348,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 130
+        "y": 138
       },
       "targets": [
         {
@@ -3215,7 +3400,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 134
+        "y": 142
       },
       "targets": [
         {
@@ -3274,7 +3459,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 134
+        "y": 142
       },
       "targets": [
         {
@@ -3349,7 +3534,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 142
+        "y": 150
       },
       "targets": [
         {
@@ -3433,7 +3618,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 142
+        "y": 150
       },
       "targets": [
         {
@@ -3499,7 +3684,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 150
+        "y": 158
       },
       "targets": [
         {
@@ -3565,7 +3750,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 150
+        "y": 158
       },
       "targets": [
         {
@@ -3624,7 +3809,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 158
+        "y": 166
       },
       "targets": [
         {
@@ -3690,7 +3875,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 158
+        "y": 166
       },
       "targets": [
         {

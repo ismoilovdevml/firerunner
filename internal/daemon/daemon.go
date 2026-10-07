@@ -196,6 +196,8 @@ type Daemon struct {
 	cfgPath string
 	log     *slog.Logger
 	metrics *Metrics
+	// now times builder boot phases; tests replace it to make them exact.
+	now func() time.Time
 
 	mu      sync.Mutex
 	cfg     config.Config
@@ -336,7 +338,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &Daemon{cfgPath: cfgPath, log: log, cfg: cfg, fl: fl, metrics: NewMetrics(),
+	d := &Daemon{cfgPath: cfgPath, log: log, cfg: cfg, fl: fl, metrics: NewMetrics(), now: time.Now,
 		claimed: map[string]time.Time{}, deleting: map[string]bool{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{},
 		bootingIDs: map[string]bool{}, refillNow: make(chan struct{}, 1), staleLeases: map[string]time.Time{},
 		builders: map[string]*builder{}, builderFailed: map[string]time.Time{},
