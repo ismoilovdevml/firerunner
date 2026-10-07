@@ -217,7 +217,8 @@ func (m *Metrics) addBuilderMetrics() {
 	m.builderBootPhase = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "firerunner_builder_boot_phase_seconds",
 		Help: "Time of each phase of a builder boot, by phase and result. Phases in order: admit (waiting for host memory), " +
 			"vm (create until SSH answers), save_wait (waiting for the project's previous builder to copy its cache out; timeout: it started without that copy), " +
-			"restore (loading the saved cache, with the result firerunner_builder_cache_total counts: ok, legacy, missing, stale, failed), " +
+			"restore (loading the saved cache, with the result firerunner_builder_cache_total counts: ok, legacy, missing, stale, failed; " +
+			"failed also when the copy cannot be opened, or when builder rm dropped a loaded copy and it could not be wiped), " +
 			"buildkitd (start until it listens and its host port is mapped). A phase ends where the next begins; " +
 			"a failed boot keeps the phases it ran, the last with result failed.",
 		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 450, 600}}, []string{"phase", "result"})

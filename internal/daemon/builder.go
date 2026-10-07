@@ -452,7 +452,10 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	// One line per boot with every phase, whatever the boot's end.
 	phases := newBootPhases(d.now, d.metrics.builderBootPhase)
 	defer func() {
-		phases.finish("abandoned") // removed while booting, or shutting down
+		// Not finished as ready or failed: the builder was removed while it
+		// booted, or the daemon stopped after the last phase succeeded. A stop
+		// that cuts a phase short fails that phase, and the boot is failed.
+		phases.finish("abandoned")
 		d.log.Info("builder boot phases", append([]any{"project", project}, phases.logAttrs()...)...)
 	}()
 	fail := func(inst *vm.Instance, err error) {

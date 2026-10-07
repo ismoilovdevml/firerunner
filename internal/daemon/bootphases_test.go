@@ -115,18 +115,23 @@ func TestBuilderBootPhases(t *testing.T) {
 		setupT   = 5 * time.Second
 	)
 	sshDrop := func(t *testing.T) error { return fmt.Errorf("stream: %w", exitErr(t, 255)) }
+	refused := func(t *testing.T) error { return fmt.Errorf("tar: unexpected EOF: %w", exitErr(t, 1)) }
 	for _, tc := range []struct {
-		name     string
-		cache    bool // a saved cache exists
-		save     bool // the previous builder is copying its cache out
-		noFit    bool // no host memory
-		noEntry  bool // the builder was removed before its VM booted
-		bootErr  error
-		loadErr  func(*testing.T) error
-		setupErr error
-		want     []string // phase/result/seconds, in order
-		result   string
-		total    time.Duration
+		name        string
+		cache       bool // a saved cache exists
+		save        bool // the previous builder is copying its cache out
+		stopInSave  bool // the daemon stops while the save is pending
+		stopInSetup bool // the daemon stops while buildkitd starts, which still succeeds
+		noFit       bool // no host memory
+		noEntry     bool // the builder was removed before its VM booted
+		dropInLoad  bool // `builder rm` drops the cache while it loads
+		bootErr     error
+		loadErr     func(*testing.T) error
+		wipeErr     error
+		setupErr    error
+		want        []string // phase/result/seconds, in order
+		result      string
+		total       time.Duration
 	}{
 		{name: "ready after a save and a restore", cache: true, save: true,
 			want:   []string{"admit/ok/3", "vm/ok/7", "save_wait/ok/30", "restore/ok/20", "buildkitd/ok/5"},
@@ -149,20 +154,44 @@ func TestBuilderBootPhases(t *testing.T) {
 		{name: "builder removed while its VM booted", noEntry: true,
 			want:   []string{"admit/ok/3", "vm/ok/7"},
 			result: "abandoned", total: admitT + vmT},
+		{name: "daemon stops while buildkitd starts", cache: true, stopInSetup: true,
+			want:   []string{"admit/ok/3", "vm/ok/7", "save_wait/ok/0", "restore/ok/20", "buildkitd/ok/5"},
+			result: "abandoned", total: admitT + vmT + restoreT + setupT},
+		{name: "daemon stops while a save is pending", save: true, stopInSave: true,
+			// buildkitd then fails at once on the ended context, like ssh does.
+			want:   []string{"admit/ok/3", "vm/ok/7", "save_wait/failed/30", "restore/missing/0", "buildkitd/failed/0"},
+			result: "failed", total: admitT + vmT + saveT},
+		{name: "refused copy, starts empty", cache: true, loadErr: refused,
+			want:   []string{"admit/ok/3", "vm/ok/7", "save_wait/ok/0", "restore/failed/20", "buildkitd/ok/5"},
+			result: "ready", total: admitT + vmT + restoreT + setupT},
+		{name: "cache dropped while it loaded, wipe fails", cache: true, dropInLoad: true, wipeErr: errors.New("ssh: no route"),
+			want:   []string{"admit/ok/3", "vm/ok/7", "save_wait/ok/0", "restore/failed/20"},
+			result: "failed", total: admitT + vmT + restoreT},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stubBuilders(t, func(string) bool { return true })
 			clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+			ctx, stop := context.WithCancel(context.Background())
+			t.Cleanup(stop)
+			var dp *Daemon
 			dir := stubBuilderCache(t, nil, nil, func(_ context.Context, _ config.Config, _ *vm.Instance, r io.Reader) error {
 				clock.Advance(restoreT)
 				if _, err := io.ReadAll(r); err != nil {
 					return err
+				}
+				if tc.dropInLoad {
+					dp.mu.Lock()
+					dp.builders["7"].dropped = true
+					dp.mu.Unlock()
 				}
 				if tc.loadErr != nil {
 					return tc.loadErr(t)
 				}
 				return nil
 			})
+			if tc.wipeErr != nil {
+				builderCacheWipe = func(context.Context, config.Config, *vm.Instance) error { return tc.wipeErr }
+			}
 			stubBoot(t, nil)
 			var admitted sync.Once
 			builderFits = func(context.Context, config.Config, *flintlock.Client, int) (bool, string, error) {
@@ -179,11 +208,18 @@ func TestBuilderBootPhases(t *testing.T) {
 				}
 				return &vm.Instance{ID: id, UID: "uid-" + id, IP: "10.200.0.77"}, nil
 			}
-			builderSetup = func(context.Context, config.Config, *vm.Instance, *builderCreds) error {
+			builderSetup = func(ctx context.Context, _ config.Config, _ *vm.Instance, _ *builderCreds) error {
+				if err := ctx.Err(); err != nil {
+					return fmt.Errorf("starting buildkitd: %w", err)
+				}
 				clock.Advance(setupT)
+				if tc.stopInSetup {
+					stop()
+				}
 				return tc.setupErr
 			}
 			d, _ := newTestDaemon(t)
+			dp = d
 			d.now = clock.Now
 			logs := &logBuffer{}
 			d.log = slog.New(slog.NewJSONHandler(logs, nil))
@@ -208,6 +244,10 @@ func TestBuilderBootPhases(t *testing.T) {
 						}
 					}
 					clock.Advance(saveT)
+					if tc.stopInSave {
+						stop()
+						return
+					}
 					d.mu.Lock()
 					delete(d.saving, "7")
 					d.mu.Unlock()
@@ -216,7 +256,7 @@ func TestBuilderBootPhases(t *testing.T) {
 			} else {
 				close(saveDone)
 			}
-			d.bootBuilder(context.Background(), d.cfg, "7")
+			d.bootBuilder(ctx, d.cfg, "7")
 			<-saveDone
 			d.bg.Wait()
 
@@ -293,8 +333,44 @@ func TestBuilderBootPhases(t *testing.T) {
 			if got, _ := line["failed_phase"].(string); got != wantFailed {
 				t.Errorf("failed_phase = %q, want %q", got, wantFailed)
 			}
+			if tc.dropInLoad && cacheCount(d, "restore", "ok") != 1 {
+				t.Errorf("restore ok = %v: the counter counts the load, the phase the failed wipe", cacheCount(d, "restore", "ok"))
+			}
 			if n := metricValue(t, d, "firerunner_vm_boot_failures_total", "builder"); (n == 1) != (tc.result == "failed") {
 				t.Errorf("builder boot failures = %v for a %s boot", n, tc.result)
+			}
+		})
+	}
+}
+
+// The total is the sum of the phases: time after the last one (the lock,
+// builders.json, deleting a failed VM) is not added, and the first finish
+// fixes the result.
+func TestBootPhasesTotalIsTheSumOfPhases(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		phases []time.Duration
+		result string
+	}{
+		{"ready", []time.Duration{3 * time.Second, 7 * time.Second, 5 * time.Second}, "ready"},
+		{"failed in the first phase", []time.Duration{4 * time.Second}, "failed"},
+		{"no phase ended", nil, "abandoned"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+			p := newBootPhases(clock.Now, NewMetrics().builderBootPhase)
+			var sum time.Duration
+			for i, d := range tc.phases {
+				clock.Advance(d)
+				p.end(builderPhaseResults[i].phase, "ok")
+				sum += d
+			}
+			clock.Advance(time.Minute) // bookkeeping after the last phase
+			p.finish(tc.result)
+			clock.Advance(time.Minute)
+			p.finish("abandoned")
+			if p.result != tc.result || p.total != sum {
+				t.Fatalf("result %s, total %v; want %s, %v", p.result, p.total, tc.result, sum)
 			}
 		})
 	}

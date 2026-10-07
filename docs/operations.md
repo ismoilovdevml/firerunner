@@ -137,7 +137,9 @@ failures FireRunner or the host caused, never for failing project scripts. Watch
   cache copy, `restore` loading the saved cache (it grows with the cache size), `buildkitd` its
   start. The phases add up to the boot. One boot, failed ones too, is one log line with every
   phase's seconds and the total:
-  `journalctl -u firerunner | grep 'builder boot phases'`; `failed_phase` names where it failed.
+  `journalctl -u firerunner | grep 'builder boot phases'`. Its `result` is `ready`, `failed`
+  (`failed_phase` names where; a daemon stop that cuts a phase short counts here) or `abandoned`
+  (the builder was removed while it booted, or the daemon stopped after its last phase).
 - **Node (node_exporter)** row: the host under the microVMs. *CPU steal* (the hypervisor, on a
   host that is itself a VM), *IO wait* and *Pressure stall* show a saturated host before jobs
   fail. It needs node_exporter on the host, with the same `instance` label in both scrape jobs

@@ -11,7 +11,9 @@ import (
 // bootBuilder runs them, with the results each may end with: the series of
 // firerunner_builder_boot_phase_seconds (all pre-created). restore ends with
 // the result firerunner_builder_cache_total{op="restore"} counts; failed also
-// covers a copy that could not be opened, which that counter does not count.
+// covers two cases that counter does not count as failed: a copy that could
+// not be opened (not counted), and a loaded copy (counted ok or legacy) that
+// `builder rm` dropped meanwhile and that could not be wiped from the VM.
 var builderPhaseResults = []struct {
 	phase   string
 	results []string
@@ -54,11 +56,13 @@ func (p *bootPhases) end(name, result string) {
 	p.hist.WithLabelValues(name, result).Observe(took.Seconds())
 }
 
-// finish fixes the boot's result and total the first time it is called: a
-// failed boot is finished before its VM is deleted, which is not boot time.
+// finish fixes the boot's result the first time it is called. The total is
+// the sum of the phases, up to the end of the last one: what runs after it
+// (the lock, builders.json, deleting a failed VM, releasing the admission)
+// is bookkeeping, not time a build waits for.
 func (p *bootPhases) finish(result string) {
 	if p.result == "" {
-		p.result, p.total = result, p.now().Sub(p.start)
+		p.result, p.total = result, p.last.Sub(p.start)
 	}
 }
 
