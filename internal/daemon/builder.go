@@ -628,14 +628,14 @@ var builderSaveWait = 5 * time.Minute
 // waitForSave waits until the project's previous builder has copied its cache
 // out, at most until builderSaveWait after start: a slow save must not keep
 // the project without a builder, which then starts from the older copy, if any.
-// It returns how the wait ended, the save_wait phase result: ok (copied, or
-// nothing to wait for), timeout or failed (ctx ended).
+// It returns how the wait ended, the save_wait phase result: none (no copy
+// was being written), ok (copied), timeout or failed (ctx ended).
 func (d *Daemon) waitForSave(ctx context.Context, project string, start time.Time) string {
 	d.mu.Lock()
 	saving := d.saving[project]
 	d.mu.Unlock()
 	if saving == nil {
-		return "ok"
+		return "none"
 	}
 	select {
 	case <-saving.done:

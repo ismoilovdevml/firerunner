@@ -216,7 +216,7 @@ func (m *Metrics) addBuilderMetrics() {
 	// waitBuilderFits may start just before its own builderFitWait runs out.
 	m.builderBootPhase = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "firerunner_builder_boot_phase_seconds",
 		Help: "Time of each phase of a builder boot, by phase and result. Phases in order: admit (waiting for host memory), " +
-			"vm (create until SSH answers), save_wait (waiting for the project's previous builder to copy its cache out; timeout: it started without that copy), " +
+			"vm (create until SSH answers), save_wait (waiting for the project's previous builder to copy its cache out; none: no copy was being written, timeout: it started without that copy), " +
 			"restore (loading the saved cache, with the result firerunner_builder_cache_total counts: ok, legacy, missing, stale, failed; " +
 			"failed also when the copy cannot be opened, or when builder rm dropped a loaded copy and it could not be wiped), " +
 			"buildkitd (start until it listens and its host port is mapped). A phase ends where the next begins; " +

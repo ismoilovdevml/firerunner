@@ -2353,7 +2353,7 @@
       "id": 68,
       "type": "table",
       "title": "Builder boot by phase",
-      "description": "Where builders spend their boot over the selected time range, largest share first. admit: waiting for host memory; vm: create until SSH answers; save_wait: waiting for the project's previous builder to copy its cache out; restore: loading the saved cache (about 90 MB/s, so it grows with the cache); buildkitd: start until jobs can reach it. p50 and p90 count only boots in which the phase did its work (restore: a copy was loaded or tried; missing and stale restores take no time and are left out). Share counts all boots, failed ones and those without a saved cache included: the phase's seconds over all builder boot seconds. Boots: how many boots reached the phase; p50 and p90 of a few boots say little. One boot in detail: journalctl -u firerunner | grep 'builder boot phases'.",
+      "description": "Where builders spend their boot over the selected time range, largest share first. admit: waiting for host memory; vm: create until SSH answers; save_wait: waiting for the project's previous builder to copy its cache out; restore: loading the saved cache (about 90 MB/s, so it grows with the cache); buildkitd: start until jobs can reach it. p50, p90 and Boots that ran the phase count only boots in which the phase did its work: restore missing and stale (no copy to load) and save_wait none (no copy being written) are left out. Share counts all boots, failed ones and those that did not wait or had no saved cache included: the phase's seconds over all builder boot seconds. p50 and p90 of a few boots say little. One boot in detail: journalctl -u firerunner | grep 'builder boot phases'.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2404,7 +2404,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (phase) (increase(firerunner_builder_boot_phase_seconds_count{instance=~\"$instance\"}[$__range]))",
+          "expr": "sum by (phase) (increase(firerunner_builder_boot_phase_seconds_count{instance=~\"$instance\",result=~\"ok|legacy|failed|timeout\"}[$__range]))",
           "instant": true,
           "range": false,
           "format": "table"
@@ -2433,7 +2433,7 @@
               "Value #A": "p50",
               "Value #B": "p90",
               "Value #C": "Share of boot time",
-              "Value #D": "Boots"
+              "Value #D": "Boots that ran the phase"
             }
           }
         },
@@ -2518,7 +2518,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Boots"
+              "options": "Boots that ran the phase"
             },
             "properties": [
               {

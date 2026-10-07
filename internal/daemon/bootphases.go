@@ -20,7 +20,7 @@ var builderPhaseResults = []struct {
 }{
 	{"admit", []string{"ok", "failed"}},
 	{"vm", []string{"ok", "failed"}},
-	{"save_wait", []string{"ok", "timeout", "failed"}},
+	{"save_wait", []string{"none", "ok", "timeout", "failed"}},
 	{"restore", []string{"ok", "legacy", "missing", "stale", "failed"}},
 	{"buildkitd", []string{"ok", "failed"}},
 }
