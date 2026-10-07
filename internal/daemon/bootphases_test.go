@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -119,6 +120,7 @@ func TestBuilderBootPhases(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		cache       bool // a saved cache exists
+		unreadable  bool // the saved cache cannot be opened
 		save        bool // the previous builder is copying its cache out
 		stopInSave  bool // the daemon stops while the save is pending
 		stopInSetup bool // the daemon stops while buildkitd starts, which still succeeds
@@ -164,6 +166,9 @@ func TestBuilderBootPhases(t *testing.T) {
 		{name: "refused copy, starts empty", cache: true, loadErr: refused,
 			want:   []string{"admit/ok/3", "vm/ok/7", "save_wait/none/0", "restore/failed/20", "buildkitd/ok/5"},
 			result: "ready", total: admitT + vmT + restoreT + setupT},
+		{name: "unreadable copy, starts empty", unreadable: true,
+			want:   []string{"admit/ok/3", "vm/ok/7", "save_wait/none/0", "restore/failed/0", "buildkitd/ok/5"},
+			result: "ready", total: admitT + vmT + setupT},
 		{name: "cache dropped while it loaded, wipe fails", cache: true, dropInLoad: true, wipeErr: errors.New("ssh: no route"),
 			want:   []string{"admit/ok/3", "vm/ok/7", "save_wait/none/0", "restore/failed/20"},
 			result: "failed", total: admitT + vmT + restoreT},
@@ -225,6 +230,18 @@ func TestBuilderBootPhases(t *testing.T) {
 			d.log = slog.New(slog.NewJSONHandler(logs, nil))
 			if tc.cache {
 				writeFile(t, filepath.Join(dir, "7.tar"), saved("warm"), time.Minute)
+			}
+			if tc.unreadable {
+				// A symlink to itself: open fails (ELOOP) but not with
+				// ErrNotExist, even for root, unlike a file with mode 0.
+				if err := os.Symlink("7.tar", filepath.Join(dir, "7.tar")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			restoreResults := []string{"ok", "legacy", "missing", "stale", "failed"}
+			countedBefore := map[string]float64{}
+			for _, r := range restoreResults {
+				countedBefore[r] = cacheCount(d, "restore", r)
 			}
 			if !tc.noEntry {
 				d.Builder("7", true) // entry with credentials; builderBoot is stubbed
@@ -332,6 +349,14 @@ func TestBuilderBootPhases(t *testing.T) {
 			}
 			if got, _ := line["failed_phase"].(string); got != wantFailed {
 				t.Errorf("failed_phase = %q, want %q", got, wantFailed)
+			}
+			if tc.unreadable {
+				// builder_cache_total does not count a copy it could not open.
+				for _, r := range restoreResults {
+					if got := cacheCount(d, "restore", r); got != countedBefore[r] {
+						t.Errorf("builder_cache_total{restore,%s} = %v, was %v before an unreadable copy", r, got, countedBefore[r])
+					}
+				}
 			}
 			if tc.dropInLoad && cacheCount(d, "restore", "ok") != 1 {
 				t.Errorf("restore ok = %v: the counter counts the load, the phase the failed wipe", cacheCount(d, "restore", "ok"))
