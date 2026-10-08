@@ -81,9 +81,18 @@ A new builder size applies to builders started later; existing caches are kept.
 All the jobs of a project build in its one builder. Without a cap, a pipeline that builds ten
 images at once runs ten compilers in one VM; when its memory is full, the guest does not kill a
 process but evicts and re-reads its programs from disk (thrashing) and stops answering for many
-minutes. `builder.max_parallelism` keeps that from happening: the steps over the cap wait their
-turn. A builder that a job uses but that does not answer for five minutes is deleted, so its jobs
-fail then instead of when their connections time out.
+minutes. `builder.max_parallelism` limits the steps that run at once, so the builds of one
+pipeline take turns instead of all compiling together. Size it from what one step of the largest
+build needs: a step may use every vCPU of the builder, and compilers that start a worker per CPU
+(MSBuild) need more memory on a larger builder.
+
+A builder that a job uses but that has not answered for five minutes is deleted, so the project's
+next builds get a new one. Builds still connected to the frozen builder are not ended by that:
+they fail when their connection times out.
+
+After an upgrade to a version with this setting, every builder is replaced once, when it has been
+idle for 10 minutes (its cache is saved). A builder keeps the cap it started with; a new
+`builder.memory_mb` changes the derived cap of builders started later.
 
 ## Sizing a host
 

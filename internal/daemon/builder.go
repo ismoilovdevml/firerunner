@@ -86,8 +86,10 @@ type builder struct {
 	// creds are created with the entry, so jobs can be configured for the
 	// builder while it is still starting (only a starting builder needs them).
 	creds *builderCreds
-	// strikes counts consecutive reconciles whose buildkitd probe failed.
-	strikes int
+	// strikes counts consecutive reconciles whose buildkitd probe failed;
+	// silentSince is when the first of them probed.
+	strikes     int
+	silentSince time.Time
 	// dropped: an operator's `builder rm` came while the builder booted. The
 	// saved cache it may be loading (from a file that is open, so unlinking it
 	// does not stop the load) must not stay in it; see bootBuilder.
@@ -122,12 +124,12 @@ var builderRemovals = []builderRemoval{removedLRU, removedIdle, removedMaxAge, r
 
 // builderStrikes consecutive failed probes drop a builder. One missed 3 s
 // probe (a builder VM busy with a heavy build) must not throw its cache away.
-// A builder a job uses is kept until builderBusyStrikes: by then (a probe per
-// reconcile, a minute apart) it is frozen, not busy, and its jobs would
-// otherwise wait for their connections to time out (over 20 minutes).
+// A builder a job uses is kept until it has not answered for
+// builderBusySilence, whatever daemon.reconcile_interval is: by then it is
+// frozen, not busy, and only a new builder lets the project build again.
 const (
 	builderStrikes     = 2
-	builderBusyStrikes = 5
+	builderBusySilence = 5 * time.Minute
 )
 
 var projectID = regexp.MustCompile(`^[0-9]{1,20}$`)
@@ -927,7 +929,7 @@ func (d *Daemon) expireBuilders() {
 // checkBuilders adopts the previous run's builders if that has not happened
 // yet, restores port mappings (restarting firerunner-net clears them)
 // and drops builders whose VM is gone, or whose buildkitd missed builderStrikes
-// probes in a row while no job uses it (builderBusyStrikes while one does).
+// probes in a row while no job uses it (for builderBusySilence while one does).
 // present is the flintlock listing taken
 // at listedAt; a builder that became ready after that is not in it yet.
 func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
@@ -951,6 +953,7 @@ func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
 	d.mu.Unlock()
 	// Probe without the lock (a hung builder must not stall job claims) and
 	// all at once (64 silent builders must not take 64 x 3 s).
+	probedAt := time.Now()
 	gone, answers := map[string]bool{}, map[string]bool{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -986,10 +989,13 @@ func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
 		case !probed:
 			continue // became ready after the listing: check it next time
 		case answered:
-			b.strikes = 0
+			b.strikes, b.silentSince = 0, time.Time{}
 		default:
 			b.strikes++
-			if b.strikes >= builderStrikes && !busy[b.Project] || b.strikes >= builderBusyStrikes {
+			if b.silentSince.IsZero() {
+				b.silentSince = probedAt
+			}
+			if b.strikes >= builderStrikes && (!busy[b.Project] || probedAt.Sub(b.silentSince) >= builderBusySilence) {
 				d.removeBuilderLocked(b, removedSilent)
 				continue
 			}
@@ -1018,7 +1024,7 @@ func answersWithin(ip, caPEM string, tries int) bool {
 // probeTimeout bounds each probe of a builder.
 var probeTimeout = 3 * time.Second
 
-// buildkitdAnswers reports whether buildkitd itself answers: it must complete
+// probeBuildkitd reports whether buildkitd itself answers: it must complete
 // a TLS handshake with the builder's certificate (caPEM, its CA). A TCP
 // connect is not enough: a guest whose memory is full thrashes the page cache
 // for many minutes, and its kernel still accepts connections while buildkitd
@@ -1091,7 +1097,7 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 		d.log.Warn("builders of the previous run not adopted", "err", err)
 		list = nil
 	}
-	var keep, cut []*builder
+	var probe, keep, cut []*builder
 	for _, b := range list {
 		if !projectID.MatchString(b.Project) || !live[b.Instance.UID] {
 			continue
@@ -1100,8 +1106,23 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 			cut = append(cut, b) // its buildkitd is stopped: not probed
 			continue
 		}
-		// Two tries: one missed probe must not cost a project its warm cache.
-		if !answersWithin(b.Instance.IP, b.CA, 2) {
+		probe = append(probe, b)
+	}
+	// All at once: a silent builder takes up to two probes of dial and
+	// handshake each, and the daemon starts only after this.
+	answered := make([]bool, len(probe))
+	var wg sync.WaitGroup
+	for i, b := range probe {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Two tries: one missed probe must not cost a project its warm cache.
+			answered[i] = answersWithin(b.Instance.IP, b.CA, 2)
+		}()
+	}
+	wg.Wait()
+	for i, b := range probe {
+		if !answered[i] {
 			d.log.Warn("builder from previous run not answering, left for reconcile", "project", b.Project, "vm", b.Instance.ID)
 			continue
 		}

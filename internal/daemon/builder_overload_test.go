@@ -6,6 +6,8 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -146,11 +148,13 @@ func TestBuildkitdProbeNeedsBuildkitd(t *testing.T) {
 	}
 }
 
-// A builder a job uses survives a few missed probes (a heavy build), but one
-// silent for builderBusyStrikes reconciles is frozen: it is dropped, so its
-// jobs fail now instead of when their connections time out.
+// A builder a job uses survives missed probes (a heavy build) however often
+// reconcile runs, but one silent for builderBusySilence is frozen and is
+// dropped, so the project's next builds get a new builder. An answer in
+// between starts the silence over.
 func TestCheckBuildersDropsFrozenBusyBuilder(t *testing.T) {
-	stubBuilders(t, func(string) bool { return false })
+	var answering atomic.Bool
+	stubBuilders(t, func(string) bool { return answering.Load() })
 	dir := t.TempDir()
 	old := jobStateGlob
 	jobStateGlob = filepath.Join(dir, "*.json")
@@ -160,14 +164,87 @@ func TestCheckBuildersDropsFrozenBusyBuilder(t *testing.T) {
 	}
 	d, _ := newTestDaemon(t)
 	d.builders = map[string]*builder{"1": readyBuilder("1", 20001, 0, builderSpec(d.cfg))}
-	for i := 1; i < builderBusyStrikes; i++ {
-		d.checkBuilders(map[string]bool{"uid-1": true}, time.Now())
+	check := func() { d.checkBuilders(map[string]bool{"uid-1": true}, time.Now()) }
+	// daemon.reconcile_interval 10s: 30 misses within five minutes.
+	for i := 0; i < 30; i++ {
+		check()
 		if d.builders["1"] == nil {
-			t.Fatalf("busy builder dropped after %d missed probes", i)
+			t.Fatalf("busy builder dropped after %d quick missed probes", i+1)
 		}
 	}
-	d.checkBuilders(map[string]bool{"uid-1": true}, time.Now())
+	d.builders["1"].silentSince = time.Now().Add(-builderBusySilence + time.Minute)
+	check()
+	if d.builders["1"] == nil {
+		t.Fatal("busy builder dropped before builderBusySilence")
+	}
+	d.builders["1"].silentSince = time.Now().Add(-builderBusySilence)
+	answering.Store(true)
+	check()
+	if b := d.builders["1"]; b == nil || b.strikes != 0 || !b.silentSince.IsZero() {
+		t.Fatalf("an answer did not reset the silence: %+v", b)
+	}
+	answering.Store(false)
+	check()
+	if d.builders["1"] == nil {
+		t.Fatal("silence counted from before the builder answered")
+	}
+	d.builders["1"].silentSince = time.Now().Add(-builderBusySilence)
+	check()
 	if d.builders["1"] != nil {
-		t.Fatalf("builder silent for %d probes kept for its jobs", builderBusyStrikes)
+		t.Fatalf("busy builder silent for %v kept", builderBusySilence)
+	}
+}
+
+// Both probe paths hand the builder's own CA to the probe: without it the
+// probe falls back to a TCP connect, which a frozen guest still accepts.
+func TestBuilderProbesUseBuilderCA(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	var mu sync.Mutex
+	got := map[string][]string{}
+	buildkitdAnswers = func(ip string, _ int, ca string) bool {
+		mu.Lock()
+		got[ip] = append(got[ip], ca)
+		mu.Unlock()
+		return true
+	}
+	d, _ := newTestDaemon(t)
+	b := readyBuilder("1", 20001, 0, builderSpec(d.cfg))
+	b.CA = "builder-1-ca"
+	d.builders = map[string]*builder{"1": b}
+	recordBuilders(d)
+	d.checkBuilders(map[string]bool{"uid-1": true}, time.Now())
+	if cas := got[b.Instance.IP]; len(cas) == 0 || cas[0] != "builder-1-ca" {
+		t.Fatalf("reconcile probe got CA %q, want the builder's", cas)
+	}
+	got = map[string][]string{}
+	d.builders = map[string]*builder{}
+	d.buildersAdopted = false
+	d.adoptBuilders(map[string]bool{"uid-1": true})
+	if cas := got[b.Instance.IP]; len(cas) == 0 || cas[0] != "builder-1-ca" {
+		t.Fatalf("adoption probe got CA %q, want the builder's", cas)
+	}
+}
+
+// Startup probes the previous run's builders all at once: silent ones cost
+// one builder's probes, not one per builder.
+func TestAdoptBuildersProbesInParallel(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	const slow = 200 * time.Millisecond
+	buildkitdAnswers = func(string, int, string) bool { time.Sleep(slow); return false }
+	d, _ := newTestDaemon(t)
+	live := map[string]bool{}
+	for _, p := range []string{"1", "2", "3", "4"} {
+		d.builders[p] = readyBuilder(p, 20000+int(p[0]-'0'), 0, builderSpec(d.cfg))
+		live["uid-"+p] = true
+	}
+	recordBuilders(d)
+	d.builders = map[string]*builder{}
+	start := time.Now()
+	d.adoptBuilders(live)
+	if took := time.Since(start); took > 3*slow {
+		t.Fatalf("adopting 4 silent builders took %v: probed one after another", took)
+	}
+	if len(d.builders) != 0 {
+		t.Fatalf("silent builders adopted: %v", d.builders)
 	}
 }
