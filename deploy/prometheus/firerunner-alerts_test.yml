@@ -347,6 +347,6 @@ tests:
       exp_annotations:
         summary: 3 builders failed to start or died in the last hour on h
         description: 'Those projects'' docker builds run without the layer cache, or fail when their builder dies. See which: journalctl -u firerunner --since -1h | grep -E ''builder boot failed|builder:
-          (not answering|VM gone)''. ''no host memory for a builder'': builders do not fit next to the jobs, lower builder.max or builder.memory_mb. Not answering or VM gone: usually BuildKit ran out
-          of memory in the builder, raise builder.memory_mb or lower builder.max.'
+          (not answering|VM gone)''. ''no host memory for a builder'': builders do not fit next to the jobs, lower builder.max or builder.memory_mb. Not answering or VM gone: usually the builds of one
+          project filled the builder''s memory, lower builder.max_parallelism or raise builder.memory_mb.'
         runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerbuildersfailing

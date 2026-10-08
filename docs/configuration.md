@@ -61,6 +61,7 @@ boot and counts its own size.
 | `builder.max` | `4` | the least recently used builder idle for 5 minutes makes room for a new one; while none is, a build goes without a cache |
 | `builder.idle_ttl` | `24h` | an unused builder is deleted; its cache is saved |
 | `builder.saved_cache_gb` | `100` | host disk for the caches of deleted builders; `0` saves none |
+| `builder.max_parallelism` | `0` | build steps (`RUN`, `COPY`, ...) a builder runs at once, over all its project's jobs; the rest wait. `0`: one per 6 GB of `builder.memory_mb` (a large .NET build step measured 4.8-6.3 GB) |
 
 When a builder is deleted because it was idle, its slot was needed, it was a week old, or its
 settings changed (not its size), its cache is copied to
@@ -76,6 +77,22 @@ image were all written by `moby/buildkit:v0.33.0`: they are still loaded while `
 image, and dropped otherwise.
 
 A new builder size applies to builders started later; existing caches are kept.
+
+All the jobs of a project build in its one builder. Without a cap, a pipeline that builds ten
+images at once runs ten compilers in one VM; when its memory is full, the guest does not kill a
+process but evicts and re-reads its programs from disk (thrashing) and stops answering for many
+minutes. `builder.max_parallelism` limits the steps that run at once, so the builds of one
+pipeline take turns instead of all compiling together. Size it from what one step of the largest
+build needs: a step may use every vCPU of the builder, and compilers that start a worker per CPU
+(MSBuild) need more memory on a larger builder.
+
+A builder that a job uses but that has not answered for five minutes is deleted, so the project's
+next builds get a new one. Builds still connected to the frozen builder are not ended by that:
+they fail when their connection times out.
+
+After an upgrade to a version with this setting, every builder is replaced once, when it has been
+idle for 10 minutes (its cache is saved). A builder keeps the cap it started with; a new
+`builder.memory_mb` changes the derived cap of builders started later.
 
 ## Sizing a host
 

@@ -287,8 +287,8 @@ Those projects' `docker build` runs without the layer cache, or fails when its b
 
 - Check: `journalctl -u firerunner --since -1h | grep -E 'builder boot failed|builder: (not answering|VM gone)'`.
 - Fix: `no host memory for a builder` means builders do not fit next to the jobs: lower
-  `builder.max` or `builder.memory_mb`. Not answering or VM gone: usually BuildKit ran out of memory
-  in the builder: raise `builder.memory_mb` or lower `builder.max`.
+  `builder.max` or `builder.memory_mb`. Not answering or VM gone: usually the builds of one project
+  filled the builder's memory: lower `builder.max_parallelism` or raise `builder.memory_mb`.
 - Recovered: *Builder removals by reason* shows no `not_answering` or `vm_gone`; the alert resolves
   an hour after the last one.
 
