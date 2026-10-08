@@ -61,6 +61,7 @@ boot and counts its own size.
 | `builder.max` | `4` | the least recently used builder idle for 5 minutes makes room for a new one; while none is, a build goes without a cache |
 | `builder.idle_ttl` | `24h` | an unused builder is deleted; its cache is saved |
 | `builder.saved_cache_gb` | `100` | host disk for the caches of deleted builders; `0` saves none |
+| `builder.max_parallelism` | `0` | build steps (`RUN`, `COPY`, ...) a builder runs at once, over all its project's jobs; the rest wait. `0`: one per 2 GB of `builder.memory_mb` |
 
 When a builder is deleted because it was idle, its slot was needed, it was a week old, or its
 settings changed (not its size), its cache is copied to
@@ -76,6 +77,13 @@ image were all written by `moby/buildkit:v0.33.0`: they are still loaded while `
 image, and dropped otherwise.
 
 A new builder size applies to builders started later; existing caches are kept.
+
+All the jobs of a project build in its one builder. Without a cap, a pipeline that builds ten
+images at once runs ten compilers in one VM; when its memory is full, the guest does not kill a
+process but evicts and re-reads its programs from disk (thrashing) and stops answering for many
+minutes. `builder.max_parallelism` keeps that from happening: the steps over the cap wait their
+turn. A builder that a job uses but that does not answer for five minutes is deleted, so its jobs
+fail then instead of when their connections time out.
 
 ## Sizing a host
 

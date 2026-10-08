@@ -365,3 +365,40 @@ func TestRegistryMirrors(t *testing.T) {
 		t.Fatalf("config set: %v %v", err, cfg.VM.RegistryMirrors)
 	}
 }
+
+// Builders cap their parallel build steps by memory unless told; a cap left
+// at 0 is not written, so an older binary still loads the file.
+func TestBuilderParallelism(t *testing.T) {
+	for _, c := range []struct{ memory, set, want int }{
+		{8192, 0, 4}, {16384, 0, 8}, {1024, 0, 1}, {8192, 6, 6},
+	} {
+		b := Default().Builder
+		b.MemoryMB, b.MaxParallelism = c.memory, c.set
+		if got := b.Parallelism(); got != c.want {
+			t.Errorf("memory %d, max_parallelism %d: %d, want %d", c.memory, c.set, got, c.want)
+		}
+	}
+	for _, bad := range []int{-1, 257} {
+		cfg := Default()
+		cfg.Builder.MaxParallelism = bad
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("max_parallelism %d accepted", bad)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := Default()
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(path); strings.Contains(string(data), "max_parallelism") {
+		t.Fatalf("unused max_parallelism written:\n%s", data)
+	}
+	if cfg, err := Set(cfg, "builder.max_parallelism", "3"); err != nil || cfg.Builder.Parallelism() != 3 {
+		t.Fatalf("set: %v %d", err, cfg.Builder.Parallelism())
+	} else if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := Load(path); err != nil || got.Builder.MaxParallelism != 3 {
+		t.Fatalf("reload: %d %v", got.Builder.MaxParallelism, err)
+	}
+}

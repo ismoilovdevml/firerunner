@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
@@ -119,9 +120,15 @@ var (
 var builderRemovals = []builderRemoval{removedLRU, removedIdle, removedMaxAge, removedConfig,
 	removedVMGone, removedSilent, removedOperator, removedDisabled}
 
-// builderStrikes consecutive failed probes drop a builder. One missed 3 s dial
-// (a builder VM busy with a heavy build) must not throw its cache away.
-const builderStrikes = 2
+// builderStrikes consecutive failed probes drop a builder. One missed 3 s
+// probe (a builder VM busy with a heavy build) must not throw its cache away.
+// A builder a job uses is kept until builderBusyStrikes: by then (a probe per
+// reconcile, a minute apart) it is frozen, not busy, and its jobs would
+// otherwise wait for their connections to time out (over 20 minutes).
+const (
+	builderStrikes     = 2
+	builderBusyStrikes = 5
+)
 
 var projectID = regexp.MustCompile(`^[0-9]{1,20}$`)
 
@@ -129,8 +136,9 @@ var projectID = regexp.MustCompile(`^[0-9]{1,20}$`)
 // Size (vcpu, memory) is left out on purpose: a new size applies to new
 // builders, and resizing must not throw away every project's warm cache.
 func builderSpec(c config.Config) string {
-	return fmt.Sprintf("v2|%s|%s|%s|%s|%d", c.Builder.Image,
-		c.VM.KernelImage, c.VM.RootFSImage, c.VM.RegistryMirror, c.Builder.CacheMB) + proxySpec(c)
+	return fmt.Sprintf("v2|%s|%s|%s|%s|%d|p%d", c.Builder.Image,
+		c.VM.KernelImage, c.VM.RootFSImage, c.VM.RegistryMirror, c.Builder.CacheMB,
+		c.Builder.MaxParallelism) + proxySpec(c)
 }
 
 // specImage is the builder image in a builderSpec fingerprint, "" for a
@@ -919,7 +927,8 @@ func (d *Daemon) expireBuilders() {
 // checkBuilders adopts the previous run's builders if that has not happened
 // yet, restores port mappings (restarting firerunner-net clears them)
 // and drops builders whose VM is gone, or whose buildkitd missed builderStrikes
-// probes in a row while no job uses it. present is the flintlock listing taken
+// probes in a row while no job uses it (builderBusyStrikes while one does).
+// present is the flintlock listing taken
 // at listedAt; a builder that became ready after that is not in it yet.
 func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
 	d.mu.Lock()
@@ -953,13 +962,13 @@ func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
 			continue
 		}
 		wg.Add(1)
-		go func(project, ip string) {
+		go func(project, ip, ca string) {
 			defer wg.Done()
-			ok := tcpOpen(ip, 1234)
+			ok := buildkitdAnswers(ip, 1234, ca)
 			mu.Lock()
 			answers[project] = ok
 			mu.Unlock()
-		}(b.Project, b.Instance.IP)
+		}(b.Project, b.Instance.IP, b.CA)
 	}
 	wg.Wait()
 
@@ -980,7 +989,7 @@ func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
 			b.strikes = 0
 		default:
 			b.strikes++
-			if b.strikes >= builderStrikes && !busy[b.Project] {
+			if b.strikes >= builderStrikes && !busy[b.Project] || b.strikes >= builderBusyStrikes {
 				d.removeBuilderLocked(b, removedSilent)
 				continue
 			}
@@ -997,24 +1006,44 @@ func (d *Daemon) checkBuilders(present map[string]bool, listedAt time.Time) {
 }
 
 // answersWithin probes a builder's buildkitd up to tries times.
-func answersWithin(ip string, tries int) bool {
+func answersWithin(ip, caPEM string, tries int) bool {
 	for i := 0; i < tries; i++ {
-		if tcpOpen(ip, 1234) {
+		if buildkitdAnswers(ip, 1234, caPEM) {
 			return true
 		}
 	}
 	return false
 }
 
-// tcpOpen is a variable so tests do not need a listener.
-var tcpOpen = func(ip string, port int) bool {
-	c, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), 3*time.Second)
+// probeTimeout bounds each probe of a builder.
+var probeTimeout = 3 * time.Second
+
+// buildkitdAnswers reports whether buildkitd itself answers: it must complete
+// a TLS handshake with the builder's certificate (caPEM, its CA). A TCP
+// connect is not enough: a guest whose memory is full thrashes the page cache
+// for many minutes, and its kernel still accepts connections while buildkitd
+// never runs. The probe has no client certificate, so buildkitd may end the
+// handshake with an alert, which is an answer too. Without a usable CA the
+// connect alone counts.
+func probeBuildkitd(ip string, port int, caPEM string) bool {
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), probeTimeout)
 	if err != nil {
 		return false
 	}
-	_ = c.Close()
-	return true
+	defer func() { _ = c.Close() }()
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM([]byte(caPEM)) {
+		return true
+	}
+	_ = c.SetDeadline(time.Now().Add(probeTimeout))
+	err = tls.Client(c, &tls.Config{RootCAs: roots, ServerName: BuilderServerName, MinVersion: tls.VersionTLS12}).Handshake()
+	// crypto/tls reports an alert from the peer as a "remote error".
+	var remote *net.OpError
+	return err == nil || errors.As(err, &remote) && remote.Op == "remote error"
 }
+
+// buildkitdAnswers is a variable so tests do not need a listener.
+var buildkitdAnswers = probeBuildkitd
 
 func (d *Daemon) buildersFile() string {
 	return filepath.Join(filepath.Dir(d.cfg.Daemon.Socket), "builders.json")
@@ -1072,7 +1101,7 @@ func (d *Daemon) adoptBuilders(live map[string]bool) {
 			continue
 		}
 		// Two tries: one missed probe must not cost a project its warm cache.
-		if !answersWithin(b.Instance.IP, 2) {
+		if !answersWithin(b.Instance.IP, b.CA, 2) {
 			d.log.Warn("builder from previous run not answering, left for reconcile", "project", b.Project, "vm", b.Instance.ID)
 			continue
 		}
@@ -1248,7 +1277,8 @@ func serial() *big.Int {
 	return n
 }
 
-// buildkitdTOML points Docker Hub at the host's mirror (plain HTTP) and sets
+// buildkitdTOML caps the build steps run at once (builder.max_parallelism),
+// points Docker Hub at the host's mirror (plain HTTP) and sets
 // vm.insecure_registries: http://host:port as plain HTTP, host:port as TLS
 // without a certificate check. BuildKit, unlike Docker, does not fall back
 // from one to the other. One table per registry: TOML refuses duplicates.
@@ -1286,6 +1316,7 @@ func buildkitdTOML(cfg config.Config) string {
 	for _, r := range cfg.VM.InsecureRegistries {
 		table(config.RegistryHost(r), strings.HasPrefix(r, "http://"))
 	}
+	fmt.Fprintf(&b, "[worker.oci]\n  max-parallelism = %d\n", cfg.Builder.Parallelism())
 	return b.String()
 }
 

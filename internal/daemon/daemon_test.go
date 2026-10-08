@@ -46,7 +46,7 @@ func TestMain(m *testing.M) {
 	warmDocker = func(config.Config, *vm.Instance) error { return nil }
 	serviceActive = func(context.Context, string) bool { return false }
 	thinPoolUsage = func(context.Context) (float64, float64, error) { return 0, 0, errors.New("no lvs in tests") }
-	tcpOpen = func(string, int) bool { return false }
+	buildkitdAnswers = func(string, int, string) bool { return false }
 	code := m.Run()
 	_ = os.RemoveAll(root)
 	os.Exit(code)

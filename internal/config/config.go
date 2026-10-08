@@ -88,6 +88,24 @@ type Builder struct {
 	SavedCacheGB int `yaml:"saved_cache_gb"`
 	// PortBase: builder n is reached by job VMs at <bridge address>:PortBase+n.
 	PortBase int `yaml:"port_base"`
+	// MaxParallelism caps the build steps (RUN, COPY, ...) a builder runs at
+	// once, over all the builds of its project; the rest wait their turn. 0
+	// derives it from MemoryMB (Parallelism). Without a cap, every job of a
+	// pipeline builds in the one builder at once and a full guest memory
+	// thrashes the page cache instead of killing a process: the VM freezes.
+	MaxParallelism int `yaml:"max_parallelism"`
+}
+
+// BuildStepMB is the memory one build step is given when
+// builder.max_parallelism is derived.
+const BuildStepMB = 2048
+
+// Parallelism is the number of build steps a builder runs at once.
+func (b Builder) Parallelism() int {
+	if b.MaxParallelism > 0 {
+		return b.MaxParallelism
+	}
+	return max(1, b.MemoryMB/BuildStepMB)
 }
 
 // Pool keeps pre-booted microVMs so a job starts without waiting for a boot.
@@ -361,6 +379,9 @@ func (c Config) Validate() error {
 	if c.Builder.CacheMB < 1000 {
 		errs = append(errs, "builder.cache_mb must be at least 1000")
 	}
+	if c.Builder.MaxParallelism < 0 || c.Builder.MaxParallelism > 256 {
+		errs = append(errs, "builder.max_parallelism must be between 0 (from builder.memory_mb) and 256")
+	}
 	if c.Proxy.Enabled {
 		if host, port, err := net.SplitHostPort(c.Proxy.Listen); err != nil || net.ParseIP(host).To4() == nil || port == "" {
 			errs = append(errs, "proxy.listen must be the bridge address and a port, like 10.200.0.1:"+ProxyPort)
@@ -485,6 +506,9 @@ func pruneUnused(m map[string]any, cfg Config) {
 	}
 	if nw, ok := m["network"].(map[string]any); ok && len(cfg.Network.EgressDeny) == 0 {
 		delete(nw, "egress_deny")
+	}
+	if b, ok := m["builder"].(map[string]any); ok && cfg.Builder.MaxParallelism == 0 {
+		delete(b, "max_parallelism")
 	}
 }
 
