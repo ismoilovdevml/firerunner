@@ -370,7 +370,7 @@ func TestRegistryMirrors(t *testing.T) {
 // at 0 is not written, so an older binary still loads the file.
 func TestBuilderParallelism(t *testing.T) {
 	for _, c := range []struct{ memory, set, want int }{
-		{8192, 0, 4}, {16384, 0, 8}, {1024, 0, 1}, {8192, 6, 6},
+		{8192, 0, 1}, {16384, 0, 2}, {24576, 0, 4}, {1024, 0, 1}, {8192, 6, 6},
 	} {
 		b := Default().Builder
 		b.MemoryMB, b.MaxParallelism = c.memory, c.set

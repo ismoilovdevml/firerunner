@@ -97,8 +97,10 @@ type Builder struct {
 }
 
 // BuildStepMB is the memory one build step is given when
-// builder.max_parallelism is derived.
-const BuildStepMB = 2048
+// builder.max_parallelism is derived. Measured on KVM: one `dotnet build` of
+// a 60-project solution peaked at 4.8 GB on 4 vCPUs and 6.3 GB on 16 (MSBuild
+// starts a worker per CPU), so an 8 GB builder runs one such step at a time.
+const BuildStepMB = 6144
 
 // Parallelism is the number of build steps a builder runs at once.
 func (b Builder) Parallelism() int {

@@ -61,7 +61,7 @@ boot and counts its own size.
 | `builder.max` | `4` | the least recently used builder idle for 5 minutes makes room for a new one; while none is, a build goes without a cache |
 | `builder.idle_ttl` | `24h` | an unused builder is deleted; its cache is saved |
 | `builder.saved_cache_gb` | `100` | host disk for the caches of deleted builders; `0` saves none |
-| `builder.max_parallelism` | `0` | build steps (`RUN`, `COPY`, ...) a builder runs at once, over all its project's jobs; the rest wait. `0`: one per 2 GB of `builder.memory_mb` |
+| `builder.max_parallelism` | `0` | build steps (`RUN`, `COPY`, ...) a builder runs at once, over all its project's jobs; the rest wait. `0`: one per 6 GB of `builder.memory_mb` (a large .NET build step measured 4.8-6.3 GB) |
 
 When a builder is deleted because it was idle, its slot was needed, it was a week old, or its
 settings changed (not its size), its cache is copied to

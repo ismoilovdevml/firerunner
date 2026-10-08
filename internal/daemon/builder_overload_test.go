@@ -19,12 +19,12 @@ import (
 // setting the cap replaces builders, a new size alone does not.
 func TestBuildkitdTOMLCapsParallelism(t *testing.T) {
 	cfg := config.Default()
-	if s := buildkitdTOML(cfg); !strings.Contains(s, "[worker.oci]\n  max-parallelism = 4\n") {
-		t.Fatalf("8 GB builder without a step cap of 4:\n%s", s)
+	if s := buildkitdTOML(cfg); !strings.Contains(s, "[worker.oci]\n  max-parallelism = 1\n") {
+		t.Fatalf("8 GB builder without a step cap of 1:\n%s", s)
 	}
-	cfg.Builder.MemoryMB = 4096
+	cfg.Builder.MemoryMB = 16384
 	if s := buildkitdTOML(cfg); !strings.Contains(s, "max-parallelism = 2\n") {
-		t.Fatalf("4 GB builder without a step cap of 2:\n%s", s)
+		t.Fatalf("16 GB builder without a step cap of 2:\n%s", s)
 	}
 	cfg.VM.RegistryMirror = "http://10.200.0.1:5000"
 	cfg.Builder.MaxParallelism = 3
