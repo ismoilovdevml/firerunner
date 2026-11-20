@@ -20,8 +20,15 @@ The release's `checksums.txt` must carry the release signature (Ed25519, key in
 `internal/upgrade/release-signing.pub`), the binary must match its checksum and say it is the
 version asked for; then it is replaced in place. v0.1.0 and v0.1.1 were published before releases
 were signed: `--allow-unsigned` installs them. Running jobs, pre-booted VMs and builders keep
-running. To upgrade the host stack (containerd, Firecracker, flintlock, gitlab-runner, network),
-run the installer again.
+running, so `firerunner upgrade` needs no drain. To upgrade the host stack (containerd,
+Firecracker, flintlock, gitlab-runner, network), run the installer again. While jobs run it leaves
+the restarts and the gitlab-runner upgrade for a later run; drained, it does them at once:
+
+```bash
+sudo firerunner drain              # no new jobs; returns once the running ones finished
+curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo bash
+sudo firerunner undrain            # take jobs again
+```
 
 v0.1.1 and older do not check signatures, so their `firerunner upgrade` does not either. For that
 one upgrade, run the installer instead (`FR_VERSION=<version>`), which checks it.
@@ -40,6 +47,47 @@ says so. `sudo firerunner doctor` warns while the API runs without TLS and when 
 (also the one flintlockd serves) expires within 90 days; a run of the installer renews them and
 restarts flintlockd when no job runs.
 
+### Drain
+
+Drain the host before work that would stop running jobs: a reboot, the installer's restarts,
+[rebuilding the thin pool](#rebuilding-the-thin-pool). For example (times vary):
+
+```console
+$ sudo firerunner drain
+drain: the daemon boots no pool VMs and no builders
+drain: gitlab-runner takes no new jobs and exits once its running jobs finished
+waiting 0s: 2 jobs running, gitlab-runner finishing its jobs
+waiting 6m14s: 1 job running, gitlab-runner finishing its jobs
+waiting 9m2s: gitlab-runner finishing its jobs
+drained: no job runs and gitlab-runner has stopped. Safe to upgrade or reboot;
+firerunner undrain takes jobs again (a reboot starts gitlab-runner and ends the drain)
+```
+
+- gitlab-runner stops gracefully: it asks GitLab for no new jobs and exits once its running jobs
+  finished. No job fails: the ones it did not take stay pending in GitLab, for another runner with
+  the same tags or for this host after `undrain`.
+- The daemon boots no pool VMs and no builders. Jobs gitlab-runner took before the drain still
+  get the ready pool VMs and their project's builder; a job whose project has none builds without
+  the layer cache.
+- `drain` prints a line whenever what still runs changes, and every minute. It waits at most
+  `daemon.job_max_age` plus `daemon.reconcile_interval`, the longest a job can run (`--timeout`).
+  A timeout or Ctrl-C ends the wait, not the drain: `drain` again waits again.
+- `firerunner status` shows it on the `Drained` line, `firerunner_drained` is 1, and
+  `FireRunnerServiceDown` does not fire for the stopped gitlab-runner.
+- The drain outlives a daemon restart (`firerunner upgrade`), not a reboot: gitlab-runner starts at
+  boot and takes jobs. The installer starts gitlab-runner when it installs a new version of it, and
+  from then on it takes jobs (`status` says so): before more work, `drain` again.
+
+`sudo firerunner undrain` (or `drain --cancel`) starts gitlab-runner again, if `drain` stopped it,
+and lets the daemon boot again. While gitlab-runner still finishes jobs it ran when drained, it
+cannot take new ones; it starts again once they are done.
+
+To stop gitlab-runner gracefully, `drain` adds a runtime drop-in,
+`/run/systemd/system/gitlab-runner.service.d/zz-firerunner-drain.conf` (`KillMode=mixed`,
+`KillSignal=SIGQUIT`, `TimeoutStopSec=infinity`), checks that systemd took it, and stops the unit;
+`undrain` removes it. Without it, `systemctl stop gitlab-runner` sends SIGTERM to every job's
+processes and cancels the jobs.
+
 ## microVMs
 
 ```bash
@@ -51,7 +99,7 @@ sudo firerunner builder list
 
 VMs that no job owns are deleted automatically every minute.
 
-To drain a host, pause the runner in GitLab and wait until `vm list` shows no `job` VMs.
+To take no new jobs and wait for the running ones, [drain](#drain) the host: `sudo firerunner drain`.
 
 ## Rebuilding the thin pool
 
@@ -64,13 +112,12 @@ and root filesystem again on the first boot. It keeps the registry mirrors, the 
 the saved builder caches (`/var/lib/firerunner`, on the root disk). Running builders lose what they
 cached since their last save. The host takes no jobs while it runs.
 
-1. Drain the host: pause the runner in GitLab and wait until `sudo firerunner vm list` shows no
-   `job` VMs.
-2. Stop taking jobs and refilling the pool, then delete the remaining microVMs. flintlockd deletes
-   in the background: repeat `vm list` until it is empty.
+1. [Drain](#drain) the host: `sudo firerunner drain`. It returns once no job runs.
+2. Stop the daemon, then delete the remaining microVMs. flintlockd deletes in the background:
+   repeat `vm list` until it is empty.
 
    ```bash
-   sudo systemctl stop gitlab-runner firerunner
+   sudo systemctl stop firerunner
    sudo firerunner vm rm --all
    sudo firerunner vm list
    ```
@@ -100,11 +147,11 @@ cached since their last save. The host takes no jobs while it runs.
    curl -sfL https://raw.githubusercontent.com/ismoilovdevml/firerunner/main/install.sh | sudo FR_DISK=/dev/sdb bash
    ```
 
-6. Check the new pool, start gitlab-runner and resume the runner in GitLab:
+6. Check the new pool and take jobs again:
 
    ```bash
    sudo lvs -o lv_name,chunk_size,zero flintlock/thinpool   # 64.00k, zero
-   sudo systemctl start gitlab-runner
+   sudo firerunner undrain
    sudo firerunner doctor
    ```
 
@@ -180,6 +227,7 @@ Critical. `flintlockd`, `containerd-flintlock`, `firerunner-net`, `firerunner-dn
 `gitlab-runner` has been inactive for 3 minutes: jobs fail (no microVM, network or DHCP) or are not
 taken from GitLab.
 
+- Not for gitlab-runner while the host is [drained](#drain): `firerunner drain` stops it on purpose.
 - Check: `journalctl -u <service> -n 100`, `sudo firerunner doctor`.
 - Fix: `sudo systemctl start <service>`. Never restart `firerunner-net` while jobs run: stopping it
   removes the bridge; its rules reload with `systemctl reload firerunner-net`.
