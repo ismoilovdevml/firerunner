@@ -116,7 +116,7 @@ func TestBuilderBootPhases(t *testing.T) {
 		setupT   = 5 * time.Second
 	)
 	sshDrop := func(t *testing.T) error { return fmt.Errorf("stream: %w", exitErr(t, 255)) }
-	refused := func(t *testing.T) error { return fmt.Errorf("tar: unexpected EOF: %w", exitErr(t, 1)) }
+	refused := func(t *testing.T) error { return fmt.Errorf("tar: unexpected EOF: %w", exitErr(t, loadArchiveRefused)) }
 	for _, tc := range []struct {
 		name        string
 		cache       bool // a saved cache exists
