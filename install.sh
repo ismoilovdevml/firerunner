@@ -259,12 +259,23 @@ EGRESS_FILE="$CONF_DIR/egress-deny"
 # jobs_running: microVM jobs are in progress on this host.
 jobs_running() { compgen -G "/run/firerunner/jobs/*.json" >/dev/null; }
 
+# drained: `firerunner drain` stopped (or is stopping) gitlab-runner on
+# purpose; only `firerunner undrain` starts it again. The installer never
+# starts or restarts it then: its next start picks up what changed.
+DRAIN_FILE=/run/firerunner/drain.json
+drained() { [[ -f $DRAIN_FILE ]]; }
+
 # restart_when_idle SERVICE: restart now or, while jobs run, remember it in
 # PENDING_FILE, so a later run of the installer when idle does it
 # (containerd, flintlockd, the registry mirror and gitlab-runner serve jobs).
 PENDING_FILE=/var/lib/firerunner/pending-restarts
 PENDING=""
 restart_when_idle() {
+    if [[ $1 == gitlab-runner ]] && drained; then
+        log "  gitlab-runner not restarted: the host is drained (firerunner undrain starts it with the change)"
+        [[ -f $PENDING_FILE ]] && sed -i "/^restart $1\$/d" "$PENDING_FILE"
+        return 0
+    fi
     if systemctl is-active -q "$1" && jobs_running; then
         warn "  $1 not restarted: jobs are running (re-run the installer when the runner is idle)"
         PENDING+="$1 "
@@ -288,6 +299,10 @@ apply_pending() {
     fi
     local action svc
     while read -r action svc; do
+        if [[ $svc == gitlab-runner ]] && drained; then
+            log "  gitlab-runner not restarted (pending): the host is drained (firerunner undrain starts it with the change)"
+            continue
+        fi
         case $action in
             restart) log "  restarting $svc (pending)"; systemctl restart "$svc" ;;
             stop)    log "  stopping $svc (pending)"; systemctl disable --now -q "$svc" ;;
@@ -1968,11 +1983,18 @@ EOF
 
     local have=""
     [[ -x $BIN_DIR/gitlab-runner ]] && have=$($BIN_DIR/gitlab-runner --version 2>/dev/null | awk '/^Version:/ {print $2}' || true)
-    if [[ -n $have && "$have" != "${GITLAB_RUNNER_VERSION}" ]] && systemctl is-active -q gitlab-runner && jobs_running; then
+    if [[ "$have" == "${GITLAB_RUNNER_VERSION}" ]]; then
+        :
+    elif drained && [[ $(systemctl is-active gitlab-runner 2>/dev/null || true) =~ ^(active|activating|deactivating|reloading)$ ]]; then
+        # Draining: gitlab-runner finishes its jobs and stops by itself (a stop
+        # now would wait for them, a start would undo the drain).
+        warn "gitlab-runner $have not upgraded to v${GITLAB_RUNNER_VERSION}: the host is being drained (re-run the installer once it is)"
+        PENDING+="gitlab-runner(upgrade) "
+    elif [[ -n $have ]] && systemctl is-active -q gitlab-runner && jobs_running; then
         # Stopping gitlab-runner would abort the running jobs; the next run when idle upgrades it.
         warn "gitlab-runner $have not upgraded to v${GITLAB_RUNNER_VERSION}: jobs are running"
         PENDING+="gitlab-runner(upgrade) "
-    elif [[ "$have" != "${GITLAB_RUNNER_VERSION}" ]]; then
+    else
         log "installing gitlab-runner v${GITLAB_RUNNER_VERSION}"
         local base="https://gitlab-runner-downloads.s3.amazonaws.com/v${GITLAB_RUNNER_VERSION}"
         local bin="gitlab-runner-linux-${ARCH}"
@@ -1983,9 +2005,15 @@ EOF
             want=$(awk -v f="binaries/$bin" '$2==f {print $1}' "$TMP_DIR/runner.sums")
         }
         verify "$TMP_DIR/$bin" "$want"
-        systemctl stop gitlab-runner 2>/dev/null || true
-        install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/gitlab-runner"
-        systemctl start gitlab-runner 2>/dev/null || true
+        if drained; then
+            # Stopped by the drain: the new binary runs from `firerunner undrain`.
+            install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/gitlab-runner"
+            log "  gitlab-runner stays stopped: the host is drained (firerunner undrain starts it)"
+        else
+            systemctl stop gitlab-runner 2>/dev/null || true
+            install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/gitlab-runner"
+            systemctl start gitlab-runner 2>/dev/null || true
+        fi
     fi
 }
 
