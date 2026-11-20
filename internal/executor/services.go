@@ -70,8 +70,11 @@ func (s Service) Aliases() []string {
 // docker executor's health check (a port that never opens is only a warning).
 //
 // With the proxy, noProxy (the proxy exceptions plus the service aliases)
-// replaces the VM's no_proxy for stage scripts without image:, and extra
-// (vm.ContainerArgs) is passed to each service container.
+// replaces the VM's no_proxy in /etc/environment, and extra (vm.ContainerArgs)
+// is passed to each service container. pam_env reads /etc/environment once
+// per SSH connection, so only connections opened later see the new no_proxy:
+// stages, which share the connection prepare opened before, export it
+// themselves (see Run).
 func ServicesScript(services []Service, noProxy string, extra ...string) string {
 	var b strings.Builder
 	b.WriteString("set -e\n")

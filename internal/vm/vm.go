@@ -225,7 +225,8 @@ func Spec(cfg config.Config, id, mac, sshPubKey string, hostKey HostKey, labels 
 		np := NoProxy(cfg)
 		cli, _ := json.Marshal(map[string]any{"proxies": DockerCLIProxies(cfg, np)})
 		files = append(files,
-			// pam_env reads it for every SSH session: stage scripts, git, apt.
+			// pam_env reads it for every SSH connection (once, when it opens;
+			// multiplexed sessions share it): stage scripts, git, apt.
 			map[string]any{"path": "/etc/environment", "append": true, "content": strings.Join(ProxyEnv(cfg, np), "\n") + "\n"},
 			map[string]any{"path": "/root/.docker/config.json", "permissions": "0600", "content": string(cli)})
 	}

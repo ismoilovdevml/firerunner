@@ -638,9 +638,21 @@ func Run(ctx context.Context, cfg config.Config, script, stage string) error {
 				buildWith(cfg, id, st)
 			}
 		}
+		var prefix string
+		if cfg.Proxy.Enabled && len(st.ServiceAliases) > 0 {
+			// The services script put the aliases into /etc/environment, but
+			// pam_env read that file once, when prepare opened the connection
+			// every stage shares: without this the stage would still send its
+			// requests to the services through the proxy.
+			np := shellQuote(vm.NoProxy(cfg, st.ServiceAliases...))
+			prefix += "export no_proxy=" + np + " NO_PROXY=" + np + "\n"
+		}
 		if st.BuilderProject != "" && isUserStage(stage) {
 			// `docker build` only uses a buildx builder named in the environment.
-			script = io.MultiReader(strings.NewReader("export BUILDX_BUILDER="+BuilderName+"\n"), script)
+			prefix += "export BUILDX_BUILDER=" + BuilderName + "\n"
+		}
+		if prefix != "" {
+			script = io.MultiReader(strings.NewReader(prefix), script)
 		}
 		cmd := vm.SSH(cfg, &st.Instance, "/bin/bash")
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = script, os.Stdout, os.Stderr
