@@ -1,8 +1,10 @@
 package host
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // config.toml is edited in place rather than decoded and re-encoded, so an
@@ -230,18 +232,85 @@ func stripBlanks(s string) string {
 	return b.String()
 }
 
+// tomlQuote writes s as a TOML basic string with the escapes TOML 1.0
+// defines only: strconv.Quote also writes \a, \v and \xNN, which TOML 1.0
+// readers refuse. Other control characters become \uXXXX.
+func tomlQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				fmt.Fprintf(&b, `\u%04X`, r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
 // tomlUnquote returns the content of a single-line basic or literal string;
-// ok is false for any other value.
+// ok is false for any other value. Basic strings take TOML's escapes, with
+// TOML 1.1's \e and \xHH, and no others: Go's strconv.Unquote refuses \e and
+// accepts \a or \v, which TOML does not.
 func tomlUnquote(v string) (string, bool) {
 	switch {
 	case len(v) < 2 || strings.HasPrefix(v, `"""`) || strings.HasPrefix(v, "'''"):
 		return "", false
 	case v[0] == '\'' && v[len(v)-1] == '\'':
-		return v[1 : len(v)-1], true
-	case v[0] == '"':
-		// TOML's basic-string escapes are a subset of Go's.
-		s, err := strconv.Unquote(v)
-		return s, err == nil
+		body := v[1 : len(v)-1]
+		return body, !strings.ContainsAny(body, "'\n")
+	case v[0] != '"' || v[len(v)-1] != '"':
+		return "", false
 	}
-	return "", false
+	body := v[1 : len(v)-1]
+	var b strings.Builder
+	for i := 0; i < len(body); {
+		c := body[i]
+		if c == '"' || c == '\n' {
+			return "", false
+		}
+		if c != '\\' {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		if i+1 >= len(body) {
+			return "", false
+		}
+		e := body[i+1]
+		i += 2
+		if simple, ok := map[byte]byte{'b': '\b', 't': '\t', 'n': '\n', 'f': '\f', 'r': '\r', '"': '"', '\\': '\\', 'e': 0x1b}[e]; ok {
+			b.WriteByte(simple)
+			continue
+		}
+		digits := map[byte]int{'x': 2, 'u': 4, 'U': 8}[e]
+		if digits == 0 || i+digits > len(body) {
+			return "", false
+		}
+		n, err := strconv.ParseUint(body[i:i+digits], 16, 32)
+		if err != nil || !utf8.ValidRune(rune(n)) {
+			return "", false
+		}
+		b.WriteRune(rune(n))
+		i += digits
+	}
+	return b.String(), true
 }

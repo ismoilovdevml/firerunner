@@ -75,7 +75,7 @@ func TestEnsureRunnerEnvMultiLine(t *testing.T) {
 	got := ensureRunnerEnv(edited, cacheEnv...)
 	const oldEnv = "environment = [\n    \"FF_USE_FASTZIP=false\", # \"CACHE_COMPRESSION_LEVEL=slow\" is only a comment\n    'NO_PROXY=a,b',\n  ]"
 	want := strings.Replace(edited, oldEnv,
-		`environment = ["FF_USE_FASTZIP=false", "NO_PROXY=a,b", "CACHE_COMPRESSION_LEVEL=fastest"]`, 1)
+		`environment = ["FF_USE_FASTZIP=false", 'NO_PROXY=a,b', "CACHE_COMPRESSION_LEVEL=fastest"]`, 1)
 	if !strings.Contains(edited, oldEnv) || got != want {
 		t.Fatalf("ensureRunnerEnv =\n%s\nwant\n%s", got, want)
 	}
