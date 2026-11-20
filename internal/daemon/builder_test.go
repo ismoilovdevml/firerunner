@@ -228,6 +228,9 @@ func TestExpireBuilders(t *testing.T) {
 		"4": readyBuilder("4", 20004, time.Minute, "old"),                           // old config, busy
 		"5": {Project: "5", Port: 20005, LastUsed: time.Now().Add(-24 * time.Hour)}, // still booting
 	}
+	if err := d.mapBuilderPorts(*d.builders["2"]); err != nil {
+		t.Fatal(err)
+	}
 	d.expireBuilders()
 	for _, p := range []string{"1", "4", "5"} {
 		if _, ok := d.builders[p]; !ok {
@@ -608,6 +611,54 @@ func TestBuilderPortMappedBeforeReady(t *testing.T) {
 	}
 }
 
+// A builder whose port cannot be mapped is not declared ready: jobs would get
+// a port that leads nowhere (or to a former builder's address). The boot
+// fails like any other: buildkitd phase failed, a boot failure counted, the
+// VM deleted and the project cooling down before the next try.
+func TestBuilderPortMappingFailureFailsTheBoot(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	boots := stubBoot(t, nil)
+	nft := stubNft(t)
+	d, srv := newTestDaemon(t)
+	old := nftRun
+	nftRun = func(script string, args ...string) (string, error) {
+		if script != "" {
+			return "", errors.New("nft: Could not process rule: No such file or directory")
+		}
+		return nft.run(script, args...)
+	}
+	t.Cleanup(func() { nftRun = old })
+	failuresBefore := metricValue(t, d, "firerunner_vm_boot_failures_total", "builder")
+
+	if got := d.Builder("3", true).State; got != BuilderBooting {
+		t.Fatalf("Builder = %s, want booting", got)
+	}
+	d.bootBuilder(context.Background(), d.cfg, "3")
+	srv.WaitDeleted(t, "uid-"+boots.last(), 2*time.Second)
+
+	d.mu.Lock()
+	b, failedAt := d.builders["3"], d.builderFailed["3"]
+	d.mu.Unlock()
+	if b != nil {
+		t.Fatalf("builder kept after its port mapping failed: ready=%v", b.ready)
+	}
+	if failedAt.IsZero() {
+		t.Fatal("failed boot does not cool the project down")
+	}
+	if n := phaseCount(d, "buildkitd", "failed"); n != 1 {
+		t.Fatalf("buildkitd failed observed %d times, want 1", n)
+	}
+	if n := phaseCount(d, "buildkitd", "ok"); n != 0 {
+		t.Fatalf("buildkitd ok observed %d times, want 0", n)
+	}
+	if got := metricValue(t, d, "firerunner_vm_boot_failures_total", "builder") - failuresBefore; got != 1 {
+		t.Fatalf("builder boot failures +%v, want +1", got)
+	}
+	if got := d.Builder("3", true).State; got != BuilderBusy {
+		t.Fatalf("right after the failed boot: %s, want busy", got)
+	}
+}
+
 func TestBuilderPersistsLastUsedAtMostOncePerMinute(t *testing.T) {
 	stubBuilders(t, func(string) bool { return true })
 	d, _ := newTestDaemon(t)
@@ -656,6 +707,9 @@ func TestRemoveBuildersKeepsBusyUnlessForced(t *testing.T) {
 		"101": readyBuilder("101", 20001, 0, spec),               // a job builds on it
 		"8":   readyBuilder("8", 20002, time.Hour, spec),         // idle
 		"9":   {Project: "9", Port: 20003, LastUsed: time.Now()}, // still booting
+	}
+	if err := d.mapBuilderPorts(*d.builders["101"], *d.builders["8"]); err != nil {
+		t.Fatal(err)
 	}
 	dc := serveAPI(t, d)
 
@@ -809,6 +863,23 @@ func TestBuildkitdTOMLHTTPSMirror(t *testing.T) {
 	cfg.VM.InsecureRegistries = []string{"mirror.corp:5000"}
 	if s := buildkitdTOML(cfg); !strings.Contains(s, "[registry.\"mirror.corp:5000\"]\n  insecure = true") {
 		t.Fatalf("https mirror listed as insecure:\n%s", s)
+	}
+}
+
+// vm.registry_mirror with a trailing slash names the same host as without
+// one: buildkitd takes a mirror as host[:port], like vm.registry_mirrors.
+func TestBuildkitdTOMLMirrorTrailingSlash(t *testing.T) {
+	for _, mirror := range []string{"http://10.200.0.1:5000/", "https://mirror.corp:5000/"} {
+		cfg := config.Default()
+		cfg.VM.RegistryMirror = mirror
+		s := buildkitdTOML(cfg)
+		host := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(mirror, "http://"), "https://"), "/")
+		if strings.Contains(s, host+"/") || !strings.Contains(s, "mirrors = [\""+host+"\"]") {
+			t.Fatalf("mirror %s:\n%s", mirror, s)
+		}
+		if strings.HasPrefix(mirror, "http://") && !strings.Contains(s, "[registry.\""+host+"\"]\n  http = true") {
+			t.Fatalf("plain-HTTP mirror %s has no http table:\n%s", mirror, s)
+		}
 	}
 }
 
@@ -1021,6 +1092,38 @@ func TestBuilderBootCutByShutdownUnmapsPort(t *testing.T) {
 	}
 	if d.builders["3"].ready {
 		t.Fatal("builder marked ready while shutting down")
+	}
+}
+
+// builders.json that cannot be written is reported, like pool.json: a
+// restart that does not find the builders deletes them without their caches.
+// A failed write leaves no temp file behind.
+func TestBuildersFileWriteFailureIsReported(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		block func(file string) error
+	}{
+		{"temp file not writable", func(file string) error { return os.Mkdir(file+".tmp", 0o700) }},
+		{"rename refused", func(file string) error { return os.MkdirAll(filepath.Join(file, "x"), 0o700) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			stubBuilders(t, func(string) bool { return true })
+			d, _ := newTestDaemon(t)
+			logs := captureLog(d)
+			d.builders["1"] = readyBuilder("1", d.cfg.Builder.PortBase+1, 0, builderSpec(d.cfg))
+			if err := c.block(d.buildersFile()); err != nil {
+				t.Fatal(err)
+			}
+			recordBuilders(d)
+			if out := logs.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "builders.json") {
+				t.Fatalf("builders.json not written, but nothing was reported:\n%s", out)
+			}
+			if c.name == "rename refused" {
+				if _, err := os.Stat(d.buildersFile() + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("temp file left behind: %v", err)
+				}
+			}
+		})
 	}
 }
 
@@ -1305,7 +1408,7 @@ func TestStaleBuilderPortsAreUnmapped(t *testing.T) {
 		go func() { done <- d.mapBuilderPorts(*b) }()
 		<-inTx
 		unmapDone := make(chan struct{})
-		go func() { d.unmapBuilderPort(nftRun, 20001); close(unmapDone) }()
+		go func() { d.unmapBuilderPort(nftRun, 20001, b.Instance.IP); close(unmapDone) }()
 		time.Sleep(100 * time.Millisecond)
 		early := unmapped.Load()
 		close(release)
@@ -1476,6 +1579,56 @@ func TestEvictionIdleGuard(t *testing.T) {
 	}
 	if _, ok := d.builders["8"]; ok {
 		t.Fatal("idle builder kept its slot")
+	}
+}
+
+// An evicted builder's port goes to the next builder at once, while the old
+// builder's unmap runs in the background. When that unmap only gets nftMu
+// after the new builder mapped the port (nft slow under a reconcile), it must
+// leave the new builder's mapping alone; one still leading to the old
+// builder's VM is removed.
+func TestEvictedBuilderUnmapsOnlyItsOwnMapping(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		newFirst bool // the new builder's mapping landed before the old unmap ran
+		want     string
+	}{
+		{"new builder mapped first", true, "10.200.0.99 . 1234"},
+		{"old mapping still in place", false, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			stubBuilders(t, func(string) bool { return true })
+			nft := stubNft(t)
+			d, _ := newTestDaemon(t)
+			d.mu.Lock()
+			d.cfg.Builder.Max = 1
+			port := d.cfg.Builder.PortBase + 1
+			d.mu.Unlock()
+			old := readyBuilder("8", port, time.Hour, builderSpec(d.cfg))
+			d.builders["8"] = old
+			nft.elems = map[int]string{port: old.Instance.IP + " . 1234"}
+
+			d.nftMu.Lock() // a reconcile's nft run holds the map
+			info := d.Builder("9", true)
+			if info.State != BuilderBooting || info.Port != port {
+				d.nftMu.Unlock()
+				t.Fatalf("Builder = %+v, want booting on the evicted builder's port %d", info, port)
+			}
+			if c.newFirst {
+				nft.mu.Lock()
+				nft.elems[port] = "10.200.0.99 . 1234"
+				nft.mu.Unlock()
+			}
+			d.nftMu.Unlock()
+			d.bg.Wait()
+
+			nft.mu.Lock()
+			got := nft.elems[port]
+			nft.mu.Unlock()
+			if got != c.want {
+				t.Fatalf("port %d maps to %q after the old builder's unmap, want %q\n%s", port, got, c.want, nft)
+			}
+		})
 	}
 }
 

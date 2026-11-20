@@ -3,6 +3,7 @@ package upgrade
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -149,6 +151,13 @@ func Run(ctx context.Context, tag, current string, opts Options) (*Result, error
 		return nil, fmt.Errorf("checksum mismatch for %s: got %s, want %s", asset, got, want)
 	}
 	if _, err := tmp.Write(bin); err != nil {
+		_ = tmp.Close()
+		return nil, err
+	}
+	// On disk before the rename: a crash right after it must not leave an
+	// empty or partial binary under the executable's name.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
 		return nil, err
 	}
 	if err := tmp.Close(); err != nil {
@@ -165,10 +174,84 @@ func Run(ctx context.Context, tag, current string, opts Options) (*Result, error
 	if err := releaseMatches(tag, next); err != nil {
 		return nil, err
 	}
+	if err := refuseDowngrade(tag, current, next); err != nil {
+		return nil, err
+	}
 	if err := os.Rename(tmp.Name(), exe); err != nil {
 		return nil, fmt.Errorf("replacing %s: %w", exe, err)
 	}
+	// The rename itself is only durable once the directory is (as config.Save).
+	if dir, err := os.Open(filepath.Dir(exe)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
 	return &Result{From: current, To: next, Changed: true, Unsigned: unsigned}, nil
+}
+
+// refuseDowngrade: "latest" moves a host forward only. A release older than
+// the running one (the host runs a newer tag, or an older signed release is
+// served as latest) is installed only when asked for by its tag. Versions
+// that are not vMAJOR[.MINOR[.PATCH]][-PRE] (edge-<sha>, dev) are not
+// compared: leaving edge for the stable line is a choice, not a downgrade.
+func refuseDowngrade(tag, current, next string) error {
+	if tag != "latest" {
+		return nil
+	}
+	cur, ok1 := parseVersion(current)
+	nxt, ok2 := parseVersion(next)
+	if ok1 && ok2 && compareVersions(nxt, cur) < 0 {
+		return fmt.Errorf("the latest release is firerunner %s, older than this %s; not installing it "+
+			"(firerunner upgrade --version %s installs it anyway)", next, current, next)
+	}
+	return nil
+}
+
+// version is a parsed vMAJOR[.MINOR[.PATCH]][-PRE][+BUILD].
+type version struct {
+	num [3]int
+	pre string
+}
+
+func parseVersion(s string) (version, bool) {
+	var v version
+	rest, ok := strings.CutPrefix(s, "v")
+	if !ok {
+		return v, false
+	}
+	rest, _, _ = strings.Cut(rest, "+")
+	rest, v.pre, _ = strings.Cut(rest, "-")
+	parts := strings.Split(rest, ".")
+	if len(parts) > 3 {
+		return v, false
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil { // "+" and "-" are cut above, so no sign gets here
+			return v, false
+		}
+		v.num[i] = n
+	}
+	return v, true
+}
+
+// compareVersions is -1, 0 or 1 as a is older than, the same as or newer
+// than b. A pre-release is older than its release; two pre-releases of the
+// same version compare as text.
+func compareVersions(a, b version) int {
+	for i := range a.num {
+		if c := cmp.Compare(a.num[i], b.num[i]); c != 0 {
+			return c
+		}
+	}
+	switch {
+	case a.pre == b.pre:
+		return 0
+	case a.pre == "":
+		return 1
+	case b.pre == "":
+		return -1
+	}
+	return strings.Compare(a.pre, b.pre)
 }
 
 // releaseMatches: the binary says it is the release asked for, so an older

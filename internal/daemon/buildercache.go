@@ -1,12 +1,14 @@
 package daemon
 
 import (
+	"archive/tar"
 	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -73,10 +75,58 @@ const (
 
 	builderSizeScript = builderStop + ` && ` + builderVolume + ` && ` + builderArchive + ` --totals -cf /dev/null` + builderMembers + ` 2>&1`
 	builderSaveScript = builderStop + ` && ` + builderVolume + ` && ` + builderArchive + ` -cf -` + builderMembers
-	builderLoadScript = `docker volume create buildkit >/dev/null && ` + builderVolume +
-		` && tar -C "$mp" -xf - && [ -e "$mp/` + builderMarker + `" ] && rm -f "$mp/` + builderMarker + `"` +
-		` || { docker volume rm -f buildkit >/dev/null 2>&1; exit 1; }`
+	// The load exits loadArchiveRefused only when tar fails or the archive
+	// ends without the marker, and loadVMFailed when the VM cannot take a
+	// cache at all (dockerd, the volume). Either way the volume is removed.
+	builderLoadUndo   = `{ docker volume rm -f buildkit >/dev/null 2>&1; exit `
+	builderLoadScript = `{ docker volume create buildkit >/dev/null && ` + builderVolume + `; } || ` + builderLoadUndo + `4; }; ` +
+		`tar -C "$mp" -xf - || ` + builderLoadUndo + `3; }; ` +
+		`[ -e "$mp/` + builderMarker + `" ] || ` + builderLoadUndo + `3; }; ` +
+		`rm -f "$mp/` + builderMarker + `" || ` + builderLoadUndo + `4; }`
 )
+
+// Exit statuses of builderLoadScript. tar also fails when it cannot write
+// (the VM's disk full, an I/O error), not only on a broken archive, so
+// loadArchiveRefused alone does not condemn the saved copy: the host reads it
+// again (verifyCacheArchive) before deleting it.
+const (
+	loadArchiveRefused = 3
+	loadVMFailed       = 4
+)
+
+// errCacheCorrupt: a saved cache file is not a whole archive.
+var errCacheCorrupt = errors.New("saved builder cache is not a complete archive")
+
+// verifyCacheArchive reads the saved cache f from its start the way a restore
+// does (the header, then the archive) and reports errCacheCorrupt when the
+// archive is broken or ends without the marker; any other error (ctx ended)
+// means it could not tell, and nil that the file is whole.
+func verifyCacheArchive(ctx context.Context, f *os.File) error {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	r := bufio.NewReader(f)
+	readCacheHeader(r) // a legacy copy has none: nothing is consumed then
+	tr := tar.NewReader(r)
+	last := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		h, err := tr.Next() // reads past the previous member's data: a cut-off file fails here
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("%w: %v", errCacheCorrupt, err)
+		}
+		last = h.Name
+	}
+	if path.Clean(last) != builderMarker {
+		return fmt.Errorf("%w: it ends without %s", errCacheCorrupt, builderMarker)
+	}
+	return nil
+}
 
 // Remote steps are variables so tests run without VMs.
 var (
@@ -407,10 +457,12 @@ func (d *Daemon) makeRoomForCache(project string, size, limit, reserved int64) e
 // missing, stale or failed when the builder starts empty or the error is not
 // nil (failed also when the copy cannot be opened). A copy written by
 // another builder image than cfg's is deleted unread. A copy that tar or the
-// completeness check refuses is deleted, so it is not tried again, and the
-// volume is removed so buildkitd starts empty. A load that failed on the way
-// (the SSH connection, a timeout) keeps the copy and returns an error: the VM
-// may hold part of a cache and is not used, and the next builder retries.
+// completeness check refuses, and that the host cannot read whole either
+// (verifyCacheArchive), is deleted, so it is not tried again, and the volume
+// is removed so buildkitd starts empty. Any other failed load (the SSH
+// connection, a timeout, dockerd, the VM's disk) keeps the copy and returns
+// an error: the VM may hold part of a cache and is not used, and the next
+// builder retries.
 func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, project string, inst *vm.Instance) (string, error) {
 	file := builderCacheFile(project)
 	f, err := os.Open(file)
@@ -437,28 +489,43 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 			"project", project, "cache_image", image, "image", cfg.Builder.Image)
 		return "stale", nil
 	}
+	// The modification time orders caches for makeRoomForCache, oldest
+	// dropped first: this one is in use from now on. Touched after the load
+	// instead, it would be the first candidate for another project's save
+	// during a long load.
+	now := time.Now()
+	_ = os.Chtimes(file, now, now)
 	lctx, cancel := context.WithTimeout(ctx, builderCacheTimeout)
 	defer cancel()
 	start := time.Now()
 	if err := builderCacheLoad(lctx, cfg, inst, r); err != nil {
 		d.metrics.builderCache.WithLabelValues("restore", "failed").Inc()
-		// Only the VM's own verdict (tar or the marker check: exit 1..254) says the
-		// copy is bad. 255 is ssh failing, -1 ssh killed (e.g. by the OOM killer).
-		if code := exitCode(err); lctx.Err() != nil || code <= 0 || code == 255 {
+		// Only tar refusing the archive (loadArchiveRefused) may mean the copy
+		// is bad; ssh failing (255), ssh killed (-1, e.g. by the OOM killer) or
+		// the VM not taking the cache (loadVMFailed: dockerd, the volume) do
+		// not. tar fails the same way on a full VM disk, so the host reads
+		// the copy again and only deletes it if that read fails as well.
+		keep := lctx.Err() != nil || exitCode(err) != loadArchiveRefused
+		if !keep {
+			if verr := verifyCacheArchive(lctx, f); !errors.Is(verr, errCacheCorrupt) {
+				keep = true
+				if verr != nil {
+					err = fmt.Errorf("%w (the host could not read the copy again: %v)", err, verr)
+				}
+			}
+		}
+		if keep {
 			// The copy may be fine. A builder started empty would, once deleted,
 			// save its empty cache over it: fail this boot, the next one retries.
 			return "failed", fmt.Errorf("saved builder cache not restored (kept, the next builder retries it): %w", err)
 		}
-		_ = os.Remove(file)
+		d.dropRefusedCache(file, f)
 		d.log.Warn("saved builder cache refused and deleted, starting empty", "project", project, "err", err)
 		if werr := wipeBuilderCache(ctx, cfg, inst); werr != nil {
 			return "failed", fmt.Errorf("partly restored builder cache could not be removed: %w", werr)
 		}
 		return "failed", nil
 	}
-	// The modification time orders caches for makeRoomForCache: this one is in use.
-	now := time.Now()
-	_ = os.Chtimes(file, now, now)
 	result := "ok"
 	if legacy {
 		result = "legacy" // its next save writes the header
@@ -467,6 +534,26 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 	d.log.Info("builder cache restored", "project", project, "bytes", size,
 		"took", time.Since(start).Round(100*time.Millisecond).String())
 	return result, nil
+}
+
+// dropRefusedCache deletes the saved cache file, opened as f, that a restore
+// found broken, unless a save put a new copy in its place meanwhile (the boot
+// stops waiting for a slow save after builderSaveWait). The check and the
+// rename are under mu, as saves rename under it; the blocks are freed after.
+func (d *Daemon) dropRefusedCache(file string, f *os.File) {
+	loaded, err := f.Stat()
+	if err != nil {
+		return
+	}
+	aside := ""
+	d.mu.Lock()
+	if cur, err := os.Stat(file); err == nil && os.SameFile(loaded, cur) {
+		aside = setAside(file)
+	}
+	d.mu.Unlock()
+	if aside != "" {
+		_ = unlinkCache(aside)
+	}
 }
 
 // wipeBuilderCache removes the volume a restore loaded (all or part of), so

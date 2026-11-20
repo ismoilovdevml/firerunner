@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"archive/tar"
 	"context"
 	"encoding/json"
 	"errors"
@@ -236,7 +237,7 @@ func TestBuilderCacheFailedRestoreDropsCopy(t *testing.T) {
 	stubBuilders(t, func(string) bool { return true })
 	dir := stubBuilderCache(t, nil, nil,
 		func(context.Context, config.Config, *vm.Instance, io.Reader) error {
-			return fmt.Errorf("tar: unexpected EOF: %w", exec.Command("sh", "-c", "exit 1").Run())
+			return fmt.Errorf("tar: unexpected EOF: %w", exec.Command("sh", "-c", fmt.Sprintf("exit %d", loadArchiveRefused)).Run())
 		})
 	writeFile(t, filepath.Join(dir, "7.tar"), saved("broken"), time.Hour)
 	d, _ := newTestDaemon(t)
@@ -526,7 +527,7 @@ func TestRestoreFailures(t *testing.T) {
 	}
 
 	// tar or the marker check refused it: deleted, volume wiped, start empty.
-	loadErr = fmt.Errorf("stream: %w", exitErr(t, 1))
+	loadErr = fmt.Errorf("stream: %w", exitErr(t, loadArchiveRefused))
 	wipeErr = errors.New("ssh: no route")
 	if _, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", inst); err == nil {
 		t.Fatal("volume could not be wiped, but the builder was declared usable")
@@ -538,6 +539,171 @@ func TestRestoreFailures(t *testing.T) {
 	}
 	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) || wipes != 2 {
 		t.Fatalf("refused copy kept or volume not wiped (wipes %d)", wipes)
+	}
+}
+
+// tarArchive is an archive like builderSaveScript writes: the volume's files,
+// then the marker unless noMarker. cut drops that many bytes off its end.
+func tarArchive(t *testing.T, noMarker bool, cut int) string {
+	t.Helper()
+	var buf strings.Builder
+	tw := tar.NewWriter(&buf)
+	members := []string{"./", "./runc-overlayfs/metadata_v2.db"}
+	if !noMarker {
+		members = append(members, builderMarker)
+	}
+	for _, name := range members {
+		body := strings.Repeat("x", 1500)
+		h := &tar.Header{Name: name, Mode: 0o600, Size: int64(len(body)), Typeflag: tar.TypeReg}
+		if strings.HasSuffix(name, "/") {
+			h.Typeflag, h.Size, h.Mode, body = tar.TypeDir, 0, 0o700, ""
+		}
+		if err := tw.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(tw, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s := buf.String()
+	return s[:len(s)-cut]
+}
+
+// Only an archive the host cannot read either is deleted when a restore
+// fails. tar in the VM fails the same way on a full disk as on a broken
+// archive; dockerd or the volume failing, and ssh failing, say nothing about
+// the copy. A copy kept fails the boot (an error), so the next builder
+// retries it instead of starting empty and later saving that over it.
+func TestRestoreDeletesOnlyABrokenArchive(t *testing.T) {
+	whole := saved(tarArchive(t, false, 0))
+	for _, c := range []struct {
+		name    string
+		code    int
+		data    string
+		legacy  bool // a copy saved before copies had a header
+		deleted bool
+	}{
+		{"VM cannot take the cache", loadVMFailed, whole, false, false},
+		{"other failure in the VM", 1, whole, false, false},
+		{"ssh failed", 255, whole, false, false},
+		{"tar failed on a whole archive (VM disk full)", loadArchiveRefused, whole, false, false},
+		{"tar failed on a whole legacy archive", loadArchiveRefused, tarArchive(t, false, 0), true, false},
+		{"archive without the marker", loadArchiveRefused, saved(tarArchive(t, true, 0)), false, true},
+		{"archive cut off inside a member", loadArchiveRefused, saved(tarArchive(t, false, 0)[:2500]), false, true},
+		{"not an archive", loadArchiveRefused, saved("garbage"), false, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			stubBuilders(t, func(string) bool { return true })
+			wipes := 0
+			dir := stubBuilderCache(t, nil, nil, func(_ context.Context, _ config.Config, _ *vm.Instance, r io.Reader) error {
+				_, _ = io.Copy(io.Discard, r)
+				return fmt.Errorf("stream: %w", exitErr(t, c.code))
+			})
+			builderCacheWipe = func(context.Context, config.Config, *vm.Instance) error { wipes++; return nil }
+			d, _ := newTestDaemon(t)
+			if c.legacy {
+				d.cfg.Builder.Image = legacyBuilderImage // the image header-less copies are restored into
+			}
+			file := filepath.Join(dir, "7.tar")
+			writeFile(t, file, c.data, time.Hour)
+
+			res, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", &vm.Instance{ID: "bld-7"})
+			_, statErr := os.Stat(file)
+			gone := errors.Is(statErr, os.ErrNotExist)
+			if res != "failed" || gone != c.deleted || (err == nil) != c.deleted {
+				t.Fatalf("restore = %q, %v; copy deleted %v, want deleted %v (and an error only when kept)", res, err, gone, c.deleted)
+			}
+			if !c.deleted && readFile(t, file) != c.data {
+				t.Fatal("kept copy changed")
+			}
+			if c.deleted && wipes != 1 {
+				t.Fatalf("volume wiped %d times after a broken archive, want 1", wipes)
+			}
+		})
+	}
+}
+
+// The saved copy is marked used before its load starts: a load takes minutes,
+// and another project's save meanwhile drops the least recently used copies.
+func TestRestoreTouchesTheCopyBeforeLoading(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	var dir string
+	var during time.Time
+	dir = stubBuilderCache(t, nil, nil, func(_ context.Context, _ config.Config, _ *vm.Instance, r io.Reader) error {
+		if fi, err := os.Stat(filepath.Join(dir, "7.tar")); err == nil {
+			during = fi.ModTime()
+		}
+		_, err := io.Copy(io.Discard, r)
+		return err
+	})
+	d, _ := newTestDaemon(t)
+	writeFile(t, filepath.Join(dir, "7.tar"), saved(tarArchive(t, false, 0)), 48*time.Hour)
+	writeFile(t, filepath.Join(dir, "8.tar"), saved("other"), time.Hour)
+	if res, err := d.restoreBuilderCache(context.Background(), d.cfg, "7", &vm.Instance{ID: "bld-7"}); res != "ok" || err != nil {
+		t.Fatalf("restore = %q, %v", res, err)
+	}
+	if time.Since(during) > time.Minute {
+		t.Fatalf("copy last used %s ago while it loaded: the first one a save drops", time.Since(during).Round(time.Second))
+	}
+}
+
+// builderLoadScript's exit status tells a broken archive from a VM that
+// cannot take a cache. Run with sh, a fake docker and the host's tar.
+func TestBuilderLoadScriptExitStatus(t *testing.T) {
+	if _, err := exec.LookPath("tar"); err != nil {
+		t.Fatalf("tar not found: %v", err)
+	}
+	// One fake docker for every case (a new executable per case is slow to
+	// start on macOS): it fails unless FAKE_DOCKER_MP names the volume.
+	bin := t.TempDir()
+	docker := "#!/bin/sh\n[ -n \"$FAKE_DOCKER_MP\" ] || exit 1\n" +
+		"case \"$1 $2\" in\n\"volume inspect\") echo \"$FAKE_DOCKER_MP\" ;;\nesac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(docker), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name     string
+		input    string
+		dockerOK bool
+		readOnly bool // the volume cannot be written (a full disk fails tar the same way)
+		want     int
+	}{
+		{"whole archive", tarArchive(t, false, 0), true, false, 0},
+		{"archive without the marker", tarArchive(t, true, 0), true, false, loadArchiveRefused},
+		{"not an archive", strings.Repeat("garbage!", 200), true, false, loadArchiveRefused},
+		{"dockerd fails", tarArchive(t, false, 0), false, false, loadVMFailed},
+		{"volume not writable", tarArchive(t, false, 0), true, true, loadArchiveRefused},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if c.readOnly && os.Geteuid() == 0 {
+				t.Fatal("run as root: a read-only directory does not stop root's writes")
+			}
+			mp, dockerMP := t.TempDir(), ""
+			if c.dockerOK {
+				dockerMP = mp
+			}
+			if c.readOnly {
+				if err := os.Chmod(mp, 0o500); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(mp, 0o700) })
+			}
+			cmd := exec.Command("sh", "-c", builderLoadScript)
+			cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_DOCKER_MP="+dockerMP)
+			cmd.Stdin = strings.NewReader(c.input)
+			out, err := cmd.CombinedOutput()
+			if got := max(exitCode(err), 0); got != c.want {
+				t.Fatalf("exit %d, want %d: %v\n%s", got, c.want, err, out)
+			}
+			if c.want == 0 {
+				if _, err := os.Stat(filepath.Join(mp, builderMarker)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("marker left in the volume")
+				}
+			}
+		})
 	}
 }
 

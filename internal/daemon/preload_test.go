@@ -178,3 +178,114 @@ func TestPreloadCancelStopsPulls(t *testing.T) {
 		t.Fatalf("finished preload: err %v, stopPreload called %d times", err, stopped)
 	}
 }
+
+// A pool refresh (POST /pool/refresh, after a new rootfs image under the same
+// tag) replaces the whole pool, not only the ready VMs: a VM booted from the
+// old image and still preloading, or still booting, does not join the pool
+// once its boot ends, and no job is handed one meanwhile.
+func TestPoolRefreshReplacesVMsStillBooting(t *testing.T) {
+	stubPoolVM := func(t *testing.T, during func()) {
+		t.Helper()
+		oldBoot, oldStop := poolBoot, stopPreload
+		t.Cleanup(func() { poolBoot, stopPreload = oldBoot, oldStop })
+		stopPreload = func(config.Config, *vm.Instance) error { return nil }
+		poolBoot = func(_ context.Context, _ config.Config, _ *flintlock.Client, id string, _ map[string]string) (*vm.Instance, error) {
+			if during != nil {
+				during()
+			}
+			return &vm.Instance{ID: id, UID: "u-" + id, IP: "10.200.0.5", HostKey: "ssh-ed25519 AAAA"}, nil
+		}
+	}
+	slowSSH := func(t *testing.T) {
+		t.Helper()
+		bin := t.TempDir()
+		if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+	boot := func(d *Daemon, cfg config.Config) chan struct{} {
+		d.mu.Lock()
+		d.booting++
+		d.mu.Unlock()
+		done := make(chan struct{})
+		go func() { defer close(done); d.bootOne(context.Background(), cfg, "pool-x") }()
+		return done
+	}
+	waitPreloading := func(t *testing.T, d *Daemon) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+			d.mu.Lock()
+			n := len(d.preloading)
+			d.mu.Unlock()
+			if n == 1 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the pool VM never started its preload")
+			}
+		}
+	}
+	check := func(t *testing.T, d *Daemon, done chan struct{}) {
+		t.Helper()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the refresh did not stop the preload")
+		}
+		d.mu.Lock()
+		ready, booting := len(d.ready), d.booting
+		d.mu.Unlock()
+		if ready != 0 || booting != 0 {
+			t.Fatalf("after the refresh: %d ready, %d booting; want the old-image VM in neither", ready, booting)
+		}
+		if got := metricValue(t, d, "firerunner_vm_boot_failures_total", "preload"); got != 0 {
+			t.Fatalf("a refresh counted as %v preload failures", got)
+		}
+	}
+
+	t.Run("ready VMs and the gauge", func(t *testing.T) {
+		d, srv := newTestDaemon(t)
+		fp := fingerprint(d.cfg)
+		d.ready = []*pooled{pooledVM("a", fp, 0), pooledVM("b", fp, 0)}
+		d.metrics.poolReady.Set(2)
+		d.drain(context.Background(), "refresh")
+		srv.WaitDeleted(t, "a", 2*time.Second)
+		srv.WaitDeleted(t, "b", 2*time.Second)
+		if got := metricValue(t, d, "firerunner_pool_ready", ""); got != 0 {
+			t.Fatalf("firerunner_pool_ready = %v after the refresh, want 0", got)
+		}
+	})
+	t.Run("a preloading VM is not claimed after the refresh", func(t *testing.T) {
+		d, _ := newTestDaemon(t)
+		cancelled := false
+		d.preloading["warm"] = &preloadingVM{inst: &vm.Instance{ID: "pool-warm", UID: "warm"}, specID: fingerprint(d.cfg),
+			cancel: func() { cancelled = true }}
+		d.drain(context.Background(), "refresh")
+		if !cancelled {
+			t.Fatal("the refresh did not stop the old-image VM's preload")
+		}
+		if inst := d.Claim(); inst != nil {
+			t.Fatalf("Claim = %s after the refresh, want no old-image VM", inst.ID)
+		}
+	})
+	t.Run("a VM preloading during the refresh", func(t *testing.T) {
+		slowSSH(t)
+		stubPoolVM(t, nil)
+		d, srv := newTestDaemon(t)
+		cfg := d.cfgSnapshot()
+		cfg.Pool.PreloadImages = []string{"sdk:1"}
+		done := boot(d, cfg)
+		waitPreloading(t, d)
+		d.drain(context.Background(), "refresh")
+		check(t, d, done)
+		srv.WaitDeleted(t, "u-pool-x", 2*time.Second)
+	})
+	t.Run("a VM booting during the refresh", func(t *testing.T) {
+		d, srv := newTestDaemon(t)
+		stubPoolVM(t, func() { d.drain(context.Background(), "refresh") })
+		done := boot(d, d.cfgSnapshot())
+		check(t, d, done)
+		srv.WaitDeleted(t, "u-pool-x", 2*time.Second)
+	})
+}

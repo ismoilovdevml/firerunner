@@ -345,7 +345,7 @@ func (d *Daemon) retireLocked(project string, port int, inst vm.Instance, specID
 	}
 	d.spawn(func() {
 		if port != 0 {
-			d.unmapBuilderPort(nft, port)
+			d.unmapBuilderPort(nft, port, inst.IP)
 		}
 		if saved != nil {
 			// A copy the daemon's stop cuts off (or that could not start
@@ -559,7 +559,13 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	d.mu.Unlock()
 	if port != 0 {
 		if err := d.mapBuilderPorts(builder{Project: project, Port: port, Instance: *inst}); err != nil {
-			d.log.Error("builder port mapping failed", "project", project, "err", err)
+			// A ready builder behind an unmapped port fails every job's build
+			// until a reconcile maps it; one whose port still leads to a former
+			// builder's address sends them there. The map is changed in one nft
+			// transaction, so a failure changed nothing: no mapping to undo.
+			phases.end("buildkitd", "failed")
+			fail(inst, fmt.Errorf("mapping builder port %d: %w", port, err))
+			return
 		}
 	}
 	// Jobs reach buildkitd through the port: until it is mapped they wait.
@@ -583,7 +589,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		nft := nftRun
 		d.spawn(func() {
 			if unmap {
-				d.unmapBuilderPort(nft, port)
+				d.unmapBuilderPort(nft, port, inst.IP)
 			}
 			d.delete(context.Background(), inst, "builder no longer needed")
 		})
@@ -854,10 +860,25 @@ func (d *Daemon) mapBuilderPorts(bs ...builder) error {
 }
 
 // unmapBuilderPort deletes the mapping of a removed builder's port with nft
-// (nftRun as the caller read it), serialized with mapBuilderPorts.
-func (d *Daemon) unmapBuilderPort(nft func(string, ...string) (string, error), port int) {
+// (nftRun as the caller read it), serialized with mapBuilderPorts, but only
+// while the port still leads to that builder's address ip. The port is free
+// for the next builder as soon as the old one is removed, and this runs in
+// the background: by the time it holds nftMu the new builder may have mapped
+// the port, and deleting that mapping would cut its jobs off until a
+// reconcile restored it. Callers unmap before they delete the VM, so the
+// address cannot have gone to the new builder meanwhile. A map that cannot
+// be listed is left alone: the reconcile sweep removes a port no builder
+// holds, and a new holder replaces the mapping when it maps its own.
+func (d *Daemon) unmapBuilderPort(nft func(string, ...string) (string, error), port int, ip string) {
 	d.nftMu.Lock()
 	defer d.nftMu.Unlock()
+	out, err := nft("", "list", "map", "inet", "firerunner", "builders")
+	if err != nil {
+		return
+	}
+	if to, ok := parseBuilderMap(out)[port]; !ok || ip == "" || to != ip+" . 1234" {
+		return
+	}
 	_, _ = nft("", "delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", port))
 }
 
@@ -1039,13 +1060,15 @@ func (d *Daemon) saveBuildersLocked() {
 		}
 	}
 	data, err := json.Marshal(list)
-	if err != nil {
-		return
+	if err == nil {
+		err = writeFileSync(d.buildersFile(), data)
 	}
-	file := d.buildersFile()
-	tmp := file + ".tmp"
-	if os.WriteFile(tmp, data, 0o600) == nil {
-		_ = os.Rename(tmp, file)
+	if err != nil {
+		// The previous record stays: a restart adopts the builders it names
+		// that still answer, and reconcile deletes the others without
+		// copying their caches out.
+		d.warnLimited("builders-save", "cannot record the builders; a restart may lose the newer ones and their caches",
+			"file", d.buildersFile(), "err", err)
 	}
 }
 
@@ -1266,7 +1289,7 @@ func buildkitdTOML(cfg config.Config) string {
 			fmt.Fprintf(&b, "[registry.%q]\n  insecure = true\n", host)
 		}
 	}
-	mirror := strings.TrimPrefix(strings.TrimPrefix(cfg.VM.RegistryMirror, "http://"), "https://")
+	mirror := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(cfg.VM.RegistryMirror, "http://"), "https://"), "/")
 	if mirror != "" {
 		fmt.Fprintf(&b, "[registry.\"docker.io\"]\n  mirrors = [%q]\n", mirror)
 		// Only a plain-HTTP mirror needs a table; an https:// one keeps its

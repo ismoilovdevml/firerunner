@@ -348,3 +348,44 @@ func TestAnotherSignedReleaseIsNotInstalled(t *testing.T) {
 		t.Fatalf("the release asked for: res %+v err %v", res, err)
 	}
 }
+
+// `--version latest` never installs a release older than the running one
+// (a host on a newer tag, or an older signed release served as latest);
+// naming that release with --version installs it.
+func TestLatestDoesNotDowngrade(t *testing.T) {
+	for _, c := range []struct {
+		tag, current, says string
+		refused            bool
+	}{
+		{"latest", "v0.3.0", "v0.2.0", true},
+		{"latest", "v0.3.0", "v0.3.0-rc1", true},
+		{"latest", "v0.10.0", "v0.9.1", true},
+		{"latest", "v1.0.0", "v0.9.9", true},
+		{"latest", "v0.2.0", "v0.3.0", false},
+		{"latest", "v0.3.0-rc1", "v0.3.0", false},
+		{"latest", "edge-abc1234", "v0.2.0", false}, // leaving edge for the stable line
+		{"latest", "dev", "v0.2.0", false},
+		{"v0.2.0", "v0.3.0", "v0.2.0", false}, // asked for by name
+	} {
+		newBin := []byte("#!/bin/sh\necho firerunner " + c.says + "\n")
+		_, done := release(t, newBin, sha(newBin), signed)
+		exe := installed(t, []byte("old binary"))
+		_, err := Run(context.Background(), c.tag, c.current, Options{})
+		done()
+		replaced := readOrEmpty(exe) != "old binary"
+		if c.refused {
+			if err == nil || !strings.Contains(err.Error(), "--version "+c.says) || replaced {
+				t.Fatalf("%s from %s to %s: err = %v, replaced %v; want refused with the way to install it anyway", c.tag, c.current, c.says, err, replaced)
+			}
+			continue
+		}
+		if err != nil || !replaced {
+			t.Fatalf("%s from %s to %s: err = %v, replaced %v; want installed", c.tag, c.current, c.says, err, replaced)
+		}
+	}
+}
+
+func readOrEmpty(path string) string {
+	b, _ := os.ReadFile(path)
+	return string(b)
+}
