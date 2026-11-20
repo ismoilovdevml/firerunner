@@ -955,6 +955,74 @@ func TestForwardUsesOneUpstreamPerRequest(t *testing.T) {
 	}
 }
 
+// An upstream that routes by the Host header reaches the host the policy
+// checked: for an absolute-form request net/http takes Host from the URL
+// and ignores the client's Host line (RFC 9112 3.2.2), and the forwarder
+// sends that. The upstream here reads the request bytes itself, since a Go
+// server would apply the same rule and hide a mismatch.
+func TestUpstreamSeesCheckedHost(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	seen := make(chan []string, 4)
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+				br := bufio.NewReader(c)
+				var lines []string // the request line and every Host line
+				for {
+					line, err := br.ReadString('\n')
+					line = strings.TrimRight(line, "\r\n")
+					if err != nil || line == "" {
+						break
+					}
+					if len(lines) == 0 || strings.HasPrefix(strings.ToLower(line), "host:") {
+						lines = append(lines, line)
+					}
+				}
+				seen <- lines
+				fmt.Fprint(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+			}()
+		}
+	}()
+	f := &Forwarder{Upstream: func() (Upstream, error) { return Upstream{Addr: l.Addr().String()}, nil }, Allowed: AllowNets(),
+		Policy: testPolicy(), Log: slog.New(slog.NewTextHandler(io.Discard, nil)), DialTimeout: 2 * time.Second}
+	fwd := serveForwarder(t, f)
+	for _, tc := range []struct{ request, want string }{
+		{"GET http://github.com/x HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n", "GET http://github.com/x HTTP/1.1|Host: github.com"},
+		{"GET https://github.com/x HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n", "GET https://github.com/x HTTP/1.1|Host: github.com"},
+		{"GET http://github.com:8080/x HTTP/1.1\r\nHost: localhost\r\n\r\n", "GET http://github.com:8080/x HTTP/1.1|Host: github.com:8080"},
+	} {
+		c, err := net.Dial("tcp", fwd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		fmt.Fprint(c, tc.request)
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		c.Close()
+		if err != nil || resp.StatusCode != 200 {
+			t.Fatalf("%q: %v %v", tc.request, resp, err)
+		}
+		select {
+		case lines := <-seen:
+			if got := strings.Join(lines, "|"); got != tc.want {
+				t.Errorf("%q: upstream got %q, want %q", tc.request, got, tc.want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%q: upstream saw nothing", tc.request)
+		}
+	}
+}
+
 // An https:// upload in absolute form that takes longer than DialTimeout is
 // not cut: DialTimeout covers reaching the upstream, not sending the body.
 func TestPassThroughSlowUpload(t *testing.T) {
