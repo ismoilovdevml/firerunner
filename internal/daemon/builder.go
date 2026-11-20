@@ -588,8 +588,9 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	}
 	if !ok || ctx.Err() != nil {
 		// Removed while booting, or shutting down. The port leads to this VM
-		// unless another builder took it meanwhile.
-		unmap := port != 0 && (ok || !d.portUsedLocked(port))
+		// until its new holder, if any, maps it; unmapBuilderPort leaves the
+		// port alone once it leads elsewhere.
+		unmap := port != 0
 		nft := nftRun
 		d.spawn(func() {
 			if unmap {
