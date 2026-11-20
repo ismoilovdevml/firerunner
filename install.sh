@@ -42,6 +42,8 @@
 #                           (a private image) goes to the registry itself
 #   VERSITYGW_VERSION       S3 server for the runner's cache: (default: 1.8.0)
 #   FR_CACHE_DAYS           delete cache: archives not written for this many days (default: 14)
+#   FR_CACHE_MAX_GB         above this size the oldest cache: archives are deleted, checked hourly
+#                           (default: auto, a fifth of the file system the cache is on)
 #   GITLAB_RUNNER_VERSION   (default: 19.4.0)
 #
 # Corporate networks (all remembered for later re-runs):
@@ -74,6 +76,7 @@ FLINTLOCK_VERSION="${FLINTLOCK_VERSION:-0.15.2}"
 REGISTRY_VERSION="${REGISTRY_VERSION:-3.1.1}"
 VERSITYGW_VERSION="${VERSITYGW_VERSION:-1.8.0}"
 FR_CACHE_DAYS="${FR_CACHE_DAYS:-14}"
+FR_CACHE_MAX_GB="${FR_CACHE_MAX_GB:-auto}"
 GITLAB_RUNNER_VERSION="${GITLAB_RUNNER_VERSION:-19.4.0}"
 FR_VERSION="${FR_VERSION:-edge}"
 FR_BINARY="${FR_BINARY:-}"            # local firerunner binary instead of a release (development)
@@ -194,6 +197,8 @@ default_vcpu() {
 # preflight_settings checks the FR_* settings that end up in firewall rules,
 # systemd units and the microVM config, before anything is changed.
 preflight_settings() {
+    [[ $FR_CACHE_DAYS =~ ^[0-9]{1,4}$ ]] || die "FR_CACHE_DAYS must be a whole number of days"
+    [[ $FR_CACHE_MAX_GB == auto || $FR_CACHE_MAX_GB =~ ^[1-9][0-9]{0,5}$ ]] || die "FR_CACHE_MAX_GB must be auto or a whole number of GB from 1"
     [[ $FR_THIN_CHUNK =~ ^(64|128|256|512|1024)[Kk]$ ]] || die "FR_THIN_CHUNK must be 64K, 128K, 256K, 512K or 1024K"
     [[ $FR_RUNNER_CONCURRENT =~ ^[1-9][0-9]{0,2}$ ]] || die "FR_RUNNER_CONCURRENT must be a whole number from 1"
     [[ -n $FR_POOL_SIZE_GIVEN ]] || ((FR_POOL_SIZE <= 32)) || FR_POOL_SIZE=32
@@ -1424,6 +1429,45 @@ WantedBy=multi-user.target
 EOF
 }
 
+# cache_clean_script: the cache cleanup the timer runs (install_cache_server).
+cache_clean_script() {
+    cat <<'EOF'
+#!/bin/bash
+# cache-clean.sh DAYS MAX_GB: deletes cache: archives not written for DAYS
+# days, then the oldest ones until the cache takes at most MAX_GB (auto: a
+# fifth of the file system it is on), so jobs cannot fill the host's disk.
+set -euo pipefail
+export LC_ALL=C
+dir=${FR_CACHE_DIR:-/var/lib/firerunner/cache/runner-cache}
+days=$1 max_gb=$2
+[[ -d $dir ]] || exit 0
+find "$dir" -mindepth 1 -type f -mtime +"$days" -delete
+if [[ $max_gb == auto ]]; then
+    max_kb=$(( $(df -Pk "$dir" | awk 'NR == 2 {print $2}') / 5 ))
+else
+    max_kb=$(( max_gb * 1024 * 1024 ))
+fi
+# "mtime KiB path", oldest first; KiB is what the file takes on disk.
+mapfile -d '' files < <(find "$dir" -mindepth 1 -type f -printf '%T@ %k %p\0' | sort -z -n)
+total=0
+for f in "${files[@]}"; do
+    read -r _ kb _ <<<"$f"
+    total=$((total + kb))
+done
+deleted=0 freed=0
+for f in "${files[@]}"; do
+    ((total > max_kb)) || break
+    read -r _ kb _ <<<"$f"
+    rm -f -- "${f#* * }"
+    total=$((total - kb)) deleted=$((deleted + 1)) freed=$((freed + kb))
+done
+if ((deleted > 0)); then
+    echo "deleted the $deleted oldest cache archives ($((freed / 1024)) MiB) to stay under $((max_kb / 1024)) MiB"
+fi
+find "$dir" -mindepth 1 -type d -empty -delete
+EOF
+}
+
 # S3 server for gitlab-runner's cache: (versitygw, plain files on disk). Jobs only get
 # presigned URLs from the runner, so the keys stay on the host.
 install_cache_server() {
@@ -1475,22 +1519,29 @@ PrivateTmp=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+    cache_clean_script | put "$LIB_DIR/cache-clean.sh" 0755
     put /etc/systemd/system/firerunner-cache-clean.service <<EOF
 [Unit]
-Description=Delete FireRunner cache: archives older than ${FR_CACHE_DAYS} days
+Description=Delete FireRunner cache: archives older than ${FR_CACHE_DAYS} days, then the oldest above the size cap
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/find /var/lib/firerunner/cache/runner-cache -mindepth 1 -type f -mtime +${FR_CACHE_DAYS} -delete
-ExecStart=/usr/bin/find /var/lib/firerunner/cache/runner-cache -mindepth 1 -type d -empty -delete
+ExecStart=${LIB_DIR}/cache-clean.sh ${FR_CACHE_DAYS} ${FR_CACHE_MAX_GB}
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/firerunner/cache
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
 EOF
+    # Hourly: a day of uploads above the size cap could fill the disk first.
     put /etc/systemd/system/firerunner-cache-clean.timer <<EOF
 [Unit]
-Description=Daily cleanup of the FireRunner cache
+Description=Hourly cleanup of the FireRunner cache
 
 [Timer]
-OnCalendar=daily
-RandomizedDelaySec=1h
+OnCalendar=hourly
+RandomizedDelaySec=10min
 Persistent=true
 
 [Install]
@@ -1698,6 +1749,10 @@ start_services() {
         fi
     done
     systemctl enable -q --now firerunner-cache-clean.timer
+    # A changed schedule applies from the timer's next start.
+    if changed /etc/systemd/system/firerunner-cache-clean.timer; then
+        systemctl restart firerunner-cache-clean.timer
+    fi
 }
 
 verify_install() {
