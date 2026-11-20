@@ -354,7 +354,7 @@ func cmdStatus(cfg config.Config) error {
 	fmt.Fprintf(w, "KVM\t%s\n", kvm)
 
 	var svc []string
-	for _, s := range append(host.Services, "gitlab-runner") {
+	for _, s := range host.MonitoredServices(cfg.Proxy.Enabled) {
 		state := "down"
 		if host.ServiceActive(s) {
 			state = "up"

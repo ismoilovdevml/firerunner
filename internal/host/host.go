@@ -32,6 +32,21 @@ const DnsmasqConfig = "/etc/firerunner/dnsmasq.conf"
 var Services = []string{"containerd-flintlock", "firerunner-net", "firerunner-dnsmasq", "firerunner-registry",
 	"firerunner-cache", "flintlockd"}
 
+// ProxyService is the forwarder's unit; install.sh runs it only with a
+// corporate proxy (proxy.enabled).
+const ProxyService = "firerunner-proxy"
+
+// MonitoredServices are the units status and the daemon's
+// firerunner_service_up report: Services, the forwarder where proxy.enabled
+// is on (absent, not down, elsewhere), and gitlab-runner. A new slice each call.
+func MonitoredServices(proxyEnabled bool) []string {
+	out := append([]string(nil), Services...)
+	if proxyEnabled {
+		out = append(out, ProxyService)
+	}
+	return append(out, "gitlab-runner")
+}
+
 // commandTimeout bounds each systemctl and lvs run: systemd or LVM stuck on
 // a device must not stall the caller, the daemon's main loop included.
 var commandTimeout = 10 * time.Second

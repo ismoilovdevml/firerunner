@@ -38,6 +38,15 @@ groups:
           summary: "{{ $labels.service }} is down on {{ $labels.instance }}"
           description: "Jobs run but slower: image pulls bypass the mirror (Docker Hub rate limits) or cache: is not restored. Check: journalctl -u {{ $labels.service }} -n 100; df -h /var/lib/firerunner."
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnercacheservicedown
+      - alert: FireRunnerProxyDown
+        # Only hosts with proxy.enabled report the forwarder; elsewhere the series is absent.
+        expr: firerunner_service_up{service="firerunner-proxy"} == 0
+        for: 3m
+        labels: {severity: critical}
+        annotations:
+          summary: "firerunner-proxy is down on {{ $labels.instance }}: nothing reaches the corporate proxy"
+          description: "microVMs, builders, gitlab-runner, containerd-flintlock and the registry mirrors reach the outside through it: jobs fail on pulls, clones and downloads (hosts in proxy.no_proxy still work). Check: journalctl -u firerunner-proxy -n 100; firerunner doctor (a 407 means the upstream refused the credentials). Fix: systemctl start firerunner-proxy."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxydown
       - alert: FireRunnerSystemFailures
         # Only failures FireRunner or the host caused; failing project scripts never page.
         expr: |

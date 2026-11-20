@@ -90,6 +90,26 @@ func TestServiceActive(t *testing.T) {
 	}
 }
 
+// The forwarder is watched like the other services, but only where it runs.
+func TestMonitoredServices(t *testing.T) {
+	for _, c := range []struct {
+		proxy bool
+		want  string
+	}{
+		{false, "containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd gitlab-runner"},
+		{true, "containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd firerunner-proxy gitlab-runner"},
+	} {
+		if got := strings.Join(MonitoredServices(c.proxy), " "); got != c.want {
+			t.Errorf("MonitoredServices(%v) = %s, want %s", c.proxy, got, c.want)
+		}
+	}
+	// The list is a copy: appending to it never changes Services.
+	_ = append(MonitoredServices(true)[:1], "x")
+	if Services[1] != "firerunner-net" {
+		t.Fatalf("Services changed: %v", Services)
+	}
+}
+
 // gitlab-runner register writes the runner token into config.toml: the file
 // must be 0600 from the moment it holds it, not from a chmod afterwards.
 func TestRunRootOnly(t *testing.T) {
