@@ -559,7 +559,13 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	d.mu.Unlock()
 	if port != 0 {
 		if err := d.mapBuilderPorts(builder{Project: project, Port: port, Instance: *inst}); err != nil {
-			d.log.Error("builder port mapping failed", "project", project, "err", err)
+			// A ready builder behind an unmapped port fails every job's build
+			// until a reconcile maps it; one whose port still leads to a former
+			// builder's address sends them there. The map is changed in one nft
+			// transaction, so a failure changed nothing: no mapping to undo.
+			phases.end("buildkitd", "failed")
+			fail(inst, fmt.Errorf("mapping builder port %d: %w", port, err))
+			return
 		}
 	}
 	// Jobs reach buildkitd through the port: until it is mapped they wait.

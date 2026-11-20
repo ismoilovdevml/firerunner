@@ -608,6 +608,54 @@ func TestBuilderPortMappedBeforeReady(t *testing.T) {
 	}
 }
 
+// A builder whose port cannot be mapped is not declared ready: jobs would get
+// a port that leads nowhere (or to a former builder's address). The boot
+// fails like any other: buildkitd phase failed, a boot failure counted, the
+// VM deleted and the project cooling down before the next try.
+func TestBuilderPortMappingFailureFailsTheBoot(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	boots := stubBoot(t, nil)
+	nft := stubNft(t)
+	d, srv := newTestDaemon(t)
+	old := nftRun
+	nftRun = func(script string, args ...string) (string, error) {
+		if script != "" {
+			return "", errors.New("nft: Could not process rule: No such file or directory")
+		}
+		return nft.run(script, args...)
+	}
+	t.Cleanup(func() { nftRun = old })
+	failuresBefore := metricValue(t, d, "firerunner_vm_boot_failures_total", "builder")
+
+	if got := d.Builder("3", true).State; got != BuilderBooting {
+		t.Fatalf("Builder = %s, want booting", got)
+	}
+	d.bootBuilder(context.Background(), d.cfg, "3")
+	srv.WaitDeleted(t, "uid-"+boots.last(), 2*time.Second)
+
+	d.mu.Lock()
+	b, failedAt := d.builders["3"], d.builderFailed["3"]
+	d.mu.Unlock()
+	if b != nil {
+		t.Fatalf("builder kept after its port mapping failed: ready=%v", b.ready)
+	}
+	if failedAt.IsZero() {
+		t.Fatal("failed boot does not cool the project down")
+	}
+	if n := phaseCount(d, "buildkitd", "failed"); n != 1 {
+		t.Fatalf("buildkitd failed observed %d times, want 1", n)
+	}
+	if n := phaseCount(d, "buildkitd", "ok"); n != 0 {
+		t.Fatalf("buildkitd ok observed %d times, want 0", n)
+	}
+	if got := metricValue(t, d, "firerunner_vm_boot_failures_total", "builder") - failuresBefore; got != 1 {
+		t.Fatalf("builder boot failures +%v, want +1", got)
+	}
+	if got := d.Builder("3", true).State; got != BuilderBusy {
+		t.Fatalf("right after the failed boot: %s, want busy", got)
+	}
+}
+
 func TestBuilderPersistsLastUsedAtMostOncePerMinute(t *testing.T) {
 	stubBuilders(t, func(string) bool { return true })
 	d, _ := newTestDaemon(t)
