@@ -789,18 +789,18 @@ func TestBuilderLoadScriptExitStatus(t *testing.T) {
 		{"volume not writable", tarArchive(t, false, 0), true, true, loadArchiveRefused},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			if c.readOnly && os.Geteuid() == 0 {
-				t.Fatal("run as root: a read-only directory does not stop root's writes")
-			}
 			mp, dockerMP := t.TempDir(), ""
-			if c.dockerOK {
-				dockerMP = mp
-			}
 			if c.readOnly {
-				if err := os.Chmod(mp, 0o500); err != nil {
+				// A volume path tar cannot write into, for root too (a
+				// read-only directory does not stop root's writes, and CI
+				// or roberta may run the tests as root).
+				mp = filepath.Join(mp, "not-a-directory")
+				if err := os.WriteFile(mp, nil, 0o600); err != nil {
 					t.Fatal(err)
 				}
-				t.Cleanup(func() { _ = os.Chmod(mp, 0o700) })
+			}
+			if c.dockerOK {
+				dockerMP = mp
 			}
 			cmd := exec.Command("sh", "-c", builderLoadScript)
 			cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_DOCKER_MP="+dockerMP)
