@@ -178,10 +178,10 @@ func (f *Forwarder) noteUpstream(up Upstream, err error) {
 		f.upstreamState = upstreamFailed
 	default:
 		key := up.Addr + "\x00" + up.Auth
-		if f.upstreamState == upstreamFailed || (f.upstreamState == upstreamOK && key != f.upstreamKey) {
+		if f.upstreamState == upstreamFailed || (f.upstreamState == upstreamOK && key != f.upstreamSeen) {
 			f.m.reloads.WithLabelValues("ok").Inc()
 		}
-		f.upstreamState, f.upstreamKey = upstreamOK, key
+		f.upstreamState, f.upstreamSeen = upstreamOK, key
 	}
 }
 

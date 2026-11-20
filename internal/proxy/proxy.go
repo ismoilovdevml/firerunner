@@ -317,7 +317,7 @@ type Forwarder struct {
 	}
 	// What the upstream file held at the last request (noteUpstream).
 	upstreamState int
-	upstreamKey   string
+	upstreamSeen  string
 	// handlers counts ServeHTTP calls under way, which a stop waits for;
 	// open holds what cut closes: hijacked tunnels and upstream connections,
 	// which http.Server.Shutdown neither waits for nor closes.
