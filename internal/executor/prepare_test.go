@@ -135,12 +135,16 @@ func TestPrepareCancelledDuringGuestSetupIsCanceled(t *testing.T) {
 
 // Like gitlab-runner's Docker executor (Build.GetServiceVariables), service
 // containers get the job's variables whose effective entry in the payload is
-// public (.gitlab-ci.yml variables, GitLab's public predefined ones), with
-// the values gitlab-runner expanded, under the service's own variables. Never
-// a non-public one (CI_JOB_TOKEN, CI/CD settings variables), not even a
-// public one a non-public entry overrides, and nothing gitlab-runner adds
-// itself, `secrets:` variables included. variables: {POSTGRES_PASSWORD: test}
-// with services: [postgres:16] works as on the Docker executor.
+// public (.gitlab-ci.yml variables, GitLab's public predefined ones), under
+// the service's own variables. Never a non-public one (CI_JOB_TOKEN, CI/CD
+// settings variables), not even a public one a non-public entry overrides,
+// and nothing gitlab-runner adds itself, `secrets:` variables included.
+// variables: {POSTGRES_PASSWORD: test} with services: [postgres:16] works as
+// on the Docker executor.
+//
+// A public variable's references are expanded against what the service gets
+// only: NPM_TOKEN: $CI_JOB_TOKEN must not carry the job token into the
+// service, as the value gitlab-runner expanded (CUSTOM_ENV_NPM_TOKEN) would.
 func TestPrepareGivesServicesTheJobsPublicVariables(t *testing.T) {
 	sent := filepath.Join(t.TempDir(), "services")
 	cfg := prepareFixture(t, `{"id":31,"job_info":{"project_id":5},"variables":[
@@ -154,7 +158,13 @@ func TestPrepareGivesServicesTheJobsPublicVariables(t *testing.T) {
 		{"key":"MODE","value":"settings-mode","public":false},
 		{"key":"POSTGRES_DB","value":"job-db","public":true},
 		{"key":"CA_PEM","value":"pem-data","public":true,"file":true},
-		{"key":"VAULT_PW","value":"from-yaml","public":true}
+		{"key":"VAULT_PW","value":"from-yaml","public":true},
+		{"key":"NPM_TOKEN","value":"$CI_JOB_TOKEN","public":true},
+		{"key":"DB_PASSWORD","value":"settings-pw","public":false,"masked":true},
+		{"key":"APP_DSN","value":"postgres://app:${DB_PASSWORD}@db/app","public":true},
+		{"key":"PG_URL","value":"postgres://$POSTGRES_USER@db","public":true},
+		{"key":"RAW_VAL","value":"keep $DB_HOST","public":true,"raw":true},
+		{"key":"PRICE","value":"5$$","public":true}
 	],"secrets":{"VAULT_PW":{"vault":{"engine":{"name":"kv-v2","path":"kv"},"path":"db","field":"pw"}}}}`, "for last; do :; done\nif [ \"$last\" = /bin/bash ]; then cat > "+sent+"; else cat >/dev/null; fi\nexit 0\n")
 	for k, v := range map[string]string{
 		"CI_JOB_TOKEN": "job-token", "CI_PROJECT_NAME": "app", "POSTGRES_PASSWORD": "test", "DB_HOST": "db",
@@ -162,10 +172,13 @@ func TestPrepareGivesServicesTheJobsPublicVariables(t *testing.T) {
 		"MODE":         "settings-mode", "DEPLOY_KEY": "settings-secret", "POSTGRES_DB": "job-db", "CA_PEM": "pem-data",
 		"CI_BUILDS_DIR": "/builds",      // gitlab-runner's own, not in the payload
 		"VAULT_PW":      "vault-secret", // the secrets: variable overrides the public one
+		// As gitlab-runner expanded them, against every variable.
+		"NPM_TOKEN": "job-token", "DB_PASSWORD": "settings-pw", "APP_DSN": "postgres://app:settings-pw@db/app",
+		"PG_URL": "postgres://@db", "RAW_VAL": "keep $DB_HOST", "PRICE": "5$",
 	} {
 		t.Setenv("CUSTOM_ENV_"+k, v)
 	}
-	t.Setenv("CUSTOM_ENV_CI_JOB_SERVICES", `[{"name":"postgres:16","variables":{"POSTGRES_DB":"svc-db"}}]`)
+	t.Setenv("CUSTOM_ENV_CI_JOB_SERVICES", `[{"name":"postgres:16","variables":{"POSTGRES_DB":"svc-db","POSTGRES_USER":"svc-user"}}]`)
 
 	if err := Prepare(context.Background(), cfg); err != nil {
 		t.Fatalf("Prepare = %v", err)
@@ -174,12 +187,14 @@ func TestPrepareGivesServicesTheJobsPublicVariables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no services script: %v", err)
 	}
-	for _, want := range []string{"'POSTGRES_PASSWORD=test'", "'CI_PROJECT_NAME=app'", "'DB_HOST=db'", "'DATABASE_URL=postgres://db/x'", "'POSTGRES_DB=svc-db'"} {
+	for _, want := range []string{"'POSTGRES_PASSWORD=test'", "'CI_PROJECT_NAME=app'", "'DB_HOST=db'", "'DATABASE_URL=postgres://db/x'", "'POSTGRES_DB=svc-db'",
+		"'NPM_TOKEN='", "'APP_DSN=postgres://app:@db/app'", "'PG_URL=postgres://svc-user@db'", "'RAW_VAL=keep $DB_HOST'", "'PRICE=5$'",
+	} {
 		if !strings.Contains(string(script), "-e "+want) {
 			t.Errorf("service lacks %s:\n%s", want, script)
 		}
 	}
-	for _, leak := range []string{"job-token", "settings-secret", "MODE=", "job-db", "CA_PEM", "pem-data", "CI_BUILDS_DIR", "CI_JOB_SERVICES", "vault-secret"} {
+	for _, leak := range []string{"job-token", "settings-secret", "MODE=", "job-db", "CA_PEM", "pem-data", "CI_BUILDS_DIR", "CI_JOB_SERVICES", "vault-secret", "settings-pw"} {
 		if strings.Contains(string(script), leak) {
 			t.Errorf("service gets %q:\n%s", leak, script)
 		}

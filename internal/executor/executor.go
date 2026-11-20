@@ -266,7 +266,7 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 		if err != nil {
 			return fail("services", fmt.Errorf("reading the job payload: %w", err))
 		}
-		jobVars, err := ServiceJobVariables(payload, os.LookupEnv)
+		jobVars, err := ServiceJobVariables(payload)
 		if err != nil {
 			return fail("services", err)
 		}
