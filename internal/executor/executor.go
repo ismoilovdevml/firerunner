@@ -431,10 +431,6 @@ func flintlockErr(err error) error {
 // BuilderName is the buildx builder created in job VMs for the project's builder.
 const BuilderName = "firerunner"
 
-// useBuilder points the VM's buildx at the project's builder, ready or still
-// starting. Nothing waits here: jobs that never build (checks, deploys) start at
-// once, and the docker wrapper (BuilderScript) waits for a starting builder only
-// when the job actually builds.
 // buildWith gives a stage that builds images the project's builder (its
 // docker wrapper waits while the builder starts), unless prepare already
 // did, and reports the job's first build with the builder's state.
@@ -464,8 +460,11 @@ func buildWith(ctx context.Context, cfg config.Config, id string, st *vm.JobStat
 // each stage at most this.
 const eventWait = 500 * time.Millisecond
 
-// state is the builder's state (for the build event): ready or booting when
-// attached, else busy, disabled or none.
+// useBuilder points the VM's buildx at the project's builder, ready or still
+// starting. Nothing waits here: jobs that never build (checks, deploys) start at
+// once, and the docker wrapper (BuilderScript) waits for a starting builder only
+// when the job actually builds. state is the builder's state (for the build
+// event): ready or booting when attached, else busy, disabled or none.
 func useBuilder(ctx context.Context, cfg config.Config, dc *daemon.Client, inst *vm.Instance, project string, start bool) (state string, attached bool) {
 	info, err := dc.Builder(project, start)
 	switch {
