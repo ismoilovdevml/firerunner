@@ -130,6 +130,12 @@ failures FireRunner or the host caused, never for failing project scripts. Watch
   copies that fail or are skipped for lack of room.
 - **Disk free**: the saved builder caches and flintlock's microVM state.
 - **Flintlock errors**: failed flintlock calls by RPC and gRPC code.
+- **Corporate proxy** row (hosts with `proxy.enabled`): what became of the forwarder's requests
+  (*Proxy requests per second by outcome*), tunnels open, connections against their limits,
+  throughput, how long the corporate proxy takes to accept a connection and answer CONNECT, and
+  whether it refuses the credentials. The daemon reads these from the forwarder at each scrape;
+  *metrics read* at 0 means it could not (the forwarder is down, or its unit predates
+  `RuntimeDirectory=firerunner-proxy`: run the installer again).
 - **Speed**: *Warm builds* and *Builder boot* (a build that finds its builder booting waits
   for it), *Stage duration p95 by stage* (which part of a job grew).
 - **Builder boot by phase** (Docker layer cache row): which part of a builder boot builds wait

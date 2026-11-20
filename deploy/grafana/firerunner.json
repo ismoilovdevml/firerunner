@@ -3063,6 +3063,397 @@
       "description": "systemd services the daemon checks every 15 s, and the flintlock API."
     },
     {
+      "id": 69,
+      "type": "row",
+      "title": "Corporate proxy",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 137
+      },
+      "panels": []
+    },
+    {
+      "id": 70,
+      "type": "timeseries",
+      "title": "Proxy requests per second by outcome",
+      "description": "Requests to the forwarder (firerunner-proxy) by outcome, tunnels and plain requests together. upstream_auth_failed: the corporate proxy refused the credentials (FireRunnerProxyUpstreamAuthFailing); upstream_error: unreachable or silent upstream, or an unusable upstream file (FireRunnerProxyUpstreamErrors); upstream_refused: the corporate proxy blocks or cannot reach the site; limit_refused: a connection limit (FireRunnerProxyAtLimit); policy_denied: a destination network.egress_deny or the host's own addresses refuse. Only hosts with proxy.enabled.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 138
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(firerunner_proxy_requests_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0,
+          "noValue": "No proxy (proxy.enabled false) or no requests"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 71,
+      "type": "timeseries",
+      "title": "Proxy tunnels and requests open",
+      "description": "CONNECT tunnels (https, git over https, docker pulls) and plain requests the forwarder handles now, all hosts together.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 138
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (firerunner_proxy_active{instance=~\"$instance\"})",
+          "legendFormat": "{{kind}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 72,
+      "type": "timeseries",
+      "title": "Proxy connections against their limit",
+      "description": "Slots in use as a share of each limit, the fullest host per scope: busiest_microvm (one microVM, limit 256), microvms (all together, 4096), host (gitlab-runner, containerd, the registry mirrors: 1024). Past 100 % requests get 503; FireRunnerProxyAtLimit fires over 80 %.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 146
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (scope) (firerunner_proxy_connections{instance=~\"$instance\"} / (firerunner_proxy_connections_limit{instance=~\"$instance\"} > 0))",
+          "legendFormat": "{{scope}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 73,
+      "type": "timeseries",
+      "title": "Proxy throughput",
+      "description": "Bytes through the forwarder per second: up is from jobs and host services to the corporate proxy, down the other way. Tunnels and request and answer bodies, counted as they move.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 146
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (direction) (rate(firerunner_proxy_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{direction}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 74,
+      "type": "timeseries",
+      "title": "Upstream connect time p50 / p95",
+      "description": "Time to reach the corporate proxy, the slowest host: dial is the TCP connect (every request and tunnel), handshake the proxy's answer to CONNECT. Buckets 5 ms, 25 ms, 100 ms, 250 ms, 1 s, 5 s, 15 s (the dial timeout).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 154
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (step) (histogram_quantile(0.5, sum by (instance, step, le) (rate(firerunner_proxy_upstream_connect_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))))",
+          "legendFormat": "{{step}} p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (step) (histogram_quantile(0.95, sum by (instance, step, le) (rate(firerunner_proxy_upstream_connect_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))))",
+          "legendFormat": "{{step}} p95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 75,
+      "type": "timeseries",
+      "title": "Upstream credentials and file",
+      "description": "credentials refused: 1 while the corporate proxy refuses the host's credentials (407). file changes: the upstream file took a new address or password (ok) or became unusable (failed). metrics read: 0 when the daemon could not read the forwarder's metrics (the other proxy panels are then empty).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 154
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(firerunner_proxy_upstream_auth_failing{instance=~\"$instance\"})",
+          "legendFormat": "credentials refused",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (result) (increase(firerunner_proxy_upstream_reloads_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "file changes {{result}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "min(firerunner_proxy_metrics_up{instance=~\"$instance\"})",
+          "legendFormat": "metrics read",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0,
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
       "id": 53,
       "type": "row",
       "title": "Node (node_exporter)",
@@ -3071,7 +3462,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 137
+        "y": 162
       },
       "panels": []
     },
@@ -3088,7 +3479,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 138
+        "y": 163
       },
       "targets": [
         {
@@ -3140,7 +3531,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 138
+        "y": 163
       },
       "targets": [
         {
@@ -3192,7 +3583,7 @@
         "h": 4,
         "w": 4,
         "x": 8,
-        "y": 138
+        "y": 163
       },
       "targets": [
         {
@@ -3244,7 +3635,7 @@
         "h": 4,
         "w": 4,
         "x": 12,
-        "y": 138
+        "y": 163
       },
       "targets": [
         {
@@ -3296,7 +3687,7 @@
         "h": 4,
         "w": 4,
         "x": 16,
-        "y": 138
+        "y": 163
       },
       "targets": [
         {
@@ -3348,7 +3739,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 138
+        "y": 163
       },
       "targets": [
         {
@@ -3400,7 +3791,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 142
+        "y": 167
       },
       "targets": [
         {
@@ -3459,7 +3850,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 142
+        "y": 167
       },
       "targets": [
         {
@@ -3534,7 +3925,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 150
+        "y": 175
       },
       "targets": [
         {
@@ -3618,7 +4009,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 150
+        "y": 175
       },
       "targets": [
         {
@@ -3684,7 +4075,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 158
+        "y": 183
       },
       "targets": [
         {
@@ -3750,7 +4141,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 158
+        "y": 183
       },
       "targets": [
         {
@@ -3809,7 +4200,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 166
+        "y": 191
       },
       "targets": [
         {
@@ -3875,7 +4266,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 166
+        "y": 191
       },
       "targets": [
         {
