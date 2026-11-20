@@ -108,39 +108,43 @@ type Runner struct {
 }
 
 func ReadRunner() (*Runner, error) {
-	f, err := os.Open(RunnerConfig)
+	b, err := os.ReadFile(RunnerConfig)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	return parseRunner(string(b))
+}
+
+// parseRunner reads the global concurrent and the first [[runners]] entry:
+// keys of that table only, not same-named ones in its sub-tables (a docker
+// service's name) and never a comment.
+func parseRunner(conf string) (*Runner, error) {
 	r := &Runner{}
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		k, v, ok := strings.Cut(strings.TrimSpace(sc.Text()), "=")
-		if !ok {
-			continue
-		}
-		k, v = strings.TrimSpace(k), strings.Trim(strings.TrimSpace(v), `"`)
-		switch k {
-		case "concurrent":
-			r.Concurrent, _ = strconv.Atoi(v)
-		case "name":
-			r.Name = v
-		case "url":
-			r.URL = v
-		case "executor":
-			r.Executor = v
+	runner := -1 // tableN of the first [[runners]]
+	for _, s := range tomlStatements(conf) {
+		switch {
+		case s.header:
+			if s.table == "[[runners]]" && runner < 0 {
+				runner = s.tableN
+			}
+		case s.tableN == 0 && s.key == "concurrent":
+			r.Concurrent, _ = strconv.Atoi(s.value)
+		case s.tableN == runner:
+			v, _ := tomlUnquote(s.value)
+			switch s.key {
+			case "name":
+				r.Name = v
+			case "url":
+				r.URL = v
+			case "executor":
+				r.Executor = v
+			}
 		}
 	}
 	if r.URL == "" {
 		return nil, errors.New("no runner registered")
 	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	if b, err := os.ReadFile(RunnerConfig); err == nil {
-		r.CacheType, r.CacheServer = cacheFromConfig(string(b))
-	}
+	r.CacheType, r.CacheServer = cacheFromConfig(conf)
 	return r, nil
 }
 
@@ -214,18 +218,19 @@ func SetConcurrent(n int) error {
 	if err != nil {
 		return err
 	}
-	lines := strings.Split(string(b), "\n")
-	found := false
-	for i, l := range lines {
-		if strings.HasPrefix(strings.TrimSpace(l), "concurrent") {
-			lines[i] = fmt.Sprintf("concurrent = %d", n)
-			found = true
+	return writeRootOnly(RunnerConfig, []byte(setConcurrent(string(b), n)))
+}
+
+// setConcurrent replaces the value of the root table's concurrent key, and
+// nothing else: not a key that only starts with "concurrent", not one in a
+// table, not its comment.
+func setConcurrent(conf string, n int) string {
+	for _, s := range tomlStatements(conf) {
+		if !s.header && s.tableN == 0 && s.key == "concurrent" {
+			return conf[:s.valStart] + strconv.Itoa(n) + conf[s.end:]
 		}
 	}
-	if !found {
-		lines = append([]string{fmt.Sprintf("concurrent = %d", n)}, lines...)
-	}
-	return writeRootOnly(RunnerConfig, []byte(strings.Join(lines, "\n")))
+	return fmt.Sprintf("concurrent = %d\n", n) + conf
 }
 
 // writeRootOnly replaces path atomically with a 0600 file. gitlab-runner
