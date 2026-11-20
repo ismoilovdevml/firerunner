@@ -19,9 +19,14 @@ permissions:
   id-token: write      # Sigstore signing of the build provenance
   attestations: write
 
+# One run per ref at a time, and a running one is never cancelled: edge is
+# updated in place (binaries, then checksums.txt and its signature), so a run
+# cancelled between the two uploads would leave binaries that fail the
+# signed-checksum check in install.sh and `firerunner upgrade`. A newer push
+# waits; GitHub keeps only the newest pending run.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   release:
