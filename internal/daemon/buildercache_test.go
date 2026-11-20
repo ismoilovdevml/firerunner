@@ -656,6 +656,14 @@ func TestBuilderLoadScriptExitStatus(t *testing.T) {
 	if _, err := exec.LookPath("tar"); err != nil {
 		t.Fatalf("tar not found: %v", err)
 	}
+	// One fake docker for every case (a new executable per case is slow to
+	// start on macOS): it fails unless FAKE_DOCKER_MP names the volume.
+	bin := t.TempDir()
+	docker := "#!/bin/sh\n[ -n \"$FAKE_DOCKER_MP\" ] || exit 1\n" +
+		"case \"$1 $2\" in\n\"volume inspect\") echo \"$FAKE_DOCKER_MP\" ;;\nesac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(docker), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	for _, c := range []struct {
 		name     string
 		input    string
@@ -673,13 +681,9 @@ func TestBuilderLoadScriptExitStatus(t *testing.T) {
 			if c.readOnly && os.Geteuid() == 0 {
 				t.Fatal("run as root: a read-only directory does not stop root's writes")
 			}
-			bin, mp := t.TempDir(), t.TempDir()
-			docker := "#!/bin/sh\nexit 1\n"
+			mp, dockerMP := t.TempDir(), ""
 			if c.dockerOK {
-				docker = "#!/bin/sh\ncase \"$1 $2\" in\n\"volume inspect\") echo " + mp + " ;;\nesac\nexit 0\n"
-			}
-			if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(docker), 0o755); err != nil {
-				t.Fatal(err)
+				dockerMP = mp
 			}
 			if c.readOnly {
 				if err := os.Chmod(mp, 0o500); err != nil {
@@ -688,7 +692,7 @@ func TestBuilderLoadScriptExitStatus(t *testing.T) {
 				t.Cleanup(func() { _ = os.Chmod(mp, 0o700) })
 			}
 			cmd := exec.Command("sh", "-c", builderLoadScript)
-			cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_DOCKER_MP="+dockerMP)
 			cmd.Stdin = strings.NewReader(c.input)
 			out, err := cmd.CombinedOutput()
 			if got := max(exitCode(err), 0); got != c.want {
