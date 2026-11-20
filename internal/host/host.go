@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -178,7 +179,7 @@ func RegisterRunner(url, token, name string, concurrent int) error {
 		"--custom-cleanup-exec", ExecutorBin, "--custom-cleanup-args", "executor", "--custom-cleanup-args", "cleanup",
 	)
 	reg.Env = append(os.Environ(), "CI_SERVER_TOKEN="+token)
-	if out, err := reg.CombinedOutput(); err != nil {
+	if out, err := runRootOnly(reg, RunnerConfig); err != nil {
 		return fmt.Errorf("gitlab-runner register: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
 	if err := SetConcurrent(concurrent); err != nil {
@@ -199,6 +200,20 @@ func RegisterRunner(url, token, name string, concurrent int) error {
 		return err
 	}
 	return run(RunnerBin, "verify", "--config", RunnerConfig)
+}
+
+// runRootOnly runs cmd, which writes secrets to path, so that path is never
+// readable by others, not even until a later chmod: an existing path is made
+// 0600 first, and a path cmd creates is 0600 at most (umask 077 while it
+// runs, inherited by cmd). The umask is process-wide: call it only where no
+// other goroutine creates files, as in the CLI.
+func runRootOnly(cmd *exec.Cmd, path string) ([]byte, error) {
+	if err := os.Chmod(path, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	old := syscall.Umask(0o077)
+	defer syscall.Umask(old)
+	return cmd.CombinedOutput()
 }
 
 // UnregisterRunner removes the runner from this host and from GitLab.
