@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -251,5 +252,48 @@ func TestConfigSetOnABrokenFile(t *testing.T) {
 				t.Fatalf("after set: vcpu %d, memory_mb %d, %v", cfg.VM.VCPU, cfg.VM.MemoryMB, err)
 			}
 		})
+	}
+}
+
+// config set says what the change needs, from what reads the key: jobs and
+// the daemon's reload see most keys, but some are read once at a service's
+// start, and the firewall has its own copy of the egress list.
+func TestApplyNote(t *testing.T) {
+	// Patterns: the daemon's unit is firerunner, not firerunner-proxy.
+	const nextJob, daemon, forwarder = `applies to the next job`, `systemctl restart firerunner($|[^-])`, `systemctl restart firerunner-proxy`
+	for _, c := range []struct {
+		key  string
+		want []string // patterns the note must match
+		not  []string // patterns it must not match
+	}{
+		{"vm.vcpu", []string{nextJob}, []string{"restart"}},
+		{"vm.kernel_cmdline.ipv6.disable", []string{nextJob}, []string{"restart"}},
+		{"pool.size", []string{nextJob}, []string{"restart"}},
+		{"daemon.job_max_age", []string{nextJob}, []string{"restart"}},
+		{"daemon.metrics_listen", []string{daemon}, []string{nextJob}},
+		{"daemon.reconcile_interval", []string{daemon}, []string{nextJob}},
+		{"daemon.socket", []string{daemon}, nil},
+		{"flintlock.endpoint", []string{daemon}, nil},
+		{"flintlock.tls_ca_file", []string{daemon}, nil},
+		{"flintlock.namespace", []string{daemon}, nil},
+		{"proxy.egress_strict", []string{forwarder}, []string{nextJob}},
+		{"proxy.connect_ports", []string{forwarder}, []string{nextJob}},
+		{"proxy.upstream_file", []string{forwarder}, []string{nextJob}},
+		{"proxy.listen", []string{forwarder, "next job"}, nil},
+		{"network.egress_deny", []string{forwarder, "FR_EGRESS_DENY", "install.sh"}, []string{nextJob}},
+		{"proxy.enabled", []string{"install.sh"}, nil},
+		{"proxy.no_proxy", []string{"next job", "install.sh"}, nil},
+	} {
+		note := applyNote(c.key)
+		for _, w := range c.want {
+			if !regexp.MustCompile(w).MatchString(note) {
+				t.Errorf("applyNote(%s) = %q, want it to match %q", c.key, note, w)
+			}
+		}
+		for _, n := range c.not {
+			if regexp.MustCompile(n).MatchString(note) {
+				t.Errorf("applyNote(%s) = %q, must not match %q", c.key, note, n)
+			}
+		}
 	}
 }
