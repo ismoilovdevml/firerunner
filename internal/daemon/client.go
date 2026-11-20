@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -139,4 +140,41 @@ func (c *Client) Refresh() error {
 		return err
 	}
 	return resp.Body.Close()
+}
+
+// DrainStatus reports whether the host is drained and what still runs on it.
+func (c *Client) DrainStatus(ctx context.Context) (*DrainStatus, error) {
+	return c.drain(ctx, http.MethodGet)
+}
+
+// SetDrain drains the host (on) or ends the drain, and returns the status
+// after the change. The daemon records the drain, so it outlives a daemon
+// restart.
+func (c *Client) SetDrain(ctx context.Context, on bool) (*DrainStatus, error) {
+	if on {
+		return c.drain(ctx, http.MethodPost)
+	}
+	return c.drain(ctx, http.MethodDelete)
+}
+
+func (c *Client) drain(ctx context.Context, method string) (*DrainStatus, error) {
+	req, err := http.NewRequestWithContext(ctx, method, "http://daemon/drain", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound, http.StatusMethodNotAllowed:
+		return nil, fmt.Errorf("drain: %s (restart firerunner if it runs an older version)", resp.Status)
+	default:
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("drain: %s: %s", resp.Status, bytes.TrimSpace(msg))
+	}
+	st := &DrainStatus{}
+	return st, json.NewDecoder(resp.Body).Decode(st)
 }

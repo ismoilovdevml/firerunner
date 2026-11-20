@@ -101,6 +101,9 @@ func (d *Daemon) apiHandler() http.Handler {
 		d.record(e)
 		w.WriteHeader(http.StatusNoContent)
 	})
+	mux.HandleFunc("GET /drain", d.drainHandler)
+	mux.HandleFunc("POST /drain", d.drainHandler)
+	mux.HandleFunc("DELETE /drain", d.drainHandler)
 	mux.HandleFunc("POST /pool/refresh", func(w http.ResponseWriter, r *http.Request) {
 		// Replace every idle VM, e.g. after a new rootfs image was published under the same tag.
 		d.spawn(func() { d.refreshPool(context.Background(), "refresh") })

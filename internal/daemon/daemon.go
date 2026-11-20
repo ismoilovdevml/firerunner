@@ -257,6 +257,9 @@ type Daemon struct {
 	// buildersAdopted: adoptBuilders has read builders.json. Until then the
 	// file holds the previous run's builders and is not written (builder.go).
 	buildersAdopted bool
+	// drainedSince is when `firerunner drain` drained the host, zero when
+	// it is not drained: no pool refills, no builder boots (drain.go).
+	drainedSince time.Time
 	// warned: when warnLimited last logged each problem at Warn.
 	warnMu sync.Mutex
 	warned map[string]time.Time
@@ -370,6 +373,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 	if fi, err := os.Stat(cfgPath); err == nil {
 		d.cfgMod, d.cfgLen = fi.ModTime(), fi.Size()
 	}
+	d.loadDrain()
 	return d, nil
 }
 
@@ -584,10 +588,11 @@ func (d *Daemon) refill(ctx context.Context) {
 	d.mu.Lock()
 	cfg := d.cfg
 	missing := cfg.Pool.Size - len(d.ready) - d.booting
+	drained := d.drainedLocked()
 	d.mu.Unlock()
 	d.metrics.poolTarget.Set(float64(cfg.Pool.Size))
 
-	if missing <= 0 {
+	if missing <= 0 || drained {
 		return
 	}
 	// One admission for the whole batch. It reserves the memory of each VM
