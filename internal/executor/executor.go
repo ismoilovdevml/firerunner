@@ -493,12 +493,78 @@ func useBuilder(ctx context.Context, cfg config.Config, dc *daemon.Client, inst 
 	return info.State, true
 }
 
-// buildCommand matches a command in a stage script that builds images.
-var buildCommand = regexp.MustCompile(`\bdocker(\s+buildx)?\s+build\b|\bdocker\s+buildx\s+bake\b|\bdocker(-|\s+)compose\b[^\n]*\bbuild\b`)
+var (
+	// dockerCall is where a docker command's arguments start in a script.
+	dockerCall = regexp.MustCompile(`\bdocker[ \t]+`)
+	// buildWord is a compose command line that builds: compose build, or
+	// up/run/create --build.
+	buildWord     = regexp.MustCompile(`\bbuild\b`)
+	composeBuilds = regexp.MustCompile(`\bdocker-compose\b[^\n]*\bbuild\b`)
+)
 
-// BuildsImages reports whether a stage script runs docker build (or buildx
-// build/bake, compose build). Only such stages need the project's builder.
-func BuildsImages(script []byte) bool { return buildCommand.Match(script) }
+// dockerValueOptions are docker's global options that take a value, which is
+// never the command; the same list as the docker wrapper's (BuilderScript).
+var dockerValueOptions = map[string]bool{
+	"--config": true, "-c": true, "--context": true, "-H": true, "--host": true,
+	"-l": true, "--log-level": true, "--tlscacert": true, "--tlscert": true, "--tlskey": true,
+}
+
+// BuildsImages reports whether a stage script runs docker build, image build,
+// builder build, buildx build or bake, or compose build, also after docker's
+// global options (docker --debug build). Only such stages need the project's
+// builder; FIRERUNNER_BUILDER=1 asks for it for any other (see wantsBuilder).
+func BuildsImages(script []byte) bool {
+	script = bytes.ReplaceAll(script, []byte("\\\n"), []byte(" ")) // continued lines
+	if composeBuilds.Match(script) {
+		return true
+	}
+	for _, loc := range dockerCall.FindAllIndex(script, -1) {
+		line := script[loc[1]:]
+		if i := bytes.IndexByte(line, '\n'); i >= 0 {
+			line = line[:i]
+		}
+		if dockerBuilds(strings.Fields(string(line))) {
+			return true
+		}
+	}
+	return false
+}
+
+// dockerBuilds reports whether docker's arguments args build images.
+func dockerBuilds(args []string) bool {
+	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		if dockerValueOptions[args[0]] && len(args) > 1 {
+			args = args[1:]
+		}
+		args = args[1:]
+	}
+	// A command word may end the shell command it is in: docker build;
+	word := func(i int) string {
+		if i >= len(args) {
+			return ""
+		}
+		return strings.TrimRight(args[i], ";&|)")
+	}
+	switch word(0) {
+	case "build":
+		return true
+	case "buildx":
+		return word(1) == "build" || word(1) == "bake"
+	case "image", "builder":
+		return word(1) == "build"
+	case "compose":
+		return buildWord.MatchString(strings.Join(args[1:], " "))
+	}
+	return false
+}
+
+// wantsBuilder reports whether the job asked for the project's builder in
+// every stage with the job variable FIRERUNNER_BUILDER (1 or true), for
+// builds BuildsImages cannot see: docker build run by make or a script.
+func wantsBuilder() bool {
+	on, err := strconv.ParseBool(os.Getenv("CUSTOM_ENV_FIRERUNNER_BUILDER"))
+	return err == nil && on
+}
 
 // BuilderWait is how long `docker build` in a job waits for a starting builder:
 // a boot restores the project's saved cache first (about 100 MB/s, so up to
@@ -665,7 +731,7 @@ func Run(ctx context.Context, cfg config.Config, script, stage string) error {
 				return systemFailure(fmt.Errorf("reading stage script: %w", rerr))
 			}
 			script = bytes.NewReader(body)
-			if BuildsImages(body) {
+			if BuildsImages(body) || wantsBuilder() {
 				buildWith(ctx, cfg, id, st)
 			}
 		}

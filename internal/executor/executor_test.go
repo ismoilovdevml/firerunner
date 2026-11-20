@@ -684,6 +684,24 @@ func TestBuildsImages(t *testing.T) {
 		"docker compose up -d":                          false,
 		"npm run build":                                 false,
 		"dotnet build":                                  false,
+		// The wrapper's fr_builds sees these too: image and builder build,
+		// and docker's global options before the command.
+		"docker image build -t app .":                         true,
+		"docker builder build .":                              true,
+		"docker --debug build .":                              true,
+		"docker -D build .":                                   true,
+		"docker -H tcp://10.0.0.1:2375 build .":               true,
+		"docker --log-level=debug --tls image build .":        true,
+		"docker --context remote buildx build --push .":       true,
+		"docker -c ci --config /tmp/cfg buildx bake":          true,
+		"docker --debug compose -f ci.yml build":              true,
+		"docker image ls\ndocker images build":                false,
+		"docker -H tcp://10.0.0.1:2375 run alpine echo build": false,
+		"docker --context build run alpine":                   false,
+		"docker --config build image ls":                      false,
+		"docker \\\n    --debug build .":                      true,
+		"(docker build -t app .)":                             true,
+		"docker.io/library/app build":                         false,
 	} {
 		if got := BuildsImages([]byte(script)); got != want {
 			t.Errorf("BuildsImages(%q) = %v, want %v", script, got, want)
