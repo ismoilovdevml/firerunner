@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -20,9 +21,16 @@ func fakeSSH(t *testing.T, body string) (cfg config.Config, inst *Instance, pidF
 	t.Helper()
 	bin := t.TempDir()
 	pidFile = filepath.Join(t.TempDir(), "pid")
-	script := "#!/bin/sh\necho $$ > " + pidFile + ".tmp && mv " + pidFile + ".tmp " + pidFile + "\n" + body
+	script := "#!/bin/sh\n[ -n \"$FAKE_SSH_WARM\" ] && exit 0\necho $$ > " + pidFile + ".tmp && mv " + pidFile + ".tmp " + pidFile + "\n" + body
 	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
+	}
+	// The first exec of a new script is slow on macOS (seconds under -race
+	// load); pay it here, not inside a test's deadline.
+	warm := exec.Command(filepath.Join(bin, "ssh"))
+	warm.Env = append(os.Environ(), "FAKE_SSH_WARM=1")
+	if err := warm.Run(); err != nil {
+		t.Fatalf("warming the fake ssh: %v", err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	oldKH, oldPoll := KnownHostsDir, bootPoll
@@ -60,8 +68,8 @@ func TestWaitSSHEndsAHungProbe(t *testing.T) {
 		want     func(error) bool
 	}{
 		{"job cancelled", time.Minute, true, func(err error) bool { return errors.Is(err, context.Canceled) }},
-		// Not shorter: a new script's first exec takes ~0.3 s on macOS.
-		{"boot timeout passes", 2 * time.Second, false, func(err error) bool { return errors.Is(err, ErrNotReady) }},
+		// Long enough for the (warmed) fake ssh to start under -race load.
+		{"boot timeout passes", 3 * time.Second, false, func(err error) bool { return errors.Is(err, ErrNotReady) }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cfg, inst, pidFile := fakeSSH(t, "exec sleep 30\n")
