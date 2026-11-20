@@ -292,6 +292,9 @@ type Forwarder struct {
 	// tunnels already open may still finish before they are cut; 0 cuts them
 	// at once. New connections are refused from the start of the stop.
 	ShutdownWait time.Duration
+	// MetricsSocket is the unix socket Serve exports Metrics on, for the
+	// daemon to re-export (DefaultMetricsSocket); "" exports none.
+	MetricsSocket string
 
 	// setupOnce makes the metrics, the transport and the context of upstream
 	// calls on first use, so a Forwarder is ready as a struct literal; the

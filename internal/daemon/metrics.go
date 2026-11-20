@@ -245,7 +245,11 @@ func (d *Daemon) tick() {
 
 func (d *Daemon) metricsHandler() http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(d.metrics.reg, promhttp.HandlerOpts{}))
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		// Per scrape: the forwarder is read within the scrape's context.
+		g := prometheus.Gatherers{d.metrics.reg, d.proxyGatherer(r.Context())}
+		promhttp.HandlerFor(g, promhttp.HandlerOpts{}).ServeHTTP(w, r)
+	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		// The loop passes every 2 s; a hung flintlock call or exec stops it.
 		if last := d.lastTick.Load(); last > 0 && time.Since(time.Unix(last, 0)) > stuckAfter {

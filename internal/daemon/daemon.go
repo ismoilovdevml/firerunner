@@ -36,6 +36,7 @@ import (
 	"github.com/ismoilovdevml/firerunner/internal/config"
 	"github.com/ismoilovdevml/firerunner/internal/flintlock"
 	"github.com/ismoilovdevml/firerunner/internal/host"
+	"github.com/ismoilovdevml/firerunner/internal/proxy"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
@@ -210,6 +211,9 @@ type Daemon struct {
 	cfgPath string
 	log     *slog.Logger
 	metrics *Metrics
+	// proxyMetricsSocket is where the forwarder serves the metrics /metrics
+	// re-exports (proxy.DefaultMetricsSocket).
+	proxyMetricsSocket string
 	// now times builder boot phases; tests replace it to make them exact.
 	now func() time.Time
 
@@ -365,7 +369,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 		builders: map[string]*builder{}, builderFailed: map[string]time.Time{},
 		saving: map[string]*cacheSave{}, cacheDropped: map[string]time.Time{}, cacheRefused: map[string]cacheRefusal{},
 		runCtx:   context.Background(),
-		oomKills: -1}
+		oomKills: -1, proxyMetricsSocket: proxy.DefaultMetricsSocket}
 	fl.OnError = d.flintlockFailed
 	if fi, err := os.Stat(cfgPath); err == nil {
 		d.cfgMod, d.cfgLen = fi.ModTime(), fi.Size()

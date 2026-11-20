@@ -1015,10 +1015,11 @@ func cmdProxy(cfg config.Config) error {
 		Allowed:  proxy.AllowNets(bridge),
 		Policy: &proxy.Policy{Bridge: bridge, Deny: deny, ConnectPorts: cfg.Proxy.ConnectPorts,
 			LocalAddrs: localAddrs, Strict: cfg.Proxy.EgressStrict},
-		Limits:       proxy.DefaultLimits,
-		Log:          log,
-		DialTimeout:  15 * time.Second,
-		ShutdownWait: cfg.Proxy.ShutdownTimeout,
+		Limits:        proxy.DefaultLimits,
+		Log:           log,
+		DialTimeout:   15 * time.Second,
+		ShutdownWait:  cfg.Proxy.ShutdownTimeout,
+		MetricsSocket: proxy.DefaultMetricsSocket,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

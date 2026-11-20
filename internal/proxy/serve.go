@@ -5,8 +5,11 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // cutGrace bounds the wait for handlers after a stop has cut their
@@ -54,6 +57,8 @@ func ServeListeners(ctx context.Context, f *Forwarder, ls ...net.Listener) error
 		}()
 		f.Log.Info("proxy forwarder listening", "addr", l.Addr().String())
 	}
+	// Last to stop: a scrape during the stop still sees what is open.
+	defer f.serveMetrics(&wg)()
 	var err error
 	wait := f.ShutdownWait
 	select {
@@ -66,6 +71,50 @@ func ServeListeners(ctx context.Context, f *Forwarder, ls ...net.Listener) error
 	}
 	f.stop(servers, wait)
 	return err
+}
+
+// DefaultMetricsSocket is where firerunner-proxy serves its metrics and the
+// daemon reads them: in the unit's RuntimeDirectory, readable by root only.
+const DefaultMetricsSocket = "/run/firerunner-proxy/metrics.sock"
+
+// serveMetrics serves the metrics on f.MetricsSocket, under wg, and returns
+// the func that stops it. A socket it cannot make costs the metrics only:
+// the forwarder runs on.
+func (f *Forwarder) serveMetrics(wg *sync.WaitGroup) (stop func()) {
+	if f.MetricsSocket == "" {
+		return func() {}
+	}
+	l, err := listenSocket(f.MetricsSocket)
+	if err != nil {
+		f.Log.Warn("proxy metrics not exported: cannot listen on the metrics socket (firerunner-proxy.service needs RuntimeDirectory=firerunner-proxy: re-run install.sh)",
+			"socket", f.MetricsSocket, "err", err)
+		return func() {}
+	}
+	s := &http.Server{Handler: promhttp.HandlerFor(f.m.reg, promhttp.HandlerOpts{}), ReadHeaderTimeout: 5 * time.Second}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = s.Serve(l)
+	}()
+	return func() { _ = s.Close() }
+}
+
+// listenSocket listens on a unix socket at path for root only. A socket a
+// previous run left is replaced; any other file there is not touched.
+func listenSocket(path string) (net.Listener, error) {
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSocket != 0 {
+		_ = os.Remove(path)
+	}
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	// The runtime directory is 0700 already; the socket is not left to the umask.
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = l.Close()
+		return nil, err
+	}
+	return l, nil
 }
 
 // stop shuts the servers down, waits up to wait for open handlers, then cuts.
