@@ -321,6 +321,11 @@ func applyNote(key string) string {
 		return "microVMs use it from the next job; install.sh starts or stops firerunner-proxy and the host services' proxy settings (FR_PROXY)"
 	case key == "proxy.no_proxy":
 		return "microVMs use it from the next job; host services when install.sh runs again"
+	case key == "builder.max_parallelism":
+		// Written into buildkitd.toml at the builder's start; part of
+		// builderSpec, so expireBuilders replaces a builder started with
+		// another value once it is idle.
+		return "new builders use it; a running builder is replaced once it has been idle for 10 minutes (its cache is saved)"
 	}
 	return "applies to the next job"
 }

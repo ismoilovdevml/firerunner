@@ -299,6 +299,8 @@ func TestApplyNote(t *testing.T) {
 		{"network.egress_deny", []string{forwarder, "FR_EGRESS_DENY", "install.sh"}, []string{nextJob}},
 		{"proxy.enabled", []string{"install.sh"}, nil},
 		{"proxy.no_proxy", []string{"next job", "install.sh"}, nil},
+		// A builder keeps the step cap it started with (buildkitd.toml).
+		{"builder.max_parallelism", []string{"new builders", "idle for 10 minutes"}, []string{nextJob, "restart"}},
 	} {
 		note := applyNote(c.key)
 		for _, w := range c.want {
