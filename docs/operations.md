@@ -61,7 +61,8 @@ a pool from an older install keeps 512K until it is rebuilt. Check yours with
 
 A rebuild deletes every microVM disk and the images flintlock pulled; the host pulls the kernel
 and root filesystem again on the first boot. It keeps the registry mirrors, the `cache:` store and
-the saved builder caches (`/var/lib/firerunner`, on the root disk). Running builders lose what they
+the saved builder caches (`/var/lib/firerunner`, on the root disk; the mirrors in their own file
+system there, see [Registry mirrors](#registry-mirrors)). Running builders lose what they
 cached since their last save. The host takes no jobs while it runs.
 
 1. Drain the host: pause the runner in GitLab and wait until `sudo firerunner vm list` shows no
@@ -110,6 +111,120 @@ cached since their last save. The host takes no jobs while it runs.
 
 A volume group on more than one disk is rebuilt on the first one; add the others afterwards with
 `vgextend flintlock /dev/sdX` and grow the pool with `lvextend -L +<size> flintlock/thinpool`.
+
+## Registry mirrors
+
+Each mirror (`docker.io` for Docker Hub, and every `FR_REGISTRY_MIRRORS` host) runs as two services:
+
+| Unit | Listens on | Runs as |
+|---|---|---|
+| `firerunner-registry@<name>` | `127.0.0.1:<port + 10000>` (15000, 15001, ...) | `firerunner-registry` |
+| `firerunner-registry-front@<name>` | the bridge address, port 5000 (Docker Hub) or 5001+ | a dynamic user |
+
+The front (`firerunner registry-front`) passes only pulls (GET and HEAD of `/v2/`, manifests and
+blobs) and answers 502 while its registry is down. microVMs use the same ports as before. With a
+`firerunner` older than `registry-front`, the registries listen on the bridge ports themselves and
+no front runs; the next installer run with a newer one adds them. `firerunner-registry` starts all
+of them; `systemctl stop|restart firerunner-registry` stops or restarts all of them. Configs are in
+`/etc/firerunner/registries.d/<name>.yml` (registry) and `<name>.env` (front).
+
+When a mirror is down, microVMs pull from the registry itself: slower, and against Docker Hub's
+rate limits, but jobs still run.
+
+### Storage
+
+The mirrors keep their data in `/var/lib/firerunner/registries/<name>`, an ext4 file system in
+`/var/lib/firerunner/registries.img` on the root disk (`var-lib-firerunner-registries.mount`).
+The image is sparse: it takes as much of the root disk as the mirrors store, never more than its
+size (`FR_REGISTRY_GB`, by default a fifth of the root file system). Deleted blobs give their space
+back to the root disk (`discard`).
+
+```bash
+df -h /var/lib/firerunner/registries        # what the mirrors use, of their size
+du -sh --apparent-size /var/lib/firerunner/registries.img; du -sh /var/lib/firerunner/registries.img  # size, and what it takes
+```
+
+- Grow it: run the installer with a larger `FR_REGISTRY_GB`. It grows online; nothing restarts.
+- Shrink it: the installer does not (ext4 shrinks only unmounted). When no job runs:
+  `systemctl stop firerunner-registry var-lib-firerunner-registries.mount`, then
+  `e2fsck -f /var/lib/firerunner/registries.img && resize2fs /var/lib/firerunner/registries.img <N>G && truncate -s <N>G /var/lib/firerunner/registries.img`,
+  then `systemctl start var-lib-firerunner-registries.mount firerunner-registry`. Or delete the
+  image (the mirrors start empty) and run the installer with the new `FR_REGISTRY_GB`.
+- Another disk: put a file system in `/etc/fstab` on `/var/lib/firerunner/registries`. The installer
+  then uses it instead of the image. On a host that already has the image, stop
+  `firerunner-registry`, copy the data over, and remove
+  `/etc/systemd/system/var-lib-firerunner-registries.mount` (it hides the fstab entry from systemd).
+
+### What frees space
+
+- **ttl**: a mirror deletes what it fetched 7 days ago (`proxy.ttl: 168h`). Earlier versions could
+  not (`delete.enabled: false`), so their data never expired; data they fetched is removed only by
+  the two below.
+- **Eviction**, every 10 minutes (`firerunner-registry-evict.timer`): above 90 % in use, the layers
+  read longest ago (to within a day) are deleted until 80 % is in use, across all mirrors. The
+  mirrors keep running: a pull of an evicted layer fetches it again. Manifests are never evicted.
+- **Garbage collection**, hourly (`firerunner-registry-gc.timer`): at most once a day per mirror and
+  only while no job runs, it stops that mirror, runs `registry garbage-collect` and starts it
+  again. It removes the blobs no manifest refers to any more.
+
+```bash
+systemctl list-timers 'firerunner-registry-*'
+journalctl -u firerunner-registry-evict -u firerunner-registry-gc --since -1d
+```
+
+A failed garbage collection fails `firerunner-registry-gc` (`systemctl --failed`); it is tried again
+the next day, and the eviction still keeps the file system under 90 %.
+
+The daemon's `firerunner_disk_*` metrics do not cover this file system. With node_exporter,
+`node_filesystem_avail_bytes{mountpoint="/var/lib/firerunner/registries"}` does. No alert rule
+covers it: the eviction keeps it under 90 %, and full only slows pulls.
+
+`firerunner_service_up{service="firerunner-registry"}` (and the alert on it) reports
+`firerunner-registry`, which only starts the mirrors: it stays up while one mirror's service fails.
+Check them one by one with `systemctl list-units 'firerunner-registry*'`.
+
+### Upgrading from the single service
+
+Hosts installed before this layout ran every mirror in one `firerunner-registry` service as root,
+with data in `/var/lib/firerunner/registry` and `/var/lib/firerunner/registry-mirrors` on the root
+disk without a limit. The installer moves them in a run when no job runs; while jobs run it leaves
+the old service as it is and says so (`firerunner-registry(move)`): run it again when the runner is
+idle.
+
+That run:
+
+1. stops `firerunner-registry` (microVMs pull from the registries themselves until step 4);
+2. copies each mirror's data into the new file system, if it fits under 80 % of `FR_REGISTRY_GB`
+   and the root disk has room for the copy (else that mirror starts empty), and gives it to
+   `firerunner-registry`;
+3. renames the old directories to `<dir>.migrated` (nothing is deleted);
+4. starts every `firerunner-registry@`, `firerunner-registry-front@` and the timers.
+
+It also stops `firerunner-cache` once to give `/var/lib/firerunner/cache` to `firerunner-cache`
+(an upload or download of a running job fails; jobs only warn about `cache:`). No other service
+restarts for this. A run cut short continues on the next run.
+
+Check, then free the root disk:
+
+```bash
+systemctl list-units 'firerunner-registry*'
+curl -fsS http://10.200.0.1:5000/v2/ && echo ok      # FR_SUBNET.1
+sudo firerunner run -- docker pull alpine
+sudo rm -rf /var/lib/firerunner/registry.migrated /var/lib/firerunner/registry-mirrors/*.migrated
+```
+
+To go back to the earlier installer version, when no job runs:
+
+```bash
+sudo systemctl disable --now firerunner-registry-evict.timer firerunner-registry-gc.timer firerunner-registry
+sudo rm -rf /etc/systemd/system/firerunner-registry.service.wants   # else the old service starts the fronts too
+sudo mv /var/lib/firerunner/registry.migrated /var/lib/firerunner/registry
+for d in /var/lib/firerunner/registry-mirrors/*.migrated; do sudo mv "$d" "${d%.migrated}"; done
+```
+
+Then run the earlier installer: it writes its single service again. The renamed-back directories
+are still root's, as that service needs (it runs as root without capabilities). What the mirrors
+fetched since the move stays in the image.
 
 ## Monitoring
 
@@ -187,13 +302,17 @@ taken from GitLab.
 
 ### FireRunnerCacheServiceDown
 
-Warning. `firerunner-registry` (the Docker Hub mirror) or `firerunner-cache` (`cache:` storage) has
-been down for 10 minutes. Jobs still run, but pull from Docker Hub directly (rate limits) or start
-without their `cache:`.
+Warning. `firerunner-registry` (it starts the registry mirrors) or `firerunner-cache` (`cache:`
+storage) has been down for 10 minutes. Jobs still run, but pull from the registries directly
+(Docker Hub rate limits) or start without their `cache:`. One mirror's failing service does not
+fire it: see [Registry mirrors](#registry-mirrors).
 
-- Check: `journalctl -u <service> -n 100`, `df -h /var/lib/firerunner`.
-- Fix: `sudo systemctl start <service>`.
-- Recovered: *Services* shows it up.
+- Check: `journalctl -u <service> -n 100`; for the mirrors `systemctl list-units 'firerunner-registry*'`,
+  `df -h /var/lib/firerunner/registries` and `systemctl status var-lib-firerunner-registries.mount`
+  (the mirrors do not start without their file system).
+- Fix: `sudo systemctl start <service>` (`firerunner-registry` starts every mirror).
+- Recovered: *Services* shows it up, and `systemctl list-units 'firerunner-registry*'` shows every
+  mirror and front `active`.
 
 ### FireRunnerProxyDown
 
@@ -282,8 +401,9 @@ get no address and jobs fail with `got no DHCP lease`.
 ### FireRunnerDiskFilling
 
 Warning. The file system of `/var/lib/firerunner/builder-cache` or `/var/lib/flintlock/vm` has had
-less than 15 % free for 15 minutes. Below 10 % no builder cache is saved; at 0 the registry mirror,
-`cache:` uploads and flintlockd's microVM state can no longer be written.
+less than 15 % free for 15 minutes. Below 10 % no builder cache is saved; at 0 `cache:` uploads
+and flintlockd's microVM state can no longer be written. The registry mirrors take at most
+`FR_REGISTRY_GB` of it ([Registry mirrors](#registry-mirrors)).
 
 - Check: `df -h /var/lib/firerunner /var/lib/flintlock/vm`;
   `sudo du -xsh /var/lib/firerunner/* /var/lib/flintlock/vm`.
@@ -312,7 +432,9 @@ Those projects' `docker build` runs without the layer cache, or fails when its b
 | `firerunner` | daemon: pool, builders, cleanup, metrics |
 | `flintlockd`, `containerd-flintlock` | start and stop microVMs; store their images |
 | `firerunner-net`, `firerunner-dnsmasq` | microVM network, DHCP and DNS |
-| `firerunner-registry` | registry mirrors for the VMs (Docker Hub and `FR_REGISTRY_MIRRORS`) |
+| `firerunner-registry` | starts the registry mirrors for the VMs (Docker Hub and `FR_REGISTRY_MIRRORS`) |
+| `firerunner-registry@<name>`, `firerunner-registry-front@<name>` | one mirror, and its pull-only front on the bridge; see [Registry mirrors](#registry-mirrors) |
+| `firerunner-registry-evict.timer`, `firerunner-registry-gc.timer` | keep the mirrors' file system under 90 %; remove blobs no image uses |
 | `firerunner-cache` | storage for `cache:` |
 | `gitlab-runner` | takes jobs from GitLab |
 
