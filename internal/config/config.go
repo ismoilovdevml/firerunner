@@ -63,7 +63,15 @@ type Proxy struct {
 	// address in network.egress_deny. Off by default, since it breaks networks
 	// where only the corporate proxy resolves outside names.
 	EgressStrict bool `yaml:"egress_strict"`
+	// ShutdownTimeout is how long a stopping forwarder lets open requests and
+	// tunnels (clones, pulls) finish before it cuts them; 0 cuts them at once.
+	// firerunner-proxy's TimeoutStopSec must leave room for it.
+	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 }
+
+// MaxProxyShutdownTimeout bounds proxy.shutdown_timeout: a stop, and so a
+// host reboot, never waits longer on the forwarder.
+const MaxProxyShutdownTimeout = 10 * time.Minute
 
 // ProxyPort is the forwarder's port; install.sh opens it in the firewall.
 const ProxyPort = "3128"
@@ -226,6 +234,9 @@ func Default() Config {
 			Listen:       "10.200.0.1:" + ProxyPort,
 			UpstreamFile: "/etc/firerunner/proxy-upstream",
 			ConnectPorts: []int{443},
+			// Long enough for the requests and short downloads under way to
+			// end; a long pull is cut either way, and a reboot waits on it.
+			ShutdownTimeout: 30 * time.Second,
 		},
 		Builder: Builder{
 			Enabled:      true,
@@ -412,6 +423,9 @@ func (c Config) Validate() error {
 			}
 		}
 	}
+	if c.Proxy.ShutdownTimeout < 0 || c.Proxy.ShutdownTimeout > MaxProxyShutdownTimeout {
+		errs = append(errs, "proxy.shutdown_timeout must be between 0 (cut open connections at once) and "+MaxProxyShutdownTimeout.String())
+	}
 	for _, e := range SplitNoProxy(c.Proxy.NoProxy) {
 		if !noProxyEntry.MatchString(e) {
 			errs = append(errs, fmt.Sprintf("proxy.no_proxy entry %q is not a host, .domain or CIDR", e))
@@ -483,7 +497,8 @@ func pruneUnused(m map[string]any, cfg Config) {
 	def := Default().Proxy
 	p := cfg.Proxy
 	defaultPorts := fmt.Sprint(p.ConnectPorts) == fmt.Sprint(def.ConnectPorts)
-	if !p.Enabled && p.Listen == def.Listen && p.UpstreamFile == def.UpstreamFile && p.NoProxy == "" && defaultPorts && !p.EgressStrict {
+	defaultWait := p.ShutdownTimeout == def.ShutdownTimeout
+	if !p.Enabled && p.Listen == def.Listen && p.UpstreamFile == def.UpstreamFile && p.NoProxy == "" && defaultPorts && !p.EgressStrict && defaultWait {
 		delete(m, "proxy")
 	} else if pm, ok := m["proxy"].(map[string]any); ok {
 		if defaultPorts {
@@ -491,6 +506,9 @@ func pruneUnused(m map[string]any, cfg Config) {
 		}
 		if !p.EgressStrict {
 			delete(pm, "egress_strict")
+		}
+		if defaultWait {
+			delete(pm, "shutdown_timeout")
 		}
 	}
 	if vm, ok := m["vm"].(map[string]any); ok {

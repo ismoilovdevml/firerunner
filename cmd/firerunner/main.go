@@ -310,7 +310,7 @@ func applyNote(key string) string {
 		return "applies after " + daemonRestart
 	case key == "daemon.socket" || strings.HasPrefix(key, "flintlock."):
 		return "jobs use it from the next job; the daemon after " + daemonRestart
-	case key == "proxy.upstream_file" || key == "proxy.connect_ports" || key == "proxy.egress_strict":
+	case key == "proxy.upstream_file" || key == "proxy.connect_ports" || key == "proxy.egress_strict" || key == "proxy.shutdown_timeout":
 		return "applies after " + proxyRestart
 	case key == "proxy.listen":
 		return "microVMs use it from the next job; the forwarder after " + proxyRestart
@@ -1015,9 +1015,10 @@ func cmdProxy(cfg config.Config) error {
 		Allowed:  proxy.AllowNets(bridge),
 		Policy: &proxy.Policy{Bridge: bridge, Deny: deny, ConnectPorts: cfg.Proxy.ConnectPorts,
 			LocalAddrs: localAddrs, Strict: cfg.Proxy.EgressStrict},
-		Limits:      proxy.DefaultLimits,
-		Log:         log,
-		DialTimeout: 15 * time.Second,
+		Limits:       proxy.DefaultLimits,
+		Log:          log,
+		DialTimeout:  15 * time.Second,
+		ShutdownWait: cfg.Proxy.ShutdownTimeout,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

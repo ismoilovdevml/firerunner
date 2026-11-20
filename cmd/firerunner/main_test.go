@@ -293,6 +293,7 @@ func TestApplyNote(t *testing.T) {
 		{"flintlock.tls_ca_file", []string{daemon}, nil},
 		{"flintlock.namespace", []string{daemon}, nil},
 		{"proxy.egress_strict", []string{forwarder}, []string{nextJob}},
+		{"proxy.shutdown_timeout", []string{forwarder}, []string{nextJob}},
 		{"proxy.connect_ports", []string{forwarder}, []string{nextJob}},
 		{"proxy.upstream_file", []string{forwarder}, []string{nextJob}},
 		{"proxy.listen", []string{forwarder, "next job"}, nil},

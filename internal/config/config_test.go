@@ -151,6 +151,8 @@ func TestProxyValidation(t *testing.T) {
 		"registry with https scheme": func(c *Config) { c.VM.InsecureRegistries = []string{"https://harbor.corp"} },
 		"empty registry":             func(c *Config) { c.VM.InsecureRegistries = []string{""} },
 		"registry with a newline":    func(c *Config) { c.VM.InsecureRegistries = []string{"a\nb"} },
+		"negative shutdown_timeout":  func(c *Config) { c.Proxy.ShutdownTimeout = -time.Second },
+		"shutdown_timeout over 10m":  func(c *Config) { c.Proxy.ShutdownTimeout = 10*time.Minute + time.Second },
 	} {
 		c := ok
 		c.VM.InsecureRegistries = append([]string(nil), ok.VM.InsecureRegistries...)
@@ -209,9 +211,31 @@ func TestSaveLeavesOutUnusedNewKeys(t *testing.T) {
 	if got, err := Load(path); err != nil || !got.Proxy.Enabled || got.Network.EgressDeny[0] != "192.168.0.0/16" || len(got.Proxy.ConnectPorts) != 1 {
 		t.Fatalf("reload with proxy: %+v %v", got, err)
 	}
-	// connect_ports is unknown to v0.1.0: written only when not the default.
-	if strings.Contains(string(data), "connect_ports") {
-		t.Fatalf("default connect_ports written:\n%s", data)
+	// connect_ports and shutdown_timeout are unknown to v0.1.0: written only
+	// when not the default.
+	for _, key := range []string{"connect_ports", "shutdown_timeout"} {
+		if strings.Contains(string(data), key) {
+			t.Fatalf("default %s written:\n%s", key, data)
+		}
+	}
+	cfg.Proxy.ShutdownTimeout = 0
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := Load(path); err != nil || got.Proxy.ShutdownTimeout != 0 {
+		t.Fatalf("shutdown_timeout 0 (cut at once) not kept: %v %v", got.Proxy.ShutdownTimeout, err)
+	}
+}
+
+// The forwarder lets open requests and tunnels finish for 30 s on stop by
+// default; firerunner-proxy's TimeoutStopSec is set from it (install.sh).
+func TestProxyShutdownTimeoutDefault(t *testing.T) {
+	if d := Default().Proxy.ShutdownTimeout; d != 30*time.Second {
+		t.Fatalf("default proxy.shutdown_timeout %v", d)
+	}
+	cfg, err := Set(Default(), "proxy.shutdown_timeout", "2m")
+	if err != nil || cfg.Proxy.ShutdownTimeout != 2*time.Minute {
+		t.Fatalf("set 2m: %v %v", cfg.Proxy.ShutdownTimeout, err)
 	}
 }
 

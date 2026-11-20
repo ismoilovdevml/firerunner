@@ -288,12 +288,21 @@ type Forwarder struct {
 	Log    *slog.Logger
 	// DialTimeout bounds connecting to the upstream and its answer to CONNECT.
 	DialTimeout time.Duration
+	// ShutdownWait is how long, once Serve is told to stop, requests and
+	// tunnels already open may still finish before they are cut; 0 cuts them
+	// at once. New connections are refused from the start of the stop.
+	ShutdownWait time.Duration
 
-	// setupOnce makes the metrics and the transport on first use, so a
-	// Forwarder is ready as a struct literal; the fields above are read then.
+	// setupOnce makes the metrics, the transport and the context of upstream
+	// calls on first use, so a Forwarder is ready as a struct literal; the
+	// fields above are read then.
 	setupOnce sync.Once
 	m         *metrics
 	transport *http.Transport
+	// upstreamCtx is the parent of every upstream dial and plain request
+	// (not the client's request context, see forward); cut cancels it.
+	upstreamCtx context.Context
+	cancelAll   context.CancelFunc
 
 	mu      sync.Mutex
 	active  map[string]int
@@ -306,11 +315,19 @@ type Forwarder struct {
 	// What the upstream file held at the last request (noteUpstream).
 	upstreamState int
 	upstreamKey   string
+	// handlers counts ServeHTTP calls under way, which a stop waits for;
+	// open holds what cut closes: hijacked tunnels and upstream connections,
+	// which http.Server.Shutdown neither waits for nor closes.
+	handlers int
+	open     map[uint64]func()
+	openSeq  uint64
+	cutting  bool
 }
 
 func (f *Forwarder) setup() {
 	f.setupOnce.Do(func() {
 		f.m = newMetrics(f)
+		f.upstreamCtx, f.cancelAll = context.WithCancel(context.Background())
 		dialer := &net.Dialer{Timeout: f.DialTimeout}
 		f.transport = &http.Transport{
 			// The address comes with the request, from the same read of the
@@ -453,6 +470,12 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodConnect {
 		o.kind = kindTunnel
 	}
+	if !f.enter() {
+		o.set(outcomeLimitRefused)
+		http.Error(w, "firerunner proxy: stopping", http.StatusServiceUnavailable)
+		return
+	}
+	defer f.leave()
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
 	ip := net.ParseIP(host)
 	if ip == nil || !f.Allowed(ip) {
@@ -557,13 +580,14 @@ func targetHostPort(target string, connect bool, scheme string) (string, int, er
 
 // tunnel opens CONNECT through the upstream and splices the two connections.
 func (f *Forwarder) tunnel(w http.ResponseWriter, o *outcome, up Upstream, target string) (int, int64) {
-	upConn, err := f.dialUpstream(context.Background(), up.Addr)
+	upConn, err := f.dialUpstream(f.upstreamCtx, up.Addr)
 	if err != nil {
 		o.set(outcomeUpstreamError)
 		f.Log.Warn("upstream proxy unreachable", "upstream", up.Addr, "err", err)
 		http.Error(w, "firerunner proxy: upstream proxy unreachable", http.StatusBadGateway)
 		return http.StatusBadGateway, 0
 	}
+	defer f.track(func() { _ = upConn.Close() })()
 	_ = upConn.SetDeadline(time.Now().Add(f.DialTimeout))
 	req := "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n"
 	if up.Auth != "" {
@@ -605,6 +629,7 @@ func (f *Forwarder) tunnel(w http.ResponseWriter, o *outcome, up Upstream, targe
 		return http.StatusInternalServerError, 0
 	}
 	o.set(outcomeAllowed)
+	defer f.track(func() { _ = client.Close() })()
 	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
 		_ = client.Close()
 		_ = upConn.Close()
@@ -680,8 +705,9 @@ type upstreamKey struct{}
 // forward sends a plain http:// request through the upstream proxy.
 func (f *Forwarder) forward(w http.ResponseWriter, r *http.Request, o *outcome, up Upstream) (int, int64) {
 	// Not the request's context: a client that half-closes (busybox) cancels it.
-	// The answer is abandoned instead when no byte comes for HeaderWait.
-	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), upstreamKey{}, up))
+	// The answer is abandoned instead when no byte comes for HeaderWait, or
+	// when a stop cuts what is still open.
+	ctx, cancel := context.WithCancel(context.WithValue(f.upstreamCtx, upstreamKey{}, up))
 	defer cancel()
 	out := r.Clone(ctx)
 	out.RequestURI = ""
@@ -749,7 +775,7 @@ func (w idleWriter) Write(p []byte) (int, error) {
 // upstream is given up after HeaderWait. The request's context is not used:
 // clients like busybox wget half-close after the request, which cancels it.
 func (f *Forwarder) passThrough(w http.ResponseWriter, r *http.Request, o *outcome, up Upstream) (int, int64) {
-	conn, err := f.dialUpstream(context.Background(), up.Addr)
+	conn, err := f.dialUpstream(f.upstreamCtx, up.Addr)
 	if err != nil {
 		o.set(outcomeUpstreamError)
 		f.Log.Warn("upstream proxy unreachable", "upstream", up.Addr, "err", err)
@@ -757,6 +783,7 @@ func (f *Forwarder) passThrough(w http.ResponseWriter, r *http.Request, o *outco
 		return http.StatusBadGateway, 0
 	}
 	defer conn.Close()
+	defer f.track(func() { _ = conn.Close() })()
 	out := r.Clone(context.Background())
 	out.Body = countBody(out.Body, f.m.bytesUp)
 	removeHopHeaders(out.Header)
@@ -835,39 +862,4 @@ func AllowNets(nets ...*net.IPNet) func(net.IP) bool {
 		}
 		return false
 	}
-}
-
-// Serve runs the forwarder on each address until ctx is done.
-func Serve(ctx context.Context, f *Forwarder, addrs ...string) error {
-	var servers []*http.Server
-	errs := make(chan error, len(addrs))
-	for _, addr := range addrs {
-		l, err := net.Listen("tcp", addr)
-		if err != nil {
-			for _, s := range servers {
-				_ = s.Close()
-			}
-			return err
-		}
-		s := &http.Server{Handler: f, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: f.Limits.ServerIdle}
-		servers = append(servers, s)
-		go func() { errs <- s.Serve(l) }()
-		f.Log.Info("proxy forwarder listening", "addr", addr)
-	}
-	select {
-	case <-ctx.Done():
-	case err := <-errs:
-		if !errors.Is(err, http.ErrServerClosed) {
-			for _, s := range servers {
-				_ = s.Close()
-			}
-			return err
-		}
-	}
-	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	for _, s := range servers {
-		_ = s.Shutdown(sctx)
-	}
-	return nil
 }
