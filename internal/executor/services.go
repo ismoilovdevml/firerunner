@@ -127,8 +127,9 @@ func (s Service) Aliases() []string {
 
 // ServicesScript returns the shell script run in the job VM to start the
 // services on ServiceNetwork, publish their aliases in /etc/hosts (for jobs
-// without image:) and wait up to 30 s for each exposed TCP port, like the
-// docker executor's health check (a port that never opens is only a warning).
+// without image:) and wait up to 30 s for their exposed TCP ports, all at
+// once, like the docker executor's health check (a port that never opens is
+// only a warning).
 //
 // With the proxy, noProxy (the proxy exceptions plus the service aliases)
 // replaces the VM's no_proxy in /etc/environment, and extra (vm.ContainerArgs)
@@ -182,22 +183,39 @@ func ServicesScript(services []Service, noProxy string, extra ...string) string 
 		fmt.Fprintf(&b, "echo %s\n", shellQuote("Starting service "+svc.Name+" as "+strings.Join(svc.Aliases(), ", ")))
 		b.WriteString(strings.Join(args, " ") + " >/dev/null\n")
 	}
+	// Every port is checked at once, like the docker executor waits for its
+	// services in parallel: a job waits about 30 s for silent services, not
+	// 30 s per port. Each check writes its report to its own file, printed in
+	// order once all are done, so reports and logs do not interleave.
 	b.WriteString(`set +e
+checks=$(mktemp -d) || { echo "WARNING: not waiting for the services: no temporary directory"; exit 0; }
+n=0
 for c in $(docker ps -q --filter network=` + ServiceNetwork + `); do
   ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$c")
   for a in $(docker inspect -f '{{range .NetworkSettings.Networks}}{{range .Aliases}}{{.}} {{end}}{{end}}' "$c"); do
     echo "$ip $a" >>/etc/hosts
   done
+  image=$(docker inspect -f '{{.Config.Image}}' "$c")
   for p in $(docker inspect -f '{{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}' "$c"); do
     case $p in */tcp) port=${p%/tcp} ;; *) continue ;; esac
-    if timeout 30 bash -c "until (</dev/tcp/$ip/$port) 2>/dev/null; do sleep 0.2; done"; then
-      echo "Service $(docker inspect -f '{{.Config.Image}}' "$c") is listening on $port"
-    else
-      echo "WARNING: service $(docker inspect -f '{{.Config.Image}}' "$c") did not open port $port within 30s"
-      docker logs --tail 20 "$c" 2>&1 | sed 's/^/  /'
-    fi
+    n=$((n + 1))
+    (
+      if timeout 30 bash -c "until (</dev/tcp/$ip/$port) 2>/dev/null; do sleep 0.2; done"; then
+        echo "Service $image is listening on $port"
+      else
+        echo "WARNING: service $image did not open port $port within 30s"
+        docker logs --tail 20 "$c" 2>&1 | sed 's/^/  /'
+      fi
+    ) >"$checks/$n" 2>&1 &
   done
 done
+wait
+i=1
+while [ "$i" -le "$n" ]; do
+  cat "$checks/$i"
+  i=$((i + 1))
+done
+rm -rf "$checks"
 exit 0
 `)
 	return b.String()

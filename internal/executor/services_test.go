@@ -3,12 +3,78 @@ package executor
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
+
+// The services script waits for every exposed TCP port of every service at
+// once, each for up to 30 s like the Docker executor's health check, so a job
+// waits at most about 30 s for its services, not 30 s per port. Each port's
+// report and a silent service's logs stay together, in a fixed order.
+// It runs under bash with a fake docker (two services: db exposing 5432 and
+// 8080, cache exposing 6379) and a fake timeout that logs when each check
+// starts and ends, takes 2 s and finds only 6379 open. The log, not the wall
+// clock, shows the overlap: macOS takes seconds to first run a new script.
+func TestServicesScriptWaitsForAllPortsAtOnce(t *testing.T) {
+	bin, checks := t.TempDir(), filepath.Join(t.TempDir(), "checks")
+	fakes := map[string]string{
+		"docker": `#!/bin/bash
+case "$1" in
+ps) echo db cache ;;
+inspect)
+    c=${!#}
+    case "$3" in
+    *IPAddress*) [ "$c" = db ] && echo 10.0.0.2 || echo 10.0.0.3 ;;
+    *ExposedPorts*) [ "$c" = db ] && echo "5432/tcp 8080/tcp 53/udp " || echo "6379/tcp " ;;
+    *Config.Image*) echo "image-$c" ;;
+    esac ;;
+logs) echo "log of ${!#}" ;;
+esac
+exit 0
+`,
+		"timeout": `#!/bin/bash
+[ "$1" = 30 ] || { echo "timeout $1, want 30" >&2; exit 2; }
+echo start >>` + checks + `
+sleep 2
+echo end >>` + checks + `
+case "$4" in */6379\)*) exit 0 ;; esac
+exit 124
+`,
+	}
+	for name, body := range fakes {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sc := ServicesScript([]Service{{Name: "postgres:16", Alias: "db"}, {Name: "redis:7", Alias: "cache"}}, "")
+	cmd := exec.Command("bash", "-c", sc)
+	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("script failed: %v\n%s", err, out)
+	}
+	if log, _ := os.ReadFile(checks); strings.Join(strings.Fields(string(log)), ",") != "start,start,start,end,end,end" {
+		t.Errorf("port checks %q: they did not all run at once", strings.Fields(string(log)))
+	}
+	var reports []string
+	for _, l := range strings.Split(string(out), "\n") {
+		if strings.Contains(l, "port") || strings.HasPrefix(l, "  log of") || strings.Contains(l, "listening") {
+			reports = append(reports, l)
+		}
+	}
+	want := []string{
+		"WARNING: service image-db did not open port 5432 within 30s", "  log of db",
+		"WARNING: service image-db did not open port 8080 within 30s", "  log of db",
+		"Service image-cache is listening on 6379",
+	}
+	if strings.Join(reports, "\n") != strings.Join(want, "\n") {
+		t.Errorf("reports:\n%s\nwant:\n%s\nfull output:\n%s", strings.Join(reports, "\n"), strings.Join(want, "\n"), out)
+	}
+}
 
 // sshd's pam_env reads /etc/environment once per connection, and every stage
 // of a job runs over the connection opened before the services script added
