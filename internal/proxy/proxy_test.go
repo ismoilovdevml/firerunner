@@ -101,7 +101,7 @@ func startUpstream(t *testing.T, want string) *fakeUpstream {
 			}
 			w.WriteHeader(http.StatusOK)
 			c, buf, _ := w.(http.Hijacker).Hijack()
-			splice(c, buf.Reader, dst, dst, 0)
+			splice(c, buf.Reader, dst, dst, 0, nil, nil)
 			return
 		}
 		out := r.Clone(context.Background())

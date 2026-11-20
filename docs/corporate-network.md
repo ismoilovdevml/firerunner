@@ -194,6 +194,12 @@ sudo firerunner run -- sh -c 'env | grep -i proxy; curl -sI https://github.com |
 cuts the open tunnels of running jobs. Restart it when the runner is idle:
 `sudo systemctl restart firerunner-proxy`.
 
+On stop or restart the forwarder takes no new connections at once, lets the requests and tunnels
+already open finish for up to `proxy.shutdown_timeout` (30 s), then cuts what is left. A long
+clone or pull is cut either way; short requests under way end normally. While it drains, new
+connections are refused, so jobs that start one then fail as they would with the forwarder down.
+systemd's `TimeoutStopSec` for the unit must be at least `proxy.shutdown_timeout` plus 15 s.
+
 The installer is careful in the same way. While jobs run it does not restart the forwarder,
 containerd, flintlockd, the Docker Hub cache or gitlab-runner, and does not upgrade gitlab-runner.
 It lists what it left and keeps it in `/var/lib/firerunner/pending-restarts`; run the installer

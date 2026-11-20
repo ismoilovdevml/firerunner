@@ -1,0 +1,397 @@
+package proxy
+
+import (
+	"bufio"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+)
+
+// startMetered runs a Forwarder whose upstream comes from a 0600 file and
+// returns it with its address and the file, so a test can read its metrics.
+func startMetered(t *testing.T, upstreamURL string, p *Policy, lim Limits) (*Forwarder, string, string) {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "upstream")
+	if err := os.WriteFile(file, []byte(upstreamURL), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := &Forwarder{Upstream: func() (Upstream, error) { return LoadUpstream(file) }, Allowed: AllowNets(),
+		Policy: p, Limits: lim, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), DialTimeout: 2 * time.Second}
+	return f, serveForwarder(t, f), file
+}
+
+// series reads one series of f's metrics the way the daemon gets them: a
+// counter's or gauge's value, a histogram's sample count. found is false
+// when no series of that name has exactly these labels.
+func series(t *testing.T, f *Forwarder, name string, labels map[string]string) (value float64, found bool) {
+	t.Helper()
+	mfs, err := f.Metrics().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+	next:
+		for _, m := range mf.GetMetric() {
+			if len(m.GetLabel()) != len(labels) {
+				continue
+			}
+			for _, l := range m.GetLabel() {
+				if labels[l.GetName()] != l.GetValue() {
+					continue next
+				}
+			}
+			switch {
+			case m.GetCounter() != nil:
+				return m.GetCounter().GetValue(), true
+			case m.GetGauge() != nil:
+				return m.GetGauge().GetValue(), true
+			case m.GetHistogram() != nil:
+				return float64(m.GetHistogram().GetSampleCount()), true
+			}
+		}
+	}
+	return 0, false
+}
+
+// eventually waits until cond holds: a handler counts after it has answered.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// requestCounts are the non-zero firerunner_proxy_requests_total series, as
+// "kind/outcome" -> count.
+func requestCounts(t *testing.T, f *Forwarder) map[string]float64 {
+	t.Helper()
+	out := map[string]float64{}
+	for _, kind := range []string{"tunnel", "request"} {
+		for _, o := range []string{"allowed", "policy_denied", "limit_refused", "upstream_auth_failed", "upstream_error", "upstream_refused", "bad_request"} {
+			v, found := series(t, f, "firerunner_proxy_requests_total", map[string]string{"kind": kind, "outcome": o})
+			if !found {
+				t.Fatalf("firerunner_proxy_requests_total{kind=%q,outcome=%q} missing: every combination is created at start", kind, o)
+			}
+			if v != 0 {
+				out[kind+"/"+o] = v
+			}
+		}
+	}
+	return out
+}
+
+func deadAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	return addr
+}
+
+// raw sends one request line as written and waits for the answer.
+func raw(req string) func(t *testing.T, fwd string) {
+	return func(t *testing.T, fwd string) {
+		c, err := net.Dial("tcp", fwd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		_, _ = io.WriteString(c, req)
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+}
+
+// Every request is counted once, by kind and by what became of it.
+func TestRequestOutcomesCounted(t *testing.T) {
+	right := "Basic " + base64.StdEncoding.EncodeToString([]byte("bob:right"))
+	open, locked := startUpstream(t, ""), startUpstream(t, right)
+	echo, web, dead := echoServer(t), origin(t), deadAddr(t)
+	tunnelTo := func(target string) func(*testing.T, string) {
+		return func(t *testing.T, fwd string) {
+			c, _, _ := connect(t, fwd, target)
+			c.Close()
+		}
+	}
+	get := func(t *testing.T, fwd string) {
+		resp, err := client(fwd).Get(web.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	for _, c := range []struct {
+		name     string
+		upstream string
+		policy   *Policy
+		do       func(*testing.T, string)
+		want     string // kind/outcome
+	}{
+		{"tunnel opened", "http://" + open.addr, nil, tunnelTo(echo), "tunnel/allowed"},
+		{"request answered", "http://" + open.addr, nil, get, "request/allowed"},
+		{"destination refused", "http://" + open.addr, testPolicy(), tunnelTo("169.254.169.254:443"), "tunnel/policy_denied"},
+		{"request to a refused destination", "http://" + open.addr, testPolicy(), raw("GET http://169.254.169.254/ HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n"), "request/policy_denied"},
+		{"credentials refused on CONNECT", "http://bob:wrong@" + locked.addr, nil, tunnelTo(echo), "tunnel/upstream_auth_failed"},
+		{"credentials refused on a request", "http://bob:wrong@" + locked.addr, nil, get, "request/upstream_auth_failed"},
+		{"upstream unreachable for CONNECT", "http://" + dead, nil, tunnelTo(echo), "tunnel/upstream_error"},
+		{"upstream unreachable for a request", "http://" + dead, nil, get, "request/upstream_error"},
+		{"upstream file unusable", "ftp://corp:21", nil, get, "request/upstream_error"},
+		{"upstream cannot reach the destination", "http://" + open.addr, nil, tunnelTo(dead), "tunnel/upstream_refused"},
+		{"origin-form request", "http://" + open.addr, nil, raw("GET /x HTTP/1.1\r\nHost: x\r\n\r\n"), "request/bad_request"},
+		{"CONNECT without a port", "http://" + open.addr, nil, raw("CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n"), "tunnel/bad_request"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f, fwd, _ := startMetered(t, c.upstream, c.policy, Limits{})
+			c.do(t, fwd)
+			eventually(t, c.want, func() bool { return len(requestCounts(t, f)) > 0 })
+			if got := requestCounts(t, f); len(got) != 1 || got[c.want] != 1 {
+				t.Fatalf("counted %v, want only %s once", got, c.want)
+			}
+		})
+	}
+}
+
+// A client at its limit is refused and counted; the gauges show how close the
+// busiest client and the host services are to their limits.
+func TestLimitRefusalsAndConnectionsCounted(t *testing.T) {
+	up := startUpstream(t, "")
+	echo := echoServer(t)
+	f, fwd, _ := startMetered(t, "http://"+up.addr, nil, Limits{Loopback: 1, PerClient: 2, Total: 3})
+	for scope, want := range map[string]float64{"microvms": 3, "busiest_microvm": 2, "host": 1} {
+		if v, ok := series(t, f, "firerunner_proxy_connections_limit", map[string]string{"scope": scope}); !ok || v != want {
+			t.Errorf("limit %s = %v (%v), want %v", scope, v, ok, want)
+		}
+	}
+	c1, _, code := connect(t, fwd, echo)
+	defer c1.Close()
+	if code != 200 {
+		t.Fatalf("first tunnel: %d", code)
+	}
+	eventually(t, "the tunnel counted against the host's budget", func() bool {
+		v, _ := series(t, f, "firerunner_proxy_connections", map[string]string{"scope": "host"})
+		return v == 1
+	})
+	for _, scope := range []string{"microvms", "busiest_microvm"} {
+		if v, ok := series(t, f, "firerunner_proxy_connections", map[string]string{"scope": scope}); !ok || v != 0 {
+			t.Errorf("%s = %v (%v): a host service's tunnel is not a microVM's", scope, v, ok)
+		}
+	}
+	c2, _, code := connect(t, fwd, echo)
+	c2.Close()
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("second tunnel: %d, want 503", code)
+	}
+	eventually(t, "the refusal counted", func() bool { return requestCounts(t, f)["tunnel/limit_refused"] == 1 })
+}
+
+// Bytes are counted as they move, both ways, for tunnels and requests; an
+// open tunnel shows in the active gauge until it closes.
+func TestTrafficAndActiveCounted(t *testing.T) {
+	up := startUpstream(t, "")
+	echo, web := echoServer(t), origin(t)
+	f, fwd, _ := startMetered(t, "http://"+up.addr, nil, Limits{})
+	bytes := func(dir string) float64 {
+		v, _ := series(t, f, "firerunner_proxy_bytes_total", map[string]string{"direction": dir})
+		return v
+	}
+	active := func(kind string) float64 {
+		v, _ := series(t, f, "firerunner_proxy_active", map[string]string{"kind": kind})
+		return v
+	}
+
+	c, br, code := connect(t, fwd, echo)
+	if code != 200 {
+		t.Fatal(code)
+	}
+	eventually(t, "an active tunnel", func() bool { return active("tunnel") == 1 })
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprint(c, "hello world")
+	if _, err := io.ReadFull(br, make([]byte, 11)); err != nil {
+		t.Fatal(err)
+	}
+	// Counted while the tunnel is still open, not when it ends.
+	eventually(t, "tunnel bytes", func() bool { return bytes("up") == 11 && bytes("down") == 11 })
+	c.Close()
+	eventually(t, "the tunnel to end", func() bool { return active("tunnel") == 0 })
+
+	resp, err := client(fwd).Post(web.URL+"/up", "text/plain", strings.NewReader("abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	eventually(t, "request bytes", func() bool { return bytes("up") == 11+6 && bytes("down") == float64(11+len(body)) })
+	eventually(t, "the request to end", func() bool { return active("request") == 0 })
+}
+
+// Connecting to the upstream is timed: the TCP dial for every kind, and the
+// CONNECT exchange for tunnels.
+func TestUpstreamLatencyObserved(t *testing.T) {
+	up := startUpstream(t, "")
+	echo, web := echoServer(t), origin(t)
+	f, fwd, _ := startMetered(t, "http://"+up.addr, nil, Limits{})
+	count := func(step string) float64 {
+		v, found := series(t, f, "firerunner_proxy_upstream_connect_seconds", map[string]string{"step": step})
+		if !found {
+			t.Fatalf("no %s histogram", step)
+		}
+		return v
+	}
+	if count("dial") != 0 || count("handshake") != 0 {
+		t.Fatal("observed before any request")
+	}
+	c, _, _ := connect(t, fwd, echo)
+	c.Close()
+	eventually(t, "tunnel timings", func() bool { return count("dial") == 1 && count("handshake") == 1 })
+	resp, err := client(fwd).Get(web.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if count("dial") != 2 || count("handshake") != 1 {
+		t.Fatalf("after a plain request: dial %v, handshake %v; want 2, 1", count("dial"), count("handshake"))
+	}
+}
+
+// A change of the upstream file is counted once when it takes effect, and an
+// unusable file once until it is fixed, however many requests meet it.
+func TestUpstreamReloadsCounted(t *testing.T) {
+	up := startUpstream(t, "")
+	web := origin(t)
+	f, fwd, file := startMetered(t, "http://"+up.addr, nil, Limits{})
+	reloads := func() (ok, failed float64) {
+		ok, _ = series(t, f, "firerunner_proxy_upstream_reloads_total", map[string]string{"result": "ok"})
+		failed, _ = series(t, f, "firerunner_proxy_upstream_reloads_total", map[string]string{"result": "failed"})
+		return ok, failed
+	}
+	get := func() {
+		resp, err := client(fwd).Get(web.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	write := func(s string) {
+		if err := os.WriteFile(file, []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, step := range []struct {
+		name       string
+		file       string // "" keeps the file
+		ok, failed float64
+	}{
+		{"first read is not a reload", "", 0, 0},
+		{"same file again", "", 0, 0},
+		{"new credentials", "http://bob:new@" + up.addr, 1, 0},
+		{"file broken", "ftp://" + up.addr, 1, 1},
+		{"still broken", "", 1, 1},
+		{"fixed", "http://" + up.addr, 2, 1},
+	} {
+		if step.file != "" {
+			write(step.file)
+		}
+		get()
+		eventually(t, step.name, func() bool {
+			ok, failed := reloads()
+			return ok == step.ok && failed == step.failed
+		})
+	}
+}
+
+// The upstream refusing the host's credentials shows in a gauge until it
+// accepts them again.
+func TestUpstreamAuthFailingGauge(t *testing.T) {
+	up := startUpstream(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("bob:right")))
+	echo := echoServer(t)
+	f, fwd, file := startMetered(t, "http://bob:wrong@"+up.addr, nil, Limits{RefusedWait: time.Hour})
+	failing := func() float64 {
+		v, found := series(t, f, "firerunner_proxy_upstream_auth_failing", nil)
+		if !found {
+			t.Fatal("no firerunner_proxy_upstream_auth_failing")
+		}
+		return v
+	}
+	if failing() != 0 {
+		t.Fatal("failing before any request")
+	}
+	c, _, code := connect(t, fwd, echo)
+	c.Close()
+	if code != http.StatusBadGateway || failing() != 1 {
+		t.Fatalf("after a 407: status %d, gauge %v", code, failing())
+	}
+	if err := os.WriteFile(file, []byte("http://bob:right@"+up.addr), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, _, code = connect(t, fwd, echo)
+	c.Close()
+	if code != 200 || failing() != 0 {
+		t.Fatalf("after fixing the password: status %d, gauge %v", code, failing())
+	}
+}
+
+// Labels have a handful of fixed values: never a client address or a
+// destination, which would make a series per VM or per site.
+func TestMetricsLabelsAreBounded(t *testing.T) {
+	up := startUpstream(t, "")
+	echo, web := echoServer(t), origin(t)
+	f, fwd, _ := startMetered(t, "http://"+up.addr, testPolicy(), Limits{})
+	c, _, _ := connect(t, fwd, echo)
+	c.Close()
+	raw("GET http://169.254.169.254/ HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n")(t, fwd)
+	if resp, err := client(fwd).Get(web.URL); err == nil {
+		resp.Body.Close()
+	}
+	allowed := map[string]bool{"kind": true, "outcome": true, "direction": true, "step": true, "result": true, "scope": true}
+	mfs, err := f.Metrics().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, mf := range mfs {
+		names = append(names, mf.GetName())
+		if !strings.HasPrefix(mf.GetName(), "firerunner_proxy_") {
+			t.Errorf("%s: the daemon re-exports only firerunner_proxy_* metrics", mf.GetName())
+		}
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if !allowed[l.GetName()] {
+					t.Errorf("%s has label %s", mf.GetName(), l.GetName())
+				}
+				if strings.ContainsAny(l.GetValue(), ".:") {
+					t.Errorf("%s{%s=%q} looks like an address", mf.GetName(), l.GetName(), l.GetValue())
+				}
+			}
+		}
+	}
+	sort.Strings(names)
+	want := []string{"firerunner_proxy_active", "firerunner_proxy_bytes_total", "firerunner_proxy_connections",
+		"firerunner_proxy_connections_limit", "firerunner_proxy_requests_total", "firerunner_proxy_upstream_auth_failing",
+		"firerunner_proxy_upstream_connect_seconds", "firerunner_proxy_upstream_reloads_total"}
+	if strings.Join(names, " ") != strings.Join(want, " ") {
+		t.Fatalf("metrics %v, want %v", names, want)
+	}
+}

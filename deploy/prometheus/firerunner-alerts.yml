@@ -50,6 +50,47 @@ groups:
           summary: "firerunner-proxy is down on {{ $labels.instance }}: nothing reaches the corporate proxy"
           description: "microVMs, builders, gitlab-runner, containerd-flintlock and the registry mirrors reach the outside through it: jobs fail on pulls, clones and downloads (hosts in proxy.no_proxy still work). Check: journalctl -u firerunner-proxy -n 100; firerunner doctor (a 407 means the upstream refused the credentials). Fix: systemctl start firerunner-proxy."
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxydown
+      - alert: FireRunnerProxyUpstreamAuthFailing
+        # 1 from a 407 until the upstream accepts the credentials again. The
+        # forwarder retries refused credentials once after 5 minutes (when a
+        # request comes): a one-off refusal clears well within the 10 minutes.
+        expr: firerunner_proxy_upstream_auth_failing == 1
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "The corporate proxy refuses the credentials of {{ $labels.instance }}"
+          description: "Every pull, clone and download of jobs, builders, gitlab-runner and the registry mirrors through the proxy fails with 502 (hosts in proxy.no_proxy still work). The password in proxy.upstream_file (/etc/firerunner/proxy-upstream) expired or was changed, or the account is locked. Check: journalctl -u firerunner-proxy | grep 'refused the credentials'. Fix: sudoedit /etc/firerunner/proxy-upstream with the new password, %-encoded; the next request uses it, no restart. The forwarder sends refused credentials again only every 5 minutes, so it does not lock the account."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxyupstreamauthfailing
+      - alert: FireRunnerProxyUpstreamErrors
+        # Requests that went for the upstream: opened or answered (allowed) or
+        # failed there. Destinations the upstream itself blocks
+        # (upstream_refused) are not errors; a 407 has its own alert.
+        # Over 10 %, and at least 10 such requests in 10 minutes.
+        expr: |
+          sum by (instance) (increase(firerunner_proxy_requests_total{outcome="upstream_error"}[10m]))
+            / clamp_min(sum by (instance) (increase(firerunner_proxy_requests_total{outcome=~"allowed|upstream_.*"}[10m])), 1) > 0.1
+          and
+          sum by (instance) (increase(firerunner_proxy_requests_total{outcome="upstream_error"}[10m])) >= 10
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of proxied requests on {{ $labels.instance }} fail at the corporate proxy"
+          description: "The forwarder answers them 502: the corporate proxy is unreachable, does not answer within 15 s, or the upstream file is unusable. Jobs fail on pulls, clones and downloads, or are slow while retrying. Check: sudo firerunner doctor (upstream reachable, HTTPS through the proxy); journalctl -u firerunner-proxy | grep -E 'upstream proxy (unreachable|did not answer|did not take)|no upstream'. A new proxy address goes in /etc/firerunner/proxy-upstream (no restart)."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxyupstreamerrors
+      - alert: FireRunnerProxyAtLimit
+        # The busiest microVM, all microVMs or the host services over 80 % of
+        # their connection limit, or requests refused for it (503), which a
+        # short burst causes between two scrapes.
+        expr: |
+          max by (instance, scope) (firerunner_proxy_connections / (firerunner_proxy_connections_limit > 0)) > 0.8
+          or
+          sum by (instance) (increase(firerunner_proxy_requests_total{outcome="limit_refused"}[10m])) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The proxy forwarder on {{ $labels.instance }} is near or at a connection limit"
+          description: "Past the limit requests get 503 and jobs fail on downloads. busiest_microvm: one job holds most of its 256 connections (parallel downloads, a test opening connections it does not close); microvms: all jobs together near 4096; host: gitlab-runner, containerd and the registry mirrors near 1024. Check: firerunner_proxy_connections by scope; journalctl -u firerunner-proxy | grep 'too many connections' names the client address, firerunner vm list maps it to a job."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxyatlimit
       - alert: FireRunnerSystemFailures
         # Only failures FireRunner or the host caused; failing project scripts never page.
         expr: |

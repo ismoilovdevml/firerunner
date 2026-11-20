@@ -177,6 +177,12 @@ failures FireRunner or the host caused, never for failing project scripts. Watch
   copies that fail or are skipped for lack of room.
 - **Disk free**: the saved builder caches and flintlock's microVM state.
 - **Flintlock errors**: failed flintlock calls by RPC and gRPC code.
+- **Corporate proxy** row (hosts with `proxy.enabled`): what became of the forwarder's requests
+  (*Proxy requests per second by outcome*), tunnels open, connections against their limits,
+  throughput, how long the corporate proxy takes to accept a connection and answer CONNECT, and
+  whether it refuses the credentials. The daemon reads these from the forwarder at each scrape;
+  *metrics read* at 0 means it could not (the forwarder is down, or its unit predates
+  `RuntimeDirectory=firerunner-proxy`: run the installer again).
 - **Speed**: *Warm builds* and *Builder boot* (a build that finds its builder booting waits
   for it), *Stage duration p95 by stage* (which part of a job grew).
 - **Builder boot by phase** (Docker layer cache row): which part of a builder boot builds wait
@@ -255,6 +261,56 @@ work).
 - Fix: `sudo systemctl start firerunner-proxy`; after a credential change, update the upstream file
   and `sudo systemctl restart firerunner-proxy`.
 - Recovered: *Services* shows it up and the next job's pulls succeed.
+
+### FireRunnerProxyUpstreamAuthFailing
+
+Critical. Only on hosts with `proxy.enabled`. The corporate proxy has refused the credentials in
+`proxy.upstream_file` (`/etc/firerunner/proxy-upstream`) with a 407 for 10 minutes: the password
+expired or was changed, or the account is locked. Every pull, clone and download of jobs,
+builders, `gitlab-runner` and the registry mirrors through the proxy fails with 502; hosts in
+`proxy.no_proxy` still work. The forwarder sends refused credentials again only once every
+5 minutes, so it does not lock the account further; a one-off refusal clears at that retry,
+before the alert fires.
+
+- Check: `journalctl -u firerunner-proxy | grep 'refused the credentials'`; *Upstream credentials
+  and file* shows *credentials refused* at 1.
+- Fix: `sudoedit /etc/firerunner/proxy-upstream` with the new password, %-encoded (see
+  [A proxy with a password](corporate-network.md#a-proxy-with-a-password)). The next request uses
+  it, no restart; *file changes ok* counts it.
+- Recovered: the next request the proxy accepts sets *credentials refused* to 0. With no job
+  running, `sudo firerunner doctor` makes one (*HTTPS through the proxy*).
+
+### FireRunnerProxyUpstreamErrors
+
+Warning. Over 10 % of the requests that went to the corporate proxy in 10 minutes, and at least
+10, failed there: it is unreachable, does not answer CONNECT within 15 s or a request at all, or
+the upstream file is unusable (wrong owner or mode, not a proxy URL). The forwarder answers 502,
+and jobs fail on pulls, clones and downloads. Sites the corporate proxy blocks
+(`upstream_refused`) and refused credentials have their own outcomes and do not count.
+
+- Check: `sudo firerunner doctor` (*upstream reachable*, *HTTPS through the proxy*);
+  `journalctl -u firerunner-proxy | grep -E 'upstream proxy (unreachable|did not answer|did not take)|no upstream'`.
+  *Proxy requests per second by outcome* shows when it started; *Upstream connect time* whether
+  the proxy got slow first.
+- Fix: a new proxy address goes in `/etc/firerunner/proxy-upstream` (no restart). Otherwise the
+  corporate proxy or the network to it is down: its owners fix it.
+- Recovered: `upstream_error` stays at 0 in *Proxy requests per second by outcome*.
+
+### FireRunnerProxyAtLimit
+
+Warning. For 5 minutes the forwarder's connections have been over 80 % of a limit, or it refused
+requests (503) for one in the last 10 minutes. The limits: 256 per microVM
+(`busiest_microvm`), 4096 for all microVMs (`microvms`), 1024 for host services such as
+`gitlab-runner`, `containerd-flintlock` and the registry mirrors (`host`). Past a limit requests
+get 503 and jobs fail on downloads.
+
+- Check *Proxy connections against their limit* for the scope. `busiest_microvm`: one job opens
+  many connections at once (parallel downloads, a test that does not close its connections);
+  `journalctl -u firerunner-proxy | grep 'too many connections'` names the client address and
+  `sudo firerunner vm list` the job's VM.
+- Fix: the job's own downloads (fewer in parallel, reuse connections). `microvms`: lower
+  `concurrent`. The limits are fixed in the forwarder.
+- Recovered: the share is below 80 % and no request was refused for 10 minutes.
 
 ### FireRunnerSystemFailures
 

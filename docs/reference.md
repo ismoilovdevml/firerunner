@@ -91,6 +91,34 @@ passed for 2 minutes.
 | `firerunner_flintlock_up` | gauge | | 1 if the daemon's last flintlock listing answered |
 | `firerunner_flintlock_errors_total` | counter | `op`: `CreateMicroVM`, `DeleteMicroVM`, `GetMicroVM`, `ListMicroVMs`; `code`: the gRPC code | failed flintlock calls of the daemon; every failed try of a retried listing counts |
 
+With `proxy.enabled`, the same endpoint carries the forwarder's metrics (`firerunner-proxy`, a
+process of its own). The daemon reads them from `/run/firerunner-proxy/metrics.sock` at each
+scrape, so a host stays one scrape target. No label holds a client address or a destination.
+Counters restart from 0 when the forwarder restarts.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `firerunner_proxy_metrics_up` | gauge | | 1 if the daemon read the forwarder's metrics for this scrape; 0: the forwarder is down, hung for 2 s, or its unit has no `RuntimeDirectory=firerunner-proxy` (run the installer again), and the other `firerunner_proxy_*` are absent |
+| `firerunner_proxy_requests_total` | counter | `kind`: `tunnel` (CONNECT), `request` (a plain `http://` or `https://` URL); `outcome`, below | requests to the forwarder, counted once when their outcome is decided: a tunnel when it opens, not when it ends |
+| `firerunner_proxy_active` | gauge | `kind` | requests and tunnels the forwarder handles now |
+| `firerunner_proxy_connections` | gauge | `scope`: `microvms` (all together), `busiest_microvm` (the microVM holding most), `host` (host services on 127.0.0.1) | requests and tunnels holding a slot of that scope's limit |
+| `firerunner_proxy_connections_limit` | gauge | `scope` | the limit of each scope: 4096, 256, 1024; 0 is none. Past it requests get 503 (`limit_refused`) |
+| `firerunner_proxy_bytes_total` | counter | `direction`: `up` (to the corporate proxy), `down` | bytes carried, counted as they move: tunnels, and request and answer bodies without headers |
+| `firerunner_proxy_upstream_connect_seconds` | histogram | `step`: `dial` (TCP connect, every kind), `handshake` (the answer to CONNECT, tunnels) | time to reach the corporate proxy; failed dials are not observed (they count as `upstream_error`) |
+| `firerunner_proxy_upstream_auth_failing` | gauge | | 1 from a 407 of the corporate proxy until it accepts the credentials again |
+| `firerunner_proxy_upstream_reloads_total` | counter | `result`: `ok`, `failed` | changes of the upstream file the forwarder took up (it reads the file for every request): `ok` a new address or password in use, `failed` the file became unusable (unreadable, wrong owner or mode, not a proxy URL, the forwarder itself), once until it is fixed |
+
+Outcomes in `firerunner_proxy_requests_total`: `allowed` (the corporate proxy opened the tunnel,
+or answered the request: its answer is passed on whatever its status), `policy_denied` (403: a
+client outside the bridge and loopback, or a destination the forwarder refuses: the host,
+microVMs, cloud metadata, `network.egress_deny`, a port not in `proxy.connect_ports`),
+`limit_refused` (503: a connection limit, or the forwarder stopping), `upstream_auth_failed`
+(502: the corporate proxy answered 407, or refused these credentials less than 5 minutes ago so
+they were not sent), `upstream_error` (502: no usable upstream file, the corporate proxy
+unreachable or silent), `upstream_refused` (502: the corporate proxy answered CONNECT with another
+status: it blocks or cannot reach that site), `bad_request` (400: not a proxy request or a bad
+target).
+
 System failure reasons in `firerunner_jobs_total`: `admission_timeout` (no host memory for a
 microVM within `vm.boot_timeout`, or other admissions held the admission lock that long), `flintlock_error`, `vm_boot` (no DHCP lease or no SSH in time),
 `services` (`services:` containers did not start), `docker_auth`, `state_file`, `ssh_lost` (the VM
@@ -108,7 +136,7 @@ Histogram buckets in seconds, for `le` in queries: prepare 0.5, 1, 2, 3, 4, 5, 6
 16, 18, 20, 25, 30, 45, 60, 90, 120, 180, 300; boot 2, 5, 8, 10, 12, 14, 16, 18, 20, 25, 30, 45,
 60, 90, 120, 180, 240, 300, 600; admission wait 0.5, 1, 5, 10, 30, 60, 120, 180, 300; job
 duration 10, 20, 30, 45, 60, 90, 120, 180, 300, 450, 600, 900, 1200, 1800, 3600; preload 5, 10,
-20, 30, 60, 90, 120, 180, 300, 600, 900.
+20, 30, 60, 90, 120, 180, 300, 600, 900; proxy upstream connect 0.005, 0.025, 0.1, 0.25, 1, 5, 15.
 
 ## Limits
 
