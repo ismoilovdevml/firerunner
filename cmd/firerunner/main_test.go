@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ismoilovdevml/firerunner/internal/config"
 )
 
 func TestParseBuilderRm(t *testing.T) {
@@ -195,5 +197,23 @@ func TestConfigSetSeveralKeys(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(path); string(got) != string(data) {
 		t.Error("a refused set changed the config")
+	}
+}
+
+// install.sh writes registry hosts (dots in the key) into vm.registry_mirrors;
+// `config show` prints them like every other key.
+func TestConfigShowDottedMapKeys(t *testing.T) {
+	cfg := config.Default()
+	cfg.VM.RegistryMirrors = map[string]string{"ghcr.io": "http://10.200.0.1:5001"}
+	cfg.VM.KernelCmdline = map[string]string{"ipv6.disable": "1"}
+	var out bytes.Buffer
+	if err := showConfig(&out, "/etc/firerunner/config.yaml", cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"# /etc/firerunner/config.yaml\n", "\nvm.registry_mirrors.ghcr.io = http://10.200.0.1:5001\n",
+		"\nvm.kernel_cmdline.ipv6.disable = \"1\"\n", "\nvm.vcpu = 2\n"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("missing %q in:\n%s", want, out.String())
+		}
 	}
 }

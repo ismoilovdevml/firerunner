@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -535,14 +536,19 @@ func Keys(cfg Config) []string {
 	return keys
 }
 
-// Get returns the value at a dotted key.
+// Get returns the value at a dotted key. Below a map setting the rest of the
+// key is one map key: "vm.registry_mirrors.ghcr.io".
 func Get(cfg Config, key string) (string, error) {
 	m, err := toMap(cfg)
 	if err != nil {
 		return "", err
 	}
+	parts, err := keyParts(key)
+	if err != nil {
+		return "", err
+	}
 	var cur any = m
-	for _, part := range strings.Split(key, ".") {
+	for _, part := range parts {
 		mm, ok := cur.(map[string]any)
 		if !ok {
 			return "", fmt.Errorf("unknown key %q", key)
@@ -555,8 +561,55 @@ func Get(cfg Config, key string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
+// stringMaps lists the dotted keys of the map[string]string settings. Their
+// own keys may hold dots (registry hosts, kernel args like ipv6.disable), so
+// a dotted key cannot be split on every dot. Taken from the struct, so a new
+// map setting cannot be forgotten here.
+func stringMaps() map[string]bool {
+	out := map[string]bool{}
+	var walk func(prefix string, t reflect.Type)
+	walk = func(prefix string, t reflect.Type) {
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			name, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+			if name == "" || name == "-" {
+				continue
+			}
+			switch {
+			case f.Type.Kind() == reflect.Struct:
+				walk(join(prefix, name), f.Type)
+			case f.Type.Kind() == reflect.Map && f.Type.Key().Kind() == reflect.String && f.Type.Elem().Kind() == reflect.String:
+				out[join(prefix, name)] = true
+			}
+		}
+	}
+	walk("", reflect.TypeOf(Config{}))
+	return out
+}
+
+// keyParts splits a dotted key into its path; below a map setting the rest
+// is one part, the map key.
+func keyParts(key string) ([]string, error) {
+	for field := range stringMaps() {
+		if rest, ok := strings.CutPrefix(key, field+"."); ok {
+			if rest == "" {
+				return nil, fmt.Errorf("unknown key %q: %s.<key> needs a key", key, field)
+			}
+			return append(strings.Split(field, "."), rest), nil
+		}
+	}
+	parts := strings.Split(key, ".")
+	for _, p := range parts {
+		if p == "" {
+			return nil, fmt.Errorf("unknown key %q", key)
+		}
+	}
+	return parts, nil
+}
+
 // Set changes one dotted key; the value is parsed as YAML ("4", "3m", "off").
-// New keys are only accepted under vm.kernel_cmdline.
+// New keys are only accepted under map settings (vm.kernel_cmdline,
+// vm.registry_mirrors), whose values are taken as strings.
 func Set(cfg Config, key, value string) (Config, error) {
 	return SetAll(cfg, key, value)
 }
@@ -584,12 +637,16 @@ func set(cfg Config, key, value string) (Config, error) {
 	if err != nil {
 		return cfg, err
 	}
-	parts := strings.Split(key, ".")
+	parts, err := keyParts(key)
+	if err != nil {
+		return cfg, err
+	}
+	maps := stringMaps()
 	cur := m
 	for i, part := range parts[:len(parts)-1] {
 		next, ok := cur[part].(map[string]any)
 		if !ok {
-			if strings.Join(parts[:i+1], ".") == "vm.kernel_cmdline" {
+			if maps[strings.Join(parts[:i+1], ".")] {
 				next = map[string]any{}
 				cur[part] = next
 			} else {
@@ -599,16 +656,16 @@ func set(cfg Config, key, value string) (Config, error) {
 		cur = next
 	}
 	last := parts[len(parts)-1]
-	parent := strings.Join(parts[:len(parts)-1], ".")
-	if _, ok := cur[last]; !ok && parent != "vm.kernel_cmdline" {
+	inMap := maps[strings.Join(parts[:len(parts)-1], ".")]
+	if _, ok := cur[last]; !ok && !inMap {
 		return cfg, fmt.Errorf("unknown key %q (see: firerunner config keys)", key)
 	}
-	var parsed any
-	if err := yaml.Unmarshal([]byte(value), &parsed); err != nil {
-		return cfg, fmt.Errorf("invalid value %q: %w", value, err)
-	}
-	if parent == "vm.kernel_cmdline" {
-		parsed = value // kernel args are always strings
+	// Map settings hold strings: "1" stays "1", not 1, and is not parsed as YAML.
+	var parsed any = value
+	if !inMap {
+		if err := yaml.Unmarshal([]byte(value), &parsed); err != nil {
+			return cfg, fmt.Errorf("invalid value %q: %w", value, err)
+		}
 	}
 	cur[last] = parsed
 

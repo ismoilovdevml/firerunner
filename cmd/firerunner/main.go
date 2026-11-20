@@ -253,12 +253,7 @@ func cmdConfig(args []string) error {
 	}
 	switch {
 	case sub == "show":
-		fmt.Printf("# %s\n", path)
-		for _, k := range config.Keys(cfg) {
-			v, _ := config.Get(cfg, k)
-			fmt.Printf("%s = %s\n", k, v)
-		}
-		return nil
+		return showConfig(os.Stdout, path, cfg)
 	case sub == "keys":
 		fmt.Println(strings.Join(config.Keys(cfg), "\n"))
 		return nil
@@ -295,6 +290,20 @@ func cmdConfig(args []string) error {
 		return config.Save(path, next)
 	}
 	return errors.New("usage: firerunner config show|keys|path|get <key>|set <key> <value> [<key> <value>...]|unset <key>")
+}
+
+// showConfig prints every key with its value. A key it cannot read is an
+// error, not an empty value: an empty value reads as "not set".
+func showConfig(w io.Writer, path string, cfg config.Config) error {
+	fmt.Fprintf(w, "# %s\n", path)
+	for _, k := range config.Keys(cfg) {
+		v, err := config.Get(cfg, k)
+		if err != nil {
+			return fmt.Errorf("config show: %w", err)
+		}
+		fmt.Fprintf(w, "%s = %s\n", k, v)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
