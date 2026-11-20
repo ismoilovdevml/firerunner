@@ -226,7 +226,7 @@ type Daemon struct {
 	bootingIDs map[string]bool
 	// booted pool VMs still preloading images, by uid; counted in booting
 	preloading map[string]*preloadingVM
-	// poolGen counts pool refreshes (drain). A pool VM whose boot started
+	// poolGen counts pool refreshes (refreshPool). A pool VM whose boot started
 	// before the last one may run the old rootfs image: it never joins the
 	// pool nor goes to a job.
 	poolGen int
@@ -257,6 +257,9 @@ type Daemon struct {
 	// buildersAdopted: adoptBuilders has read builders.json. Until then the
 	// file holds the previous run's builders and is not written (builder.go).
 	buildersAdopted bool
+	// drainedSince is when `firerunner drain` drained the host, zero when
+	// it is not drained: no pool refills, no builder boots (drain.go).
+	drainedSince time.Time
 	// warned: when warnLimited last logged each problem at Warn.
 	warnMu sync.Mutex
 	warned map[string]time.Time
@@ -370,6 +373,7 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 	if fi, err := os.Stat(cfgPath); err == nil {
 		d.cfgMod, d.cfgLen = fi.ModTime(), fi.Size()
 	}
+	d.loadDrain()
 	return d, nil
 }
 
@@ -584,10 +588,11 @@ func (d *Daemon) refill(ctx context.Context) {
 	d.mu.Lock()
 	cfg := d.cfg
 	missing := cfg.Pool.Size - len(d.ready) - d.booting
+	drained := d.drainedLocked()
 	d.mu.Unlock()
 	d.metrics.poolTarget.Set(float64(cfg.Pool.Size))
 
-	if missing <= 0 {
+	if missing <= 0 || drained {
 		return
 	}
 	// One admission for the whole batch. It reserves the memory of each VM
@@ -682,7 +687,7 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config, id string) {
 				d.mu.Unlock()
 				return
 			case refreshed:
-				// drain stopped the preload; the VM is deleted below.
+				// refreshPool stopped the preload; the VM is deleted below.
 			case perr != nil:
 				d.preloadFailed(ctx, id, perr)
 			default:
@@ -801,11 +806,11 @@ func (d *Daemon) expireIdle(ctx context.Context) {
 	}
 }
 
-// drain deletes every idle pool VM (POST /pool/refresh). VMs still booting
+// refreshPool deletes every idle pool VM (POST /pool/refresh). VMs still booting
 // or preloading may run the old image too: their preloads are stopped, and
 // bootOne deletes them instead of adding them to the pool (poolGen). They
 // stay counted in booting until then, so refill does not boot twice.
-func (d *Daemon) drain(ctx context.Context, reason string) {
+func (d *Daemon) refreshPool(ctx context.Context, reason string) {
 	d.mu.Lock()
 	drop := d.ready
 	d.ready = nil

@@ -23,7 +23,10 @@ groups:
           description: "Every new job fails in prepare. Check: systemctl status flintlockd containerd-flintlock; journalctl -u flintlockd -n 100; firerunner doctor."
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerflintlockdown
       - alert: FireRunnerServiceDown
-        expr: firerunner_service_up{service=~"flintlockd|containerd-flintlock|firerunner-net|firerunner-dnsmasq|gitlab-runner"} == 0
+        # A drained host (firerunner drain) stopped gitlab-runner on purpose.
+        expr: |
+          firerunner_service_up{service=~"flintlockd|containerd-flintlock|firerunner-net|firerunner-dnsmasq"} == 0
+          or (firerunner_service_up{service="gitlab-runner"} == 0 unless on(instance, job) firerunner_drained == 1)
         for: 3m
         labels: {severity: critical}
         annotations:

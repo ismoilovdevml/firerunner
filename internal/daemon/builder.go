@@ -168,8 +168,9 @@ func builderConfig(c config.Config) config.Config {
 }
 
 // Builder returns the project's builder. With start it boots one when there
-// is none; without, it only reports an existing one, so projects that never
-// build do not occupy a builder. It never blocks on a boot.
+// is none, unless the host is drained; without, it only reports an existing
+// one, so projects that never build do not occupy a builder. It never blocks
+// on a boot.
 func (d *Daemon) Builder(project string, start bool) BuilderInfo {
 	if !projectID.MatchString(project) {
 		return BuilderInfo{State: BuilderDisabled}
@@ -180,7 +181,9 @@ func (d *Daemon) Builder(project string, start bool) BuilderInfo {
 	if !cfg.Builder.Enabled || cfg.Builder.Max == 0 {
 		return BuilderInfo{State: BuilderDisabled}
 	}
-	if _, ok := d.builders[project]; !ok && !start {
+	// A drained host boots no builder; the job builds without one, as
+	// without start.
+	if _, ok := d.builders[project]; !ok && (!start || d.drainedLocked()) {
 		return BuilderInfo{State: BuilderNone}
 	}
 	if at, ok := d.builderFailed[project]; ok && time.Since(at) < builderRetryAfter {

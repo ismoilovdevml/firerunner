@@ -1,0 +1,198 @@
+package host
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+)
+
+// Draining stops gitlab-runner gracefully: on SIGQUIT it requests no new
+// jobs, waits for the running ones and exits; the jobs it never took stay
+// pending in GitLab for other runners or for this one once it is back.
+// Its unit cannot do that as installed (`gitlab-runner install`):
+//   - Restart=always would start it again after a SIGQUIT sent by hand;
+//   - systemctl stop sends SIGTERM, which cancels the running jobs;
+//   - it sends that signal to the whole cgroup, so with SIGQUIT the job
+//     processes (firerunner executor, ssh) would get it too and die;
+//   - after 90 s (systemd's default stop timeout) it kills what is left.
+//
+// So drain adds a runtime drop-in: KillMode=mixed (only gitlab-runner gets
+// the signal; leftovers are killed once it has exited), KillSignal=SIGQUIT,
+// and no stop timeout: daemon.job_max_age bounds the jobs (reconcile deletes
+// a job's VM past it, which ends the job). A runtime drop-in is gone at
+// reboot, like the drain record and like the stop itself: gitlab-runner is
+// enabled and starts at boot.
+
+// RunnerUnit is gitlab-runner's systemd unit.
+const RunnerUnit = "gitlab-runner"
+
+// runnerDropInDir holds gitlab-runner's runtime drop-ins (a variable for tests).
+var runnerDropInDir = "/run/systemd/system/" + RunnerUnit + ".service.d"
+
+// runnerDropInName sorts after the drop-ins an operator is likely to have
+// (GitLab's docs suggest kill.conf), so its settings are the ones that apply.
+const runnerDropInName = "zz-firerunner-drain.conf"
+
+const runnerDropIn = `# Written by firerunner drain, removed by firerunner undrain; gone at reboot.
+# Stopping gitlab-runner lets its running jobs finish and takes no new ones.
+[Service]
+KillMode=mixed
+KillSignal=SIGQUIT
+TimeoutStopSec=infinity
+`
+
+// ErrRunnerStopping is returned when gitlab-runner was already being
+// stopped, not gracefully: its running jobs are being cancelled.
+var ErrRunnerStopping = errors.New("gitlab-runner was already stopping, not gracefully: its running jobs are cancelled")
+
+// RunnerState is what systemd says about gitlab-runner.
+type RunnerState struct {
+	// Active is systemd's ActiveState: active, activating, deactivating,
+	// inactive, failed, ...
+	Active string
+	// Graceful: a stop now would let the running jobs finish (the drain
+	// drop-in is in effect).
+	Graceful bool
+}
+
+// Running reports whether gitlab-runner takes jobs or is about to.
+func (s RunnerState) Running() bool {
+	switch s.Active {
+	case "inactive", "failed", "deactivating", "":
+		return false
+	}
+	return true
+}
+
+// Stopping reports whether gitlab-runner is stopping: with a graceful stop,
+// it finishes its running jobs first.
+func (s RunnerState) Stopping() bool { return s.Active == "deactivating" }
+
+// ReadRunnerState asks systemd for gitlab-runner's state. A host without
+// the unit reads as inactive.
+func ReadRunnerState(ctx context.Context) (RunnerState, error) {
+	out, err := probe(ctx, "systemctl", "show", RunnerUnit, "-p", "ActiveState", "-p", "KillMode", "-p", "KillSignal", "-p", "TimeoutStopUSec")
+	if err != nil {
+		return RunnerState{}, fmt.Errorf("systemctl show %s: %w", RunnerUnit, err)
+	}
+	props := map[string]string{}
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	for sc.Scan() {
+		if k, v, ok := strings.Cut(sc.Text(), "="); ok {
+			props[k] = v
+		}
+	}
+	if props["ActiveState"] == "" {
+		return RunnerState{}, fmt.Errorf("systemctl show %s: no ActiveState in %q", RunnerUnit, out)
+	}
+	return RunnerState{
+		Active: props["ActiveState"],
+		Graceful: props["KillMode"] == "mixed" && props["KillSignal"] == strconv.Itoa(int(syscall.SIGQUIT)) &&
+			props["TimeoutStopUSec"] == "infinity",
+	}, nil
+}
+
+// StopRunnerGracefully asks gitlab-runner to stop taking jobs and to exit
+// once its running jobs finished; it does not wait for that. It reports
+// whether it asked: false when gitlab-runner was not running, or already
+// stopping gracefully. It never stops gitlab-runner when systemd would not
+// stop it gracefully.
+func StopRunnerGracefully(ctx context.Context) (bool, error) {
+	st, err := ReadRunnerState(ctx)
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case st.Stopping() && st.Graceful:
+		return false, nil
+	case st.Stopping():
+		return false, ErrRunnerStopping
+	case !st.Running():
+		return false, nil
+	}
+	path := filepath.Join(runnerDropInDir, runnerDropInName)
+	if cur, err := os.ReadFile(path); err != nil || string(cur) != runnerDropIn {
+		if err := os.MkdirAll(runnerDropInDir, 0o755); err != nil {
+			return false, err
+		}
+		if err := writeRootOnly(path, []byte(runnerDropIn)); err != nil {
+			return false, err
+		}
+		if err := systemctl(ctx, "daemon-reload"); err != nil {
+			_ = os.Remove(path)
+			return false, err
+		}
+	}
+	if st, err = ReadRunnerState(ctx); err != nil {
+		return false, err
+	}
+	if !st.Graceful {
+		// Another drop-in overrides it: a stop would cancel the jobs.
+		_ = os.Remove(path)
+		_ = systemctl(ctx, "daemon-reload")
+		return false, fmt.Errorf("not stopping %s: systemd would not stop it gracefully with %s (check: systemctl cat %s)",
+			RunnerUnit, path, RunnerUnit)
+	}
+	return true, systemctl(ctx, "stop", "--no-block", RunnerUnit)
+}
+
+// Resume is what ResumeRunner did.
+type Resume int
+
+const (
+	// ResumeNothing: drain had not stopped gitlab-runner.
+	ResumeNothing Resume = iota
+	// ResumeStarted: gitlab-runner is starting.
+	ResumeStarted
+	// ResumeAfterStop: gitlab-runner still finishes the jobs it ran when
+	// drained (a stopping gitlab-runner cannot take jobs again); it starts
+	// once it has exited.
+	ResumeAfterStop
+)
+
+// ResumeRunner starts gitlab-runner again if drain stopped it (the drain
+// drop-in is there), then removes the drop-in. While gitlab-runner still
+// stops, the drop-in stays: a reload without it would end that stop by
+// killing the jobs. A start that fails keeps it too, so undrain can be run
+// again. The Resume tells what was done, also with an error.
+func ResumeRunner(ctx context.Context) (Resume, error) {
+	path := filepath.Join(runnerDropInDir, runnerDropInName)
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return ResumeNothing, nil
+	}
+	st, err := ReadRunnerState(ctx)
+	if err != nil {
+		return ResumeNothing, err
+	}
+	if err := systemctl(ctx, "start", "--no-block", RunnerUnit); err != nil {
+		return ResumeNothing, err
+	}
+	if st.Stopping() {
+		return ResumeAfterStop, nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return ResumeStarted, err
+	}
+	return ResumeStarted, systemctl(ctx, "daemon-reload")
+}
+
+// systemctl runs systemctl with commandTimeout; the error carries its output.
+func systemctl(ctx context.Context, args ...string) error {
+	ctx, cancel := context.WithTimeout(ctx, commandTimeout)
+	defer cancel()
+	cmd := command(ctx, "systemctl", args...)
+	cmd.WaitDelay = time.Second // children holding the output must not keep it waiting
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemctl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}

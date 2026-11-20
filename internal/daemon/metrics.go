@@ -31,6 +31,7 @@ type Metrics struct {
 	flintlockUp                        prometheus.Gauge
 	flintlockErrors                    *prometheus.CounterVec
 	jobsRunning                        prometheus.Gauge
+	drained                            prometheus.Gauge
 	diskFree, diskSize                 *prometheus.GaugeVec
 	serviceUp                          *prometheus.GaugeVec
 	thinPool                           *prometheus.GaugeVec
@@ -185,7 +186,9 @@ func (m *Metrics) addHostMetrics() {
 		Help: "Size of the file system holding dir."}, []string{"dir"})
 	m.flintlockErrors = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_flintlock_errors_total",
 		Help: "Failed flintlock calls of the daemon by RPC (CreateMicroVM, DeleteMicroVM, ListMicroVMs, GetMicroVM: a boot asking for its VM's tap) and gRPC code; every failed try of a retried listing counts."}, []string{"op", "code"})
-	m.reg.MustRegister(m.jobsRunning, m.diskFree, m.diskSize, m.flintlockErrors)
+	m.drained = prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_drained",
+		Help: "1 while the host is drained (firerunner drain): gitlab-runner takes no new jobs and the daemon boots no pool VMs or builders; 0 otherwise."})
+	m.reg.MustRegister(m.jobsRunning, m.drained, m.diskFree, m.diskSize, m.flintlockErrors)
 }
 
 // addBuilderMetrics registers the builder slots in use and their removals,

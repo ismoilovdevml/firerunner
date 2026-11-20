@@ -16,6 +16,8 @@ All commands need root.
 | `firerunner pool [refresh]` | pre-booted VMs; refresh replaces them |
 | `firerunner builder list` · `rm <project> \| --all [--force]` | builders; a builder in use is kept unless `--force` |
 | `firerunner run [--keep] -- <command>` | run a command in a throwaway VM |
+| `firerunner drain [--timeout D]` | before maintenance: gitlab-runner takes no new jobs (they stay pending in GitLab), the daemon boots no VMs; returns once the running jobs finished. Waits at most `daemon.job_max_age` + `daemon.reconcile_interval` by default; a timeout or Ctrl-C ends the wait, not the drain. See [Drain](operations.md#drain) |
+| `firerunner undrain` · `drain --cancel` | take jobs again |
 | `firerunner upgrade [--version V] [--check] [--allow-unsigned]` | update the binary; the release must be signed and be the version asked for. `--allow-unsigned` only for v0.1.0 and v0.1.1, published before releases were signed |
 | `firerunner proxy` | the corporate proxy forwarder (systemd: `firerunner-proxy`), see [Corporate networks](corporate-network.md) |
 | `firerunner version` | |
@@ -38,6 +40,7 @@ passed for 2 minutes.
 | `firerunner_pool_preload_seconds` | histogram | | time to pull `pool.preload_images` into a pool VM |
 | `firerunner_admission_waits_total` | counter | | pool refill passes (every 2 s) that could not boot every missing pool VM because host memory was short |
 | `firerunner_jobs_running` | gauge | | jobs in progress on the host (the state files prepare writes and cleanup removes) |
+| `firerunner_drained` | gauge | | 1 while the host is drained (`firerunner drain`): gitlab-runner takes no new jobs, the daemon boots no pool VMs or builders |
 | `firerunner_job_prepare_seconds` | histogram | `source`: `pool`, `cold` | how long a job waited until its microVM was ready: a claimed pool VM or its own boot; failed prepares are not observed |
 | `firerunner_job_admission_wait_seconds` | histogram | | how long a job waited for host memory before its microVM was created. Only jobs that found no ready pool VM are observed: cold boots, and jobs that took a pool VM that became ready while they waited. Jobs that got a ready pool VM at once are not counted |
 | `firerunner_jobs_total` | counter | `result`, `reason` | finished jobs: `success`, and `script_failure` (the job's own commands; an exit code 255 from a VM that still answers too), both with reason `none`; `system_failure` (FireRunner or the host) with a reason below |
