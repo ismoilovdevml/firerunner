@@ -40,12 +40,12 @@ func tomlStatements(doc string) []tomlStmt {
 	var out []tomlStmt
 	table, tableN := "", 0
 	for i := 0; i < len(doc); {
-		switch c := doc[i]; {
-		case c == ' ' || c == '\t' || c == '\r' || c == '\n':
+		switch doc[i] {
+		case ' ', '\t', '\r', '\n':
 			i++
-		case c == '#':
+		case '#':
 			i = lineEnd(doc, i)
-		case c == '[':
+		case '[':
 			end, name := scanHeader(doc, i)
 			if end < 0 {
 				i = lineEnd(doc, i)
