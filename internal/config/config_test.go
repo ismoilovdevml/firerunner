@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -416,5 +417,34 @@ func TestDottedMapKeys(t *testing.T) {
 		if _, err := Set(cfg, c.key, c.value); err == nil {
 			t.Errorf("Set(%s, %s) accepted", c.key, c.value)
 		}
+	}
+}
+
+// Only a file that parsed but holds bad values is a *ValidationError: callers
+// may fix those values, but must not write over a file they could not read.
+func TestLoadErrorKinds(t *testing.T) {
+	for _, c := range []struct {
+		name, body string
+		invalid    bool
+	}{
+		{"value out of range", "vm:\n  vcpu: 0\n", true},
+		{"yaml syntax error", "vm:\n  vcpu: [\n", false},
+		{"unknown key", "vm:\n  cpus: 4\n", false},
+		{"wrong type", "vm:\n  vcpu: four\n", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "c.yaml")
+			if err := os.WriteFile(p, []byte(c.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(p)
+			var invalid *ValidationError
+			if err == nil || errors.As(err, &invalid) != c.invalid {
+				t.Fatalf("Load = %v; want an error, *ValidationError: %v", err, c.invalid)
+			}
+		})
+	}
+	if _, err := Load(t.TempDir()); err == nil || errors.As(err, new(*ValidationError)) {
+		t.Fatalf("Load(a directory) = %v; want a read error", err)
 	}
 }

@@ -265,6 +265,16 @@ func decode(data []byte, cfg *Config) error {
 	return nil
 }
 
+// ValidationError is a config that was read and parsed but holds values out
+// of range. Load returns it with the config it read, so `config set` can fix
+// such a value; any other Load error means the file itself could not be used.
+type ValidationError struct {
+	Problems []string
+}
+
+func (e *ValidationError) Error() string { return strings.Join(e.Problems, "; ") }
+
+// Validate reports every value out of range as one *ValidationError.
 func (c Config) Validate() error {
 	var errs []string
 	if c.Flintlock.Endpoint == "" {
@@ -387,7 +397,7 @@ func (c Config) Validate() error {
 		errs = append(errs, "builder.port_base must leave room for builder.max ports below 65536")
 	}
 	if len(errs) > 0 {
-		return errors.New(strings.Join(errs, "; "))
+		return &ValidationError{Problems: errs}
 	}
 	return nil
 }

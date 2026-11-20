@@ -243,13 +243,16 @@ func cmdBuilder(cfg config.Config, args []string) error {
 
 func cmdConfig(args []string) error {
 	path := config.Path()
-	cfg, err := config.Load(path)
-	if err != nil && (len(args) == 0 || args[0] != "set") {
-		return err
-	}
 	sub := "show"
 	if len(args) > 0 {
 		sub = args[0]
+	}
+	cfg, err := config.Load(path)
+	// set may fix a value out of range, but a file that could not be read or
+	// parsed is never replaced: set would write the defaults over it.
+	var invalid *config.ValidationError
+	if err != nil && (sub != "set" || !errors.As(err, &invalid)) {
+		return err
 	}
 	switch {
 	case sub == "show":

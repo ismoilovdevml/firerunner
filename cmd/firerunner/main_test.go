@@ -217,3 +217,39 @@ func TestConfigShowDottedMapKeys(t *testing.T) {
 		}
 	}
 }
+
+// config set may fix a value Validate refuses, but a file it cannot parse is
+// left alone: setting one key must never replace the user's file with defaults.
+func TestConfigSetOnABrokenFile(t *testing.T) {
+	for _, c := range []struct {
+		name, body string
+		ok         bool
+	}{
+		{"yaml syntax error", "vm:\n  vcpu: 4\n  memory_mb: [\n", false},
+		{"unknown key", "vm:\n  vcpu: 4\n  cpus: 4\n", false},
+		{"invalid value", "vm:\n  vcpu: 0\n  memory_mb: 4096\n", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			t.Setenv("FIRERUNNER_CONFIG", path)
+			if err := os.WriteFile(path, []byte(c.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err := cmdConfig([]string{"set", "vm.vcpu", "2"})
+			got, _ := os.ReadFile(path)
+			if !c.ok {
+				if err == nil || string(got) != c.body {
+					t.Fatalf("set on an unparsable file: err %v, file now:\n%s", err, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("set could not fix an invalid value: %v", err)
+			}
+			cfg, err := config.Load(path)
+			if err != nil || cfg.VM.VCPU != 2 || cfg.VM.MemoryMB != 4096 {
+				t.Fatalf("after set: vcpu %d, memory_mb %d, %v", cfg.VM.VCPU, cfg.VM.MemoryMB, err)
+			}
+		})
+	}
+}
