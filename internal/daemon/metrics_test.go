@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/ismoilovdevml/firerunner/internal/config"
+	"github.com/ismoilovdevml/firerunner/internal/host"
 	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
@@ -482,5 +483,31 @@ func TestCollectHostRecordsThinPoolForAdmissions(t *testing.T) {
 	d.collectHost(context.Background())
 	if _, err := os.Stat(vm.ThinPoolFile); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("usage kept after lvs failed: %v", err)
+	}
+}
+
+// firerunner-proxy is watched only while proxy.enabled is on, and its series
+// goes away when the forwarder is switched off: a stale 0 would page forever.
+func TestServiceUpFollowsProxyEnabled(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	old := serviceActive
+	serviceActive = func(context.Context, string) bool { return false }
+	t.Cleanup(func() { serviceActive = old })
+
+	d.mu.Lock()
+	d.cfg.Proxy.Enabled = true
+	d.mu.Unlock()
+	d.collectHost(context.Background())
+	if got := labelValue(t, d, "firerunner_service_up", map[string]string{"service": host.ProxyService}); got != 0 {
+		t.Fatalf("firerunner-proxy service_up = %v, want 0 (inactive)", got)
+	}
+	withProxy := series(t, d.metrics.serviceUp)
+
+	d.mu.Lock()
+	d.cfg.Proxy.Enabled = false
+	d.mu.Unlock()
+	d.collectHost(context.Background())
+	if got := series(t, d.metrics.serviceUp); got != withProxy-1 {
+		t.Fatalf("%d service_up series after the proxy was switched off, want %d", got, withProxy-1)
 	}
 }

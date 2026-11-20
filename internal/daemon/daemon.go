@@ -1378,12 +1378,18 @@ var (
 )
 
 func (d *Daemon) collectHost(ctx context.Context) {
-	for _, s := range append(host.Services, "gitlab-runner") {
+	proxyEnabled := d.cfgSnapshot().Proxy.Enabled
+	for _, s := range host.MonitoredServices(proxyEnabled) {
 		up := 0.0
 		if serviceActive(ctx, s) {
 			up = 1
 		}
 		d.metrics.serviceUp.WithLabelValues(s).Set(up)
+	}
+	if !proxyEnabled {
+		// A forwarder switched off must not keep its last value: a stale 0
+		// would page FireRunnerProxyDown forever.
+		d.metrics.serviceUp.DeleteLabelValues(host.ProxyService)
 	}
 	if data, meta, err := thinPoolUsage(ctx); err == nil {
 		d.metrics.thinPool.WithLabelValues("data").Set(data / 100)
