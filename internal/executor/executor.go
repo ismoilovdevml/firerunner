@@ -244,14 +244,20 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 		finish(daemon.ResultSystemFailure, "state_file", err)
 		return systemFailure(err)
 	}
-	// From here on cleanup reports the job from its state file.
+	// From here on cleanup reports the job from its state file. A step that
+	// failed because the job was cancelled (gitlab-runner's SIGTERM ends ctx
+	// and the step's ssh) is "canceled", which the alerts leave out, not a
+	// failure of that step.
 	fail := func(reason string, err error) error {
+		if ctx.Err() != nil {
+			reason = "canceled"
+		}
 		recordFailure(st, daemon.ResultSystemFailure, reason)
 		_ = vm.SaveJobState(statePath(id), st)
 		return systemFailure(err)
 	}
 	if auth := os.Getenv("CUSTOM_ENV_DOCKER_AUTH_CONFIG"); auth != "" {
-		if err := writeDockerAuth(cfg, inst, auth); err != nil {
+		if err := writeDockerAuth(ctx, cfg, inst, auth); err != nil {
 			return fail("docker_auth", fmt.Errorf("writing DOCKER_AUTH_CONFIG to the microVM: %w", err))
 		}
 	}
@@ -263,8 +269,12 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 		}
 		script := ServicesScript(services, noProxy, vm.ContainerArgs(cfg, nil)...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = strings.NewReader(script), os.Stdout, os.Stderr
-		if code, err := vm.ExitCode(cmd.Run()); err != nil || code != 0 {
-			return fail("services", fmt.Errorf("starting services failed (exit %d): %v", code, err))
+		code, err := runSSH(ctx, cmd)
+		if err != nil {
+			return fail("services", fmt.Errorf("starting services: %w", err))
+		}
+		if code != 0 {
+			return fail("services", fmt.Errorf("starting services failed (exit %d)", code))
 		}
 	}
 	// Shell-mode jobs run docker on the VM; their builds can use the project's
@@ -273,11 +283,16 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	// the cache, never the job.
 	if os.Getenv("CUSTOM_ENV_CI_JOB_IMAGE") == "" {
 		if j, err := currentJob(); err == nil && j.Project != "" {
-			if state, ok := useBuilder(cfg, dc, inst, j.Project, false); ok {
+			if state, ok := useBuilder(ctx, cfg, dc, inst, j.Project, false); ok {
 				st.BuilderProject, st.BuilderState = j.Project, state
 				_ = vm.SaveJobState(statePath(id), st)
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		// Cancelled while the builder was attached: its failure cost nothing,
+		// but the job must not be reported ready.
+		return fail("canceled", fmt.Errorf("prepare stopped: the job was cancelled or timed out: %w", err))
 	}
 	// The VM is ready: a slow daemon must not hold the job's start for dc's 3 s.
 	_ = dc.SendWithin(daemon.Event{Kind: "prepare", Source: source, Seconds: ready.Seconds(), OK: true,
@@ -415,7 +430,7 @@ const BuilderName = "firerunner"
 // buildWith gives a stage that builds images the project's builder (its
 // docker wrapper waits while the builder starts), unless prepare already
 // did, and reports the job's first build with the builder's state.
-func buildWith(cfg config.Config, id string, st *vm.JobState) {
+func buildWith(ctx context.Context, cfg config.Config, id string, st *vm.JobState) {
 	dc := daemon.NewClient(cfg.Daemon.Socket)
 	state, project := st.BuilderState, ""
 	if j, err := currentJob(); err == nil {
@@ -425,7 +440,7 @@ func buildWith(cfg config.Config, id string, st *vm.JobState) {
 		state = daemon.BuilderNone
 		if project != "" {
 			var attached bool
-			if state, attached = useBuilder(cfg, dc, &st.Instance, project, true); attached {
+			if state, attached = useBuilder(ctx, cfg, dc, &st.Instance, project, true); attached {
 				st.BuilderProject, st.BuilderState = project, state
 			}
 		}
@@ -443,7 +458,7 @@ const eventWait = 500 * time.Millisecond
 
 // state is the builder's state (for the build event): ready or booting when
 // attached, else busy, disabled or none.
-func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project string, start bool) (state string, attached bool) {
+func useBuilder(ctx context.Context, cfg config.Config, dc *daemon.Client, inst *vm.Instance, project string, start bool) (state string, attached bool) {
 	info, err := dc.Builder(project, start)
 	switch {
 	case err != nil:
@@ -456,9 +471,10 @@ func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project
 		return daemon.BuilderBusy, false
 	}
 	cmd := vm.SSH(cfg, inst, "bash")
-	cmd.Stdin = strings.NewReader(BuilderScript(info))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		fmt.Printf("Docker layer cache: could not attach the builder (%v): %s\n", err, strings.TrimSpace(string(out)))
+	var out bytes.Buffer
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = strings.NewReader(BuilderScript(info)), &out, &out
+	if code, err := runSSH(ctx, cmd); err != nil || code != 0 {
+		fmt.Printf("Docker layer cache: could not attach the builder (exit %d, %v): %s\n", code, err, strings.TrimSpace(out.String()))
 		return daemon.BuilderNone, false
 	}
 	if info.State == daemon.BuilderReady {
@@ -588,10 +604,17 @@ chmod 0755 /usr/local/bin/docker
 
 // writeDockerAuth replaces the microVM's Docker CLI config with the job's
 // DOCKER_AUTH_CONFIG, keeping the proxy settings the VM booted with.
-func writeDockerAuth(cfg config.Config, inst *vm.Instance, auth string) error {
+func writeDockerAuth(ctx context.Context, cfg config.Config, inst *vm.Instance, auth string) error {
 	cmd := vm.SSH(cfg, inst, "mkdir -p /root/.docker && umask 077 && cat > /root/.docker/config.json")
 	cmd.Stdin = strings.NewReader(vm.MergeDockerConfig(cfg, auth))
-	return cmd.Run()
+	code, err := runSSH(ctx, cmd)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("exit status %d", code)
+	}
+	return nil
 }
 
 // Run executes one stage script. gitlab-runner passes the script path and stage name.
@@ -635,7 +658,7 @@ func Run(ctx context.Context, cfg config.Config, script, stage string) error {
 			}
 			script = bytes.NewReader(body)
 			if BuildsImages(body) {
-				buildWith(cfg, id, st)
+				buildWith(ctx, cfg, id, st)
 			}
 		}
 		var prefix string
