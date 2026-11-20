@@ -36,15 +36,16 @@ Options go before `bash`, for example `sudo FR_DISK=/dev/sdb bash`:
 
 | Variable | Default | |
 |---|---|---|
-| `FR_DISK` | first blank disk | disk for microVM disks, wiped |
+| `FR_DISK` | the only blank disk | disk for microVM disks, wiped. Without it the installer takes a disk only when exactly one is blank (no partitions, signature, holders, mount or swap, first 1 MiB zero, 10 GB or more); otherwise it stops and asks for `FR_DISK` |
 | `FR_VM_DISK` | `40GB` | root disk of each microVM, thin-provisioned |
 | `FR_THIN_CHUNK` | `64K` | chunk size of a new thin pool: a VM's first write to a chunk copies or zeroes all of it; an existing pool keeps its size |
 | `FR_POOL_SIZE` | `FR_RUNNER_CONCURRENT` | pre-booted microVMs; given on a re-run, it replaces `pool.size` |
 | `FR_REGISTRY_MIRRORS` | `ghcr.io,quay.io,registry.k8s.io,mcr.microsoft.com` | registries mirrored on the host besides Docker Hub; remembered for later runs, `none` for none |
 | `FR_VM_VCPU` | host CPUs / `FR_RUNNER_CONCURRENT`, 2 to 16 | vCPUs of each job microVM; given on a re-run, it replaces `vm.vcpu` |
-| `FR_VERSION` | `edge` | firerunner release to install: `edge` (the latest `main`) or a version tag |
+| `FR_VERSION` | `edge` | firerunner release to install: `edge` (the latest `main`), `latest` (the newest release) or a version tag |
 | `FR_ALLOW_UNSIGNED` | none | `1` installs v0.1.0 or v0.1.1, published before releases were signed. Every other release needs a valid signature |
 | `FR_CACHE_DAYS` | `14` | `cache:` archives not written for this many days are deleted |
+| `FR_CACHE_MAX_GB` | `auto` | above this size the oldest `cache:` archives are deleted (checked hourly); `auto` is a fifth of the file system holding the cache |
 | `FR_METRICS_ALLOW` | none | CIDR that may scrape `:9477`; without it metrics stay local. Kept for later runs |
 | `FR_EGRESS_DENY` | none | comma-separated CIDRs jobs must not reach, e.g. `192.168.0.0/16`. Kept for later runs; `none` clears it |
 | `FR_GITLAB_URL`, `FR_RUNNER_TOKEN` | none | register the runner during install |

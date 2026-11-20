@@ -65,7 +65,7 @@ passed for 2 minutes.
 | `firerunner_runner_concurrent` | gauge | | gitlab-runner's `concurrent` limit |
 | `firerunner_service_up` | gauge | `service`: `containerd-flintlock`, `firerunner-net`, `firerunner-dnsmasq`, `firerunner-registry`, `firerunner-cache`, `flintlockd`, `gitlab-runner` | 1 if the systemd service is active |
 | `firerunner_flintlock_up` | gauge | | 1 if the daemon's last flintlock listing answered |
-| `firerunner_flintlock_errors_total` | counter | `op`: `CreateMicroVM`, `DeleteMicroVM`, `ListMicroVMs`; `code`: the gRPC code | failed flintlock calls of the daemon; every failed try of a retried listing counts |
+| `firerunner_flintlock_errors_total` | counter | `op`: `CreateMicroVM`, `DeleteMicroVM`, `GetMicroVM`, `ListMicroVMs`; `code`: the gRPC code | failed flintlock calls of the daemon; every failed try of a retried listing counts |
 
 System failure reasons in `firerunner_jobs_total`: `admission_timeout` (no host memory for a
 microVM within `vm.boot_timeout`, or other admissions held the admission lock that long), `flintlock_error`, `vm_boot` (no DHCP lease or no SSH in time),

@@ -195,6 +195,19 @@ without their `cache:`.
 - Fix: `sudo systemctl start <service>`.
 - Recovered: *Services* shows it up.
 
+### FireRunnerProxyDown
+
+Critical. Only on hosts with `proxy.enabled`. `firerunner-proxy` has been inactive for 3 minutes:
+microVMs, builders, `gitlab-runner`, `containerd-flintlock` and the registry mirrors reach the
+outside through it, so jobs fail on pulls, clones and downloads (hosts in `proxy.no_proxy` still
+work).
+
+- Check: `journalctl -u firerunner-proxy -n 100`, `sudo firerunner doctor`. A 407 there means the
+  corporate proxy refused the credentials in `proxy.upstream_file`.
+- Fix: `sudo systemctl start firerunner-proxy`; after a credential change, update the upstream file
+  and `sudo systemctl restart firerunner-proxy`.
+- Recovered: *Services* shows it up and the next job's pulls succeed.
+
 ### FireRunnerSystemFailures
 
 Critical. In 30 minutes at least 3 jobs, and over 5 % of all jobs, failed because of FireRunner or
