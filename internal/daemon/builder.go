@@ -1276,6 +1276,12 @@ func serial() *big.Int {
 	return n
 }
 
+// mirrorAddr is a registry mirror URL as buildkitd takes it: host[:port],
+// without the scheme or a trailing slash.
+func mirrorAddr(url string) string {
+	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(url, "http://"), "https://"), "/")
+}
+
 // buildkitdTOML points Docker Hub at the host's mirror (plain HTTP) and sets
 // vm.insecure_registries: http://host:port as plain HTTP, host:port as TLS
 // without a certificate check. BuildKit, unlike Docker, does not fall back
@@ -1294,7 +1300,7 @@ func buildkitdTOML(cfg config.Config) string {
 			fmt.Fprintf(&b, "[registry.%q]\n  insecure = true\n", host)
 		}
 	}
-	mirror := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(cfg.VM.RegistryMirror, "http://"), "https://"), "/")
+	mirror := mirrorAddr(cfg.VM.RegistryMirror)
 	if mirror != "" {
 		fmt.Fprintf(&b, "[registry.\"docker.io\"]\n  mirrors = [%q]\n", mirror)
 		// Only a plain-HTTP mirror needs a table; an https:// one keeps its
@@ -1305,7 +1311,7 @@ func buildkitdTOML(cfg config.Config) string {
 	}
 	for _, host := range slices.Sorted(maps.Keys(cfg.VM.RegistryMirrors)) {
 		m := cfg.VM.RegistryMirrors[host]
-		addr := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(m, "http://"), "https://"), "/")
+		addr := mirrorAddr(m)
 		fmt.Fprintf(&b, "[registry.%q]\n  mirrors = [%q]\n", host, addr)
 		if strings.HasPrefix(m, "http://") {
 			table(addr, true)
