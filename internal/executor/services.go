@@ -3,6 +3,7 @@ package executor
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 )
@@ -38,6 +39,66 @@ func ParseServices(raw string) ([]Service, error) {
 	return s, nil
 }
 
+// ServiceJobVariables returns the job variables every service container
+// gets, as gitlab-runner's Docker executor passes them
+// (Build.GetServiceVariables keeps Variables.PublicOrInternal): each variable
+// in the job payload (JOB_RESPONSE_FILE) whose last entry is public, which
+// are the .gitlab-ci.yml variables and GitLab's public predefined ones. A
+// non-public variable (CI_JOB_TOKEN, CI_REGISTRY_PASSWORD, CI/CD settings
+// variables) never reaches a service, nor does a public one that a later
+// non-public entry or a `secrets:` variable of the same name overrides. The
+// values are gitlab-runner's, already expanded: lookup reads CUSTOM_ENV_<key>.
+//
+// Unlike the Docker executor, the variables gitlab-runner adds itself
+// (CI_PROJECT_DIR, CI_RUNNER_*, FF_*) are left out, since they are not in the
+// payload and their CUSTOM_ENV_ copies look like any other, `secrets:` ones
+// included. File variables are left out too: the Docker executor passes their
+// path in the job container, which a service cannot read.
+func ServiceJobVariables(payload []byte, lookup func(string) (string, bool)) (map[string]string, error) {
+	var job struct {
+		Variables []struct {
+			Key    string `json:"key"`
+			Public bool   `json:"public"`
+			File   bool   `json:"file"`
+		} `json:"variables"`
+		Secrets map[string]json.RawMessage `json:"secrets"`
+	}
+	if err := json.Unmarshal(payload, &job); err != nil {
+		return nil, fmt.Errorf("parsing the job payload: %w", err)
+	}
+	last := map[string]int{} // a later entry of a key overrides an earlier one
+	for i, v := range job.Variables {
+		last[v.Key] = i
+	}
+	vars := map[string]string{}
+	for key, i := range last {
+		if v := job.Variables[i]; key == "" || !v.Public || v.File {
+			continue
+		}
+		if _, secret := job.Secrets[key]; secret {
+			continue
+		}
+		if value, ok := lookup("CUSTOM_ENV_" + key); ok {
+			vars[key] = value
+		}
+	}
+	return vars, nil
+}
+
+// WithJobVariables returns services whose variables are jobVars overridden by
+// each service's own, like the Docker executor sets them.
+func WithJobVariables(services []Service, jobVars map[string]string) []Service {
+	out := make([]Service, len(services))
+	for i, svc := range services {
+		merged := make(map[string]string, len(jobVars)+len(svc.Variables))
+		maps.Copy(merged, jobVars)
+		maps.Copy(merged, svc.Variables)
+		svc.Variables = merged
+		out[i] = svc
+	}
+	return out
+}
+
 // Aliases returns the hostnames a service is reachable under. Like the docker
 // executor: an explicit alias list wins; otherwise the image name without tag,
 // digest and registry port, with "/" replaced by "__" and by "-".
@@ -66,12 +127,16 @@ func (s Service) Aliases() []string {
 
 // ServicesScript returns the shell script run in the job VM to start the
 // services on ServiceNetwork, publish their aliases in /etc/hosts (for jobs
-// without image:) and wait up to 30 s for each exposed TCP port, like the
-// docker executor's health check (a port that never opens is only a warning).
+// without image:) and wait up to 30 s for their exposed TCP ports, all at
+// once, like the docker executor's health check (a port that never opens is
+// only a warning).
 //
 // With the proxy, noProxy (the proxy exceptions plus the service aliases)
-// replaces the VM's no_proxy for stage scripts without image:, and extra
-// (vm.ContainerArgs) is passed to each service container.
+// replaces the VM's no_proxy in /etc/environment, and extra (vm.ContainerArgs)
+// is passed to each service container. pam_env reads /etc/environment once
+// per SSH connection, so only connections opened later see the new no_proxy:
+// stages, which share the connection prepare opened before, export it
+// themselves (see Run).
 func ServicesScript(services []Service, noProxy string, extra ...string) string {
 	var b strings.Builder
 	b.WriteString("set -e\n")
@@ -118,22 +183,39 @@ func ServicesScript(services []Service, noProxy string, extra ...string) string 
 		fmt.Fprintf(&b, "echo %s\n", shellQuote("Starting service "+svc.Name+" as "+strings.Join(svc.Aliases(), ", ")))
 		b.WriteString(strings.Join(args, " ") + " >/dev/null\n")
 	}
+	// Every port is checked at once, like the docker executor waits for its
+	// services in parallel: a job waits about 30 s for silent services, not
+	// 30 s per port. Each check writes its report to its own file, printed in
+	// order once all are done, so reports and logs do not interleave.
 	b.WriteString(`set +e
+checks=$(mktemp -d) || { echo "WARNING: not waiting for the services: no temporary directory"; exit 0; }
+n=0
 for c in $(docker ps -q --filter network=` + ServiceNetwork + `); do
   ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$c")
   for a in $(docker inspect -f '{{range .NetworkSettings.Networks}}{{range .Aliases}}{{.}} {{end}}{{end}}' "$c"); do
     echo "$ip $a" >>/etc/hosts
   done
+  image=$(docker inspect -f '{{.Config.Image}}' "$c")
   for p in $(docker inspect -f '{{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}' "$c"); do
     case $p in */tcp) port=${p%/tcp} ;; *) continue ;; esac
-    if timeout 30 bash -c "until (</dev/tcp/$ip/$port) 2>/dev/null; do sleep 0.2; done"; then
-      echo "Service $(docker inspect -f '{{.Config.Image}}' "$c") is listening on $port"
-    else
-      echo "WARNING: service $(docker inspect -f '{{.Config.Image}}' "$c") did not open port $port within 30s"
-      docker logs --tail 20 "$c" 2>&1 | sed 's/^/  /'
-    fi
+    n=$((n + 1))
+    (
+      if timeout 30 bash -c "until (</dev/tcp/$ip/$port) 2>/dev/null; do sleep 0.2; done"; then
+        echo "Service $image is listening on $port"
+      else
+        echo "WARNING: service $image did not open port $port within 30s"
+        docker logs --tail 20 "$c" 2>&1 | sed 's/^/  /'
+      fi
+    ) >"$checks/$n" 2>&1 &
   done
 done
+wait
+i=1
+while [ "$i" -le "$n" ]; do
+  cat "$checks/$i"
+  i=$((i + 1))
+done
+rm -rf "$checks"
 exit 0
 `)
 	return b.String()

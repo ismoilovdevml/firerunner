@@ -244,27 +244,45 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 		finish(daemon.ResultSystemFailure, "state_file", err)
 		return systemFailure(err)
 	}
-	// From here on cleanup reports the job from its state file.
+	// From here on cleanup reports the job from its state file. A step that
+	// failed because the job was cancelled (gitlab-runner's SIGTERM ends ctx
+	// and the step's ssh) is "canceled", which the alerts leave out, not a
+	// failure of that step.
 	fail := func(reason string, err error) error {
+		if ctx.Err() != nil {
+			reason = "canceled"
+		}
 		recordFailure(st, daemon.ResultSystemFailure, reason)
 		_ = vm.SaveJobState(statePath(id), st)
 		return systemFailure(err)
 	}
 	if auth := os.Getenv("CUSTOM_ENV_DOCKER_AUTH_CONFIG"); auth != "" {
-		if err := writeDockerAuth(cfg, inst, auth); err != nil {
+		if err := writeDockerAuth(ctx, cfg, inst, auth); err != nil {
 			return fail("docker_auth", fmt.Errorf("writing DOCKER_AUTH_CONFIG to the microVM: %w", err))
 		}
 	}
 	if len(services) > 0 {
+		payload, err := os.ReadFile(os.Getenv("JOB_RESPONSE_FILE"))
+		if err != nil {
+			return fail("services", fmt.Errorf("reading the job payload: %w", err))
+		}
+		jobVars, err := ServiceJobVariables(payload, os.LookupEnv)
+		if err != nil {
+			return fail("services", err)
+		}
 		cmd := vm.SSH(cfg, inst, "/bin/bash")
 		noProxy := ""
 		if cfg.Proxy.Enabled {
 			noProxy = vm.NoProxy(cfg, st.ServiceAliases...)
 		}
-		script := ServicesScript(services, noProxy, vm.ContainerArgs(cfg, nil)...)
+		script := ServicesScript(WithJobVariables(services, jobVars), noProxy, vm.ContainerArgs(cfg, nil)...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = strings.NewReader(script), os.Stdout, os.Stderr
-		if code, err := vm.ExitCode(cmd.Run()); err != nil || code != 0 {
-			return fail("services", fmt.Errorf("starting services failed (exit %d): %v", code, err))
+		code, err := runSSH(ctx, cmd)
+		if err != nil {
+			return fail("services", fmt.Errorf("starting services: %w", err))
+		}
+		if code != 0 {
+			return fail("services", fmt.Errorf("starting services failed (exit %d)", code))
 		}
 	}
 	// Shell-mode jobs run docker on the VM; their builds can use the project's
@@ -273,11 +291,16 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 	// the cache, never the job.
 	if os.Getenv("CUSTOM_ENV_CI_JOB_IMAGE") == "" {
 		if j, err := currentJob(); err == nil && j.Project != "" {
-			if state, ok := useBuilder(cfg, dc, inst, j.Project, false); ok {
+			if state, ok := useBuilder(ctx, cfg, dc, inst, j.Project, false); ok {
 				st.BuilderProject, st.BuilderState = j.Project, state
 				_ = vm.SaveJobState(statePath(id), st)
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		// Cancelled while the builder was attached: its failure cost nothing,
+		// but the job must not be reported ready.
+		return fail("canceled", fmt.Errorf("prepare stopped: the job was cancelled or timed out: %w", err))
 	}
 	// The VM is ready: a slow daemon must not hold the job's start for dc's 3 s.
 	_ = dc.SendWithin(daemon.Event{Kind: "prepare", Source: source, Seconds: ready.Seconds(), OK: true,
@@ -415,7 +438,7 @@ const BuilderName = "firerunner"
 // buildWith gives a stage that builds images the project's builder (its
 // docker wrapper waits while the builder starts), unless prepare already
 // did, and reports the job's first build with the builder's state.
-func buildWith(cfg config.Config, id string, st *vm.JobState) {
+func buildWith(ctx context.Context, cfg config.Config, id string, st *vm.JobState) {
 	dc := daemon.NewClient(cfg.Daemon.Socket)
 	state, project := st.BuilderState, ""
 	if j, err := currentJob(); err == nil {
@@ -425,7 +448,7 @@ func buildWith(cfg config.Config, id string, st *vm.JobState) {
 		state = daemon.BuilderNone
 		if project != "" {
 			var attached bool
-			if state, attached = useBuilder(cfg, dc, &st.Instance, project, true); attached {
+			if state, attached = useBuilder(ctx, cfg, dc, &st.Instance, project, true); attached {
 				st.BuilderProject, st.BuilderState = project, state
 			}
 		}
@@ -443,7 +466,7 @@ const eventWait = 500 * time.Millisecond
 
 // state is the builder's state (for the build event): ready or booting when
 // attached, else busy, disabled or none.
-func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project string, start bool) (state string, attached bool) {
+func useBuilder(ctx context.Context, cfg config.Config, dc *daemon.Client, inst *vm.Instance, project string, start bool) (state string, attached bool) {
 	info, err := dc.Builder(project, start)
 	switch {
 	case err != nil:
@@ -456,9 +479,10 @@ func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project
 		return daemon.BuilderBusy, false
 	}
 	cmd := vm.SSH(cfg, inst, "bash")
-	cmd.Stdin = strings.NewReader(BuilderScript(info))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		fmt.Printf("Docker layer cache: could not attach the builder (%v): %s\n", err, strings.TrimSpace(string(out)))
+	var out bytes.Buffer
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = strings.NewReader(BuilderScript(info)), &out, &out
+	if code, err := runSSH(ctx, cmd); err != nil || code != 0 {
+		fmt.Printf("Docker layer cache: could not attach the builder (exit %d, %v): %s\n", code, err, strings.TrimSpace(out.String()))
 		return daemon.BuilderNone, false
 	}
 	if info.State == daemon.BuilderReady {
@@ -469,12 +493,78 @@ func useBuilder(cfg config.Config, dc *daemon.Client, inst *vm.Instance, project
 	return info.State, true
 }
 
-// buildCommand matches a command in a stage script that builds images.
-var buildCommand = regexp.MustCompile(`\bdocker(\s+buildx)?\s+build\b|\bdocker\s+buildx\s+bake\b|\bdocker(-|\s+)compose\b[^\n]*\bbuild\b`)
+var (
+	// dockerCall is where a docker command's arguments start in a script.
+	dockerCall = regexp.MustCompile(`\bdocker[ \t]+`)
+	// buildWord is a compose command line that builds: compose build, or
+	// up/run/create --build.
+	buildWord     = regexp.MustCompile(`\bbuild\b`)
+	composeBuilds = regexp.MustCompile(`\bdocker-compose\b[^\n]*\bbuild\b`)
+)
 
-// BuildsImages reports whether a stage script runs docker build (or buildx
-// build/bake, compose build). Only such stages need the project's builder.
-func BuildsImages(script []byte) bool { return buildCommand.Match(script) }
+// dockerValueOptions are docker's global options that take a value, which is
+// never the command; the same list as the docker wrapper's (BuilderScript).
+var dockerValueOptions = map[string]bool{
+	"--config": true, "-c": true, "--context": true, "-H": true, "--host": true,
+	"-l": true, "--log-level": true, "--tlscacert": true, "--tlscert": true, "--tlskey": true,
+}
+
+// BuildsImages reports whether a stage script runs docker build, image build,
+// builder build, buildx build or bake, or compose build, also after docker's
+// global options (docker --debug build). Only such stages need the project's
+// builder; FIRERUNNER_BUILDER=1 asks for it for any other (see wantsBuilder).
+func BuildsImages(script []byte) bool {
+	script = bytes.ReplaceAll(script, []byte("\\\n"), []byte(" ")) // continued lines
+	if composeBuilds.Match(script) {
+		return true
+	}
+	for _, loc := range dockerCall.FindAllIndex(script, -1) {
+		line := script[loc[1]:]
+		if i := bytes.IndexByte(line, '\n'); i >= 0 {
+			line = line[:i]
+		}
+		if dockerBuilds(strings.Fields(string(line))) {
+			return true
+		}
+	}
+	return false
+}
+
+// dockerBuilds reports whether docker's arguments args build images.
+func dockerBuilds(args []string) bool {
+	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		if dockerValueOptions[args[0]] && len(args) > 1 {
+			args = args[1:]
+		}
+		args = args[1:]
+	}
+	// A command word may end the shell command it is in: docker build;
+	word := func(i int) string {
+		if i >= len(args) {
+			return ""
+		}
+		return strings.TrimRight(args[i], ";&|)")
+	}
+	switch word(0) {
+	case "build":
+		return true
+	case "buildx":
+		return word(1) == "build" || word(1) == "bake"
+	case "image", "builder":
+		return word(1) == "build"
+	case "compose":
+		return buildWord.MatchString(strings.Join(args[1:], " "))
+	}
+	return false
+}
+
+// wantsBuilder reports whether the job asked for the project's builder in
+// every stage with the job variable FIRERUNNER_BUILDER (1 or true), for
+// builds BuildsImages cannot see: docker build run by make or a script.
+func wantsBuilder() bool {
+	on, err := strconv.ParseBool(os.Getenv("CUSTOM_ENV_FIRERUNNER_BUILDER"))
+	return err == nil && on
+}
 
 // BuilderWait is how long `docker build` in a job waits for a starting builder:
 // a boot restores the project's saved cache first (about 100 MB/s, so up to
@@ -588,10 +678,17 @@ chmod 0755 /usr/local/bin/docker
 
 // writeDockerAuth replaces the microVM's Docker CLI config with the job's
 // DOCKER_AUTH_CONFIG, keeping the proxy settings the VM booted with.
-func writeDockerAuth(cfg config.Config, inst *vm.Instance, auth string) error {
+func writeDockerAuth(ctx context.Context, cfg config.Config, inst *vm.Instance, auth string) error {
 	cmd := vm.SSH(cfg, inst, "mkdir -p /root/.docker && umask 077 && cat > /root/.docker/config.json")
 	cmd.Stdin = strings.NewReader(vm.MergeDockerConfig(cfg, auth))
-	return cmd.Run()
+	code, err := runSSH(ctx, cmd)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("exit status %d", code)
+	}
+	return nil
 }
 
 // Run executes one stage script. gitlab-runner passes the script path and stage name.
@@ -634,13 +731,25 @@ func Run(ctx context.Context, cfg config.Config, script, stage string) error {
 				return systemFailure(fmt.Errorf("reading stage script: %w", rerr))
 			}
 			script = bytes.NewReader(body)
-			if BuildsImages(body) {
-				buildWith(cfg, id, st)
+			if BuildsImages(body) || wantsBuilder() {
+				buildWith(ctx, cfg, id, st)
 			}
+		}
+		var prefix string
+		if cfg.Proxy.Enabled && len(st.ServiceAliases) > 0 {
+			// The services script put the aliases into /etc/environment, but
+			// pam_env read that file once, when prepare opened the connection
+			// every stage shares: without this the stage would still send its
+			// requests to the services through the proxy.
+			np := shellQuote(vm.NoProxy(cfg, st.ServiceAliases...))
+			prefix += "export no_proxy=" + np + " NO_PROXY=" + np + "\n"
 		}
 		if st.BuilderProject != "" && isUserStage(stage) {
 			// `docker build` only uses a buildx builder named in the environment.
-			script = io.MultiReader(strings.NewReader("export BUILDX_BUILDER="+BuilderName+"\n"), script)
+			prefix += "export BUILDX_BUILDER=" + BuilderName + "\n"
+		}
+		if prefix != "" {
+			script = io.MultiReader(strings.NewReader(prefix), script)
 		}
 		cmd := vm.SSH(cfg, &st.Instance, "/bin/bash")
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = script, os.Stdout, os.Stderr

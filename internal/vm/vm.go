@@ -198,17 +198,58 @@ func Boot(ctx context.Context, cfg config.Config, fl *flintlock.Client, id strin
 	if err := waitTCP(ctx, net.JoinHostPort(inst.IP, "22"), deadline); err != nil {
 		return fail(notReady{fmt.Sprintf("microVM %s at %s did not open SSH within %s: %v", id, inst.IP, cfg.VM.BootTimeout, err)})
 	}
-	// sshd may accept connections a moment before it authenticates: retry at
-	// bootPoll, not once a second (up to 0.75 s more per boot).
-	for SSH(cfg, inst, "true").Run() != nil {
-		if time.Now().After(deadline) {
-			return fail(notReady{fmt.Sprintf("microVM %s at %s did not answer SSH within %s", id, inst.IP, cfg.VM.BootTimeout)})
-		}
-		if err := sleep(ctx, bootPoll); err != nil {
-			return fail(err)
-		}
+	if err := waitSSH(ctx, cfg, inst, deadline); err != nil {
+		return fail(err)
 	}
 	return inst, nil
+}
+
+// waitSSH runs `true` in the microVM until it succeeds, ctx ends or the
+// deadline passes (a notReady error). Each attempt is bounded by both: an
+// sshd that accepts the connection but stalls in the handshake would hold
+// ssh for ServerAliveInterval x ServerAliveCountMax (45 s), past the deadline
+// and after the job was cancelled.
+func waitSSH(ctx context.Context, cfg config.Config, inst *Instance, deadline time.Time) error {
+	for {
+		pctx, cancel := context.WithDeadline(ctx, deadline)
+		err := runContext(pctx, SSH(cfg, inst, "true"))
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			return notReady{fmt.Sprintf("microVM %s at %s did not answer SSH within %s", inst.ID, inst.IP, cfg.VM.BootTimeout)}
+		}
+		// sshd may accept connections a moment before it authenticates: retry
+		// at bootPoll, not once a second (up to 0.75 s more per boot).
+		if err := sleep(ctx, bootPoll); err != nil {
+			return err
+		}
+	}
+}
+
+// runContext runs cmd until it exits or ctx ends; then it kills cmd and
+// waits for it, so the process never outlives the call.
+func runContext(ctx context.Context, cmd *exec.Cmd) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		_ = cmd.Process.Kill()
+		<-done
+		return ctx.Err()
+	}
 }
 
 // Spec builds the flintlock request for a job microVM. cloud-init documents
@@ -225,7 +266,8 @@ func Spec(cfg config.Config, id, mac, sshPubKey string, hostKey HostKey, labels 
 		np := NoProxy(cfg)
 		cli, _ := json.Marshal(map[string]any{"proxies": DockerCLIProxies(cfg, np)})
 		files = append(files,
-			// pam_env reads it for every SSH session: stage scripts, git, apt.
+			// pam_env reads it for every SSH connection (once, when it opens;
+			// multiplexed sessions share it): stage scripts, git, apt.
 			map[string]any{"path": "/etc/environment", "append": true, "content": strings.Join(ProxyEnv(cfg, np), "\n") + "\n"},
 			map[string]any{"path": "/root/.docker/config.json", "permissions": "0600", "content": string(cli)})
 	}
