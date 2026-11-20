@@ -73,11 +73,17 @@ expect "a tagged release for edge refused"                   ! matches edge v0.2
 expect "the tag asked for"                                     matches v0.3.0 v0.3.0
 expect "an older tag for v0.3.0 refused"                     ! matches v0.3.0 v0.2.0
 expect "a binary that does not run refused"                  ! matches v0.3.0 ""
+expect "a stable release for latest"                           matches latest v0.3.0
+expect "an edge build for latest refused"                    ! matches latest edge-abc1234
+expect "latest downloads the newest stable release"            test "$(FR_VERSION=latest release_base)" = "https://github.com/$FR_REPO/releases/latest/download"
+expect "a tag downloads that release"                          test "$(FR_VERSION=v0.3.0 release_base)" = "https://github.com/$FR_REPO/releases/download/v0.3.0"
 
 # install_firerunner checks the signature before it trusts a checksum.
 signature_first() { declare -f install_firerunner | grep -A1 'verify_release ' | grep -q 'verify "'; }
 expect "install_firerunner checks the signature before the checksum" signature_first
-version_first() { declare -f install_firerunner | grep -B1 'put "$BIN_DIR/firerunner" 0755 < "$TMP_DIR/$bin"' | grep -q release_matches; }
+# The version check runs on the copy that is then renamed into place (test/installer/host.sh).
+version_first() { declare -f install_firerunner | grep -q 'install_binary "$TMP_DIR/$bin" "$BIN_DIR/firerunner" release_runs' &&
+    declare -f release_runs | grep -q 'release_matches "$got"'; }
 expect "install_firerunner checks the version before installing" version_first
 # The key in install.sh is the one release.yml signs with; its Go copy is
 # compared by internal/upgrade's tests.

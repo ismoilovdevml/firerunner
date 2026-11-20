@@ -24,7 +24,8 @@
 #   FIRECRACKER_VERSION     (default: 1.17.0)
 #   FLINTLOCK_VERSION       (default: 0.15.2)
 #
-#   FR_VERSION              firerunner release to install (default: edge = latest main)
+#   FR_VERSION              firerunner release to install: edge (latest main), latest (newest
+#                           stable release) or a tag like v1.2.0 (default: edge)
 #   FR_ALLOW_UNSIGNED=1     install a release without a signature (published before releases were
 #                           signed); a signature that does not verify is never accepted
 #   FR_POOL_SIZE            pre-booted microVMs kept ready (default: FR_RUNNER_CONCURRENT, so a
@@ -130,6 +131,7 @@ FLINTLOCK_TLS_RESET=0                       # flintlockd and firerunner restart 
 FLINTLOCK_TLS_DAEMON=0                      # firerunner's daemon restarts (it may hold the old setting)
 
 TMP_DIR=""
+BIN_TMP=""   # a binary being installed (install_binary), removed if the run ends first
 
 log()  { printf '[firerunner] %s\n' "$*"; }
 warn() { printf '[firerunner] WARNING: %s\n' "$*" >&2; }
@@ -141,6 +143,7 @@ cleanup() {
     # A run cut off while switching flintlockd to TLS puts it back first.
     [[ $FLINTLOCK_TLS_SWITCHING == 1 ]] && flintlock_tls_revert
     [[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+    [[ -n "$BIN_TMP" ]] && rm -f "$BIN_TMP"
     return 0
 }
 trap cleanup EXIT
@@ -542,9 +545,50 @@ verify_release() {
 # an older signed release served in its place is not installed.
 release_matches() {
     case $FR_VERSION in
-        edge) [[ $1 == edge-* ]] ;;
-        *)    [[ $1 == "$FR_VERSION" ]] ;;
+        edge)   [[ $1 == edge-* ]] ;;
+        latest) [[ $1 == v* ]] ;;
+        *)      [[ $1 == "$FR_VERSION" ]] ;;
     esac
+}
+
+# release_base: where FR_VERSION's files are; latest is the newest stable
+# release, as for `firerunner upgrade --version latest` (internal/upgrade).
+release_base() {
+    if [[ $FR_VERSION == latest ]]; then
+        echo "https://github.com/${FR_REPO}/releases/latest/download"
+    else
+        echo "https://github.com/${FR_REPO}/releases/download/${FR_VERSION}"
+    fi
+}
+
+# release_runs FILE: the downloaded firerunner runs and is FR_VERSION.
+release_runs() {
+    local got
+    got=$("$1" version 2>/dev/null | awk '{print $2}' || true)
+    release_matches "$got" || die "firerunner ${FR_VERSION} contains firerunner ${got:-(does not run)}; not installing it"
+}
+
+# install_binary SRC DEST [CHECK]: DEST becomes a copy of SRC, mode 0755, in
+# one rename: never missing or half written, also not after a crash. The copy
+# is written next to DEST (the same file system; /tmp may be noexec), and
+# CHECK, given its path, may refuse it first. Recorded as changed if it differs.
+install_binary() {
+    local src=$1 dest=$2 check=${3:-}
+    BIN_TMP=$(mktemp "$(dirname "$dest")/.$(basename "$dest")-new.XXXXXX")
+    cp -- "$src" "$BIN_TMP"
+    chmod 0755 "$BIN_TMP"
+    [[ -z $check ]] || "$check" "$BIN_TMP"
+    if [[ -f $dest ]] && cmp -s "$BIN_TMP" "$dest"; then
+        rm -f "$BIN_TMP"
+        BIN_TMP=""
+        chmod 0755 "$dest"
+        return 0
+    fi
+    sync -- "$BIN_TMP" 2>/dev/null || sync
+    mv -f -- "$BIN_TMP" "$dest"
+    BIN_TMP=""
+    sync -- "$(dirname "$dest")" 2>/dev/null || true
+    installed "$dest"
 }
 
 # Files that changed in this run; a service restarts only if one of its
@@ -1730,22 +1774,17 @@ link_on_sudo_path() {
 install_firerunner() {
     if [[ -n $FR_BINARY ]]; then
         log "installing firerunner from $FR_BINARY"
-        put "$BIN_DIR/firerunner" 0755 <"$FR_BINARY"
+        install_binary "$FR_BINARY" "$BIN_DIR/firerunner"
     else
         log "installing firerunner ${FR_VERSION}"
-        local base="https://github.com/${FR_REPO}/releases/download/${FR_VERSION}"
-        local bin="firerunner-linux-${ARCH}"
+        local base bin="firerunner-linux-${ARCH}"
+        base=$(release_base)
         fetch "$base/$bin" "$TMP_DIR/$bin"
         fetch "$base/checksums.txt" "$TMP_DIR/fr.sums"
         verify_release "$TMP_DIR/fr.sums" "$base/checksums.txt.sig"
         verify "$TMP_DIR/$bin" "$(awk -v f="$bin" '$2==f {print $1}' "$TMP_DIR/fr.sums")"
-        # Run next to its destination: /tmp may be mounted noexec.
-        local got
-        install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/.firerunner-new"
-        got=$("$BIN_DIR/.firerunner-new" version 2>/dev/null | awk '{print $2}' || true)
-        rm -f "$BIN_DIR/.firerunner-new"
-        release_matches "$got" || die "firerunner ${FR_VERSION} contains firerunner ${got:-(does not run)}; not installing it"
-        put "$BIN_DIR/firerunner" 0755 <"$TMP_DIR/$bin"
+        # The binary that ran is the one renamed into place.
+        install_binary "$TMP_DIR/$bin" "$BIN_DIR/firerunner" release_runs
     fi
     log "  $($BIN_DIR/firerunner version)"
     link_on_sudo_path

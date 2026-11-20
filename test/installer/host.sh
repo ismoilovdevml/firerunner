@@ -3,7 +3,8 @@
 # shellcheck disable=SC2034
 # Tests installer steps that act on the host's disks and files with
 # install.sh's own functions, the system commands they call faked: the cache
-# size cap. It needs no root and changes nothing outside a temporary
+# size cap, the choice of the thin pool disk and the install of the firerunner
+# binary. It needs no root and changes nothing outside a temporary
 # directory, so it also runs outside a container (bash 4.4 or later):
 #   bash test/installer/host.sh
 #   docker run --rm -v "$PWD":/src:ro ubuntu:24.04 bash /src/test/installer/host.sh
@@ -144,6 +145,32 @@ disks_reset; disk frt-sdb 100; echo "/dev/mapper/vg-data /srv" >> "$D/tree/frt-s
 expect "FR_DISK: a disk under a mounted LV is refused" grep -q "/dev/mapper/vg-data is mounted on /srv" <<<"$(in_use frt-sdb)"
 disks_reset; disk frt-sdb 100; echo /dev/frt-sdb > "$D/mpath"
 expect "FR_DISK: a multipath path is refused" grep -q "multipath" <<<"$(in_use frt-sdb)"
+
+# ---- firerunner binary: checked, then renamed into place
+B=$WORK/bin; mkdir -p "$B"
+# fake_release VERSION: a "firerunner" that says it is VERSION.
+fake_release() { printf '#!/bin/sh\necho "firerunner %s"\n' "$1" > "$WORK/release-$1"; echo "$WORK/release-$1"; }
+inode() { ls -i "$1" | awk '{print $1}'; }
+echo old > "$B/firerunner"; chmod 0755 "$B/firerunner"; before=$(inode "$B/firerunner")
+CHANGED=" "
+# installs VERSION WANT: install_binary of a release saying VERSION with FR_VERSION=WANT,
+# ended by the installer's own EXIT trap (cleanup) as a real run is.
+installs() { ( trap cleanup EXIT; FR_VERSION=$2; install_binary "$(fake_release "$1")" "$B/firerunner" release_runs ) >/dev/null 2>&1; }
+expect "a release that is FR_VERSION is installed" installs v0.3.0 v0.3.0
+expect "...in place of the old one" grep -q v0.3.0 "$B/firerunner"
+expect "...by a rename (a new inode, never a file half written)" test "$(inode "$B/firerunner")" != "$before"
+expect "...executable" test -x "$B/firerunner"
+expect "...and no copy is left next to it" test -z "$(compgen -G "$B/.firerunner-new.*")"
+cp "$B/firerunner" "$WORK/installed"
+expect "an older release in place of FR_VERSION is refused" ! installs v0.2.0 v0.4.0
+expect "...the installed binary is untouched" cmp -s "$WORK/installed" "$B/firerunner"
+expect "...and its copy is removed" test -z "$(compgen -G "$B/.firerunner-new.*")"
+same_inode=$(inode "$B/firerunner"); CHANGED=" "
+FR_VERSION=v0.3.0 install_binary "$(fake_release v0.3.0)" "$B/firerunner" release_runs
+expect "the same binary again is not replaced" test "$(inode "$B/firerunner")" = "$same_inode"
+expect "...nor recorded as changed" ! changed "$B/firerunner"
+FR_VERSION=v0.4.0 install_binary "$(fake_release v0.4.0)" "$B/firerunner" release_runs
+expect "a new binary is recorded as changed (the daemon restarts)" changed "$B/firerunner"
 
 echo "RESULT pass=$pass fail=$fail"
 [[ $fail -eq 0 ]]
