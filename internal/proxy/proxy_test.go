@@ -861,6 +861,97 @@ func TestPolicyStrict(t *testing.T) {
 	}
 }
 
+// recordingUpstream is a corporate proxy that answers every request itself,
+// without going anywhere, and logs what it was sent.
+type recordingUpstream struct {
+	addr string
+	mu   sync.Mutex
+	seen []seenRequest
+}
+
+type seenRequest struct{ method, url, host, auth string }
+
+func startRecordingUpstream(t *testing.T) *recordingUpstream {
+	t.Helper()
+	u := &recordingUpstream{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		u.mu.Lock()
+		u.seen = append(u.seen, seenRequest{r.Method, r.URL.String(), r.Host, r.Header.Get("Proxy-Authorization")})
+		u.mu.Unlock()
+		_, _ = io.WriteString(w, "answered")
+	}))
+	t.Cleanup(srv.Close)
+	u.addr = srv.Listener.Addr().String()
+	return u
+}
+
+func (u *recordingUpstream) requests() []seenRequest {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]seenRequest(nil), u.seen...)
+}
+
+// serveForwarder runs f on a loopback address until the test ends.
+func serveForwarder(t *testing.T, f *Forwarder) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: f}
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return l.Addr().String()
+}
+
+// A request is sent to the upstream address it took the credentials from,
+// also when the upstream file changes while it is under way: one upstream's
+// password never goes to another.
+func TestForwardUsesOneUpstreamPerRequest(t *testing.T) {
+	a, b := startRecordingUpstream(t), startRecordingUpstream(t)
+	ups := []Upstream{{Addr: a.addr, Auth: "Basic a"}, {Addr: b.addr, Auth: "Basic b"}}
+	var mu sync.Mutex
+	calls := 0
+	// Every read of the upstream file finds the other upstream.
+	f := &Forwarder{Upstream: func() (Upstream, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		return ups[(calls-1)%2], nil
+	}, Allowed: AllowNets(), Log: slog.New(slog.NewTextHandler(io.Discard, nil)), DialTimeout: 2 * time.Second}
+	fwd := serveForwarder(t, f)
+	for i := 0; i < 4; i++ {
+		resp, err := client(fwd).Get(fmt.Sprintf("http://example.test/%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("request %d: %d", i, resp.StatusCode)
+		}
+	}
+	for _, up := range []struct {
+		name string
+		u    *recordingUpstream
+		auth string
+	}{{"a", a, "Basic a"}, {"b", b, "Basic b"}} {
+		for _, s := range up.u.requests() {
+			if s.auth != up.auth {
+				t.Errorf("upstream %s was sent %q for %s, want its own %q", up.name, s.auth, s.url, up.auth)
+			}
+		}
+	}
+	if n := len(a.requests()) + len(b.requests()); n != 4 {
+		t.Errorf("upstreams saw %d requests, want 4", n)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 4 {
+		t.Errorf("upstream read %d times for 4 requests, want once each", calls)
+	}
+}
+
 // The destination check (a DNS lookup of up to 3 s) runs inside the client's
 // connection budget: a job firing requests at names that never resolve gets
 // 503 for those beyond its share instead of holding a lookup for each.

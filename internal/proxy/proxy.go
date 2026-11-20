@@ -275,8 +275,8 @@ var DefaultLimits = Limits{PerClient: 256, Loopback: 1024, Total: 4096, TunnelId
 
 // Forwarder passes requests to the upstream proxy.
 type Forwarder struct {
-	// Upstream is read for every connection, so a new password or proxy address
-	// applies without a restart.
+	// Upstream is read once for every request, so a new password or proxy
+	// address applies without a restart, and a request uses one of them only.
 	Upstream func() (Upstream, error)
 	// Allowed reports whether a client address may use the forwarder.
 	Allowed func(ip net.IP) bool
@@ -593,14 +593,20 @@ func splice(client net.Conn, clientBuf io.Reader, upstream net.Conn, upstreamBuf
 	return total.Load()
 }
 
+// upstreamKey carries the request's Upstream to the transport's Proxy func.
+type upstreamKey struct{}
+
 // forward sends a plain http:// request through the upstream proxy.
 func (f *Forwarder) forward(w http.ResponseWriter, r *http.Request, up Upstream) (int, int64) {
 	f.transportOnce.Do(func() {
 		f.transport = &http.Transport{
-			Proxy: func(*http.Request) (*url.URL, error) {
-				u, err := f.Upstream()
-				if err != nil {
-					return nil, err
+			// The address comes with the request, from the same read of the
+			// upstream file as its credentials: reading the file again here
+			// could send them to an upstream that replaced it meanwhile.
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				u, ok := req.Context().Value(upstreamKey{}).(Upstream)
+				if !ok {
+					return nil, errors.New("request without an upstream")
 				}
 				return &url.URL{Scheme: "http", Host: u.Addr}, nil
 			},
@@ -612,7 +618,7 @@ func (f *Forwarder) forward(w http.ResponseWriter, r *http.Request, up Upstream)
 	})
 	// Not the request's context: a client that half-closes (busybox) cancels it.
 	// The answer is abandoned instead when no byte comes for HeaderWait.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), upstreamKey{}, up))
 	defer cancel()
 	out := r.Clone(ctx)
 	out.RequestURI = ""
