@@ -1266,7 +1266,7 @@ func buildkitdTOML(cfg config.Config) string {
 			fmt.Fprintf(&b, "[registry.%q]\n  insecure = true\n", host)
 		}
 	}
-	mirror := strings.TrimPrefix(strings.TrimPrefix(cfg.VM.RegistryMirror, "http://"), "https://")
+	mirror := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(cfg.VM.RegistryMirror, "http://"), "https://"), "/")
 	if mirror != "" {
 		fmt.Fprintf(&b, "[registry.\"docker.io\"]\n  mirrors = [%q]\n", mirror)
 		// Only a plain-HTTP mirror needs a table; an https:// one keeps its

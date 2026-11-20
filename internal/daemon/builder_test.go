@@ -812,6 +812,23 @@ func TestBuildkitdTOMLHTTPSMirror(t *testing.T) {
 	}
 }
 
+// vm.registry_mirror with a trailing slash names the same host as without
+// one: buildkitd takes a mirror as host[:port], like vm.registry_mirrors.
+func TestBuildkitdTOMLMirrorTrailingSlash(t *testing.T) {
+	for _, mirror := range []string{"http://10.200.0.1:5000/", "https://mirror.corp:5000/"} {
+		cfg := config.Default()
+		cfg.VM.RegistryMirror = mirror
+		s := buildkitdTOML(cfg)
+		host := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(mirror, "http://"), "https://"), "/")
+		if strings.Contains(s, host+"/") || !strings.Contains(s, "mirrors = [\""+host+"\"]") {
+			t.Fatalf("mirror %s:\n%s", mirror, s)
+		}
+		if strings.HasPrefix(mirror, "http://") && !strings.Contains(s, "[registry.\""+host+"\"]\n  http = true") {
+			t.Fatalf("plain-HTTP mirror %s has no http table:\n%s", mirror, s)
+		}
+	}
+}
+
 // Mirrors of other registries: one table each, a plain-HTTP one marked so,
 // and pool VMs and builders follow a change.
 func TestBuildkitdTOMLRegistryMirrors(t *testing.T) {
