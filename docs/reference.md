@@ -20,9 +20,30 @@ All commands need root.
 | `firerunner undrain` · `drain --cancel` | take jobs again |
 | `firerunner upgrade [--version V] [--check] [--allow-unsigned]` | update the binary; the release must be signed and be the version asked for. `--allow-unsigned` only for v0.1.0 and v0.1.1, published before releases were signed |
 | `firerunner proxy` | the corporate proxy forwarder (systemd: `firerunner-proxy`), see [Corporate networks](corporate-network.md) |
+| `firerunner registry-front --listen ADDR:PORT --upstream http://127.0.0.1:PORT` | the front of one registry mirror (systemd: `firerunner-registry-front@<name>`), see below |
 | `firerunner version` | |
 
 `firerunner daemon` and `firerunner executor …` are run by systemd and gitlab-runner.
+
+### registry-front
+
+The registry mirrors serve untrusted microVMs, and the registry lists every repository any project
+pulled through it at `/v2/_catalog`, which it cannot turn off. `registry-front` sits in front of one
+mirror, on the bridge address (`--listen`), with the registry itself on loopback (`--upstream`),
+and passes only what a pull needs:
+
+- `GET`/`HEAD` of `/v2/`, `/v2/<name>/manifests/<tag or digest>` and `/v2/<name>/blobs/<digest>`.
+  The path is taken as written: an escaped (`%5F`), dot or empty segment is refused. The query
+  (containerd's `ns=`) is not passed on.
+- Everything else gets `404` with a registry error body (`UNSUPPORTED`): the catalog, `tags/list`,
+  uploads and every write. Only `docker pull --all-tags` asks a mirror for `tags/list`, and Docker
+  then pulls from the registry itself.
+
+Bodies stream, `Range` and redirects pass through. A transfer has no time limit while it moves; one
+that moves no byte for 5 minutes is cut, as is a registry that sends no headers for 5 minutes. A
+client address may hold 256 connections, all clients 4096; a connection over that is dropped, which
+makes Docker pull from the registry itself. On `SIGTERM` it stops taking connections and gives pulls
+under way 60 seconds to finish. A refused request is logged as `registry request refused`.
 
 ## Metrics
 
