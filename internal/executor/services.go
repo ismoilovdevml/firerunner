@@ -3,6 +3,7 @@ package executor
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 )
@@ -36,6 +37,66 @@ func ParseServices(raw string) ([]Service, error) {
 		}
 	}
 	return s, nil
+}
+
+// ServiceJobVariables returns the job variables every service container
+// gets, as gitlab-runner's Docker executor passes them
+// (Build.GetServiceVariables keeps Variables.PublicOrInternal): each variable
+// in the job payload (JOB_RESPONSE_FILE) whose last entry is public, which
+// are the .gitlab-ci.yml variables and GitLab's public predefined ones. A
+// non-public variable (CI_JOB_TOKEN, CI_REGISTRY_PASSWORD, CI/CD settings
+// variables) never reaches a service, nor does a public one that a later
+// non-public entry or a `secrets:` variable of the same name overrides. The
+// values are gitlab-runner's, already expanded: lookup reads CUSTOM_ENV_<key>.
+//
+// Unlike the Docker executor, the variables gitlab-runner adds itself
+// (CI_PROJECT_DIR, CI_RUNNER_*, FF_*) are left out, since they are not in the
+// payload and their CUSTOM_ENV_ copies look like any other, `secrets:` ones
+// included. File variables are left out too: the Docker executor passes their
+// path in the job container, which a service cannot read.
+func ServiceJobVariables(payload []byte, lookup func(string) (string, bool)) (map[string]string, error) {
+	var job struct {
+		Variables []struct {
+			Key    string `json:"key"`
+			Public bool   `json:"public"`
+			File   bool   `json:"file"`
+		} `json:"variables"`
+		Secrets map[string]json.RawMessage `json:"secrets"`
+	}
+	if err := json.Unmarshal(payload, &job); err != nil {
+		return nil, fmt.Errorf("parsing the job payload: %w", err)
+	}
+	last := map[string]int{} // a later entry of a key overrides an earlier one
+	for i, v := range job.Variables {
+		last[v.Key] = i
+	}
+	vars := map[string]string{}
+	for key, i := range last {
+		if v := job.Variables[i]; key == "" || !v.Public || v.File {
+			continue
+		}
+		if _, secret := job.Secrets[key]; secret {
+			continue
+		}
+		if value, ok := lookup("CUSTOM_ENV_" + key); ok {
+			vars[key] = value
+		}
+	}
+	return vars, nil
+}
+
+// WithJobVariables returns services whose variables are jobVars overridden by
+// each service's own, like the Docker executor sets them.
+func WithJobVariables(services []Service, jobVars map[string]string) []Service {
+	out := make([]Service, len(services))
+	for i, svc := range services {
+		merged := make(map[string]string, len(jobVars)+len(svc.Variables))
+		maps.Copy(merged, jobVars)
+		maps.Copy(merged, svc.Variables)
+		svc.Variables = merged
+		out[i] = svc
+	}
+	return out
 }
 
 // Aliases returns the hostnames a service is reachable under. Like the docker

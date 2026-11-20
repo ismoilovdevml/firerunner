@@ -262,12 +262,20 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 		}
 	}
 	if len(services) > 0 {
+		payload, err := os.ReadFile(os.Getenv("JOB_RESPONSE_FILE"))
+		if err != nil {
+			return fail("services", fmt.Errorf("reading the job payload: %w", err))
+		}
+		jobVars, err := ServiceJobVariables(payload, os.LookupEnv)
+		if err != nil {
+			return fail("services", err)
+		}
 		cmd := vm.SSH(cfg, inst, "/bin/bash")
 		noProxy := ""
 		if cfg.Proxy.Enabled {
 			noProxy = vm.NoProxy(cfg, st.ServiceAliases...)
 		}
-		script := ServicesScript(services, noProxy, vm.ContainerArgs(cfg, nil)...)
+		script := ServicesScript(WithJobVariables(services, jobVars), noProxy, vm.ContainerArgs(cfg, nil)...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = strings.NewReader(script), os.Stdout, os.Stderr
 		code, err := runSSH(ctx, cmd)
 		if err != nil {
