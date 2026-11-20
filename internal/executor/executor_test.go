@@ -702,6 +702,25 @@ func TestBuildsImages(t *testing.T) {
 		"docker \\\n    --debug build .":                      true,
 		"(docker build -t app .)":                             true,
 		"docker.io/library/app build":                         false,
+		// compose builds only with compose build or --build; a "build"
+		// elsewhere on the line is another command's, or a value.
+		"docker compose exec -T web npm run build":    false,
+		"docker compose up -d && npm run build":       false,
+		"docker compose -f build.yml up -d":           false,
+		"docker compose ps | grep build":              false,
+		"docker-compose up -d; make build":            false,
+		"docker compose --profile build run app":      false,
+		"docker compose -p ci build api":              true,
+		"docker compose --file=ci.yml build":          true,
+		"docker-compose -f a.yml up --build -d":       true,
+		"docker compose run --build app test; echo x": true,
+		// gitlab-runner hands a stage over as one line, eval $'...\n...',
+		// each command after the echo that shows it in the job log.
+		`( trap 'exit 1' TERM; eval $'echo hi\ndocker compose up -d\nnpm run build\n' ) < /dev/null`:                  false,
+		`( trap 'exit 1' TERM; eval $'set -e\ndocker build -t app .\n' ) < /dev/null`:                                 true,
+		`( trap 'exit 1' TERM; eval $'cd app\ndocker compose -f build.yml up -d\n' ) < /dev/null`:                     false,
+		`( trap 'exit 1' TERM; eval $'docker \\\n  --debug image build .\n' ) < /dev/null`:                            true,
+		`( trap 'exit 1' TERM; eval $'echo $\'\\x1b[32;1m$ docker compose ps\\x1b[0;m\'\nmake build\n' ) < /dev/null`: false,
 	} {
 		if got := BuildsImages([]byte(script)); got != want {
 			t.Errorf("BuildsImages(%q) = %v, want %v", script, got, want)
