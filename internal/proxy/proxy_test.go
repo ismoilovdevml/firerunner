@@ -860,3 +860,394 @@ func TestPolicyStrict(t *testing.T) {
 		t.Fatalf("strict policy refused an IP address: %s", why)
 	}
 }
+
+// recordingUpstream is a corporate proxy that answers every request itself,
+// without going anywhere, and logs what it was sent.
+type recordingUpstream struct {
+	addr string
+	mu   sync.Mutex
+	seen []seenRequest
+}
+
+type seenRequest struct {
+	method, url, host, auth string
+	body                    int64 // bytes of body received
+}
+
+func startRecordingUpstream(t *testing.T) *recordingUpstream {
+	t.Helper()
+	u := &recordingUpstream{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, _ := io.Copy(io.Discard, r.Body)
+		u.mu.Lock()
+		u.seen = append(u.seen, seenRequest{r.Method, r.URL.String(), r.Host, r.Header.Get("Proxy-Authorization"), n})
+		u.mu.Unlock()
+		_, _ = io.WriteString(w, "answered")
+	}))
+	t.Cleanup(srv.Close)
+	u.addr = srv.Listener.Addr().String()
+	return u
+}
+
+func (u *recordingUpstream) requests() []seenRequest {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]seenRequest(nil), u.seen...)
+}
+
+// serveForwarder runs f on a loopback address until the test ends.
+func serveForwarder(t *testing.T, f *Forwarder) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: f}
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return l.Addr().String()
+}
+
+// A request is sent to the upstream address it took the credentials from,
+// also when the upstream file changes while it is under way: one upstream's
+// password never goes to another.
+func TestForwardUsesOneUpstreamPerRequest(t *testing.T) {
+	a, b := startRecordingUpstream(t), startRecordingUpstream(t)
+	ups := []Upstream{{Addr: a.addr, Auth: "Basic a"}, {Addr: b.addr, Auth: "Basic b"}}
+	var mu sync.Mutex
+	calls := 0
+	// Every read of the upstream file finds the other upstream.
+	f := &Forwarder{Upstream: func() (Upstream, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		return ups[(calls-1)%2], nil
+	}, Allowed: AllowNets(), Log: slog.New(slog.NewTextHandler(io.Discard, nil)), DialTimeout: 2 * time.Second}
+	fwd := serveForwarder(t, f)
+	for i := 0; i < 4; i++ {
+		resp, err := client(fwd).Get(fmt.Sprintf("http://example.test/%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("request %d: %d", i, resp.StatusCode)
+		}
+	}
+	for _, up := range []struct {
+		name string
+		u    *recordingUpstream
+		auth string
+	}{{"a", a, "Basic a"}, {"b", b, "Basic b"}} {
+		for _, s := range up.u.requests() {
+			if s.auth != up.auth {
+				t.Errorf("upstream %s was sent %q for %s, want its own %q", up.name, s.auth, s.url, up.auth)
+			}
+		}
+	}
+	if n := len(a.requests()) + len(b.requests()); n != 4 {
+		t.Errorf("upstreams saw %d requests, want 4", n)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 4 {
+		t.Errorf("upstream read %d times for 4 requests, want once each", calls)
+	}
+}
+
+// An upstream that routes by the Host header reaches the host the policy
+// checked: for an absolute-form request net/http takes Host from the URL
+// and ignores the client's Host line (RFC 9112 3.2.2), and the forwarder
+// sends that. The upstream here reads the request bytes itself, since a Go
+// server would apply the same rule and hide a mismatch.
+func TestUpstreamSeesCheckedHost(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	seen := make(chan []string, 4)
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+				br := bufio.NewReader(c)
+				var lines []string // the request line and every Host line
+				for {
+					line, err := br.ReadString('\n')
+					line = strings.TrimRight(line, "\r\n")
+					if err != nil || line == "" {
+						break
+					}
+					if len(lines) == 0 || strings.HasPrefix(strings.ToLower(line), "host:") {
+						lines = append(lines, line)
+					}
+				}
+				seen <- lines
+				fmt.Fprint(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+			}()
+		}
+	}()
+	f := &Forwarder{Upstream: func() (Upstream, error) { return Upstream{Addr: l.Addr().String()}, nil }, Allowed: AllowNets(),
+		Policy: testPolicy(), Log: slog.New(slog.NewTextHandler(io.Discard, nil)), DialTimeout: 2 * time.Second}
+	fwd := serveForwarder(t, f)
+	for _, tc := range []struct{ request, want string }{
+		{"GET http://github.com/x HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n", "GET http://github.com/x HTTP/1.1|Host: github.com"},
+		{"GET https://github.com/x HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n", "GET https://github.com/x HTTP/1.1|Host: github.com"},
+		{"GET http://github.com:8080/x HTTP/1.1\r\nHost: localhost\r\n\r\n", "GET http://github.com:8080/x HTTP/1.1|Host: github.com:8080"},
+	} {
+		c, err := net.Dial("tcp", fwd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		fmt.Fprint(c, tc.request)
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		c.Close()
+		if err != nil || resp.StatusCode != 200 {
+			t.Fatalf("%q: %v %v", tc.request, resp, err)
+		}
+		select {
+		case lines := <-seen:
+			if got := strings.Join(lines, "|"); got != tc.want {
+				t.Errorf("%q: upstream got %q, want %q", tc.request, got, tc.want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%q: upstream saw nothing", tc.request)
+		}
+	}
+}
+
+// An https:// upload in absolute form that takes longer than DialTimeout is
+// not cut: DialTimeout covers reaching the upstream, not sending the body.
+func TestPassThroughSlowUpload(t *testing.T) {
+	up := startRecordingUpstream(t)
+	f := &Forwarder{Upstream: func() (Upstream, error) { return Upstream{Addr: up.addr}, nil }, Allowed: AllowNets(),
+		Limits: Limits{HeaderWait: time.Minute}, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DialTimeout: 200 * time.Millisecond}
+	fwd := serveForwarder(t, f)
+	c, err := net.Dial("tcp", fwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	const size = 8
+	fmt.Fprintf(c, "POST https://example.com/upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", size)
+	for i := 0; i < size; i++ { // 800 ms of upload, four times DialTimeout
+		time.Sleep(100 * time.Millisecond)
+		if _, err := c.Write([]byte{'x'}); err != nil {
+			t.Fatalf("byte %d: %v", i, err)
+		}
+	}
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || string(body) != "answered" {
+		t.Fatalf("slow upload: %d %q, want 200 from the upstream", resp.StatusCode, body)
+	}
+	if seen := up.requests(); len(seen) != 1 || seen[0].body != size {
+		t.Fatalf("upstream saw %+v, want one request with %d bytes of body", seen, size)
+	}
+}
+
+// An upstream that takes no byte of an upload for HeaderWait is given up.
+func TestPassThroughUploadToStalledUpstream(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		<-done // never reads the request
+		c.Close()
+	}()
+	f := &Forwarder{Upstream: func() (Upstream, error) { return Upstream{Addr: l.Addr().String()}, nil }, Allowed: AllowNets(),
+		Limits: Limits{HeaderWait: 500 * time.Millisecond}, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DialTimeout: 2 * time.Second}
+	fwd := serveForwarder(t, f)
+	c, err := net.Dial("tcp", fwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	const size = 256 << 20 // far more than socket buffers hold
+	go func() {
+		fmt.Fprintf(c, "POST https://example.com/upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: %d\r\n\r\n", size)
+		buf := make([]byte, 64<<10)
+		for sent := 0; sent < size; sent += len(buf) {
+			if _, err := c.Write(buf); err != nil {
+				return // the forwarder gave up, or the test ended
+			}
+		}
+	}()
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatalf("no answer while the upstream stalls an upload: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("upload to a stalled upstream: %d, want 502", resp.StatusCode)
+	}
+}
+
+// The destination check (a DNS lookup of up to 3 s) runs inside the client's
+// connection budget: a job firing requests at names that never resolve gets
+// 503 for those beyond its share instead of holding a lookup for each.
+func TestPolicyCheckInsideConnectionLimit(t *testing.T) {
+	var mu sync.Mutex
+	inFlight, peak := 0, 0
+	unblock := make(chan struct{})
+	p := testPolicy()
+	p.Resolve = func(ctx context.Context, _ string) ([]net.IP, error) {
+		mu.Lock()
+		inFlight++
+		peak = max(peak, inFlight)
+		mu.Unlock()
+		select {
+		case <-unblock:
+		case <-ctx.Done():
+		}
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return nil, errors.New("no such host")
+	}
+	_, vms, _ := net.ParseCIDR("10.200.0.0/24")
+	f := &Forwarder{Upstream: func() (Upstream, error) { return Upstream{}, errors.New("none") }, Allowed: AllowNets(vms),
+		Policy: p, Limits: Limits{PerClient: 2, Total: 100}, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	serve := func(url string) int {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, url, nil)
+		r.RemoteAddr = "10.200.0.5:40000"
+		f.ServeHTTP(w, r)
+		return w.Code
+	}
+	const n = 10
+	codes := make(chan int, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes <- serve(fmt.Sprintf("http://never-%d.example/", i))
+		}()
+	}
+	// Those beyond the share are answered while two lookups still hang, well
+	// before the lookups' own 3 s timeout.
+	for i := 0; i < n-2; i++ {
+		select {
+		case code := <-codes:
+			if code != http.StatusServiceUnavailable {
+				t.Errorf("request beyond the client's share: %d, want 503", code)
+			}
+		case <-time.After(2 * time.Second):
+			close(unblock)
+			wg.Wait()
+			t.Fatalf("only %d of %d requests beyond the share answered while lookups hung; peak lookups %d", i, n-2, peak)
+		}
+	}
+	close(unblock)
+	wg.Wait()
+	close(codes)
+	for code := range codes {
+		if code != http.StatusBadGateway {
+			t.Errorf("request within the share: %d, want 502 (no upstream)", code)
+		}
+	}
+	if peak > 2 {
+		t.Errorf("%d lookups at once from one client, want at most its share of 2", peak)
+	}
+	// Every slot came back, refused destinations included.
+	if code := serve("http://127.0.0.1/"); code != http.StatusForbidden {
+		t.Errorf("refused destination: %d, want 403", code)
+	}
+	for i := 0; i < 2; i++ {
+		if !f.acquire("10.200.0.5", false) {
+			t.Fatalf("slot %d not released", i+1)
+		}
+	}
+}
+
+// A target is split like net.SplitHostPort does, so an IPv6 literal reaches
+// the policy without brackets, also when the URL leaves the port out.
+func TestTargetHostPort(t *testing.T) {
+	for _, tc := range []struct {
+		target  string
+		connect bool
+		scheme  string
+		host    string
+		port    int
+		bad     bool
+	}{
+		{target: "example.com:443", connect: true, host: "example.com", port: 443},
+		{target: "140.82.121.4:443", connect: true, host: "140.82.121.4", port: 443},
+		{target: "[2606:4700::1111]:443", connect: true, host: "2606:4700::1111", port: 443},
+		{target: "example.com", connect: true, bad: true},
+		{target: "[2606:4700::1111]", connect: true, bad: true},
+		{target: "example.com", scheme: "http", host: "example.com", port: 80},
+		{target: "example.com", scheme: "https", host: "example.com", port: 443},
+		{target: "example.com:8080", scheme: "http", host: "example.com", port: 8080},
+		{target: "140.82.121.4", scheme: "http", host: "140.82.121.4", port: 80},
+		{target: "140.82.121.4:8443", scheme: "https", host: "140.82.121.4", port: 8443},
+		{target: "[2606:4700::1111]", scheme: "http", host: "2606:4700::1111", port: 80},
+		{target: "[2606:4700::1111]", scheme: "https", host: "2606:4700::1111", port: 443},
+		{target: "[2606:4700::1111]:8080", scheme: "http", host: "2606:4700::1111", port: 8080},
+		{target: "2606:4700::1111", scheme: "http", bad: true}, // IPv6 without brackets
+		{target: "[2606:4700::1111", scheme: "http", bad: true},
+		{target: "a:b:c", scheme: "http", bad: true},
+		{target: "example.com:", scheme: "http", bad: true},
+		{target: "example.com:0", scheme: "http", bad: true},
+		{target: "example.com:65536", scheme: "http", bad: true},
+		{target: "example.com:http", scheme: "http", bad: true},
+	} {
+		host, port, err := targetHostPort(tc.target, tc.connect, tc.scheme)
+		if tc.bad {
+			if err == nil {
+				t.Errorf("targetHostPort(%q, connect=%v) = %q %d, want an error", tc.target, tc.connect, host, port)
+			}
+			continue
+		}
+		if err != nil || host != tc.host || port != tc.port {
+			t.Errorf("targetHostPort(%q, connect=%v, %q) = %q %d %v, want %q %d", tc.target, tc.connect, tc.scheme, host, port, err, tc.host, tc.port)
+		}
+	}
+
+	// Through the forwarder: a portless IPv6 URL passes the policy (and fails
+	// later only because no upstream is configured); a denied one is refused.
+	_, deny, _ := net.ParseCIDR("2001:db8::/32")
+	p := testPolicy()
+	p.Deny = append(p.Deny, deny)
+	f := &Forwarder{Upstream: func() (Upstream, error) { return Upstream{}, errors.New("none") }, Allowed: AllowNets(),
+		Policy: p, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	for url, want := range map[string]int{
+		"http://[2606:4700::1111]/":     http.StatusBadGateway,
+		"https://[2606:4700::1111]/":    http.StatusBadGateway,
+		"http://[2001:db8::1]/":         http.StatusForbidden,
+		"http://[2001:db8::1]:8080/x":   http.StatusForbidden,
+		"http://[64:ff9b::a9fe:a9fe]/":  http.StatusForbidden, // metadata through NAT64
+		"http://[2606:4700::1111]:80/x": http.StatusBadGateway,
+	} {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, url, nil)
+		r.RemoteAddr = "127.0.0.1:40000"
+		f.ServeHTTP(w, r)
+		if w.Code != want {
+			t.Errorf("GET %s: %d %q, want %d", url, w.Code, w.Body, want)
+		}
+	}
+}

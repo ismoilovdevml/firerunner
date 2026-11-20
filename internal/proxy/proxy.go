@@ -275,8 +275,8 @@ var DefaultLimits = Limits{PerClient: 256, Loopback: 1024, Total: 4096, TunnelId
 
 // Forwarder passes requests to the upstream proxy.
 type Forwarder struct {
-	// Upstream is read for every connection, so a new password or proxy address
-	// applies without a restart.
+	// Upstream is read once for every request, so a new password or proxy
+	// address applies without a restart, and a request uses one of them only.
 	Upstream func() (Upstream, error)
 	// Allowed reports whether a client address may use the forwarder.
 	Allowed func(ip net.IP) bool
@@ -413,6 +413,15 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "firerunner proxy: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	// The slot is taken before the destination check: the check can wait
+	// seconds on DNS, and requests waiting on it count against the client's
+	// share like any other.
+	if !f.acquire(host, ip.IsLoopback()) {
+		f.Log.Warn("proxy request refused: too many connections", "client", host)
+		http.Error(w, "firerunner proxy: too many connections from this client", http.StatusServiceUnavailable)
+		return
+	}
+	defer f.release(host, ip.IsLoopback())
 	if f.Policy != nil {
 		if why := f.Policy.Check(r.Context(), dhost, dport, r.Method == http.MethodConnect); why != "" {
 			f.Log.Warn("proxy request refused", "client", host, "target", target, "reason", why)
@@ -420,12 +429,6 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if !f.acquire(host, ip.IsLoopback()) {
-		f.Log.Warn("proxy request refused: too many connections", "client", host)
-		http.Error(w, "firerunner proxy: too many connections from this client", http.StatusServiceUnavailable)
-		return
-	}
-	defer f.release(host, ip.IsLoopback())
 	up, err := f.Upstream()
 	if err != nil {
 		f.Log.Error("proxy request refused: no upstream", "err", err)
@@ -464,9 +467,15 @@ func targetHostPort(target string, connect bool, scheme string) (string, int, er
 		if connect {
 			return "", 0, errors.New("CONNECT needs host:port")
 		}
-		host, port = target, "80"
+		// A URL without a port: the default one is added and the result split
+		// again, so [2001:db8::1] loses its brackets like [2001:db8::1]:80 does,
+		// and what is not host or host:port (2001:db8::1, a:b:c) is refused.
+		port = "80"
 		if scheme == "https" {
 			port = "443"
+		}
+		if host, port, err = net.SplitHostPort(target + ":" + port); err != nil {
+			return "", 0, errors.New("bad host")
 		}
 	}
 	p, err := strconv.Atoi(port)
@@ -584,14 +593,20 @@ func splice(client net.Conn, clientBuf io.Reader, upstream net.Conn, upstreamBuf
 	return total.Load()
 }
 
+// upstreamKey carries the request's Upstream to the transport's Proxy func.
+type upstreamKey struct{}
+
 // forward sends a plain http:// request through the upstream proxy.
 func (f *Forwarder) forward(w http.ResponseWriter, r *http.Request, up Upstream) (int, int64) {
 	f.transportOnce.Do(func() {
 		f.transport = &http.Transport{
-			Proxy: func(*http.Request) (*url.URL, error) {
-				u, err := f.Upstream()
-				if err != nil {
-					return nil, err
+			// The address comes with the request, from the same read of the
+			// upstream file as its credentials: reading the file again here
+			// could send them to an upstream that replaced it meanwhile.
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				u, ok := req.Context().Value(upstreamKey{}).(Upstream)
+				if !ok {
+					return nil, errors.New("request without an upstream")
 				}
 				return &url.URL{Scheme: "http", Host: u.Addr}, nil
 			},
@@ -603,7 +618,7 @@ func (f *Forwarder) forward(w http.ResponseWriter, r *http.Request, up Upstream)
 	})
 	// Not the request's context: a client that half-closes (busybox) cancels it.
 	// The answer is abandoned instead when no byte comes for HeaderWait.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), upstreamKey{}, up))
 	defer cancel()
 	out := r.Clone(ctx)
 	out.RequestURI = ""
@@ -649,6 +664,21 @@ func (r *idleReader) Close() error {
 	return r.ReadCloser.Close()
 }
 
+// idleWriter writes to conn with a deadline of idle (0: none) from each
+// write, so a long transfer that keeps moving is never cut and a stalled
+// peer is.
+type idleWriter struct {
+	conn net.Conn
+	idle time.Duration
+}
+
+func (w idleWriter) Write(p []byte) (int, error) {
+	if w.idle > 0 {
+		_ = w.conn.SetWriteDeadline(time.Now().Add(w.idle))
+	}
+	return w.conn.Write(p)
+}
+
 // passThrough sends an absolute-form request to the upstream as it came,
 // with the upstream's credentials, over a connection of its own. A stalled
 // upstream is given up after HeaderWait. The request's context is not used:
@@ -667,8 +697,11 @@ func (f *Forwarder) passThrough(w http.ResponseWriter, r *http.Request, up Upstr
 		out.Header.Set("Proxy-Authorization", up.Auth)
 	}
 	out.Close = true
-	_ = conn.SetDeadline(time.Now().Add(f.DialTimeout))
-	if err := out.WriteProxy(conn); err != nil {
+	// DialTimeout covered reaching the upstream. Sending the request, body
+	// included, may take as long as it keeps moving: an upstream that takes
+	// nothing for HeaderWait is given up, like one that answers nothing.
+	if err := out.WriteProxy(idleWriter{conn: conn, idle: f.Limits.HeaderWait}); err != nil {
+		f.Log.Warn("upstream proxy did not take the request", "upstream", up.Addr, "url", r.URL.Host, "err", err)
 		http.Error(w, "firerunner proxy: upstream proxy unreachable", http.StatusBadGateway)
 		return http.StatusBadGateway, 0
 	}
