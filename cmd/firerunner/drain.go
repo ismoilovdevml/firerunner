@@ -52,8 +52,9 @@ type drainer struct {
 	daemon drainDaemon
 	runner drainRunner
 	out    io.Writer
-	// poll is how often the wait looks again: the daemon's main loop
-	// counts jobs at that pace (firerunner_jobs_running).
+	// poll is how often the wait looks again: the pace of the daemon's
+	// main loop, which counts jobs for firerunner_jobs_running. Each look
+	// costs a socket call and a systemctl show.
 	poll time.Duration
 	// progressEvery is how often an unchanged wait still prints its line,
 	// so a long wait shows it is alive.
