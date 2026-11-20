@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -363,5 +364,121 @@ func TestRegistryMirrors(t *testing.T) {
 	cfg, err := Set(Default(), "vm.registry_mirrors", `{"ghcr.io": "http://10.200.0.1:5001"}`)
 	if err != nil || cfg.VM.RegistryMirrors["ghcr.io"] != "http://10.200.0.1:5001" {
 		t.Fatalf("config set: %v %v", err, cfg.VM.RegistryMirrors)
+	}
+}
+
+// Map settings take keys with dots (registry hosts, kernel args like
+// ipv6.disable): after the map's own key, the rest of a dotted key is one map key.
+func TestDottedMapKeys(t *testing.T) {
+	cfg, err := Set(Default(), "vm.registry_mirrors", `{"ghcr.io": "http://10.200.0.1:5001", "registry.k8s.io": "http://10.200.0.1:5003"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = Set(cfg, "vm.kernel_cmdline.ipv6.disable", "1"); err != nil {
+		t.Fatalf("set a dotted kernel arg: %v", err)
+	}
+	if cfg.VM.KernelCmdline["ipv6.disable"] != "1" {
+		t.Fatalf("kernel_cmdline = %v", cfg.VM.KernelCmdline)
+	}
+	if cfg, err = Set(cfg, "vm.registry_mirrors.quay.io", "http://10.200.0.1:5002"); err != nil {
+		t.Fatalf("set a mirror by its host: %v", err)
+	}
+	if cfg.VM.RegistryMirrors["quay.io"] != "http://10.200.0.1:5002" || cfg.VM.RegistryMirrors["ghcr.io"] != "http://10.200.0.1:5001" {
+		t.Fatalf("registry_mirrors = %v", cfg.VM.RegistryMirrors)
+	}
+
+	// Every key Keys lists can be read back.
+	for _, k := range Keys(cfg) {
+		if _, err := Get(cfg, k); err != nil {
+			t.Errorf("Keys lists %q but Get fails: %v", k, err)
+		}
+	}
+	for _, c := range []struct{ key, want string }{
+		{"vm.registry_mirrors.ghcr.io", "http://10.200.0.1:5001"},
+		{"vm.registry_mirrors.registry.k8s.io", "http://10.200.0.1:5003"},
+		{"vm.kernel_cmdline.ipv6.disable", `"1"`},
+		{"vm.vcpu", "2"},
+	} {
+		if got, err := Get(cfg, c.key); err != nil || got != c.want {
+			t.Errorf("Get(%s) = %q, %v; want %q", c.key, got, err, c.want)
+		}
+	}
+	for _, key := range []string{"vm.registry_mirrors.docker.io", "vm.registry_mirrorsx.ghcr.io", "vm.vcpu.x", "vm.registry_mirrors."} {
+		if got, err := Get(cfg, key); err == nil {
+			t.Errorf("Get(%s) = %q, want an error", key, got)
+		}
+	}
+	for _, c := range []struct{ key, value string }{
+		{"vm.registry_mirrors.ghcr.io", "not-a-url"},       // the mirror is still checked
+		{"vm.registry_mirrors.docker.io", "http://a:5000"}, // that is vm.registry_mirror
+		{"vm.registry_mirrors.", "http://a:5000"},          // no host
+		{"vm.vcpu.x", "1"},
+	} {
+		if _, err := Set(cfg, c.key, c.value); err == nil {
+			t.Errorf("Set(%s, %s) accepted", c.key, c.value)
+		}
+	}
+}
+
+// vm.registry_mirror goes into the guest's daemon.json as Docker Hub's
+// mirror, and proxy.listen's port is what microVMs and the forwarder use: both
+// are checked like the other addresses.
+func TestMirrorAndProxyPortFormat(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		mutate func(*Config)
+		ok     bool
+	}{
+		{"no mirror", func(c *Config) { c.VM.RegistryMirror = "" }, true},
+		{"install.sh mirror", func(c *Config) { c.VM.RegistryMirror = "http://10.200.0.1:5000" }, true},
+		{"https mirror with a slash", func(c *Config) { c.VM.RegistryMirror = "https://mirror.corp/" }, true},
+		{"mirror without a scheme", func(c *Config) { c.VM.RegistryMirror = "10.200.0.1:5000" }, false},
+		{"mirror with a path", func(c *Config) { c.VM.RegistryMirror = "http://10.200.0.1:5000/v2" }, false},
+		{"mirror with a quote", func(c *Config) { c.VM.RegistryMirror = `http://a"b:5000` }, false},
+		{"mirror with a newline", func(c *Config) { c.VM.RegistryMirror = "http://a:5000\nb" }, false},
+		{"proxy port 3128", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:3128" }, true},
+		{"proxy port 65535", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:65535" }, true},
+		{"proxy port a name", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:squid" }, false},
+		{"proxy port 0", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:0" }, false},
+		{"proxy port 65536", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:65536" }, false},
+		{"proxy port negative", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:-1" }, false},
+		{"proxy port with a sign", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:+3128" }, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := Default()
+			c.mutate(&cfg)
+			if err := cfg.Validate(); (err == nil) != c.ok {
+				t.Fatalf("Validate = %v, want ok=%v", err, c.ok)
+			}
+		})
+	}
+}
+
+// Only a file that parsed but holds bad values is a *ValidationError: callers
+// may fix those values, but must not write over a file they could not read.
+func TestLoadErrorKinds(t *testing.T) {
+	for _, c := range []struct {
+		name, body string
+		invalid    bool
+	}{
+		{"value out of range", "vm:\n  vcpu: 0\n", true},
+		{"yaml syntax error", "vm:\n  vcpu: [\n", false},
+		{"unknown key", "vm:\n  cpus: 4\n", false},
+		{"wrong type", "vm:\n  vcpu: four\n", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "c.yaml")
+			if err := os.WriteFile(p, []byte(c.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(p)
+			var invalid *ValidationError
+			if err == nil || errors.As(err, &invalid) != c.invalid {
+				t.Fatalf("Load = %v; want an error, *ValidationError: %v", err, c.invalid)
+			}
+		})
+	}
+	if _, err := Load(t.TempDir()); err == nil || errors.As(err, new(*ValidationError)) {
+		t.Fatalf("Load(a directory) = %v; want a read error", err)
 	}
 }

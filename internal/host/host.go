@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -30,6 +31,21 @@ const DnsmasqConfig = "/etc/firerunner/dnsmasq.conf"
 // Services installed by install.sh, in start order.
 var Services = []string{"containerd-flintlock", "firerunner-net", "firerunner-dnsmasq", "firerunner-registry",
 	"firerunner-cache", "flintlockd"}
+
+// ProxyService is the forwarder's unit; install.sh runs it only with a
+// corporate proxy (proxy.enabled).
+const ProxyService = "firerunner-proxy"
+
+// MonitoredServices are the units status and the daemon's
+// firerunner_service_up report: Services, the forwarder where proxy.enabled
+// is on (absent, not down, elsewhere), and gitlab-runner. A new slice each call.
+func MonitoredServices(proxyEnabled bool) []string {
+	out := append([]string(nil), Services...)
+	if proxyEnabled {
+		out = append(out, ProxyService)
+	}
+	return append(out, "gitlab-runner")
+}
 
 // commandTimeout bounds each systemctl and lvs run: systemd or LVM stuck on
 // a device must not stall the caller, the daemon's main loop included.
@@ -108,39 +124,43 @@ type Runner struct {
 }
 
 func ReadRunner() (*Runner, error) {
-	f, err := os.Open(RunnerConfig)
+	b, err := os.ReadFile(RunnerConfig)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	return parseRunner(string(b))
+}
+
+// parseRunner reads the global concurrent and the first [[runners]] entry:
+// keys of that table only, not same-named ones in its sub-tables (a docker
+// service's name) and never a comment.
+func parseRunner(conf string) (*Runner, error) {
 	r := &Runner{}
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		k, v, ok := strings.Cut(strings.TrimSpace(sc.Text()), "=")
-		if !ok {
-			continue
-		}
-		k, v = strings.TrimSpace(k), strings.Trim(strings.TrimSpace(v), `"`)
-		switch k {
-		case "concurrent":
-			r.Concurrent, _ = strconv.Atoi(v)
-		case "name":
-			r.Name = v
-		case "url":
-			r.URL = v
-		case "executor":
-			r.Executor = v
+	runner := -1 // tableN of the first [[runners]]
+	for _, s := range tomlStatements(conf) {
+		switch {
+		case s.header:
+			if s.table == "[[runners]]" && runner < 0 {
+				runner = s.tableN
+			}
+		case s.tableN == 0 && s.key == "concurrent":
+			r.Concurrent, _ = strconv.Atoi(s.value)
+		case s.tableN == runner:
+			v, _ := tomlUnquote(s.value)
+			switch s.key {
+			case "name":
+				r.Name = v
+			case "url":
+				r.URL = v
+			case "executor":
+				r.Executor = v
+			}
 		}
 	}
 	if r.URL == "" {
 		return nil, errors.New("no runner registered")
 	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	if b, err := os.ReadFile(RunnerConfig); err == nil {
-		r.CacheType, r.CacheServer = cacheFromConfig(string(b))
-	}
+	r.CacheType, r.CacheServer = cacheFromConfig(conf)
 	return r, nil
 }
 
@@ -174,7 +194,7 @@ func RegisterRunner(url, token, name string, concurrent int) error {
 		"--custom-cleanup-exec", ExecutorBin, "--custom-cleanup-args", "executor", "--custom-cleanup-args", "cleanup",
 	)
 	reg.Env = append(os.Environ(), "CI_SERVER_TOKEN="+token)
-	if out, err := reg.CombinedOutput(); err != nil {
+	if out, err := runRootOnly(reg, RunnerConfig); err != nil {
 		return fmt.Errorf("gitlab-runner register: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
 	if err := SetConcurrent(concurrent); err != nil {
@@ -197,6 +217,20 @@ func RegisterRunner(url, token, name string, concurrent int) error {
 	return run(RunnerBin, "verify", "--config", RunnerConfig)
 }
 
+// runRootOnly runs cmd, which writes secrets to path, so that path is never
+// readable by others, not even until a later chmod: an existing path is made
+// 0600 first, and a path cmd creates is 0600 at most (umask 077 while it
+// runs, inherited by cmd). The umask is process-wide: call it only where no
+// other goroutine creates files, as in the CLI.
+func runRootOnly(cmd *exec.Cmd, path string) ([]byte, error) {
+	if err := os.Chmod(path, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	old := syscall.Umask(0o077)
+	defer syscall.Umask(old)
+	return cmd.CombinedOutput()
+}
+
 // UnregisterRunner removes the runner from this host and from GitLab.
 func UnregisterRunner() error {
 	if err := run(RunnerBin, "unregister", "--all-runners", "--config", RunnerConfig); err != nil {
@@ -214,18 +248,19 @@ func SetConcurrent(n int) error {
 	if err != nil {
 		return err
 	}
-	lines := strings.Split(string(b), "\n")
-	found := false
-	for i, l := range lines {
-		if strings.HasPrefix(strings.TrimSpace(l), "concurrent") {
-			lines[i] = fmt.Sprintf("concurrent = %d", n)
-			found = true
+	return writeRootOnly(RunnerConfig, []byte(setConcurrent(string(b), n)))
+}
+
+// setConcurrent replaces the value of the root table's concurrent key, and
+// nothing else: not a key that only starts with "concurrent", not one in a
+// table, not its comment.
+func setConcurrent(conf string, n int) string {
+	for _, s := range tomlStatements(conf) {
+		if !s.header && s.tableN == 0 && s.key == "concurrent" {
+			return conf[:s.valStart] + strconv.Itoa(n) + conf[s.end:]
 		}
 	}
-	if !found {
-		lines = append([]string{fmt.Sprintf("concurrent = %d", n)}, lines...)
-	}
-	return writeRootOnly(RunnerConfig, []byte(strings.Join(lines, "\n")))
+	return fmt.Sprintf("concurrent = %d\n", n) + conf
 }
 
 // writeRootOnly replaces path atomically with a 0600 file. gitlab-runner

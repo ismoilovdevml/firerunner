@@ -87,6 +87,8 @@ tests:
     values: 1x5 0x20
   - series: firerunner_service_up{instance="h3",job="firerunner",service="firerunner-cache"}
     values: 1x5 0x20
+  - series: firerunner_service_up{instance="h3",job="firerunner",service="firerunner-proxy"}
+    values: 1x5 0x20
   - series: firerunner_service_up{instance="h3",job="firerunner",service="firerunner-net"}
     values: 1x25
   - series: firerunner_thinpool_usage_ratio{instance="h3",job="firerunner",type="data"}
@@ -135,6 +137,22 @@ tests:
         summary: firerunner-cache is down on h3
         description: 'Jobs run but slower: image pulls bypass the mirror (Docker Hub rate limits) or cache: is not restored. Check: journalctl -u firerunner-cache -n 100; df -h /var/lib/firerunner.'
         runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnercacheservicedown
+  # The forwarder is down from 6m: quiet before its 3 minutes, critical after.
+  - eval_time: 8m
+    alertname: FireRunnerProxyDown
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: FireRunnerProxyDown
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        instance: h3
+        job: firerunner
+        service: firerunner-proxy
+      exp_annotations:
+        summary: 'firerunner-proxy is down on h3: nothing reaches the corporate proxy'
+        description: 'microVMs, builders, gitlab-runner, containerd-flintlock and the registry mirrors reach the outside through it: jobs fail on pulls, clones and downloads (hosts in proxy.no_proxy still work). Check: journalctl -u firerunner-proxy -n 100; firerunner doctor (a 407 means the upstream refused the credentials). Fix: systemctl start firerunner-proxy.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxydown
   # Data at 50 % stays quiet; metadata at 80 % is over its 75 %.
   - eval_time: 20m
     alertname: FireRunnerThinPoolFull

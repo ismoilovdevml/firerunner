@@ -7,8 +7,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/ismoilovdevml/firerunner/internal/config"
 )
 
 func TestParseBuilderRm(t *testing.T) {
@@ -195,5 +198,118 @@ func TestConfigSetSeveralKeys(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(path); string(got) != string(data) {
 		t.Error("a refused set changed the config")
+	}
+}
+
+// install.sh writes registry hosts (dots in the key) into vm.registry_mirrors;
+// `config show` prints them like every other key.
+func TestConfigShowDottedMapKeys(t *testing.T) {
+	cfg := config.Default()
+	cfg.VM.RegistryMirrors = map[string]string{"ghcr.io": "http://10.200.0.1:5001"}
+	cfg.VM.KernelCmdline = map[string]string{"ipv6.disable": "1"}
+	var out bytes.Buffer
+	if err := showConfig(&out, "/etc/firerunner/config.yaml", cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"# /etc/firerunner/config.yaml\n", "\nvm.registry_mirrors.ghcr.io = http://10.200.0.1:5001\n",
+		"\nvm.kernel_cmdline.ipv6.disable = \"1\"\n", "\nvm.vcpu = 2\n"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("missing %q in:\n%s", want, out.String())
+		}
+	}
+}
+
+// config set may fix a value Validate refuses, but a file it cannot parse is
+// left alone: setting one key must never replace the user's file with defaults.
+func TestConfigSetOnABrokenFile(t *testing.T) {
+	for _, c := range []struct {
+		name, body string
+		ok         bool
+	}{
+		{"yaml syntax error", "vm:\n  vcpu: 4\n  memory_mb: [\n", false},
+		{"unknown key", "vm:\n  vcpu: 4\n  cpus: 4\n", false},
+		{"invalid value", "vm:\n  vcpu: 0\n  memory_mb: 4096\n", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			t.Setenv("FIRERUNNER_CONFIG", path)
+			if err := os.WriteFile(path, []byte(c.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err := cmdConfig([]string{"set", "vm.vcpu", "2"})
+			got, _ := os.ReadFile(path)
+			if !c.ok {
+				if err == nil || string(got) != c.body {
+					t.Fatalf("set on an unparsable file: err %v, file now:\n%s", err, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("set could not fix an invalid value: %v", err)
+			}
+			cfg, err := config.Load(path)
+			if err != nil || cfg.VM.VCPU != 2 || cfg.VM.MemoryMB != 4096 {
+				t.Fatalf("after set: vcpu %d, memory_mb %d, %v", cfg.VM.VCPU, cfg.VM.MemoryMB, err)
+			}
+		})
+	}
+}
+
+// The whole argument is the number: "4abc" is a typo, not 4.
+func TestParseConcurrent(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want int // 0: an error
+	}{
+		{"4", 4}, {"64", 64},
+		{"4abc", 0}, {"4 5", 0}, {"4.5", 0}, {"", 0}, {"abc", 0}, {"0", 0}, {"-2", 0}, {" 4", 0},
+	} {
+		n, err := parseConcurrent(c.in)
+		if (c.want == 0) != (err != nil) || (err == nil && n != c.want) {
+			t.Errorf("parseConcurrent(%q) = %d, %v; want %d", c.in, n, err, c.want)
+		}
+	}
+}
+
+// config set says what the change needs, from what reads the key: jobs and
+// the daemon's reload see most keys, but some are read once at a service's
+// start, and the firewall has its own copy of the egress list.
+func TestApplyNote(t *testing.T) {
+	// Patterns: the daemon's unit is firerunner, not firerunner-proxy.
+	const nextJob, daemon, forwarder = `applies to the next job`, `systemctl restart firerunner($|[^-])`, `systemctl restart firerunner-proxy`
+	for _, c := range []struct {
+		key  string
+		want []string // patterns the note must match
+		not  []string // patterns it must not match
+	}{
+		{"vm.vcpu", []string{nextJob}, []string{"restart"}},
+		{"vm.kernel_cmdline.ipv6.disable", []string{nextJob}, []string{"restart"}},
+		{"pool.size", []string{nextJob}, []string{"restart"}},
+		{"daemon.job_max_age", []string{nextJob}, []string{"restart"}},
+		{"daemon.metrics_listen", []string{daemon}, []string{nextJob}},
+		{"daemon.reconcile_interval", []string{daemon}, []string{nextJob}},
+		{"daemon.socket", []string{daemon}, nil},
+		{"flintlock.endpoint", []string{daemon}, nil},
+		{"flintlock.tls_ca_file", []string{daemon}, nil},
+		{"flintlock.namespace", []string{daemon}, nil},
+		{"proxy.egress_strict", []string{forwarder}, []string{nextJob}},
+		{"proxy.connect_ports", []string{forwarder}, []string{nextJob}},
+		{"proxy.upstream_file", []string{forwarder}, []string{nextJob}},
+		{"proxy.listen", []string{forwarder, "next job"}, nil},
+		{"network.egress_deny", []string{forwarder, "FR_EGRESS_DENY", "install.sh"}, []string{nextJob}},
+		{"proxy.enabled", []string{"install.sh"}, nil},
+		{"proxy.no_proxy", []string{"next job", "install.sh"}, nil},
+	} {
+		note := applyNote(c.key)
+		for _, w := range c.want {
+			if !regexp.MustCompile(w).MatchString(note) {
+				t.Errorf("applyNote(%s) = %q, want it to match %q", c.key, note, w)
+			}
+		}
+		for _, n := range c.not {
+			if regexp.MustCompile(n).MatchString(note) {
+				t.Errorf("applyNote(%s) = %q, must not match %q", c.key, note, n)
+			}
+		}
 	}
 }

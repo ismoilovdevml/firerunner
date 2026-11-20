@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -86,6 +87,62 @@ func TestServiceActive(t *testing.T) {
 		if took := time.Since(start); took > 5*time.Second {
 			t.Errorf("%q: took %s", c.script, took)
 		}
+	}
+}
+
+// The forwarder is watched like the other services, but only where it runs.
+func TestMonitoredServices(t *testing.T) {
+	for _, c := range []struct {
+		proxy bool
+		want  string
+	}{
+		{false, "containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd gitlab-runner"},
+		{true, "containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd firerunner-proxy gitlab-runner"},
+	} {
+		if got := strings.Join(MonitoredServices(c.proxy), " "); got != c.want {
+			t.Errorf("MonitoredServices(%v) = %s, want %s", c.proxy, got, c.want)
+		}
+	}
+	// The list is a copy: appending to it never changes Services.
+	_ = append(MonitoredServices(true)[:1], "x")
+	if Services[1] != "firerunner-net" {
+		t.Fatalf("Services changed: %v", Services)
+	}
+}
+
+// gitlab-runner register writes the runner token into config.toml: the file
+// must be 0600 from the moment it holds it, not from a chmod afterwards.
+func TestRunRootOnly(t *testing.T) {
+	// A common umask, as a root shell has: files are created 0644.
+	old := syscall.Umask(0o022)
+	t.Cleanup(func() { syscall.Umask(old) })
+	for _, c := range []struct {
+		name     string
+		existing bool
+	}{{"created by the command", false}, {"left 0644 by an earlier run", true}} {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if c.existing {
+				if err := os.WriteFile(path, []byte("concurrent = 1\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// What the command sees while it writes: the mode right after.
+			cmd := exec.Command("sh", "-c", `echo 'token = "glrt-x"' >> "$1" && stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"`, "sh", path)
+			out, err := runRootOnly(cmd, path)
+			if err != nil {
+				t.Fatalf("%v: %s", err, out)
+			}
+			if mode := strings.TrimSpace(string(out)); mode != "600" {
+				t.Errorf("mode while the token was written: %s, want 600", mode)
+			}
+			if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o600 {
+				t.Fatalf("mode after: %v, %v", fi.Mode().Perm(), err)
+			}
+		})
+	}
+	if got := syscall.Umask(0o022); got != 0o022 {
+		t.Errorf("umask left at %o", got)
 	}
 }
 

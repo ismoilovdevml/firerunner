@@ -184,7 +184,7 @@ func (m *Metrics) addHostMetrics() {
 	m.diskSize = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "firerunner_disk_size_bytes",
 		Help: "Size of the file system holding dir."}, []string{"dir"})
 	m.flintlockErrors = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_flintlock_errors_total",
-		Help: "Failed flintlock calls of the daemon by RPC (CreateMicroVM, DeleteMicroVM, ListMicroVMs) and gRPC code; every failed try of a retried listing counts."}, []string{"op", "code"})
+		Help: "Failed flintlock calls of the daemon by RPC (CreateMicroVM, DeleteMicroVM, ListMicroVMs, GetMicroVM: a boot asking for its VM's tap) and gRPC code; every failed try of a retried listing counts."}, []string{"op", "code"})
 	m.reg.MustRegister(m.jobsRunning, m.diskFree, m.diskSize, m.flintlockErrors)
 }
 

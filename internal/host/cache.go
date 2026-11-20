@@ -79,35 +79,40 @@ func SetCache(c *Cache) error {
 // (measured: restore 8s -> 5s, upload 5s -> 3s for a 367 MB BuildKit cache).
 var cacheEnv = []string{"FF_USE_FASTZIP=true", "CACHE_COMPRESSION_LEVEL=fastest"}
 
-// tomlString matches one TOML basic string ("..." with backslash escapes).
-var tomlString = regexp.MustCompile(`"(?:[^"\\]|\\.)*"`)
+// tomlString matches one TOML basic ("..." with backslash escapes) or literal
+// ('...') string.
+var tomlString = regexp.MustCompile(`"(?:[^"\\]|\\.)*"|'[^']*'`)
 
 // ensureRunnerEnv adds entries to the runner's `environment` list unless a
-// value for that variable is already set there.
+// value for that variable is already set there. Only the list's value is
+// rewritten, on one line however many it spanned; the rest of conf is kept.
 func ensureRunnerEnv(conf string, entries ...string) string {
-	lines := strings.Split(conf, "\n")
-	runner, envLine := -1, -1
-	for i, l := range lines {
-		t := strings.TrimSpace(l)
-		if t == "[[runners]]" {
-			runner = i
+	var runner, env *tomlStmt
+	stmts := tomlStatements(conf)
+	for i := range stmts {
+		s := &stmts[i]
+		if runner == nil {
+			if s.header && s.table == "[[runners]]" {
+				runner = s
+			}
+			continue
 		}
-		if runner >= 0 && strings.HasPrefix(t, "environment") && strings.Contains(t, "=") {
-			envLine = i
+		if s.tableN != runner.tableN {
 			break
 		}
-		if runner >= 0 && i > runner && strings.HasPrefix(t, "[") {
+		if s.key == "environment" {
+			env = s
 			break
 		}
 	}
-	if runner < 0 {
+	if runner == nil {
 		return conf
 	}
 	var have []string
-	if envLine >= 0 {
-		_, list, _ := strings.Cut(lines[envLine], "=")
-		for _, q := range tomlString.FindAllString(list, -1) {
-			if v, err := strconv.Unquote(q); err == nil {
+	if env != nil {
+		// The value without its comments: a quoted name in a comment is no entry.
+		for _, q := range tomlString.FindAllString(env.value, -1) {
+			if v, ok := tomlUnquote(q); ok {
 				have = append(have, v)
 			}
 		}
@@ -129,13 +134,16 @@ func ensureRunnerEnv(conf string, entries ...string) string {
 	for i, h := range have {
 		quoted[i] = strconv.Quote(h)
 	}
-	line := "  environment = [" + strings.Join(quoted, ", ") + "]"
-	if envLine >= 0 {
-		lines[envLine] = line
-	} else {
-		lines = append(lines[:runner+1], append([]string{line}, lines[runner+1:]...)...)
+	list := "[" + strings.Join(quoted, ", ") + "]"
+	if env != nil {
+		return conf[:env.valStart] + list + conf[env.end:]
 	}
-	return strings.Join(lines, "\n")
+	// A new line right after the [[runners]] header's line.
+	at := lineEnd(conf, runner.end)
+	if at == len(conf) {
+		return conf + "\n  environment = " + list
+	}
+	return conf[:at+1] + "  environment = " + list + "\n" + conf[at+1:]
 }
 
 func cacheSection(c *Cache) []string {
@@ -193,23 +201,12 @@ func replaceCacheSection(conf string, section []string) (string, error) {
 
 // cacheFromConfig reports the cache type and server configured in config.toml.
 func cacheFromConfig(conf string) (typ, server string) {
-	table := ""
-	for _, l := range strings.Split(conf, "\n") {
-		t := strings.TrimSpace(l)
-		if strings.HasPrefix(t, "[") {
-			table = t
-			continue
-		}
-		k, v, ok := strings.Cut(t, "=")
-		if !ok {
-			continue
-		}
-		k, v = strings.TrimSpace(k), strings.Trim(strings.TrimSpace(v), `"`)
+	for _, s := range tomlStatements(conf) {
 		switch {
-		case table == "[runners.cache]" && k == "Type":
-			typ = v
-		case table == "[runners.cache.s3]" && k == "ServerAddress":
-			server = v
+		case s.table == "[runners.cache]" && s.key == "Type":
+			typ, _ = tomlUnquote(s.value)
+		case s.table == "[runners.cache.s3]" && s.key == "ServerAddress":
+			server, _ = tomlUnquote(s.value)
 		}
 	}
 	return typ, server

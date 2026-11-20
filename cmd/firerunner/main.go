@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -243,22 +244,20 @@ func cmdBuilder(cfg config.Config, args []string) error {
 
 func cmdConfig(args []string) error {
 	path := config.Path()
-	cfg, err := config.Load(path)
-	if err != nil && (len(args) == 0 || args[0] != "set") {
-		return err
-	}
 	sub := "show"
 	if len(args) > 0 {
 		sub = args[0]
 	}
+	cfg, err := config.Load(path)
+	// set may fix a value out of range, but a file that could not be read or
+	// parsed is never replaced: set would write the defaults over it.
+	var invalid *config.ValidationError
+	if err != nil && (sub != "set" || !errors.As(err, &invalid)) {
+		return err
+	}
 	switch {
 	case sub == "show":
-		fmt.Printf("# %s\n", path)
-		for _, k := range config.Keys(cfg) {
-			v, _ := config.Get(cfg, k)
-			fmt.Printf("%s = %s\n", k, v)
-		}
-		return nil
+		return showConfig(os.Stdout, path, cfg)
 	case sub == "keys":
 		fmt.Println(strings.Join(config.Keys(cfg), "\n"))
 		return nil
@@ -284,7 +283,7 @@ func cmdConfig(args []string) error {
 		}
 		for i := 1; i < len(args); i += 2 {
 			v, _ := config.Get(next, args[i])
-			fmt.Printf("%s = %s (applies to the next job)\n", args[i], v)
+			fmt.Printf("%s = %s (%s)\n", args[i], v, applyNote(args[i]))
 		}
 		return nil
 	case sub == "unset" && len(args) == 2:
@@ -295,6 +294,49 @@ func cmdConfig(args []string) error {
 		return config.Save(path, next)
 	}
 	return errors.New("usage: firerunner config show|keys|path|get <key>|set <key> <value> [<key> <value>...]|unset <key>")
+}
+
+// applyNote says when a changed key takes effect, from what reads it. Jobs
+// load the config for every job and the daemon reloads it within seconds
+// (reloadConfig), but the daemon reads its flintlock connection, socket,
+// metrics address and reconcile ticker only when it starts; the forwarder
+// (cmdProxy) reads all its settings at start; install.sh, not this file,
+// writes the firewall's egress list and the proxy settings of host services.
+func applyNote(key string) string {
+	const daemonRestart = "sudo systemctl restart firerunner"
+	const proxyRestart = "sudo systemctl restart firerunner-proxy (cuts the open connections of running jobs)"
+	switch {
+	case key == "daemon.metrics_listen" || key == "daemon.reconcile_interval":
+		return "applies after " + daemonRestart
+	case key == "daemon.socket" || strings.HasPrefix(key, "flintlock."):
+		return "jobs use it from the next job; the daemon after " + daemonRestart
+	case key == "proxy.upstream_file" || key == "proxy.connect_ports" || key == "proxy.egress_strict":
+		return "applies after " + proxyRestart
+	case key == "proxy.listen":
+		return "microVMs use it from the next job; the forwarder after " + proxyRestart
+	case key == "network.egress_deny":
+		return "the forwarder applies it after " + proxyRestart +
+			"; the firewall keeps its own list: re-run install.sh with FR_EGRESS_DENY"
+	case key == "proxy.enabled":
+		return "microVMs use it from the next job; install.sh starts or stops firerunner-proxy and the host services' proxy settings (FR_PROXY)"
+	case key == "proxy.no_proxy":
+		return "microVMs use it from the next job; host services when install.sh runs again"
+	}
+	return "applies to the next job"
+}
+
+// showConfig prints every key with its value. A key it cannot read is an
+// error, not an empty value: an empty value reads as "not set".
+func showConfig(w io.Writer, path string, cfg config.Config) error {
+	fmt.Fprintf(w, "# %s\n", path)
+	for _, k := range config.Keys(cfg) {
+		v, err := config.Get(cfg, k)
+		if err != nil {
+			return fmt.Errorf("config show: %w", err)
+		}
+		fmt.Fprintf(w, "%s = %s\n", k, v)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -312,7 +354,7 @@ func cmdStatus(cfg config.Config) error {
 	fmt.Fprintf(w, "KVM\t%s\n", kvm)
 
 	var svc []string
-	for _, s := range append(host.Services, "gitlab-runner") {
+	for _, s := range host.MonitoredServices(cfg.Proxy.Enabled) {
 		state := "down"
 		if host.ServiceActive(s) {
 			state = "up"
@@ -529,8 +571,8 @@ func cmdRunner(args []string) error {
 		if len(args) != 2 {
 			return errors.New("usage: firerunner runner concurrent <n>")
 		}
-		var n int
-		if _, err := fmt.Sscan(args[1], &n); err != nil {
+		n, err := parseConcurrent(args[1])
+		if err != nil {
 			return err
 		}
 		if err := host.SetConcurrent(n); err != nil {
@@ -542,6 +584,16 @@ func cmdRunner(args []string) error {
 		return host.UnregisterRunner()
 	}
 	return errors.New("usage: firerunner runner register|status|concurrent|cache|unregister")
+}
+
+// parseConcurrent reads the whole argument as a positive number: fmt.Sscan
+// stopped at the first non-digit and took "4abc" as 4.
+func parseConcurrent(s string) (int, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 || strings.Trim(s, "0123456789") != "" {
+		return 0, fmt.Errorf("concurrent %q is not a number of jobs (1 or more)", s)
+	}
+	return n, nil
 }
 
 // tokenEnv carries the runner token to `runner register` (install.sh passes
