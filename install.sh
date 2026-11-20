@@ -985,9 +985,28 @@ Requires=firerunner-net.service
 After=firerunner-net.service
 
 [Service]
-ExecStart=$(command -v dnsmasq) --keep-in-foreground --conf-file=${CONF_DIR}/dnsmasq.conf
+# No pid file: systemd tracks the process, and the default /run/dnsmasq.pid
+# belongs to the host's own dnsmasq, if any.
+ExecStart=$(command -v dnsmasq) --keep-in-foreground --pid-file --conf-file=${CONF_DIR}/dnsmasq.conf
 Restart=always
 RestartSec=5
+# Serves untrusted microVMs. It binds 53 and 67 on the bridge as root, then
+# runs as nobody and keeps NET_ADMIN for DHCP (and NET_RAW, SO_BINDTODEVICE on
+# older kernels); SETUID and SETGID drop root. Only the lease file is written.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/misc
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID
 
 [Install]
 WantedBy=multi-user.target
@@ -1419,10 +1438,23 @@ After=firerunner-net.service
 ExecStart=${LIB_DIR}/registries.sh
 Restart=always
 RestartSec=5
+# Serves untrusted microVMs: no capabilities (ports above 1024, its data is
+# root's own), only its data writable, no devices, kernel knobs or namespaces.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/firerunner/registry ${MIRROR_DATA_DIR}
+ProtectHome=yes
 PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target
@@ -1511,10 +1543,23 @@ EnvironmentFile=${CONF_DIR}/cache.env
 ExecStart=${BIN_DIR}/versitygw posix /var/lib/firerunner/cache
 Restart=always
 RestartSec=5
+# Serves untrusted microVMs: no capabilities (port 9000, the cache is root's
+# own), only the cache writable, no devices, kernel knobs or namespaces.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/firerunner/cache
+ProtectHome=yes
 PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target
