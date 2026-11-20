@@ -68,6 +68,9 @@ type pooled struct {
 	inst   *vm.Instance
 	bornAt time.Time
 	specID string // config fingerprint the VM was booted with
+	// preloadCut: claimed while it preloaded, and its preload stopped for
+	// the job. Such a VM is never put back in the pool (unclaim).
+	preloadCut bool
 }
 
 // preloadingVM is a pool VM that has booted and is still pulling
@@ -521,7 +524,7 @@ func (d *Daemon) claim() *pooled {
 		d.metrics.claims.WithLabelValues("hit").Inc()
 		d.log.Info("pool VM claimed before its preload finished", "vm", p.inst.ID)
 		d.wakeRefill()
-		return &pooled{inst: p.inst, bornAt: time.Now(), specID: p.specID}
+		return &pooled{inst: p.inst, bornAt: time.Now(), specID: p.specID, preloadCut: true}
 	}
 	d.metrics.claims.WithLabelValues("miss").Inc()
 	return nil
@@ -536,15 +539,25 @@ func (d *Daemon) wakeRefill() {
 	}
 }
 
-// unclaim puts a claimed VM the job never received back at the head of the
-// pool (the next job gets it) and ends its claim.
-func (d *Daemon) unclaim(p *pooled) {
+// unclaim ends the claim of a VM the job never received and puts it back at
+// the head of the pool (the next job gets it). A VM claimed mid-preload is
+// deleted instead, and refill replaces it: its pulls were stopped part way
+// (bootOne may still be stopping them), so it is not a ready pool VM. It
+// reports whether the VM went back to the pool.
+func (d *Daemon) unclaim(p *pooled) bool {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	delete(d.claimed, p.inst.UID)
-	d.ready = append([]*pooled{p}, d.ready...)
-	d.metrics.poolReady.Set(float64(len(d.ready)))
-	d.savePoolLocked()
+	if !p.preloadCut {
+		d.ready = append([]*pooled{p}, d.ready...)
+		d.metrics.poolReady.Set(float64(len(d.ready)))
+		d.savePoolLocked()
+		d.mu.Unlock()
+		return true
+	}
+	d.mu.Unlock()
+	// Its memory comes free once the delete is through: refill again then.
+	d.deleteInBackground(context.Background(), p.inst, "claim not delivered during its preload", d.wakeRefill)
+	return false
 }
 
 func (d *Daemon) refill(ctx context.Context) {

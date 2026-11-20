@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ismoilovdevml/firerunner/internal/vm"
 )
 
 // failingWriter is a response writer whose client is gone.
@@ -69,6 +71,33 @@ func TestClaimNotDeliveredGoesBack(t *testing.T) {
 				t.Fatalf("undelivered claim: claimed %v, ready %v; want a back at the head", claimed, ready)
 			}
 		})
+	}
+}
+
+// A VM taken from the preloading ones had its preload stopped for the job.
+// When the job never gets it, it is not ready: its images are partly pulled
+// and its pulls may still be stopping. It is deleted (refill replaces it),
+// not put at the head of the pool for the next job.
+func TestUndeliveredClaimOfAPreloadingVMIsDeleted(t *testing.T) {
+	d, srv := newTestDaemon(t)
+	logs := captureLog(d)
+	cancelled := false
+	d.preloading["warm"] = &preloadingVM{inst: &vm.Instance{ID: "pool-warm", UID: "warm"}, specID: fingerprint(d.cfg),
+		cancel: func() { cancelled = true }}
+	req := httptest.NewRequest(http.MethodPost, "/claim?job=job-123", nil)
+	d.apiHandler().ServeHTTP(&failingWriter{header: http.Header{}}, req)
+	if !cancelled {
+		t.Fatal("the preload was not stopped for the claim")
+	}
+	srv.WaitDeleted(t, "warm", 2*time.Second)
+	d.mu.Lock()
+	ready, claimed := len(d.ready), len(d.claimed)
+	d.mu.Unlock()
+	if ready != 0 || claimed != 0 {
+		t.Fatalf("undelivered claim of a preloading VM: %d ready, %d claimed; want it in neither", ready, claimed)
+	}
+	if out := logs.String(); strings.Contains(out, "back in the pool") {
+		t.Fatalf("log says the VM went back to the pool:\n%s", out)
 	}
 }
 

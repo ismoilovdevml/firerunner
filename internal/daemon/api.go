@@ -82,8 +82,12 @@ func (d *Daemon) apiHandler() http.Handler {
 			err = http.NewResponseController(w).Flush()
 		}
 		if err != nil {
-			d.unclaim(p)
-			d.log.Warn("pool VM claim not delivered, VM back in the pool", "vm", p.inst.ID, "job", job, "err", err)
+			if d.unclaim(p) {
+				d.log.Warn("pool VM claim not delivered, VM back in the pool", "vm", p.inst.ID, "job", job, "err", err)
+			} else {
+				d.log.Warn("pool VM claim not delivered; the VM's preload was stopped for it, so it is deleted",
+					"vm", p.inst.ID, "job", job, "err", err)
+			}
 			return
 		}
 		d.log.Info("pool VM claimed", "vm", p.inst.ID, "job", job)
