@@ -249,7 +249,7 @@ func TestPoolRefreshReplacesVMsStillBooting(t *testing.T) {
 		fp := fingerprint(d.cfg)
 		d.ready = []*pooled{pooledVM("a", fp, 0), pooledVM("b", fp, 0)}
 		d.metrics.poolReady.Set(2)
-		d.drain(context.Background(), "refresh")
+		d.refreshPool(context.Background(), "refresh")
 		srv.WaitDeleted(t, "a", 2*time.Second)
 		srv.WaitDeleted(t, "b", 2*time.Second)
 		if got := metricValue(t, d, "firerunner_pool_ready", ""); got != 0 {
@@ -261,7 +261,7 @@ func TestPoolRefreshReplacesVMsStillBooting(t *testing.T) {
 		cancelled := false
 		d.preloading["warm"] = &preloadingVM{inst: &vm.Instance{ID: "pool-warm", UID: "warm"}, specID: fingerprint(d.cfg),
 			cancel: func() { cancelled = true }}
-		d.drain(context.Background(), "refresh")
+		d.refreshPool(context.Background(), "refresh")
 		if !cancelled {
 			t.Fatal("the refresh did not stop the old-image VM's preload")
 		}
@@ -277,13 +277,13 @@ func TestPoolRefreshReplacesVMsStillBooting(t *testing.T) {
 		cfg.Pool.PreloadImages = []string{"sdk:1"}
 		done := boot(d, cfg)
 		waitPreloading(t, d)
-		d.drain(context.Background(), "refresh")
+		d.refreshPool(context.Background(), "refresh")
 		check(t, d, done)
 		srv.WaitDeleted(t, "u-pool-x", 2*time.Second)
 	})
 	t.Run("a VM booting during the refresh", func(t *testing.T) {
 		d, srv := newTestDaemon(t)
-		stubPoolVM(t, func() { d.drain(context.Background(), "refresh") })
+		stubPoolVM(t, func() { d.refreshPool(context.Background(), "refresh") })
 		done := boot(d, d.cfgSnapshot())
 		check(t, d, done)
 		srv.WaitDeleted(t, "u-pool-x", 2*time.Second)

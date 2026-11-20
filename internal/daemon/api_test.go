@@ -109,7 +109,7 @@ type refreshingWriter struct {
 }
 
 func (w *refreshingWriter) Write([]byte) (int, error) {
-	w.d.drain(context.Background(), "refresh")
+	w.d.refreshPool(context.Background(), "refresh")
 	return 0, errors.New("broken pipe")
 }
 
