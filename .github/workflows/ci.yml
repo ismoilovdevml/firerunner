@@ -43,9 +43,10 @@ jobs:
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
 
-      - name: ShellCheck install.sh
-        # shellcheck is preinstalled on ubuntu-latest runners.
-        run: shellcheck -S warning install.sh images/rootfs/firerunner-netfilter test/network/run.sh test/installer/proxy.sh test/installer/release.sh test/installer/flintlock-tls.sh test/perf/job-bench.sh
+      - name: ShellCheck
+        # shellcheck is preinstalled on ubuntu-latest runners. The scripts are
+        # SHELL_SCRIPTS in the Makefile, the list `make shellcheck` checks locally.
+        run: make shellcheck
 
   vulncheck:
     name: Vulnerability check

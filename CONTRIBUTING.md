@@ -14,8 +14,8 @@ Thanks for helping. Issues and pull requests are welcome.
 CI runs more than `make check`. These need Docker or other tools; run the ones your change
 touches:
 
-- Shell scripts: `make shellcheck`, which runs `shellcheck -S warning` on `install.sh`,
-  `images/rootfs/firerunner-netfilter`, `test/network/run.sh` and `test/installer/proxy.sh`.
+- Shell scripts: `make shellcheck`, which runs `shellcheck -S warning` on the scripts in
+  `SHELL_SCRIPTS` in the `Makefile` (CI runs the same target).
 - Host firewall (`install.sh`): the rules are tested in network namespaces, with and without
   br_netfilter, on a Linux host:
 
@@ -26,8 +26,9 @@ touches:
     done
     ```
 
-- Installer proxy, CA and registry steps:
-  `docker run --rm -v "$PWD":/src:ro ubuntu:24.04 bash /src/test/installer/proxy.sh`
+- Installer proxy, CA and registry steps, its check of the release signature and its mutual TLS
+  for flintlockd: `docker run --rm -v "$PWD":/src:ro ubuntu:24.04 bash /src/test/installer/proxy.sh`,
+  and the same with `release.sh` and `flintlock-tls.sh`.
 - Alert rules (`deploy/prometheus/`): in that directory,
   `promtool check rules firerunner-alerts.yml && promtool test rules firerunner-alerts_test.yml`.
 - Documentation: `mkdocs build --strict`, with the mkdocs and mkdocs-material versions in
