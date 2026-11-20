@@ -84,8 +84,10 @@ var cacheEnv = []string{"FF_USE_FASTZIP=true", "CACHE_COMPRESSION_LEVEL=fastest"
 var tomlString = regexp.MustCompile(`"(?:[^"\\]|\\.)*"|'[^']*'`)
 
 // ensureRunnerEnv adds entries to the runner's `environment` list unless a
-// value for that variable is already set there. Only the list's value is
-// rewritten, on one line however many it spanned; the rest of conf is kept.
+// value for that variable is already set there. With nothing to add conf is
+// returned as it is. Otherwise only the list's value is rewritten, on one
+// line however many it spanned: the entries already there exactly as written,
+// then the new ones. The rest of conf is kept.
 func ensureRunnerEnv(conf string, entries ...string) string {
 	var runner, env *tomlStmt
 	stmts := tomlStatements(conf)
@@ -108,33 +110,31 @@ func ensureRunnerEnv(conf string, entries ...string) string {
 	if runner == nil {
 		return conf
 	}
-	var have []string
+	var tokens []string // the list's entries as written
+	set := map[string]bool{}
 	if env != nil {
 		// The value without its comments: a quoted name in a comment is no entry.
 		for _, q := range tomlString.FindAllString(env.value, -1) {
-			if v, ok := tomlUnquote(q); ok {
-				have = append(have, v)
+			tokens = append(tokens, q)
+			v, ok := tomlUnquote(q)
+			if !ok {
+				v = q[1 : len(q)-1] // kept as written; its name is still plain text
 			}
+			name, _, _ := strings.Cut(v, "=")
+			set[name] = true
 		}
 	}
-	set := func(name string) bool {
-		for _, h := range have {
-			if strings.HasPrefix(h, name+"=") {
-				return true
-			}
-		}
-		return false
-	}
+	added := false
 	for _, e := range entries {
-		if name, _, _ := strings.Cut(e, "="); !set(name) {
-			have = append(have, e)
+		if name, _, _ := strings.Cut(e, "="); !set[name] {
+			tokens = append(tokens, tomlQuote(e))
+			set[name], added = true, true
 		}
 	}
-	quoted := make([]string, len(have))
-	for i, h := range have {
-		quoted[i] = strconv.Quote(h)
+	if !added {
+		return conf
 	}
-	list := "[" + strings.Join(quoted, ", ") + "]"
+	list := "[" + strings.Join(tokens, ", ") + "]"
 	if env != nil {
 		return conf[:env.valStart] + list + conf[env.end:]
 	}
@@ -155,48 +155,52 @@ func cacheSection(c *Cache) []string {
 		`    Type = "s3"`,
 		"    Shared = false",
 		"    [runners.cache.s3]",
-		"      ServerAddress = " + strconv.Quote(c.Server),
-		"      AccessKey = " + strconv.Quote(c.AccessKey),
-		"      SecretKey = " + strconv.Quote(c.SecretKey),
-		"      BucketName = " + strconv.Quote(c.Bucket),
+		"      ServerAddress = " + tomlQuote(c.Server),
+		"      AccessKey = " + tomlQuote(c.AccessKey),
+		"      SecretKey = " + tomlQuote(c.SecretKey),
+		"      BucketName = " + tomlQuote(c.Bucket),
 		"      Insecure = " + strconv.FormatBool(c.Insecure),
 	}
 }
 
 // replaceCacheSection swaps the [runners.cache] table (with its sub-tables) of
 // the single [[runners]] entry for section, or appends section to that entry.
+// Headers are found as TOML reads them (a comment after one, spaces inside
+// the brackets, none inside a string); the lines from the [runners.cache]
+// header to its tables' last statement are replaced, everything else is kept.
 func replaceCacheSection(conf string, section []string) (string, error) {
-	lines := strings.Split(strings.TrimRight(conf, "\n"), "\n")
+	stmts := tomlStatements(conf)
 	runners := 0
-	for _, l := range lines {
-		if strings.TrimSpace(l) == "[[runners]]" {
+	for _, s := range stmts {
+		if s.header && s.table == "[[runners]]" {
 			runners++
 		}
 	}
 	if runners != 1 {
 		return "", fmt.Errorf("%s has %d [[runners]] entries, expected 1", RunnerConfig, runners)
 	}
-	start, end := -1, len(lines)
-	for i, l := range lines {
-		t := strings.TrimSpace(l)
+	start, end := -1, -1
+	for _, s := range stmts {
 		if start < 0 {
-			if t == "[runners.cache]" {
-				start = i
+			if s.header && s.table == "[runners.cache]" {
+				start, end = strings.LastIndexByte(conf[:s.start], '\n')+1, s.end
 			}
 			continue
 		}
-		if strings.HasPrefix(t, "[") && !strings.HasPrefix(t, "[runners.cache.") {
-			end = i
+		if s.header && !strings.HasPrefix(s.table, "[runners.cache.") && !strings.HasPrefix(s.table, "[[runners.cache.") {
 			break
 		}
+		end = s.end
 	}
-	var out []string
+	text := strings.Join(section, "\n") + "\n"
 	if start < 0 {
-		out = append(append(out, lines...), section...)
-	} else {
-		out = append(append(append(out, lines[:start]...), section...), lines[end:]...)
+		return strings.TrimRight(conf, "\n") + "\n" + text, nil
 	}
-	return strings.Join(out, "\n") + "\n", nil
+	after := lineEnd(conf, end)
+	if after < len(conf) {
+		after++ // and its newline
+	}
+	return conf[:start] + text + conf[after:], nil
 }
 
 // cacheFromConfig reports the cache type and server configured in config.toml.
