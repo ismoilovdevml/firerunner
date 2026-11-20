@@ -589,11 +589,72 @@ release_base() {
     fi
 }
 
-# release_runs FILE: the downloaded firerunner runs and is FR_VERSION.
+# version_compare A B: prints -1, 0 or 1 as A is older than, the same as or
+# newer than B, for versions vMAJOR[.MINOR[.PATCH]][-PRE][+BUILD] (SemVer
+# order: a pre-release is older than its release, its dot-separated
+# identifiers compare as numbers when both are numeric, numbers before text,
+# and a shorter list of equal identifiers first). Fails for anything else
+# (edge-<sha>, dev): those are not compared.
+version_compare() {
+    local LC_ALL=C re='^v([0-9]{1,15})(\.([0-9]{1,15}))?(\.([0-9]{1,15}))?(-([0-9A-Za-z.-]+))?(\+[0-9A-Za-z.-]+)?$'
+    local an bn ap bp i x y
+    [[ $1 =~ $re ]] || return 1
+    an=("${BASH_REMATCH[1]}" "${BASH_REMATCH[3]:-0}" "${BASH_REMATCH[5]:-0}") ap=${BASH_REMATCH[7]}
+    [[ $2 =~ $re ]] || return 1
+    bn=("${BASH_REMATCH[1]}" "${BASH_REMATCH[3]:-0}" "${BASH_REMATCH[5]:-0}") bp=${BASH_REMATCH[7]}
+    for i in 0 1 2; do
+        if ((10#${an[i]} != 10#${bn[i]})); then
+            ((10#${an[i]} < 10#${bn[i]})) && echo -1 || echo 1
+            return 0
+        fi
+    done
+    if [[ $ap == "$bp" ]]; then echo 0; return 0; fi
+    [[ -z $ap ]] && { echo 1; return 0; }
+    [[ -z $bp ]] && { echo -1; return 0; }
+    local -a aid bid
+    IFS=. read -ra aid <<<"$ap"
+    IFS=. read -ra bid <<<"$bp"
+    for ((i = 0; i < ${#aid[@]} && i < ${#bid[@]}; i++)); do
+        x=${aid[i]} y=${bid[i]}
+        [[ $x == "$y" ]] && continue
+        if [[ $x =~ ^[0-9]{1,15}$ && $y =~ ^[0-9]{1,15}$ ]]; then
+            ((10#$x < 10#$y)) && echo -1 || echo 1
+        elif [[ $x =~ ^[0-9]+$ ]]; then
+            echo -1
+        elif [[ $y =~ ^[0-9]+$ ]]; then
+            echo 1
+        elif [[ $x < "$y" ]]; then
+            echo -1
+        else
+            echo 1
+        fi
+        return 0
+    done
+    ((${#aid[@]} < ${#bid[@]})) && echo -1 || echo 1
+}
+
+# refuse_downgrade NEW: FR_VERSION=latest moves a host forward only, as
+# `firerunner upgrade --version latest` does: a release older than the
+# installed one (a backport GitHub marks latest) may not know its config.
+# It is installed only when asked for by its tag. edge and dev installs are
+# not compared: leaving edge for the stable line is a choice.
+refuse_downgrade() {
+    [[ $FR_VERSION == latest && -x $BIN_DIR/firerunner ]] || return 0
+    local cur
+    cur=$("$BIN_DIR/firerunner" version 2>/dev/null | awk '{print $2}' || true)
+    if [[ $(version_compare "$1" "$cur" 2>/dev/null) == -1 ]]; then
+        die "the latest release is firerunner $1, older than the installed $cur; not installing it (FR_VERSION=$1 installs it anyway)"
+    fi
+    return 0
+}
+
+# release_runs FILE: the downloaded firerunner runs, is FR_VERSION and, for
+# latest, is not older than the installed one.
 release_runs() {
     local got
     got=$("$1" version 2>/dev/null | awk '{print $2}' || true)
     release_matches "$got" || die "firerunner ${FR_VERSION} contains firerunner ${got:-(does not run)}; not installing it"
+    refuse_downgrade "$got"
 }
 
 # install_binary SRC DEST [CHECK]: DEST becomes a copy of SRC, mode 0755, in

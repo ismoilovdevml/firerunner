@@ -76,6 +76,41 @@ expect "a binary that does not run refused"                  ! matches v0.3.0 ""
 expect "a stable release for latest"                           matches latest v0.3.0
 expect "an edge build for latest refused"                    ! matches latest edge-abc1234
 expect "latest downloads the newest stable release"            test "$(FR_VERSION=latest release_base)" = "https://github.com/$FR_REPO/releases/latest/download"
+
+# SemVer order (version_compare A B: A against B).
+older() { [[ $(version_compare "$1" "$2") == -1 ]]; }
+same()  { [[ $(version_compare "$1" "$2") == 0 ]]; }
+expect "v0.4.1 older than v0.5.0"                               older v0.4.1 v0.5.0
+expect "v0.9.1 older than v0.10.0 (numbers, not text)"          older v0.9.1 v0.10.0
+expect "v0.9.9 older than v1.0.0"                               older v0.9.9 v1.0.0
+expect "a release candidate older than its release"             older v0.3.0-rc1 v0.3.0
+expect "...not the other way"                                 ! older v0.3.0 v0.3.0-rc1
+expect "rc.9 older than rc.10 (numeric identifiers)"            older v1.0.0-rc.9 v1.0.0-rc.10
+expect "numeric identifier older than text (1 < alpha)"         older v1.0.0-1 v1.0.0-alpha
+expect "alpha older than beta"                                  older v1.0.0-alpha v1.0.0-beta
+expect "alpha older than alpha.1 (shorter list first)"          older v1.0.0-alpha v1.0.0-alpha.1
+expect "v1 is v1.0.0, build metadata ignored"                   same v1 v1.0.0+build.5
+expect "edge builds are not compared"                         ! version_compare edge-abc1234 v0.2.0
+expect "dev is not compared"                                  ! version_compare v0.2.0 dev
+# latest never installs a release older than the installed one; a tag does.
+mkdir -p "$WORK/installed"
+# downgrade INSTALLED NEW [FR_VERSION]: refuse_downgrade with firerunner INSTALLED in BIN_DIR.
+downgrade() {
+    printf '#!/bin/sh\necho "firerunner %s"\n' "$1" > "$WORK/installed/firerunner"
+    chmod 0755 "$WORK/installed/firerunner"
+    ( BIN_DIR=$WORK/installed FR_VERSION=${3:-latest} refuse_downgrade "$2" ) 2>"$WORK/downgrade.err"
+}
+expect "latest: v0.4.1 backport over v0.5.0 refused"          ! downgrade v0.5.0 v0.4.1
+expect "...naming the tag that installs it anyway"              grep -q "FR_VERSION=v0.4.1 installs it anyway" "$WORK/downgrade.err"
+expect "latest: v0.3.0-rc1 over v0.3.0 refused"               ! downgrade v0.3.0 v0.3.0-rc1
+expect "latest: v0.9.1 over v0.10.0 refused"                  ! downgrade v0.10.0 v0.9.1
+expect "latest: a newer release installed"                      downgrade v0.4.1 v0.5.0
+expect "latest: the same release installed again"               downgrade v0.5.0 v0.5.0
+expect "latest: over an edge build, not compared"               downgrade edge-abc1234 v0.2.0
+expect "latest: over a dev build, not compared"                 downgrade dev v0.2.0
+expect "a tag asked for by name may be older"                   downgrade v0.5.0 v0.4.1 v0.4.1
+release_runs_checks_downgrade() { declare -f release_runs | grep -q 'refuse_downgrade "$got"'; }
+expect "release_runs refuses a downgrade before the binary is renamed" release_runs_checks_downgrade
 expect "a tag downloads that release"                          test "$(FR_VERSION=v0.3.0 release_base)" = "https://github.com/$FR_REPO/releases/download/v0.3.0"
 
 # install_firerunner checks the signature before it trusts a checksum.

@@ -171,6 +171,14 @@ expect "the same binary again is not replaced" test "$(inode "$B/firerunner")" =
 expect "...nor recorded as changed" ! changed "$B/firerunner"
 FR_VERSION=v0.4.0 install_binary "$(fake_release v0.4.0)" "$B/firerunner" release_runs
 expect "a new binary is recorded as changed (the daemon restarts)" changed "$B/firerunner"
+# FR_VERSION=latest: never an older release than the installed one.
+fake_release v0.5.0 >/dev/null; cp "$WORK/release-v0.5.0" "$B/firerunner"; cp "$B/firerunner" "$WORK/installed"
+latest_installs() { ( trap cleanup EXIT; BIN_DIR=$B FR_VERSION=latest; install_binary "$(fake_release "$1")" "$B/firerunner" release_runs ) >/dev/null 2>&1; }
+expect "latest: an older release (a backport marked latest) is refused" ! latest_installs v0.4.1
+expect "...the installed binary is untouched" cmp -s "$WORK/installed" "$B/firerunner"
+expect "...and its copy is removed" test -z "$(compgen -G "$B/.firerunner-new.*")"
+expect "latest: a newer release is installed" latest_installs v0.6.0
+expect "...in place of the old one" grep -q v0.6.0 "$B/firerunner"
 
 # ---- downloads: the default versions have a pinned checksum
 # The keys are built as the install steps build them: a default version
