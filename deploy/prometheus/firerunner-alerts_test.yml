@@ -368,3 +368,51 @@ tests:
           (not answering|VM gone)''. ''no host memory for a builder'': builders do not fit next to the jobs, lower builder.max or builder.memory_mb. Not answering or VM gone: usually the builds of one
           project filled the builder''s memory, lower builder.max_parallelism or raise builder.memory_mb.'
         runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerbuildersfailing
+# A drained host's stopped gitlab-runner is no outage; its other services
+# still are, and so is gitlab-runner on a host that is not drained or whose
+# daemon is older than firerunner_drained.
+- interval: 1m
+  input_series:
+  - series: firerunner_service_up{instance="d1",job="firerunner",service="gitlab-runner"}
+    values: 0x20
+  - series: firerunner_service_up{instance="d1",job="firerunner",service="flintlockd"}
+    values: 0x20
+  - series: firerunner_drained{instance="d1",job="firerunner"}
+    values: 1x20
+  - series: firerunner_service_up{instance="d2",job="firerunner",service="gitlab-runner"}
+    values: 0x20
+  - series: firerunner_drained{instance="d2",job="firerunner"}
+    values: 0x20
+  - series: firerunner_service_up{instance="d3",job="firerunner",service="gitlab-runner"}
+    values: 0x20
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: FireRunnerServiceDown
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        instance: d1
+        job: firerunner
+        service: flintlockd
+      exp_annotations:
+        summary: flintlockd is down on d1
+        description: 'Jobs fail or are not picked up. Check: journalctl -u flintlockd -n 100; firerunner doctor.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerservicedown
+    - exp_labels:
+        severity: critical
+        instance: d2
+        job: firerunner
+        service: gitlab-runner
+      exp_annotations:
+        summary: gitlab-runner is down on d2
+        description: 'Jobs fail or are not picked up. Check: journalctl -u gitlab-runner -n 100; firerunner doctor.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerservicedown
+    - exp_labels:
+        severity: critical
+        instance: d3
+        job: firerunner
+        service: gitlab-runner
+      exp_annotations:
+        summary: gitlab-runner is down on d3
+        description: 'Jobs fail or are not picked up. Check: journalctl -u gitlab-runner -n 100; firerunner doctor.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerservicedown
