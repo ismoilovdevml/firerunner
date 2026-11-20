@@ -345,7 +345,7 @@ func (d *Daemon) retireLocked(project string, port int, inst vm.Instance, specID
 	}
 	d.spawn(func() {
 		if port != 0 {
-			d.unmapBuilderPort(nft, port)
+			d.unmapBuilderPort(nft, port, inst.IP)
 		}
 		if saved != nil {
 			// A copy the daemon's stop cuts off (or that could not start
@@ -589,7 +589,7 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 		nft := nftRun
 		d.spawn(func() {
 			if unmap {
-				d.unmapBuilderPort(nft, port)
+				d.unmapBuilderPort(nft, port, inst.IP)
 			}
 			d.delete(context.Background(), inst, "builder no longer needed")
 		})
@@ -860,10 +860,25 @@ func (d *Daemon) mapBuilderPorts(bs ...builder) error {
 }
 
 // unmapBuilderPort deletes the mapping of a removed builder's port with nft
-// (nftRun as the caller read it), serialized with mapBuilderPorts.
-func (d *Daemon) unmapBuilderPort(nft func(string, ...string) (string, error), port int) {
+// (nftRun as the caller read it), serialized with mapBuilderPorts, but only
+// while the port still leads to that builder's address ip. The port is free
+// for the next builder as soon as the old one is removed, and this runs in
+// the background: by the time it holds nftMu the new builder may have mapped
+// the port, and deleting that mapping would cut its jobs off until a
+// reconcile restored it. Callers unmap before they delete the VM, so the
+// address cannot have gone to the new builder meanwhile. A map that cannot
+// be listed is left alone: the reconcile sweep removes a port no builder
+// holds, and a new holder replaces the mapping when it maps its own.
+func (d *Daemon) unmapBuilderPort(nft func(string, ...string) (string, error), port int, ip string) {
 	d.nftMu.Lock()
 	defer d.nftMu.Unlock()
+	out, err := nft("", "list", "map", "inet", "firerunner", "builders")
+	if err != nil {
+		return
+	}
+	if to, ok := parseBuilderMap(out)[port]; !ok || ip == "" || to != ip+" . 1234" {
+		return
+	}
 	_, _ = nft("", "delete", "element", "inet", "firerunner", "builders", fmt.Sprintf("{ %d }", port))
 }
 

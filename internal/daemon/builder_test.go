@@ -228,6 +228,9 @@ func TestExpireBuilders(t *testing.T) {
 		"4": readyBuilder("4", 20004, time.Minute, "old"),                           // old config, busy
 		"5": {Project: "5", Port: 20005, LastUsed: time.Now().Add(-24 * time.Hour)}, // still booting
 	}
+	if err := d.mapBuilderPorts(*d.builders["2"]); err != nil {
+		t.Fatal(err)
+	}
 	d.expireBuilders()
 	for _, p := range []string{"1", "4", "5"} {
 		if _, ok := d.builders[p]; !ok {
@@ -704,6 +707,9 @@ func TestRemoveBuildersKeepsBusyUnlessForced(t *testing.T) {
 		"101": readyBuilder("101", 20001, 0, spec),               // a job builds on it
 		"8":   readyBuilder("8", 20002, time.Hour, spec),         // idle
 		"9":   {Project: "9", Port: 20003, LastUsed: time.Now()}, // still booting
+	}
+	if err := d.mapBuilderPorts(*d.builders["101"], *d.builders["8"]); err != nil {
+		t.Fatal(err)
 	}
 	dc := serveAPI(t, d)
 
@@ -1402,7 +1408,7 @@ func TestStaleBuilderPortsAreUnmapped(t *testing.T) {
 		go func() { done <- d.mapBuilderPorts(*b) }()
 		<-inTx
 		unmapDone := make(chan struct{})
-		go func() { d.unmapBuilderPort(nftRun, 20001); close(unmapDone) }()
+		go func() { d.unmapBuilderPort(nftRun, 20001, b.Instance.IP); close(unmapDone) }()
 		time.Sleep(100 * time.Millisecond)
 		early := unmapped.Load()
 		close(release)
@@ -1573,6 +1579,56 @@ func TestEvictionIdleGuard(t *testing.T) {
 	}
 	if _, ok := d.builders["8"]; ok {
 		t.Fatal("idle builder kept its slot")
+	}
+}
+
+// An evicted builder's port goes to the next builder at once, while the old
+// builder's unmap runs in the background. When that unmap only gets nftMu
+// after the new builder mapped the port (nft slow under a reconcile), it must
+// leave the new builder's mapping alone; one still leading to the old
+// builder's VM is removed.
+func TestEvictedBuilderUnmapsOnlyItsOwnMapping(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		newFirst bool // the new builder's mapping landed before the old unmap ran
+		want     string
+	}{
+		{"new builder mapped first", true, "10.200.0.99 . 1234"},
+		{"old mapping still in place", false, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			stubBuilders(t, func(string) bool { return true })
+			nft := stubNft(t)
+			d, _ := newTestDaemon(t)
+			d.mu.Lock()
+			d.cfg.Builder.Max = 1
+			port := d.cfg.Builder.PortBase + 1
+			d.mu.Unlock()
+			old := readyBuilder("8", port, time.Hour, builderSpec(d.cfg))
+			d.builders["8"] = old
+			nft.elems = map[int]string{port: old.Instance.IP + " . 1234"}
+
+			d.nftMu.Lock() // a reconcile's nft run holds the map
+			info := d.Builder("9", true)
+			if info.State != BuilderBooting || info.Port != port {
+				d.nftMu.Unlock()
+				t.Fatalf("Builder = %+v, want booting on the evicted builder's port %d", info, port)
+			}
+			if c.newFirst {
+				nft.mu.Lock()
+				nft.elems[port] = "10.200.0.99 . 1234"
+				nft.mu.Unlock()
+			}
+			d.nftMu.Unlock()
+			d.bg.Wait()
+
+			nft.mu.Lock()
+			got := nft.elems[port]
+			nft.mu.Unlock()
+			if got != c.want {
+				t.Fatalf("port %d maps to %q after the old builder's unmap, want %q\n%s", port, got, c.want, nft)
+			}
+		})
 	}
 }
 
