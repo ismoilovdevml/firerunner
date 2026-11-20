@@ -76,6 +76,10 @@ Usage:
                                             delete a builder and its cache; builders a
                                             running job builds on are kept without --force
 
+  firerunner drain [--timeout D]            before maintenance: take no new jobs (they stay pending
+                                            in GitLab), wait until the running ones finished
+  firerunner undrain | drain --cancel       take jobs again
+
   firerunner daemon                         pool + reconcile + metrics (systemd: firerunner.service)
   firerunner proxy                          forwards microVM traffic to the corporate proxy
                                             (systemd: firerunner-proxy.service; see proxy.*)
@@ -143,6 +147,10 @@ func dispatch(args []string) error {
 		return cmdProxy(cfg)
 	case "builder", "builders":
 		return cmdBuilder(cfg, rest)
+	case "drain":
+		return cmdDrain(cfg, rest)
+	case "undrain":
+		return cmdUndrain(cfg, rest)
 	case "pool":
 		dc := daemon.NewClient(cfg.Daemon.Socket)
 		if len(rest) > 0 && rest[0] == "refresh" {
@@ -387,6 +395,7 @@ func cmdStatus(cfg config.Config) error {
 		fmt.Fprintf(w, "microVMs\tflintlock unreachable: %v\n", err)
 	}
 
+	fmt.Fprintf(w, "Drained\t%s\n", drainLine(context.Background(), daemon.NewClient(cfg.Daemon.Socket), hostRunner{}))
 	if r, err := host.ReadRunner(); err == nil {
 		fmt.Fprintf(w, "Runner\t%s -> %s (executor %s, concurrent %d)\n", r.Name, r.URL, r.Executor, r.Concurrent)
 		fmt.Fprintf(w, "Cache\t%s\n", cacheDesc(r))
