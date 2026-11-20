@@ -1041,6 +1041,38 @@ func TestBuilderBootCutByShutdownUnmapsPort(t *testing.T) {
 	}
 }
 
+// builders.json that cannot be written is reported, like pool.json: a
+// restart that does not find the builders deletes them without their caches.
+// A failed write leaves no temp file behind.
+func TestBuildersFileWriteFailureIsReported(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		block func(file string) error
+	}{
+		{"temp file not writable", func(file string) error { return os.Mkdir(file+".tmp", 0o700) }},
+		{"rename refused", func(file string) error { return os.MkdirAll(filepath.Join(file, "x"), 0o700) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			stubBuilders(t, func(string) bool { return true })
+			d, _ := newTestDaemon(t)
+			logs := captureLog(d)
+			d.builders["1"] = readyBuilder("1", d.cfg.Builder.PortBase+1, 0, builderSpec(d.cfg))
+			if err := c.block(d.buildersFile()); err != nil {
+				t.Fatal(err)
+			}
+			recordBuilders(d)
+			if out := logs.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "builders.json") {
+				t.Fatalf("builders.json not written, but nothing was reported:\n%s", out)
+			}
+			if c.name == "rename refused" {
+				if _, err := os.Stat(d.buildersFile() + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("temp file left behind: %v", err)
+				}
+			}
+		})
+	}
+}
+
 // When the startup listing fails, builders.json is not read then. Until it is,
 // the file keeps the previous run's builders (a new builder does not overwrite
 // it), and the first listing that works adopts them: otherwise reconcile would

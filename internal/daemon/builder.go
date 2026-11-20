@@ -1039,13 +1039,15 @@ func (d *Daemon) saveBuildersLocked() {
 		}
 	}
 	data, err := json.Marshal(list)
-	if err != nil {
-		return
+	if err == nil {
+		err = writeFileSync(d.buildersFile(), data)
 	}
-	file := d.buildersFile()
-	tmp := file + ".tmp"
-	if os.WriteFile(tmp, data, 0o600) == nil {
-		_ = os.Rename(tmp, file)
+	if err != nil {
+		// The previous record stays: a restart adopts the builders it names
+		// that still answer, and reconcile deletes the others without
+		// copying their caches out.
+		d.warnLimited("builders-save", "cannot record the builders; a restart may lose the newer ones and their caches",
+			"file", d.buildersFile(), "err", err)
 	}
 }
 
