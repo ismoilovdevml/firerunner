@@ -420,6 +420,40 @@ func TestDottedMapKeys(t *testing.T) {
 	}
 }
 
+// vm.registry_mirror goes into the guest's daemon.json as Docker Hub's
+// mirror, and proxy.listen's port is what microVMs and the forwarder use: both
+// are checked like the other addresses.
+func TestMirrorAndProxyPortFormat(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		mutate func(*Config)
+		ok     bool
+	}{
+		{"no mirror", func(c *Config) { c.VM.RegistryMirror = "" }, true},
+		{"install.sh mirror", func(c *Config) { c.VM.RegistryMirror = "http://10.200.0.1:5000" }, true},
+		{"https mirror with a slash", func(c *Config) { c.VM.RegistryMirror = "https://mirror.corp/" }, true},
+		{"mirror without a scheme", func(c *Config) { c.VM.RegistryMirror = "10.200.0.1:5000" }, false},
+		{"mirror with a path", func(c *Config) { c.VM.RegistryMirror = "http://10.200.0.1:5000/v2" }, false},
+		{"mirror with a quote", func(c *Config) { c.VM.RegistryMirror = `http://a"b:5000` }, false},
+		{"mirror with a newline", func(c *Config) { c.VM.RegistryMirror = "http://a:5000\nb" }, false},
+		{"proxy port 3128", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:3128" }, true},
+		{"proxy port 65535", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:65535" }, true},
+		{"proxy port a name", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:squid" }, false},
+		{"proxy port 0", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:0" }, false},
+		{"proxy port 65536", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:65536" }, false},
+		{"proxy port negative", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:-1" }, false},
+		{"proxy port with a sign", func(c *Config) { c.Proxy.Enabled, c.Proxy.Listen = true, "10.200.0.1:+3128" }, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := Default()
+			c.mutate(&cfg)
+			if err := cfg.Validate(); (err == nil) != c.ok {
+				t.Fatalf("Validate = %v, want ok=%v", err, c.ok)
+			}
+		})
+	}
+}
+
 // Only a file that parsed but holds bad values is a *ValidationError: callers
 // may fix those values, but must not write over a file they could not read.
 func TestLoadErrorKinds(t *testing.T) {

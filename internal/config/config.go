@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -315,6 +316,9 @@ func (c Config) Validate() error {
 	if _, _, err := net.ParseCIDR(c.VM.DockerAddressPool); err != nil {
 		errs = append(errs, "vm.docker_address_pool must be a CIDR like 10.202.0.0/16")
 	}
+	if c.VM.RegistryMirror != "" && !mirrorURL.MatchString(c.VM.RegistryMirror) {
+		errs = append(errs, fmt.Sprintf("vm.registry_mirror %q must be http://host:port or https://host[:port]", c.VM.RegistryMirror))
+	}
 	for host, mirror := range c.VM.RegistryMirrors {
 		if !mirrorHost.MatchString(host) || host == "docker.io" {
 			errs = append(errs, fmt.Sprintf("vm.registry_mirrors key %q must be a registry host[:port] other than docker.io (that is vm.registry_mirror)", host))
@@ -373,7 +377,7 @@ func (c Config) Validate() error {
 		errs = append(errs, "builder.cache_mb must be at least 1000")
 	}
 	if c.Proxy.Enabled {
-		if host, port, err := net.SplitHostPort(c.Proxy.Listen); err != nil || net.ParseIP(host).To4() == nil || port == "" {
+		if host, port, err := net.SplitHostPort(c.Proxy.Listen); err != nil || net.ParseIP(host).To4() == nil || !validPort(port) {
 			errs = append(errs, "proxy.listen must be the bridge address and a port, like 10.200.0.1:"+ProxyPort)
 		}
 		if c.Proxy.UpstreamFile == "" {
@@ -510,6 +514,16 @@ var (
 	// registryEntry: host[:port] or http://host[:port].
 	registryEntry = regexp.MustCompile(`^(http://)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`)
 )
+
+// validPort reports whether s is a TCP port, 1-65535, in plain digits:
+// strconv.Atoi alone would also take "+3128".
+func validPort(s string) bool {
+	if s == "" || len(s) > 5 || strings.Trim(s, "0123456789") != "" {
+		return false
+	}
+	n, err := strconv.Atoi(s)
+	return err == nil && n >= 1 && n <= 65535
+}
 
 // ParseNet reads a CIDR or a single IP address.
 func ParseNet(s string) (*net.IPNet, error) {
