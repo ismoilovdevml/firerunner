@@ -46,6 +46,10 @@ a `docker compose up` that builds a missing image without `--build` builds witho
 `--build`, or run `docker compose build` first, to use it. With buildx older than v0.32.0 in the VM
 image, a job that finds its builder starting still waits about 20 s before its script runs.
 
+FireRunner attaches the builder when the job's script calls `docker` to build. A job that builds
+only through `make`, a shell script or another tool can ask for the builder with
+`FIRERUNNER_BUILDER: "1"` in its `variables:`.
+
 A builder unused for a while is deleted, but its cache is kept on the host and comes back with the
 project's next builder.
 
@@ -79,7 +83,11 @@ integration:
 ```
 
 Each service runs as a container in your VM, reachable by its alias (the image name without the
-tag). FireRunner waits up to 30 s for its ports before your script starts.
+tag). FireRunner waits up to 30 s for its ports, all services at once, before your script starts.
+
+As in GitLab's Docker executor, a service gets the job's `variables:` too (a service's own
+`variables:` win). Variables from the project or group CI/CD settings, `secrets:`, file variables and
+runner-internal variables are not passed.
 
 ## Private registries
 
