@@ -266,7 +266,7 @@ func Prepare(ctx context.Context, cfg config.Config) error {
 		if err != nil {
 			return fail("services", fmt.Errorf("reading the job payload: %w", err))
 		}
-		jobVars, err := ServiceJobVariables(payload, os.LookupEnv)
+		jobVars, err := ServiceJobVariables(payload)
 		if err != nil {
 			return fail("services", err)
 		}
@@ -431,10 +431,6 @@ func flintlockErr(err error) error {
 // BuilderName is the buildx builder created in job VMs for the project's builder.
 const BuilderName = "firerunner"
 
-// useBuilder points the VM's buildx at the project's builder, ready or still
-// starting. Nothing waits here: jobs that never build (checks, deploys) start at
-// once, and the docker wrapper (BuilderScript) waits for a starting builder only
-// when the job actually builds.
 // buildWith gives a stage that builds images the project's builder (its
 // docker wrapper waits while the builder starts), unless prepare already
 // did, and reports the job's first build with the builder's state.
@@ -464,8 +460,11 @@ func buildWith(ctx context.Context, cfg config.Config, id string, st *vm.JobStat
 // each stage at most this.
 const eventWait = 500 * time.Millisecond
 
-// state is the builder's state (for the build event): ready or booting when
-// attached, else busy, disabled or none.
+// useBuilder points the VM's buildx at the project's builder, ready or still
+// starting. Nothing waits here: jobs that never build (checks, deploys) start at
+// once, and the docker wrapper (BuilderScript) waits for a starting builder only
+// when the job actually builds. state is the builder's state (for the build
+// event): ready or booting when attached, else busy, disabled or none.
 func useBuilder(ctx context.Context, cfg config.Config, dc *daemon.Client, inst *vm.Instance, project string, start bool) (state string, attached bool) {
 	info, err := dc.Builder(project, start)
 	switch {
@@ -493,14 +492,18 @@ func useBuilder(ctx context.Context, cfg config.Config, dc *daemon.Client, inst 
 	return info.State, true
 }
 
-var (
-	// dockerCall is where a docker command's arguments start in a script.
-	dockerCall = regexp.MustCompile(`\bdocker[ \t]+`)
-	// buildWord is a compose command line that builds: compose build, or
-	// up/run/create --build.
-	buildWord     = regexp.MustCompile(`\bbuild\b`)
-	composeBuilds = regexp.MustCompile(`\bdocker-compose\b[^\n]*\bbuild\b`)
-)
+// dockerCall is where the arguments of a docker or docker-compose command
+// start in a script.
+var dockerCall = regexp.MustCompile(`\bdocker(-compose)?[ \t]+`)
+
+// shellSeparator ends the shell command a docker call is in.
+var shellSeparator = regexp.MustCompile("[;&|()`\n]")
+
+// unescapeStage undoes what matters here of gitlab-runner's quoting: it hands
+// a stage over as one line, ( ...; eval $'cmd1\ncmd2\n' ), so every command
+// but the first follows a literal \n. Continued lines (a backslash before the
+// newline, quoted or not) are joined.
+var unescapeStage = strings.NewReplacer(`\\\n`, " ", "\\\n", " ", `\n`, "\n")
 
 // dockerValueOptions are docker's global options that take a value, which is
 // never the command; the same list as the docker wrapper's (BuilderScript).
@@ -509,21 +512,32 @@ var dockerValueOptions = map[string]bool{
 	"-l": true, "--log-level": true, "--tlscacert": true, "--tlscert": true, "--tlskey": true,
 }
 
+// composeValueOptions are compose's options that take a value, which is never
+// the command; the same list as the docker wrapper's (--workdir is hidden).
+var composeValueOptions = map[string]bool{
+	"-f": true, "--file": true, "-p": true, "--project-name": true, "--profile": true, "--env-file": true,
+	"--project-directory": true, "--workdir": true, "--ansi": true, "--progress": true, "--parallel": true,
+}
+
 // BuildsImages reports whether a stage script runs docker build, image build,
-// builder build, buildx build or bake, or compose build, also after docker's
-// global options (docker --debug build). Only such stages need the project's
-// builder; FIRERUNNER_BUILDER=1 asks for it for any other (see wantsBuilder).
+// builder build, buildx build or bake, compose build, or compose up, run or
+// create --build, also after docker's global options (docker --debug build):
+// what the docker wrapper in the VM sees as a build (BuilderScript's
+// fr_builds). Only such stages need the project's builder; FIRERUNNER_BUILDER=1
+// asks for it for any other (see wantsBuilder).
 func BuildsImages(script []byte) bool {
-	script = bytes.ReplaceAll(script, []byte("\\\n"), []byte(" ")) // continued lines
-	if composeBuilds.Match(script) {
-		return true
-	}
-	for _, loc := range dockerCall.FindAllIndex(script, -1) {
-		line := script[loc[1]:]
-		if i := bytes.IndexByte(line, '\n'); i >= 0 {
-			line = line[:i]
+	s := unescapeStage.Replace(string(script))
+	for _, m := range dockerCall.FindAllStringSubmatchIndex(s, -1) {
+		cmd := s[m[1]:]
+		if loc := shellSeparator.FindStringIndex(cmd); loc != nil {
+			cmd = cmd[:loc[0]]
 		}
-		if dockerBuilds(strings.Fields(string(line))) {
+		args := strings.Fields(cmd)
+		if m[2] >= 0 { // docker-compose
+			if composeBuilds(args) {
+				return true
+			}
+		} else if dockerBuilds(args) {
 			return true
 		}
 	}
@@ -538,12 +552,11 @@ func dockerBuilds(args []string) bool {
 		}
 		args = args[1:]
 	}
-	// A command word may end the shell command it is in: docker build;
 	word := func(i int) string {
 		if i >= len(args) {
 			return ""
 		}
-		return strings.TrimRight(args[i], ";&|)")
+		return args[i]
 	}
 	switch word(0) {
 	case "build":
@@ -553,9 +566,29 @@ func dockerBuilds(args []string) bool {
 	case "image", "builder":
 		return word(1) == "build"
 	case "compose":
-		return buildWord.MatchString(strings.Join(args[1:], " "))
+		return composeBuilds(args[1:])
 	}
 	return false
+}
+
+// composeBuilds reports whether compose's arguments args build images:
+// --build anywhere (up, run, create --build), or build as the command.
+func composeBuilds(args []string) bool {
+	cmd := ""
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; {
+		case a == "--build":
+			return true
+		case composeValueOptions[a]:
+			if cmd == "" {
+				i++ // its value
+			}
+		case strings.HasPrefix(a, "-"):
+		case cmd == "":
+			cmd = a
+		}
+	}
+	return cmd == "build"
 }
 
 // wantsBuilder reports whether the job asked for the project's builder in

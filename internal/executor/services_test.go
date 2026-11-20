@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -73,6 +74,65 @@ exit 124
 	}
 	if strings.Join(reports, "\n") != strings.Join(want, "\n") {
 		t.Errorf("reports:\n%s\nwant:\n%s\nfull output:\n%s", strings.Join(reports, "\n"), strings.Join(want, "\n"), out)
+	}
+}
+
+// An image that exposes a port range (EXPOSE 7000-7019) does not get one
+// check per port at once: at most maxPortChecks run together, and every port
+// is still checked and reported.
+func TestServicesScriptCapsConcurrentPortChecks(t *testing.T) {
+	const ports = maxPortChecks + 4
+	bin, checks := t.TempDir(), filepath.Join(t.TempDir(), "checks")
+	var exposed []string
+	for p := 7000; p < 7000+ports; p++ {
+		exposed = append(exposed, strconv.Itoa(p)+"/tcp")
+	}
+	fakes := map[string]string{
+		"docker": `#!/bin/bash
+case "$1" in
+ps) echo range ;;
+inspect)
+    case "$3" in
+    *IPAddress*) echo 10.0.0.2 ;;
+    *ExposedPorts*) echo "` + strings.Join(exposed, " ") + `" ;;
+    *Config.Image*) echo image-range ;;
+    esac ;;
+esac
+exit 0
+`,
+		"timeout": `#!/bin/bash
+echo start >>` + checks + `
+sleep 2
+echo end >>` + checks + `
+exit 124
+`,
+	}
+	for name, body := range fakes {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := exec.Command("bash", "-c", ServicesScript([]Service{{Name: "range:1"}}, ""))
+	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("script failed: %v\n%s", err, out)
+	}
+	log, _ := os.ReadFile(checks)
+	running, most := 0, 0
+	for _, e := range strings.Fields(string(log)) {
+		if e == "start" {
+			running++
+		} else {
+			running--
+		}
+		most = max(most, running)
+	}
+	if most > maxPortChecks || most < 2 {
+		t.Errorf("%d port checks ran at once, want 2 to %d", most, maxPortChecks)
+	}
+	if n := strings.Count(string(out), "did not open port"); n != ports {
+		t.Errorf("%d ports reported, want %d:\n%s", n, ports, out)
 	}
 }
 

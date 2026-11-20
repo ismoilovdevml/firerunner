@@ -87,7 +87,12 @@ tag). FireRunner waits up to 30 s for its ports, all services at once, before yo
 
 As in GitLab's Docker executor, a service gets the job's `variables:` too (a service's own
 `variables:` win). Variables from the project or group CI/CD settings, `secrets:`, file variables and
-runner-internal variables are not passed.
+runner-internal variables are not passed. A job variable that refers to another one is expanded
+only against the variables the service gets: `DATABASE_URL: postgres://$DB_HOST/app` works when
+`DB_HOST` is in `variables:`, while `NPM_TOKEN: $CI_JOB_TOKEN` or a reference to a CI/CD settings
+variable becomes empty in the service. GitLab's Docker executor passes such values expanded, secret
+included; FireRunner does not. To hand a service a secret on purpose, set it in the service's own
+`variables:`.
 
 ## Private registries
 
