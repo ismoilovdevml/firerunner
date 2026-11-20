@@ -869,15 +869,18 @@ type recordingUpstream struct {
 	seen []seenRequest
 }
 
-type seenRequest struct{ method, url, host, auth string }
+type seenRequest struct {
+	method, url, host, auth string
+	body                    int64 // bytes of body received
+}
 
 func startRecordingUpstream(t *testing.T) *recordingUpstream {
 	t.Helper()
 	u := &recordingUpstream{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
+		n, _ := io.Copy(io.Discard, r.Body)
 		u.mu.Lock()
-		u.seen = append(u.seen, seenRequest{r.Method, r.URL.String(), r.Host, r.Header.Get("Proxy-Authorization")})
+		u.seen = append(u.seen, seenRequest{r.Method, r.URL.String(), r.Host, r.Header.Get("Proxy-Authorization"), n})
 		u.mu.Unlock()
 		_, _ = io.WriteString(w, "answered")
 	}))
@@ -949,6 +952,88 @@ func TestForwardUsesOneUpstreamPerRequest(t *testing.T) {
 	defer mu.Unlock()
 	if calls != 4 {
 		t.Errorf("upstream read %d times for 4 requests, want once each", calls)
+	}
+}
+
+// An https:// upload in absolute form that takes longer than DialTimeout is
+// not cut: DialTimeout covers reaching the upstream, not sending the body.
+func TestPassThroughSlowUpload(t *testing.T) {
+	up := startRecordingUpstream(t)
+	f := &Forwarder{Upstream: func() (Upstream, error) { return Upstream{Addr: up.addr}, nil }, Allowed: AllowNets(),
+		Limits: Limits{HeaderWait: time.Minute}, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DialTimeout: 200 * time.Millisecond}
+	fwd := serveForwarder(t, f)
+	c, err := net.Dial("tcp", fwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	const size = 8
+	fmt.Fprintf(c, "POST https://example.com/upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", size)
+	for i := 0; i < size; i++ { // 800 ms of upload, four times DialTimeout
+		time.Sleep(100 * time.Millisecond)
+		if _, err := c.Write([]byte{'x'}); err != nil {
+			t.Fatalf("byte %d: %v", i, err)
+		}
+	}
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || string(body) != "answered" {
+		t.Fatalf("slow upload: %d %q, want 200 from the upstream", resp.StatusCode, body)
+	}
+	if seen := up.requests(); len(seen) != 1 || seen[0].body != size {
+		t.Fatalf("upstream saw %+v, want one request with %d bytes of body", seen, size)
+	}
+}
+
+// An upstream that takes no byte of an upload for HeaderWait is given up.
+func TestPassThroughUploadToStalledUpstream(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		<-done // never reads the request
+		c.Close()
+	}()
+	f := &Forwarder{Upstream: func() (Upstream, error) { return Upstream{Addr: l.Addr().String()}, nil }, Allowed: AllowNets(),
+		Limits: Limits{HeaderWait: 500 * time.Millisecond}, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DialTimeout: 2 * time.Second}
+	fwd := serveForwarder(t, f)
+	c, err := net.Dial("tcp", fwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	const size = 256 << 20 // far more than socket buffers hold
+	go func() {
+		fmt.Fprintf(c, "POST https://example.com/upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: %d\r\n\r\n", size)
+		buf := make([]byte, 64<<10)
+		for sent := 0; sent < size; sent += len(buf) {
+			if _, err := c.Write(buf); err != nil {
+				return // the forwarder gave up, or the test ended
+			}
+		}
+	}()
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatalf("no answer while the upstream stalls an upload: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("upload to a stalled upstream: %d, want 502", resp.StatusCode)
 	}
 }
 

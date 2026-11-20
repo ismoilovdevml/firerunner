@@ -664,6 +664,21 @@ func (r *idleReader) Close() error {
 	return r.ReadCloser.Close()
 }
 
+// idleWriter writes to conn with a deadline of idle (0: none) from each
+// write, so a long transfer that keeps moving is never cut and a stalled
+// peer is.
+type idleWriter struct {
+	conn net.Conn
+	idle time.Duration
+}
+
+func (w idleWriter) Write(p []byte) (int, error) {
+	if w.idle > 0 {
+		_ = w.conn.SetWriteDeadline(time.Now().Add(w.idle))
+	}
+	return w.conn.Write(p)
+}
+
 // passThrough sends an absolute-form request to the upstream as it came,
 // with the upstream's credentials, over a connection of its own. A stalled
 // upstream is given up after HeaderWait. The request's context is not used:
@@ -682,8 +697,11 @@ func (f *Forwarder) passThrough(w http.ResponseWriter, r *http.Request, up Upstr
 		out.Header.Set("Proxy-Authorization", up.Auth)
 	}
 	out.Close = true
-	_ = conn.SetDeadline(time.Now().Add(f.DialTimeout))
-	if err := out.WriteProxy(conn); err != nil {
+	// DialTimeout covered reaching the upstream. Sending the request, body
+	// included, may take as long as it keeps moving: an upstream that takes
+	// nothing for HeaderWait is given up, like one that answers nothing.
+	if err := out.WriteProxy(idleWriter{conn: conn, idle: f.Limits.HeaderWait}); err != nil {
+		f.Log.Warn("upstream proxy did not take the request", "upstream", up.Addr, "url", r.URL.Host, "err", err)
 		http.Error(w, "firerunner proxy: upstream proxy unreachable", http.StatusBadGateway)
 		return http.StatusBadGateway, 0
 	}
