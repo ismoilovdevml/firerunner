@@ -861,6 +861,84 @@ func TestPolicyStrict(t *testing.T) {
 	}
 }
 
+// The destination check (a DNS lookup of up to 3 s) runs inside the client's
+// connection budget: a job firing requests at names that never resolve gets
+// 503 for those beyond its share instead of holding a lookup for each.
+func TestPolicyCheckInsideConnectionLimit(t *testing.T) {
+	var mu sync.Mutex
+	inFlight, peak := 0, 0
+	unblock := make(chan struct{})
+	p := testPolicy()
+	p.Resolve = func(ctx context.Context, _ string) ([]net.IP, error) {
+		mu.Lock()
+		inFlight++
+		peak = max(peak, inFlight)
+		mu.Unlock()
+		select {
+		case <-unblock:
+		case <-ctx.Done():
+		}
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return nil, errors.New("no such host")
+	}
+	_, vms, _ := net.ParseCIDR("10.200.0.0/24")
+	f := &Forwarder{Upstream: func() (Upstream, error) { return Upstream{}, errors.New("none") }, Allowed: AllowNets(vms),
+		Policy: p, Limits: Limits{PerClient: 2, Total: 100}, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	serve := func(url string) int {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, url, nil)
+		r.RemoteAddr = "10.200.0.5:40000"
+		f.ServeHTTP(w, r)
+		return w.Code
+	}
+	const n = 10
+	codes := make(chan int, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes <- serve(fmt.Sprintf("http://never-%d.example/", i))
+		}()
+	}
+	// Those beyond the share are answered while two lookups still hang, well
+	// before the lookups' own 3 s timeout.
+	for i := 0; i < n-2; i++ {
+		select {
+		case code := <-codes:
+			if code != http.StatusServiceUnavailable {
+				t.Errorf("request beyond the client's share: %d, want 503", code)
+			}
+		case <-time.After(2 * time.Second):
+			close(unblock)
+			wg.Wait()
+			t.Fatalf("only %d of %d requests beyond the share answered while lookups hung; peak lookups %d", i, n-2, peak)
+		}
+	}
+	close(unblock)
+	wg.Wait()
+	close(codes)
+	for code := range codes {
+		if code != http.StatusBadGateway {
+			t.Errorf("request within the share: %d, want 502 (no upstream)", code)
+		}
+	}
+	if peak > 2 {
+		t.Errorf("%d lookups at once from one client, want at most its share of 2", peak)
+	}
+	// Every slot came back, refused destinations included.
+	if code := serve("http://127.0.0.1/"); code != http.StatusForbidden {
+		t.Errorf("refused destination: %d, want 403", code)
+	}
+	for i := 0; i < 2; i++ {
+		if !f.acquire("10.200.0.5", false) {
+			t.Fatalf("slot %d not released", i+1)
+		}
+	}
+}
+
 // A target is split like net.SplitHostPort does, so an IPv6 literal reaches
 // the policy without brackets, also when the URL leaves the port out.
 func TestTargetHostPort(t *testing.T) {

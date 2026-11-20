@@ -413,6 +413,15 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "firerunner proxy: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	// The slot is taken before the destination check: the check can wait
+	// seconds on DNS, and requests waiting on it count against the client's
+	// share like any other.
+	if !f.acquire(host, ip.IsLoopback()) {
+		f.Log.Warn("proxy request refused: too many connections", "client", host)
+		http.Error(w, "firerunner proxy: too many connections from this client", http.StatusServiceUnavailable)
+		return
+	}
+	defer f.release(host, ip.IsLoopback())
 	if f.Policy != nil {
 		if why := f.Policy.Check(r.Context(), dhost, dport, r.Method == http.MethodConnect); why != "" {
 			f.Log.Warn("proxy request refused", "client", host, "target", target, "reason", why)
@@ -420,12 +429,6 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if !f.acquire(host, ip.IsLoopback()) {
-		f.Log.Warn("proxy request refused: too many connections", "client", host)
-		http.Error(w, "firerunner proxy: too many connections from this client", http.StatusServiceUnavailable)
-		return
-	}
-	defer f.release(host, ip.IsLoopback())
 	up, err := f.Upstream()
 	if err != nil {
 		f.Log.Error("proxy request refused: no upstream", "err", err)
