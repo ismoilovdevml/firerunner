@@ -11,10 +11,9 @@ on:
     paths: [ 'docs/**', 'mkdocs.yml', '.github/workflows/docs.yml' ]
   workflow_dispatch:
 
+# Pull request builds get read-only scopes; only the deploy job can publish.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # Keyed per ref: a pull request's build never cancels a deployment of main.
 concurrency:
@@ -24,6 +23,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read # configure-pages reads the site settings
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,6 +54,9 @@ jobs:
     needs: build
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
