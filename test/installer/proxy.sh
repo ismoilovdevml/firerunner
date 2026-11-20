@@ -161,6 +161,11 @@ MIRROR_PORT=(); FR_REGISTRY_MIRRORS=ghcr.io,quay.io
 assign_mirror_ports
 expect "mirrors get ports from 5001" test "$(mirrors_json)" = '{"ghcr.io": "http://10.200.0.1:5001", "quay.io": "http://10.200.0.1:5002"}'
 expect "firewall opens the mirror ports" test "$(registry_ports)" = "5000, 5001, 5002"
+# ufw gets the same ports, the cache server's and, with a proxy, the forwarder's.
+tcp_ports() { ( PROXY_FILE=$1; bridge_tcp_ports | tr '\n' ' ' ); }
+echo http://proxy.corp:3128 > $WORK/with-proxy
+expect "ufw: mirror, cache and forwarder ports" test "$(tcp_ports $WORK/with-proxy)" = "5000 5001 5002 9000 3128 "
+expect "ufw: no forwarder port without a proxy" test "$(tcp_ports $WORK/no-proxy)" = "5000 5001 5002 9000 "
 MIRROR_PORT=(); FR_REGISTRY_MIRRORS=quay.io,mcr.microsoft.com
 assign_mirror_ports
 expect "a dropped registry's port is not given to another" test "$(mirrors_json)" = '{"mcr.microsoft.com": "http://10.200.0.1:5003", "quay.io": "http://10.200.0.1:5002"}'

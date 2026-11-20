@@ -12,7 +12,8 @@
 #   curl -sfL .../install.sh | sudo bash -s -- uninstall        # remove services (keeps data)
 #
 # Settings (environment variables):
-#   FR_DISK                 empty block device for the thin pool (default: auto-detect a blank disk)
+#   FR_DISK                 empty block device for the thin pool, wiped (default: the blank disk,
+#                           if there is exactly one; never a disk in use, see thinpool_disk)
 #   FR_BRIDGE               bridge for microVM taps          (default: br-fc)
 #   FR_SUBNET               /24 prefix for microVMs           (default: 10.200.0)
 #   FR_VM_DISK              root disk of every microVM, thin-provisioned (default: 40GB)
@@ -23,7 +24,8 @@
 #   FIRECRACKER_VERSION     (default: 1.17.0)
 #   FLINTLOCK_VERSION       (default: 0.15.2)
 #
-#   FR_VERSION              firerunner release to install (default: edge = latest main)
+#   FR_VERSION              firerunner release to install: edge (latest main), latest (newest
+#                           stable release) or a tag like v1.2.0 (default: edge)
 #   FR_ALLOW_UNSIGNED=1     install a release without a signature (published before releases were
 #                           signed); a signature that does not verify is never accepted
 #   FR_POOL_SIZE            pre-booted microVMs kept ready (default: FR_RUNNER_CONCURRENT, so a
@@ -42,6 +44,8 @@
 #                           (a private image) goes to the registry itself
 #   VERSITYGW_VERSION       S3 server for the runner's cache: (default: 1.8.0)
 #   FR_CACHE_DAYS           delete cache: archives not written for this many days (default: 14)
+#   FR_CACHE_MAX_GB         above this size the oldest cache: archives are deleted, checked hourly
+#                           (default: auto, a fifth of the file system the cache is on)
 #   GITLAB_RUNNER_VERSION   (default: 19.4.0)
 #
 # Corporate networks (all remembered for later re-runs):
@@ -74,6 +78,7 @@ FLINTLOCK_VERSION="${FLINTLOCK_VERSION:-0.15.2}"
 REGISTRY_VERSION="${REGISTRY_VERSION:-3.1.1}"
 VERSITYGW_VERSION="${VERSITYGW_VERSION:-1.8.0}"
 FR_CACHE_DAYS="${FR_CACHE_DAYS:-14}"
+FR_CACHE_MAX_GB="${FR_CACHE_MAX_GB:-auto}"
 GITLAB_RUNNER_VERSION="${GITLAB_RUNNER_VERSION:-19.4.0}"
 FR_VERSION="${FR_VERSION:-edge}"
 FR_BINARY="${FR_BINARY:-}"            # local firerunner binary instead of a release (development)
@@ -126,6 +131,7 @@ FLINTLOCK_TLS_RESET=0                       # flintlockd and firerunner restart 
 FLINTLOCK_TLS_DAEMON=0                      # firerunner's daemon restarts (it may hold the old setting)
 
 TMP_DIR=""
+BIN_TMP=""   # a binary being installed (install_binary), removed if the run ends first
 
 log()  { printf '[firerunner] %s\n' "$*"; }
 warn() { printf '[firerunner] WARNING: %s\n' "$*" >&2; }
@@ -137,6 +143,7 @@ cleanup() {
     # A run cut off while switching flintlockd to TLS puts it back first.
     [[ $FLINTLOCK_TLS_SWITCHING == 1 ]] && flintlock_tls_revert
     [[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+    [[ -n "$BIN_TMP" ]] && rm -f "$BIN_TMP"
     return 0
 }
 trap cleanup EXIT
@@ -194,6 +201,8 @@ default_vcpu() {
 # preflight_settings checks the FR_* settings that end up in firewall rules,
 # systemd units and the microVM config, before anything is changed.
 preflight_settings() {
+    [[ $FR_CACHE_DAYS =~ ^[0-9]{1,4}$ ]] || die "FR_CACHE_DAYS must be a whole number of days"
+    [[ $FR_CACHE_MAX_GB == auto || $FR_CACHE_MAX_GB =~ ^[1-9][0-9]{0,5}$ ]] || die "FR_CACHE_MAX_GB must be auto or a whole number of GB from 1"
     [[ $FR_THIN_CHUNK =~ ^(64|128|256|512|1024)[Kk]$ ]] || die "FR_THIN_CHUNK must be 64K, 128K, 256K, 512K or 1024K"
     [[ $FR_RUNNER_CONCURRENT =~ ^[1-9][0-9]{0,2}$ ]] || die "FR_RUNNER_CONCURRENT must be a whole number from 1"
     [[ -n $FR_POOL_SIZE_GIVEN ]] || ((FR_POOL_SIZE <= 32)) || FR_POOL_SIZE=32
@@ -506,6 +515,34 @@ verify() {
     [[ "$got" == "$2" ]] || die "checksum mismatch for $(basename "$1"): got $got, want $2"
 }
 
+# SHA256 of the default versions' downloads, by "<release tag>/<file>". Pinned
+# here, a file changed on the download host is refused even when its checksum
+# file was changed with it. Copied on 2026-11-20 from each release's own
+# checksum file (named below); the GitHub ones also match the digest GitHub
+# records for the asset (api.github.com .../releases/tags/<tag>, "digest").
+# Another version (CONTAINERD_VERSION=... etc.) has no pin and is checked
+# against its release's checksum file, from the same host as the file.
+declare -A PINNED_SHA256=(
+    # containerd-1.7.35-linux-amd64.tar.gz.sha256sum
+    [v1.7.35/containerd-1.7.35-linux-amd64.tar.gz]=5adff3dba002f0aa0eec823d2340b695f024736503043b9ebc5d0aa1ebbf8c49
+    # firecracker-v1.17.0-x86_64.tgz.sha256.txt
+    [v1.17.0/firecracker-v1.17.0-x86_64.tgz]=06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558
+    # flintlock checksums.txt
+    [v0.15.2/flintlockd_amd64]=d08a4bd8eef185d948dd35d2857c0a3bb8db35195f88d2aa437e1e8667b0a1a8
+    # registry_3.1.1_linux_amd64.tar.gz.sha256
+    [v3.1.1/registry_3.1.1_linux_amd64.tar.gz]=6f330a3ba9ea1d23a6ee189f449d792595240585bb2f159123d76ac594f70dd8
+    # versitygw checksums.txt
+    [v1.8.0/versitygw_v1.8.0_Linux_x86_64.tar.gz]=2ba2c734d10d2c4e651d03182cb4b246656bc735a2f282db7b0b73fba6073467
+    # gitlab-runner-downloads.s3.amazonaws.com/v19.4.0/release.sha256 (not on GitHub: no second source)
+    [v19.4.0/binaries/gitlab-runner-linux-amd64]=aeebda6435d006622f135e4b095450446e1077d8980227a44b53fc404fc22157
+)
+
+# pinned TAG/FILE: prints the pinned SHA256 of FILE, or fails when it has none.
+pinned() {
+    [[ -n ${PINNED_SHA256[$1]:-} ]] || { log "  no pinned checksum for $1: using the release's checksum file" >&2; return 1; }
+    echo "${PINNED_SHA256[$1]}"
+}
+
 # verify_release SUMS URL: SUMS (a firerunner release's checksums.txt) carries
 # the release signature, downloaded from URL. Only the releases published
 # before signing may lack one, and only with FR_ALLOW_UNSIGNED=1.
@@ -536,9 +573,50 @@ verify_release() {
 # an older signed release served in its place is not installed.
 release_matches() {
     case $FR_VERSION in
-        edge) [[ $1 == edge-* ]] ;;
-        *)    [[ $1 == "$FR_VERSION" ]] ;;
+        edge)   [[ $1 == edge-* ]] ;;
+        latest) [[ $1 == v* ]] ;;
+        *)      [[ $1 == "$FR_VERSION" ]] ;;
     esac
+}
+
+# release_base: where FR_VERSION's files are; latest is the newest stable
+# release, as for `firerunner upgrade --version latest` (internal/upgrade).
+release_base() {
+    if [[ $FR_VERSION == latest ]]; then
+        echo "https://github.com/${FR_REPO}/releases/latest/download"
+    else
+        echo "https://github.com/${FR_REPO}/releases/download/${FR_VERSION}"
+    fi
+}
+
+# release_runs FILE: the downloaded firerunner runs and is FR_VERSION.
+release_runs() {
+    local got
+    got=$("$1" version 2>/dev/null | awk '{print $2}' || true)
+    release_matches "$got" || die "firerunner ${FR_VERSION} contains firerunner ${got:-(does not run)}; not installing it"
+}
+
+# install_binary SRC DEST [CHECK]: DEST becomes a copy of SRC, mode 0755, in
+# one rename: never missing or half written, also not after a crash. The copy
+# is written next to DEST (the same file system; /tmp may be noexec), and
+# CHECK, given its path, may refuse it first. Recorded as changed if it differs.
+install_binary() {
+    local src=$1 dest=$2 check=${3:-}
+    BIN_TMP=$(mktemp "$(dirname "$dest")/.$(basename "$dest")-new.XXXXXX")
+    cp -- "$src" "$BIN_TMP"
+    chmod 0755 "$BIN_TMP"
+    [[ -z $check ]] || "$check" "$BIN_TMP"
+    if [[ -f $dest ]] && cmp -s "$BIN_TMP" "$dest"; then
+        rm -f "$BIN_TMP"
+        BIN_TMP=""
+        chmod 0755 "$dest"
+        return 0
+    fi
+    sync -- "$BIN_TMP" 2>/dev/null || sync
+    mv -f -- "$BIN_TMP" "$dest"
+    BIN_TMP=""
+    sync -- "$(dirname "$dest")" 2>/dev/null || true
+    installed "$dest"
 }
 
 # Files that changed in this run; a service restarts only if one of its
@@ -581,9 +659,13 @@ install_containerd() {
         log "installing containerd v${CONTAINERD_VERSION}"
         local base="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}"
         local tgz="containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz"
+        local want
         fetch "$base/$tgz" "$TMP_DIR/$tgz"
-        fetch "$base/$tgz.sha256sum" "$TMP_DIR/$tgz.sha256sum"
-        verify "$TMP_DIR/$tgz" "$(awk '{print $1}' "$TMP_DIR/$tgz.sha256sum")"
+        want=$(pinned "v${CONTAINERD_VERSION}/$tgz") || {
+            fetch "$base/$tgz.sha256sum" "$TMP_DIR/$tgz.sha256sum"
+            want=$(awk '{print $1}' "$TMP_DIR/$tgz.sha256sum")
+        }
+        verify "$TMP_DIR/$tgz" "$want"
         tar -xzf "$TMP_DIR/$tgz" -C /usr/local
         installed "$BIN_DIR/containerd"
     else
@@ -650,33 +732,114 @@ discard_blocks() {
     fi
 }
 
-# Prints the first whole disk that has no partitions, filesystem, LVM or mount.
-find_blank_disk() {
-    local name type
-    while read -r name type; do
-        [[ $type == disk ]] || continue
-        [[ $name == sr* || $name == loop* || $name == zram* ]] && continue
-        [[ $(lsblk -nro NAME "/dev/$name" | wc -l) -eq 1 ]] || continue   # has children
-        [[ -z $(blkid -p "/dev/$name" 2>/dev/null) ]] || continue           # has a signature
-        findmnt -rn -S "/dev/$name" >/dev/null && continue
-        echo "/dev/$name"
+DISK_MIN_GB=10   # a smaller disk is never taken for the thin pool on its own
+SWAPS_FILE=/proc/swaps
+
+# canonical DEV: the device node DEV is (a /dev/disk/by-id link, /dev/mapper name).
+canonical() { readlink -f -- "$1" 2>/dev/null || echo "$1"; }
+
+# disk_has_holders DEV: a device-mapper or md device sits on DEV.
+disk_has_holders() { compgen -G "/sys/class/block/$(basename "$(canonical "$1")")/holders/*" >/dev/null; }
+
+# disk_multipath_member DEV: DEV is one path of a multipath device, assembled or not.
+disk_multipath_member() {
+    if command -v multipath >/dev/null && multipath -c "$1" >/dev/null 2>&1; then
         return 0
-    done < <(lsblk -dnro NAME,TYPE)
+    fi
+    udevadm info --query=property --name="$1" 2>/dev/null | grep -qx 'DM_MULTIPATH_DEVICE_PATH=1'
+}
+
+# disk_head_zero DEV: the first MiB of DEV is zeros, as on a disk never written.
+# Data without a signature (raw, Ceph, LUKS with a detached header) is not.
+disk_head_zero() { cmp -s -n 1048576 "$1" /dev/zero; }
+
+# disk_in_use DEV: prints why DEV must not be wiped, if anything on it is in
+# use: mounted or swap (DEV or a partition, LV or mapping on it), an LVM
+# physical volume, held by device-mapper or md, or a multipath path.
+disk_in_use() {
+    local disk=$1 dev mnt pv swap
+    while read -r dev mnt; do
+        if [[ $mnt == "[SWAP]" ]]; then
+            echo "$dev is swap"
+            return 0
+        elif [[ -n $mnt ]]; then
+            echo "$dev is mounted on $mnt"
+            return 0
+        fi
+        while read -r swap; do
+            [[ -n $swap && $(canonical "$swap") == "$(canonical "$dev")" ]] && { echo "$dev is swap"; return 0; }
+        done < <(awk 'NR > 1 {print $1}' "$SWAPS_FILE" 2>/dev/null)
+        while read -r pv; do
+            [[ -n $pv && $(canonical "$pv") == "$(canonical "$dev")" ]] && { echo "$dev is an LVM physical volume"; return 0; }
+        done < <(pvs --noheadings -o pv_name 2>/dev/null)
+    done < <(lsblk -nrpo NAME,MOUNTPOINT "$disk" 2>/dev/null)
+    if [[ $(lsblk -nrpo NAME "$disk" 2>/dev/null | wc -l) -gt 1 ]]; then
+        echo "$disk has partitions or devices on it: $(lsblk -nrpo NAME "$disk" | tail -n +2 | paste -sd ' ' -)"
+        return 0
+    fi
+    if disk_has_holders "$disk"; then
+        echo "$disk is held by another device (/sys/class/block/$(basename "$(canonical "$disk")")/holders)"
+        return 0
+    fi
+    if disk_multipath_member "$disk"; then
+        echo "$disk is a path of a multipath device"
+        return 0
+    fi
     return 1
+}
+
+# blank_disks prints every whole disk that looks never used, one per line:
+# not removable or read-only, at least DISK_MIN_GB, nothing on it or in use
+# (disk_in_use), no signature blkid knows and a first MiB of zeros.
+blank_disks() {
+    local name type rm ro size dev
+    while read -r name type rm ro size; do
+        [[ $type == disk && $rm == 0 && $ro == 0 ]] || continue
+        [[ $name == sr* || $name == loop* || $name == zram* || $name == ram* || $name == nbd* ]] && continue
+        [[ $size =~ ^[0-9]+$ ]] && ((size >= DISK_MIN_GB * 1024 * 1024 * 1024)) || continue
+        dev=/dev/$name
+        disk_in_use "$dev" >/dev/null && continue
+        [[ -z $(blkid -p "$dev" 2>/dev/null) ]] || continue
+        disk_head_zero "$dev" || continue
+        echo "$dev"
+    done < <(lsblk -dnbro NAME,TYPE,RM,RO,SIZE)
+}
+
+# thinpool_disk sets FR_DISK, the disk the thin pool is made on, and checks
+# it is safe to wipe. Without FR_DISK only the one blank disk is taken: with
+# none or several, the operator chooses.
+thinpool_disk() {
+    if [[ -z $FR_DISK ]]; then
+        local disks
+        mapfile -t disks < <(blank_disks)
+        case ${#disks[@]} in
+            1)
+                FR_DISK=${disks[0]}
+                log "using blank disk $FR_DISK ($(lsblk -dno SIZE,MODEL "$FR_DISK" 2>/dev/null | tr -s ' ')) for the thin pool" ;;
+            0)
+                die "no blank disk found for the thin pool. A disk counts as blank when it is at least
+  ${DISK_MIN_GB} GB, has no partitions, signatures or holders, is not mounted, swap, an LVM or
+  multipath member, and its first MiB is zeros. Attach an empty disk (e.g. 100G+) and re-run,
+  or choose one with FR_DISK=/dev/sdX (it will be wiped)." ;;
+            *)
+                die "found ${#disks[@]} blank disks (${disks[*]}): choose the one to wipe for the
+  thin pool with FR_DISK=/dev/sdX" ;;
+        esac
+    fi
+    [[ -b $FR_DISK ]] || die "FR_DISK=$FR_DISK is not a block device"
+    local why
+    if why=$(disk_in_use "$FR_DISK"); then
+        die "FR_DISK=$FR_DISK is not wiped: $why. Choose another disk, or free this one first
+  (unmount, swapoff, vgremove/pvremove, wipefs -a)."
+    fi
+    return 0
 }
 
 setup_thinpool() {
     if lvs "$VG/thinpool" >/dev/null 2>&1; then
         log "thin pool $VG/thinpool already exists"
     else
-        if [[ -z $FR_DISK ]]; then
-            FR_DISK=$(find_blank_disk) || die "no blank disk found for the thin pool.
-  Attach an empty disk (e.g. 100G+) and re-run, or set FR_DISK=/dev/sdX (it will be wiped)."
-            log "using blank disk $FR_DISK for the thin pool"
-        fi
-        [[ -b $FR_DISK ]] || die "FR_DISK=$FR_DISK is not a block device"
-        findmnt -rn -S "$FR_DISK" >/dev/null && die "$FR_DISK is mounted"
-
+        thinpool_disk
         log "creating LVM thin pool on $FR_DISK"
         pvcreate -qy "$FR_DISK"
         vgcreate -q "$VG" "$FR_DISK"
@@ -721,9 +884,13 @@ install_firecracker() {
     log "installing firecracker v${FIRECRACKER_VERSION}"
     local base="https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}"
     local tgz="firecracker-v${FIRECRACKER_VERSION}-${FC_ARCH}.tgz"
+    local want
     fetch "$base/$tgz" "$TMP_DIR/$tgz"
-    fetch "$base/$tgz.sha256.txt" "$TMP_DIR/$tgz.sha256.txt"
-    verify "$TMP_DIR/$tgz" "$(awk '{print $1}' "$TMP_DIR/$tgz.sha256.txt")"
+    want=$(pinned "v${FIRECRACKER_VERSION}/$tgz") || {
+        fetch "$base/$tgz.sha256.txt" "$TMP_DIR/$tgz.sha256.txt"
+        want=$(awk '{print $1}' "$TMP_DIR/$tgz.sha256.txt")
+    }
+    verify "$TMP_DIR/$tgz" "$want"
     tar -xzf "$TMP_DIR/$tgz" -C "$TMP_DIR"
     local rel="$TMP_DIR/release-v${FIRECRACKER_VERSION}-${FC_ARCH}"
     install -m 0755 "$rel/firecracker-v${FIRECRACKER_VERSION}-${FC_ARCH}" "$BIN_DIR/firecracker"
@@ -980,9 +1147,28 @@ Requires=firerunner-net.service
 After=firerunner-net.service
 
 [Service]
-ExecStart=$(command -v dnsmasq) --keep-in-foreground --conf-file=${CONF_DIR}/dnsmasq.conf
+# No pid file: systemd tracks the process, and the default /run/dnsmasq.pid
+# belongs to the host's own dnsmasq, if any.
+ExecStart=$(command -v dnsmasq) --keep-in-foreground --pid-file --conf-file=${CONF_DIR}/dnsmasq.conf
 Restart=always
 RestartSec=5
+# Serves untrusted microVMs. It binds 53 and 67 on the bridge as root, then
+# runs as nobody and keeps NET_ADMIN for DHCP (and NET_RAW, SO_BINDTODEVICE on
+# older kernels); SETUID and SETGID drop root. Only the lease file is written.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/misc
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID
 
 [Install]
 WantedBy=multi-user.target
@@ -1000,7 +1186,25 @@ EOF
         ufw route allow in on "${FR_BRIDGE}" >/dev/null
         ufw allow in on "${FR_BRIDGE}" to any port 67 proto udp >/dev/null
         ufw allow in on "${FR_BRIDGE}" to any port 53 >/dev/null
+        # ufw's own input chain drops what its rules do not allow, whatever the
+        # firerunner table accepts: the registry mirrors, the cache server and
+        # the forwarder on the bridge address, the same ports net-up.sh opens.
+        local port
+        for port in $(bridge_tcp_ports); do
+            ufw allow in on "${FR_BRIDGE}" to "${FR_SUBNET}.1" port "$port" proto tcp >/dev/null
+        done
     fi
+}
+
+# bridge_tcp_ports: the TCP ports microVMs use on the bridge address besides
+# DNS: the registry mirrors, the cache server (9000) and, with a corporate
+# proxy, the forwarder (proxy.listen).
+bridge_tcp_ports() {
+    local host
+    echo 5000
+    for host in $(mirror_hosts); do echo "${MIRROR_PORT[$host]}"; done
+    echo 9000
+    if proxy_on; then echo "$PROXY_PORT"; fi
 }
 
 # --------------------------------------------------------------------------
@@ -1213,9 +1417,13 @@ install_flintlock() {
         log "installing flintlockd v${FLINTLOCK_VERSION}"
         local base="https://github.com/liquidmetal-dev/flintlock/releases/download/v${FLINTLOCK_VERSION}"
         local bin="flintlockd_${ARCH}"
+        local want
         fetch "$base/$bin" "$TMP_DIR/$bin"
-        fetch "$base/checksums.txt" "$TMP_DIR/checksums.txt"
-        verify "$TMP_DIR/$bin" "$(awk -v f="$bin" '$2==f {print $1}' "$TMP_DIR/checksums.txt")"
+        want=$(pinned "v${FLINTLOCK_VERSION}/$bin") || {
+            fetch "$base/checksums.txt" "$TMP_DIR/checksums.txt"
+            want=$(awk -v f="$bin" '$2==f {print $1}' "$TMP_DIR/checksums.txt")
+        }
+        verify "$TMP_DIR/$bin" "$want"
         install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/flintlockd"
         installed "$BIN_DIR/flintlockd"
     else
@@ -1324,9 +1532,13 @@ install_registry_mirror() {
         log "installing Docker Hub mirror (distribution v${REGISTRY_VERSION})"
         local base="https://github.com/distribution/distribution/releases/download/v${REGISTRY_VERSION}"
         local tgz="registry_${REGISTRY_VERSION}_linux_amd64.tar.gz"
+        local want
         fetch "$base/$tgz" "$TMP_DIR/$tgz"
-        fetch "$base/$tgz.sha256" "$TMP_DIR/$tgz.sha256"
-        verify "$TMP_DIR/$tgz" "$(awk '{print $1}' "$TMP_DIR/$tgz.sha256")"
+        want=$(pinned "v${REGISTRY_VERSION}/$tgz") || {
+            fetch "$base/$tgz.sha256" "$TMP_DIR/$tgz.sha256"
+            want=$(awk '{print $1}' "$TMP_DIR/$tgz.sha256")
+        }
+        verify "$TMP_DIR/$tgz" "$want"
         tar -xzf "$TMP_DIR/$tgz" -C "$TMP_DIR" registry
         install -m 0755 "$TMP_DIR/registry" "$BIN_DIR/registry"
         installed "$BIN_DIR/registry"
@@ -1396,13 +1608,65 @@ After=firerunner-net.service
 ExecStart=${LIB_DIR}/registries.sh
 Restart=always
 RestartSec=5
+# Serves untrusted microVMs: no capabilities (ports above 1024, its data is
+# root's own), only its data writable, no devices, kernel knobs or namespaces.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/firerunner/registry ${MIRROR_DATA_DIR}
+ProtectHome=yes
 PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target
+EOF
+}
+
+# cache_clean_script: the cache cleanup the timer runs (install_cache_server).
+cache_clean_script() {
+    cat <<'EOF'
+#!/bin/bash
+# cache-clean.sh DAYS MAX_GB: deletes cache: archives not written for DAYS
+# days, then the oldest ones until the cache takes at most MAX_GB (auto: a
+# fifth of the file system it is on), so jobs cannot fill the host's disk.
+set -euo pipefail
+export LC_ALL=C
+dir=${FR_CACHE_DIR:-/var/lib/firerunner/cache/runner-cache}
+days=$1 max_gb=$2
+[[ -d $dir ]] || exit 0
+find "$dir" -mindepth 1 -type f -mtime +"$days" -delete
+if [[ $max_gb == auto ]]; then
+    max_kb=$(( $(df -Pk "$dir" | awk 'NR == 2 {print $2}') / 5 ))
+else
+    max_kb=$(( max_gb * 1024 * 1024 ))
+fi
+# "mtime KiB path", oldest first; KiB is what the file takes on disk.
+mapfile -d '' files < <(find "$dir" -mindepth 1 -type f -printf '%T@ %k %p\0' | sort -z -n)
+total=0
+for f in "${files[@]}"; do
+    read -r _ kb _ <<<"$f"
+    total=$((total + kb))
+done
+deleted=0 freed=0
+for f in "${files[@]}"; do
+    ((total > max_kb)) || break
+    read -r _ kb _ <<<"$f"
+    rm -f -- "${f#* * }"
+    total=$((total - kb)) deleted=$((deleted + 1)) freed=$((freed + kb))
+done
+if ((deleted > 0)); then
+    echo "deleted the $deleted oldest cache archives ($((freed / 1024)) MiB) to stay under $((max_kb / 1024)) MiB"
+fi
+find "$dir" -mindepth 1 -type d -empty -delete
 EOF
 }
 
@@ -1415,9 +1679,13 @@ install_cache_server() {
         log "installing cache server (versitygw v${VERSITYGW_VERSION})"
         local base="https://github.com/versity/versitygw/releases/download/v${VERSITYGW_VERSION}"
         local dir="versitygw_v${VERSITYGW_VERSION}_Linux_x86_64"
+        local want
         fetch "$base/$dir.tar.gz" "$TMP_DIR/$dir.tar.gz"
-        fetch "$base/checksums.txt" "$TMP_DIR/versitygw.sums"
-        verify "$TMP_DIR/$dir.tar.gz" "$(awk -v f="$dir.tar.gz" '$2==f {print $1}' "$TMP_DIR/versitygw.sums")"
+        want=$(pinned "v${VERSITYGW_VERSION}/$dir.tar.gz") || {
+            fetch "$base/checksums.txt" "$TMP_DIR/versitygw.sums"
+            want=$(awk -v f="$dir.tar.gz" '$2==f {print $1}' "$TMP_DIR/versitygw.sums")
+        }
+        verify "$TMP_DIR/$dir.tar.gz" "$want"
         tar -xzf "$TMP_DIR/$dir.tar.gz" -C "$TMP_DIR" "$dir/versitygw"
         install -m 0755 "$TMP_DIR/$dir/versitygw" "$BIN_DIR/versitygw"
         installed "$BIN_DIR/versitygw"
@@ -1449,30 +1717,50 @@ EnvironmentFile=${CONF_DIR}/cache.env
 ExecStart=${BIN_DIR}/versitygw posix /var/lib/firerunner/cache
 Restart=always
 RestartSec=5
+# Serves untrusted microVMs: no capabilities (port 9000, the cache is root's
+# own), only the cache writable, no devices, kernel knobs or namespaces.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/firerunner/cache
+ProtectHome=yes
 PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target
 EOF
+    cache_clean_script | put "$LIB_DIR/cache-clean.sh" 0755
     put /etc/systemd/system/firerunner-cache-clean.service <<EOF
 [Unit]
-Description=Delete FireRunner cache: archives older than ${FR_CACHE_DAYS} days
+Description=Delete FireRunner cache: archives older than ${FR_CACHE_DAYS} days, then the oldest above the size cap
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/find /var/lib/firerunner/cache/runner-cache -mindepth 1 -type f -mtime +${FR_CACHE_DAYS} -delete
-ExecStart=/usr/bin/find /var/lib/firerunner/cache/runner-cache -mindepth 1 -type d -empty -delete
+ExecStart=${LIB_DIR}/cache-clean.sh ${FR_CACHE_DAYS} ${FR_CACHE_MAX_GB}
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/firerunner/cache
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
 EOF
+    # Hourly: a day of uploads above the size cap could fill the disk first.
     put /etc/systemd/system/firerunner-cache-clean.timer <<EOF
 [Unit]
-Description=Daily cleanup of the FireRunner cache
+Description=Hourly cleanup of the FireRunner cache
 
 [Timer]
-OnCalendar=daily
-RandomizedDelaySec=1h
+OnCalendar=hourly
+RandomizedDelaySec=10min
 Persistent=true
 
 [Install]
@@ -1534,22 +1822,17 @@ link_on_sudo_path() {
 install_firerunner() {
     if [[ -n $FR_BINARY ]]; then
         log "installing firerunner from $FR_BINARY"
-        put "$BIN_DIR/firerunner" 0755 <"$FR_BINARY"
+        install_binary "$FR_BINARY" "$BIN_DIR/firerunner"
     else
         log "installing firerunner ${FR_VERSION}"
-        local base="https://github.com/${FR_REPO}/releases/download/${FR_VERSION}"
-        local bin="firerunner-linux-${ARCH}"
+        local base bin="firerunner-linux-${ARCH}"
+        base=$(release_base)
         fetch "$base/$bin" "$TMP_DIR/$bin"
         fetch "$base/checksums.txt" "$TMP_DIR/fr.sums"
         verify_release "$TMP_DIR/fr.sums" "$base/checksums.txt.sig"
         verify "$TMP_DIR/$bin" "$(awk -v f="$bin" '$2==f {print $1}' "$TMP_DIR/fr.sums")"
-        # Run next to its destination: /tmp may be mounted noexec.
-        local got
-        install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/.firerunner-new"
-        got=$("$BIN_DIR/.firerunner-new" version 2>/dev/null | awk '{print $2}' || true)
-        rm -f "$BIN_DIR/.firerunner-new"
-        release_matches "$got" || die "firerunner ${FR_VERSION} contains firerunner ${got:-(does not run)}; not installing it"
-        put "$BIN_DIR/firerunner" 0755 <"$TMP_DIR/$bin"
+        # The binary that ran is the one renamed into place.
+        install_binary "$TMP_DIR/$bin" "$BIN_DIR/firerunner" release_runs
     fi
     log "  $($BIN_DIR/firerunner version)"
     link_on_sudo_path
@@ -1613,9 +1896,13 @@ EOF
         log "installing gitlab-runner v${GITLAB_RUNNER_VERSION}"
         local base="https://gitlab-runner-downloads.s3.amazonaws.com/v${GITLAB_RUNNER_VERSION}"
         local bin="gitlab-runner-linux-${ARCH}"
+        local want
         fetch "$base/binaries/$bin" "$TMP_DIR/$bin"
-        fetch "$base/release.sha256" "$TMP_DIR/runner.sums"
-        verify "$TMP_DIR/$bin" "$(awk -v f="binaries/$bin" '$2==f {print $1}' "$TMP_DIR/runner.sums")"
+        want=$(pinned "v${GITLAB_RUNNER_VERSION}/binaries/$bin") || {
+            fetch "$base/release.sha256" "$TMP_DIR/runner.sums"
+            want=$(awk -v f="binaries/$bin" '$2==f {print $1}' "$TMP_DIR/runner.sums")
+        }
+        verify "$TMP_DIR/$bin" "$want"
         systemctl stop gitlab-runner 2>/dev/null || true
         install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/gitlab-runner"
         systemctl start gitlab-runner 2>/dev/null || true
@@ -1680,6 +1967,10 @@ start_services() {
         fi
     done
     systemctl enable -q --now firerunner-cache-clean.timer
+    # A changed schedule applies from the timer's next start.
+    if changed /etc/systemd/system/firerunner-cache-clean.timer; then
+        systemctl restart firerunner-cache-clean.timer
+    fi
 }
 
 verify_install() {
