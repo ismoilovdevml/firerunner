@@ -1247,14 +1247,33 @@ EOF
         ufw route allow in on "${FR_BRIDGE}" >/dev/null
         ufw allow in on "${FR_BRIDGE}" to any port 67 proto udp >/dev/null
         ufw allow in on "${FR_BRIDGE}" to any port 53 >/dev/null
-        # ufw's own input chain drops what its rules do not allow, whatever the
-        # firerunner table accepts: the registry mirrors, the cache server and
-        # the forwarder on the bridge address, the same ports net-up.sh opens.
-        local port
-        for port in $(bridge_tcp_ports); do
-            ufw allow in on "${FR_BRIDGE}" to "${FR_SUBNET}.1" port "$port" proto tcp >/dev/null
-        done
+        ufw_bridge_ports
     fi
+}
+
+# ufw_bridge_ports: ufw's own input chain drops what its rules do not allow,
+# whatever the firerunner table accepts: allow the registry mirrors, the cache
+# server and the forwarder on the bridge address (the ports net-up.sh opens),
+# and delete the rules an earlier run added for ports no longer used (a
+# dropped mirror, the proxy turned off). UFW_PORTS_FILE lists the rules this
+# installer added, so no rule anyone else made is deleted.
+UFW_PORTS_FILE=$CONF_DIR/ufw-bridge-ports   # "bridge address port" per rule
+ufw_bridge_ports() {
+    local port bridge addr want=""
+    for port in $(bridge_tcp_ports); do
+        ufw allow in on "${FR_BRIDGE}" to "${FR_SUBNET}.1" port "$port" proto tcp >/dev/null
+        want+="${FR_BRIDGE} ${FR_SUBNET}.1 ${port}"$'\n'
+    done
+    if [[ -f $UFW_PORTS_FILE ]]; then
+        while read -r bridge addr port; do
+            [[ -n $port ]] || continue
+            grep -qxF "$bridge $addr $port" <<<"$want" && continue
+            log "  ufw: removing the rule for port $port on $bridge (no longer used)"
+            ufw delete allow in on "$bridge" to "$addr" port "$port" proto tcp >/dev/null ||
+                warn "could not delete the ufw rule for port $port on $bridge"
+        done <"$UFW_PORTS_FILE"
+    fi
+    printf '%s' "$want" | put "$UFW_PORTS_FILE" 0644
 }
 
 # bridge_tcp_ports: the TCP ports microVMs use on the bridge address besides

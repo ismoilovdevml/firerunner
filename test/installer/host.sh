@@ -180,6 +180,36 @@ expect "...and its copy is removed" test -z "$(compgen -G "$B/.firerunner-new.*"
 expect "latest: a newer release is installed" latest_installs v0.6.0
 expect "...in place of the old one" grep -q v0.6.0 "$B/firerunner"
 
+# ---- ufw: rules for the bridge ports follow the ports in use
+U=$WORK/ufw; mkdir -p "$U"
+CONF_DIR=$U UFW_PORTS_FILE=$U/ufw-bridge-ports PROXY_FILE=$U/proxy-upstream
+FR_BRIDGE=br-fc FR_SUBNET=10.200.0
+ufw() { echo "$*" >> "$U/ufw.log"; }
+# ufw_run MIRRORS [proxy]: one installer run's ufw rules, with these mirrors (host=port,...).
+ufw_run() {
+    MIRROR_PORT=(); local m; FR_REGISTRY_MIRRORS=""
+    for m in ${1//,/ }; do MIRROR_PORT[${m%=*}]=${m#*=}; FR_REGISTRY_MIRRORS+="${FR_REGISTRY_MIRRORS:+,}${m%=*}"; done
+    [[ -n $FR_REGISTRY_MIRRORS ]] || FR_REGISTRY_MIRRORS=none
+    if [[ ${2:-} == proxy ]]; then echo http://proxy.corp:3128 > "$PROXY_FILE"; else rm -f "$PROXY_FILE"; fi
+    : > "$U/ufw.log"
+    ufw_bridge_ports >/dev/null
+}
+deleted() { grep -qx "delete allow in on br-fc to 10.200.0.1 port $1 proto tcp" "$U/ufw.log"; }
+allowed() { grep -qx "allow in on br-fc to 10.200.0.1 port $1 proto tcp" "$U/ufw.log"; }
+ufw_run ghcr.io=5001,quay.io=5002 proxy
+expect "ufw: mirror, cache and forwarder ports allowed" bash -c "grep -c '^allow in on br-fc to 10.200.0.1 port' '$U/ufw.log' | grep -qx 5"
+expect "...and nothing deleted on a first run" ! grep -q '^delete' "$U/ufw.log"
+ufw_run quay.io=5002
+expect "ufw: a dropped mirror's port is deleted" deleted 5001
+expect "ufw: the forwarder's port is deleted once the proxy is off" deleted 3128
+kept() { ! grep -Eq "^delete .* port ($1) " "$U/ufw.log"; }
+expect "...the ports still used are kept" kept "5000|5002|9000"
+expect "...and allowed again" allowed 5002
+ufw_run quay.io=5002
+expect "ufw: a run with nothing changed deletes nothing" ! grep -q '^delete' "$U/ufw.log"
+echo "br-fc 10.200.0.1 5001" > "$UFW_PORTS_FILE"; ufw_run quay.io=5002
+expect "ufw: only rules in its own list are deleted" bash -c "test \"\$(grep -c '^delete' '$U/ufw.log')\" = 1"
+
 # ---- downloads: the default versions have a pinned checksum
 # The keys are built as the install steps build them: a default version
 # raised without its pin would fall back to the download host's checksum file.
