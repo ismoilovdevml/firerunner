@@ -172,5 +172,18 @@ expect "...nor recorded as changed" ! changed "$B/firerunner"
 FR_VERSION=v0.4.0 install_binary "$(fake_release v0.4.0)" "$B/firerunner" release_runs
 expect "a new binary is recorded as changed (the daemon restarts)" changed "$B/firerunner"
 
+# ---- downloads: the default versions have a pinned checksum
+# The keys are built as the install steps build them: a default version
+# raised without its pin would fall back to the download host's checksum file.
+pin_ok() { [[ $(pinned "$1" 2>/dev/null) =~ ^[0-9a-f]{64}$ ]]; }
+expect "containerd ${CONTAINERD_VERSION} pinned"       pin_ok "v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz"
+expect "firecracker ${FIRECRACKER_VERSION} pinned"     pin_ok "v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz"
+expect "flintlockd ${FLINTLOCK_VERSION} pinned"        pin_ok "v${FLINTLOCK_VERSION}/flintlockd_amd64"
+expect "registry ${REGISTRY_VERSION} pinned"           pin_ok "v${REGISTRY_VERSION}/registry_${REGISTRY_VERSION}_linux_amd64.tar.gz"
+expect "versitygw ${VERSITYGW_VERSION} pinned"         pin_ok "v${VERSITYGW_VERSION}/versitygw_v${VERSITYGW_VERSION}_Linux_x86_64.tar.gz"
+expect "gitlab-runner ${GITLAB_RUNNER_VERSION} pinned" pin_ok "v${GITLAB_RUNNER_VERSION}/binaries/gitlab-runner-linux-amd64"
+expect "another version has no pin" ! pin_ok "v9.9.9/flintlockd_amd64"
+expect "...and says so" grep -q "no pinned checksum for v9.9.9/flintlockd_amd64" <<<"$(pinned v9.9.9/flintlockd_amd64 2>&1)"
+
 echo "RESULT pass=$pass fail=$fail"
 [[ $fail -eq 0 ]]

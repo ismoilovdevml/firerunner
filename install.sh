@@ -515,6 +515,34 @@ verify() {
     [[ "$got" == "$2" ]] || die "checksum mismatch for $(basename "$1"): got $got, want $2"
 }
 
+# SHA256 of the default versions' downloads, by "<release tag>/<file>". Pinned
+# here, a file changed on the download host is refused even when its checksum
+# file was changed with it. Copied on 2026-11-20 from each release's own
+# checksum file (named below); the GitHub ones also match the digest GitHub
+# records for the asset (api.github.com .../releases/tags/<tag>, "digest").
+# Another version (CONTAINERD_VERSION=... etc.) has no pin and is checked
+# against its release's checksum file, from the same host as the file.
+declare -A PINNED_SHA256=(
+    # containerd-1.7.35-linux-amd64.tar.gz.sha256sum
+    [v1.7.35/containerd-1.7.35-linux-amd64.tar.gz]=5adff3dba002f0aa0eec823d2340b695f024736503043b9ebc5d0aa1ebbf8c49
+    # firecracker-v1.17.0-x86_64.tgz.sha256.txt
+    [v1.17.0/firecracker-v1.17.0-x86_64.tgz]=06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558
+    # flintlock checksums.txt
+    [v0.15.2/flintlockd_amd64]=d08a4bd8eef185d948dd35d2857c0a3bb8db35195f88d2aa437e1e8667b0a1a8
+    # registry_3.1.1_linux_amd64.tar.gz.sha256
+    [v3.1.1/registry_3.1.1_linux_amd64.tar.gz]=6f330a3ba9ea1d23a6ee189f449d792595240585bb2f159123d76ac594f70dd8
+    # versitygw checksums.txt
+    [v1.8.0/versitygw_v1.8.0_Linux_x86_64.tar.gz]=2ba2c734d10d2c4e651d03182cb4b246656bc735a2f282db7b0b73fba6073467
+    # gitlab-runner-downloads.s3.amazonaws.com/v19.4.0/release.sha256 (not on GitHub: no second source)
+    [v19.4.0/binaries/gitlab-runner-linux-amd64]=aeebda6435d006622f135e4b095450446e1077d8980227a44b53fc404fc22157
+)
+
+# pinned TAG/FILE: prints the pinned SHA256 of FILE, or fails when it has none.
+pinned() {
+    [[ -n ${PINNED_SHA256[$1]:-} ]] || { log "  no pinned checksum for $1: using the release's checksum file" >&2; return 1; }
+    echo "${PINNED_SHA256[$1]}"
+}
+
 # verify_release SUMS URL: SUMS (a firerunner release's checksums.txt) carries
 # the release signature, downloaded from URL. Only the releases published
 # before signing may lack one, and only with FR_ALLOW_UNSIGNED=1.
@@ -631,9 +659,13 @@ install_containerd() {
         log "installing containerd v${CONTAINERD_VERSION}"
         local base="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}"
         local tgz="containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz"
+        local want
         fetch "$base/$tgz" "$TMP_DIR/$tgz"
-        fetch "$base/$tgz.sha256sum" "$TMP_DIR/$tgz.sha256sum"
-        verify "$TMP_DIR/$tgz" "$(awk '{print $1}' "$TMP_DIR/$tgz.sha256sum")"
+        want=$(pinned "v${CONTAINERD_VERSION}/$tgz") || {
+            fetch "$base/$tgz.sha256sum" "$TMP_DIR/$tgz.sha256sum"
+            want=$(awk '{print $1}' "$TMP_DIR/$tgz.sha256sum")
+        }
+        verify "$TMP_DIR/$tgz" "$want"
         tar -xzf "$TMP_DIR/$tgz" -C /usr/local
         installed "$BIN_DIR/containerd"
     else
@@ -852,9 +884,13 @@ install_firecracker() {
     log "installing firecracker v${FIRECRACKER_VERSION}"
     local base="https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}"
     local tgz="firecracker-v${FIRECRACKER_VERSION}-${FC_ARCH}.tgz"
+    local want
     fetch "$base/$tgz" "$TMP_DIR/$tgz"
-    fetch "$base/$tgz.sha256.txt" "$TMP_DIR/$tgz.sha256.txt"
-    verify "$TMP_DIR/$tgz" "$(awk '{print $1}' "$TMP_DIR/$tgz.sha256.txt")"
+    want=$(pinned "v${FIRECRACKER_VERSION}/$tgz") || {
+        fetch "$base/$tgz.sha256.txt" "$TMP_DIR/$tgz.sha256.txt"
+        want=$(awk '{print $1}' "$TMP_DIR/$tgz.sha256.txt")
+    }
+    verify "$TMP_DIR/$tgz" "$want"
     tar -xzf "$TMP_DIR/$tgz" -C "$TMP_DIR"
     local rel="$TMP_DIR/release-v${FIRECRACKER_VERSION}-${FC_ARCH}"
     install -m 0755 "$rel/firecracker-v${FIRECRACKER_VERSION}-${FC_ARCH}" "$BIN_DIR/firecracker"
@@ -1381,9 +1417,13 @@ install_flintlock() {
         log "installing flintlockd v${FLINTLOCK_VERSION}"
         local base="https://github.com/liquidmetal-dev/flintlock/releases/download/v${FLINTLOCK_VERSION}"
         local bin="flintlockd_${ARCH}"
+        local want
         fetch "$base/$bin" "$TMP_DIR/$bin"
-        fetch "$base/checksums.txt" "$TMP_DIR/checksums.txt"
-        verify "$TMP_DIR/$bin" "$(awk -v f="$bin" '$2==f {print $1}' "$TMP_DIR/checksums.txt")"
+        want=$(pinned "v${FLINTLOCK_VERSION}/$bin") || {
+            fetch "$base/checksums.txt" "$TMP_DIR/checksums.txt"
+            want=$(awk -v f="$bin" '$2==f {print $1}' "$TMP_DIR/checksums.txt")
+        }
+        verify "$TMP_DIR/$bin" "$want"
         install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/flintlockd"
         installed "$BIN_DIR/flintlockd"
     else
@@ -1492,9 +1532,13 @@ install_registry_mirror() {
         log "installing Docker Hub mirror (distribution v${REGISTRY_VERSION})"
         local base="https://github.com/distribution/distribution/releases/download/v${REGISTRY_VERSION}"
         local tgz="registry_${REGISTRY_VERSION}_linux_amd64.tar.gz"
+        local want
         fetch "$base/$tgz" "$TMP_DIR/$tgz"
-        fetch "$base/$tgz.sha256" "$TMP_DIR/$tgz.sha256"
-        verify "$TMP_DIR/$tgz" "$(awk '{print $1}' "$TMP_DIR/$tgz.sha256")"
+        want=$(pinned "v${REGISTRY_VERSION}/$tgz") || {
+            fetch "$base/$tgz.sha256" "$TMP_DIR/$tgz.sha256"
+            want=$(awk '{print $1}' "$TMP_DIR/$tgz.sha256")
+        }
+        verify "$TMP_DIR/$tgz" "$want"
         tar -xzf "$TMP_DIR/$tgz" -C "$TMP_DIR" registry
         install -m 0755 "$TMP_DIR/registry" "$BIN_DIR/registry"
         installed "$BIN_DIR/registry"
@@ -1635,9 +1679,13 @@ install_cache_server() {
         log "installing cache server (versitygw v${VERSITYGW_VERSION})"
         local base="https://github.com/versity/versitygw/releases/download/v${VERSITYGW_VERSION}"
         local dir="versitygw_v${VERSITYGW_VERSION}_Linux_x86_64"
+        local want
         fetch "$base/$dir.tar.gz" "$TMP_DIR/$dir.tar.gz"
-        fetch "$base/checksums.txt" "$TMP_DIR/versitygw.sums"
-        verify "$TMP_DIR/$dir.tar.gz" "$(awk -v f="$dir.tar.gz" '$2==f {print $1}' "$TMP_DIR/versitygw.sums")"
+        want=$(pinned "v${VERSITYGW_VERSION}/$dir.tar.gz") || {
+            fetch "$base/checksums.txt" "$TMP_DIR/versitygw.sums"
+            want=$(awk -v f="$dir.tar.gz" '$2==f {print $1}' "$TMP_DIR/versitygw.sums")
+        }
+        verify "$TMP_DIR/$dir.tar.gz" "$want"
         tar -xzf "$TMP_DIR/$dir.tar.gz" -C "$TMP_DIR" "$dir/versitygw"
         install -m 0755 "$TMP_DIR/$dir/versitygw" "$BIN_DIR/versitygw"
         installed "$BIN_DIR/versitygw"
@@ -1848,9 +1896,13 @@ EOF
         log "installing gitlab-runner v${GITLAB_RUNNER_VERSION}"
         local base="https://gitlab-runner-downloads.s3.amazonaws.com/v${GITLAB_RUNNER_VERSION}"
         local bin="gitlab-runner-linux-${ARCH}"
+        local want
         fetch "$base/binaries/$bin" "$TMP_DIR/$bin"
-        fetch "$base/release.sha256" "$TMP_DIR/runner.sums"
-        verify "$TMP_DIR/$bin" "$(awk -v f="binaries/$bin" '$2==f {print $1}' "$TMP_DIR/runner.sums")"
+        want=$(pinned "v${GITLAB_RUNNER_VERSION}/binaries/$bin") || {
+            fetch "$base/release.sha256" "$TMP_DIR/runner.sums"
+            want=$(awk -v f="binaries/$bin" '$2==f {print $1}' "$TMP_DIR/runner.sums")
+        }
+        verify "$TMP_DIR/$bin" "$want"
         systemctl stop gitlab-runner 2>/dev/null || true
         install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/gitlab-runner"
         systemctl start gitlab-runner 2>/dev/null || true
