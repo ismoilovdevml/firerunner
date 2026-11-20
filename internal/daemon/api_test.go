@@ -101,6 +101,34 @@ func TestUndeliveredClaimOfAPreloadingVMIsDeleted(t *testing.T) {
 	}
 }
 
+// refreshingWriter is a response writer whose client is gone, and while the
+// answer is written a pool refresh (POST /pool/refresh) runs.
+type refreshingWriter struct {
+	failingWriter
+	d *Daemon
+}
+
+func (w *refreshingWriter) Write([]byte) (int, error) {
+	w.d.drain(context.Background(), "refresh")
+	return 0, errors.New("broken pipe")
+}
+
+// A ready VM claimed before a pool refresh, whose claim is then not
+// delivered, may run the old rootfs image: it is deleted, not put back at
+// the head of the refreshed pool for the next job.
+func TestUndeliveredClaimFromBeforeARefreshIsDeleted(t *testing.T) {
+	d, srv := newTestDaemon(t)
+	d.ready = []*pooled{pooledVM("old", fingerprint(d.cfg), 0)}
+	req := httptest.NewRequest(http.MethodPost, "/claim?job=job-123", nil)
+	d.apiHandler().ServeHTTP(&refreshingWriter{failingWriter{header: http.Header{}}, d}, req)
+	srv.WaitDeleted(t, "old", 2*time.Second)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.ready) != 0 || len(d.claimed) != 0 {
+		t.Fatalf("claim undelivered across a refresh: %d ready, %d claimed; want the old VM in neither", len(d.ready), len(d.claimed))
+	}
+}
+
 // The claim log line names the job by its GitLab id, like the job events.
 func TestClaimLogsTheBareJobID(t *testing.T) {
 	d, _ := newTestDaemon(t)

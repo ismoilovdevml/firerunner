@@ -71,6 +71,9 @@ type pooled struct {
 	// preloadCut: claimed while it preloaded, and its preload stopped for
 	// the job. Such a VM is never put back in the pool (unclaim).
 	preloadCut bool
+	// gen is Daemon.poolGen when its boot started (adopted: when adoption
+	// started). After a refresh it is never put back in the pool (unclaim).
+	gen int
 }
 
 // preloadingVM is a pool VM that has booted and is still pulling
@@ -161,6 +164,7 @@ func (d *Daemon) adoptPool(vms []*types.MicroVM) {
 	d.mu.Lock()
 	d.poolAdopted = true // read: saving may replace it now
 	cfg, fp := d.cfg, fingerprint(d.cfg)
+	gen := d.poolGen // a refresh while adopting: the VMs are from before it
 	d.mu.Unlock()
 	var recs []poolRecord
 	if readErr != nil || json.Unmarshal(data, &recs) != nil {
@@ -186,8 +190,14 @@ func (d *Daemon) adoptPool(vms []*types.MicroVM) {
 			continue
 		}
 		d.mu.Lock()
-		d.ready = append(d.ready, &pooled{inst: &inst, bornAt: r.BornAt, specID: r.SpecID})
+		refreshed := d.poolGen != gen
+		if !refreshed {
+			d.ready = append(d.ready, &pooled{inst: &inst, bornAt: r.BornAt, specID: r.SpecID, gen: gen})
+		}
 		d.mu.Unlock()
+		if refreshed {
+			continue // left for reconcile, like any VM not adopted
+		}
 		d.log.Info("adopted pool VM from previous run", "vm", inst.ID)
 	}
 	d.mu.Lock()
@@ -528,7 +538,7 @@ func (d *Daemon) claim() *pooled {
 		d.metrics.claims.WithLabelValues("hit").Inc()
 		d.log.Info("pool VM claimed before its preload finished", "vm", p.inst.ID)
 		d.wakeRefill()
-		return &pooled{inst: p.inst, bornAt: time.Now(), specID: p.specID, preloadCut: true}
+		return &pooled{inst: p.inst, bornAt: time.Now(), specID: p.specID, preloadCut: true, gen: p.gen}
 	}
 	d.metrics.claims.WithLabelValues("miss").Inc()
 	return nil
@@ -546,12 +556,14 @@ func (d *Daemon) wakeRefill() {
 // unclaim ends the claim of a VM the job never received and puts it back at
 // the head of the pool (the next job gets it). A VM claimed mid-preload is
 // deleted instead, and refill replaces it: its pulls were stopped part way
-// (bootOne may still be stopping them), so it is not a ready pool VM. It
-// reports whether the VM went back to the pool.
+// (bootOne may still be stopping them), so it is not a ready pool VM. So is
+// a VM from before a pool refresh that came while the claim was answered: it
+// may run the old image. It reports whether the VM went back to the pool.
 func (d *Daemon) unclaim(p *pooled) bool {
 	d.mu.Lock()
 	delete(d.claimed, p.inst.UID)
-	if !p.preloadCut {
+	refreshed := p.gen != d.poolGen
+	if !p.preloadCut && !refreshed {
 		d.ready = append([]*pooled{p}, d.ready...)
 		d.metrics.poolReady.Set(float64(len(d.ready)))
 		d.savePoolLocked()
@@ -559,8 +571,12 @@ func (d *Daemon) unclaim(p *pooled) bool {
 		return true
 	}
 	d.mu.Unlock()
+	reason := "claim not delivered during its preload"
+	if refreshed {
+		reason = "claim not delivered across a pool refresh"
+	}
 	// Its memory comes free once the delete is through: refill again then.
-	d.deleteInBackground(context.Background(), p.inst, "claim not delivered during its preload", d.wakeRefill)
+	d.deleteInBackground(context.Background(), p.inst, reason, d.wakeRefill)
 	return false
 }
 
@@ -692,7 +708,7 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config, id string) {
 		d.spawn(func() { d.delete(context.Background(), inst, "refresh") })
 		d.wakeRefill()
 	default:
-		d.ready = append(d.ready, &pooled{inst: inst, bornAt: time.Now(), specID: fingerprint(cfg)})
+		d.ready = append(d.ready, &pooled{inst: inst, bornAt: time.Now(), specID: fingerprint(cfg), gen: gen})
 		d.metrics.poolReady.Set(float64(len(d.ready)))
 		d.savePoolLocked()
 		d.log.Info("pool VM ready", "vm", id, "ip", inst.IP, "took", time.Since(start).Round(100*time.Millisecond).String())
