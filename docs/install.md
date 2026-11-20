@@ -5,10 +5,10 @@
 - x86_64 Linux with systemd and `/dev/kvm`. Tested on Rocky Linux 9.6 and Ubuntu 24.04.
 - A blank disk for microVM disks, 100 GB or more. The installer wipes it.
 - RAM for every microVM that runs at once, plus 1 GB for the host. With the defaults, 4 parallel
-  jobs and 2 pool VMs at 2 GB and up to 4 builders at 8 GB (`builder.max` × `builder.memory_mb`),
-  that is `((4 + 2) × 2 GB + 4 × 8 GB) × 1.05 + 1 GB`, about 47 GB. On a smaller host, lower
-  `builder.max` or `builder.memory_mb`; see [Sizing a host](configuration.md#sizing-a-host).
-  Jobs that do not fit wait for memory.
+  jobs and 4 pool VMs (`FR_POOL_SIZE`) at 2 GB and up to 4 builders at 8 GB (`builder.max` ×
+  `builder.memory_mb`), that is `((4 + 4) × 2 GB + 4 × 8 GB) × 1.05 + 1 GB`, about 51 GB. On a
+  smaller host, lower `FR_POOL_SIZE`, `builder.max` or `builder.memory_mb`; see
+  [Sizing a host](configuration.md#sizing-a-host). Jobs that do not fit wait for memory.
 - Space on the host file system (not the blank disk) for saved builder caches in
   `/var/lib/firerunner/builder-cache`: up to `builder.saved_cache_gb` (100 GB), and never so much
   that the file system has less than 10% free.
