@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -570,8 +571,8 @@ func cmdRunner(args []string) error {
 		if len(args) != 2 {
 			return errors.New("usage: firerunner runner concurrent <n>")
 		}
-		var n int
-		if _, err := fmt.Sscan(args[1], &n); err != nil {
+		n, err := parseConcurrent(args[1])
+		if err != nil {
 			return err
 		}
 		if err := host.SetConcurrent(n); err != nil {
@@ -583,6 +584,16 @@ func cmdRunner(args []string) error {
 		return host.UnregisterRunner()
 	}
 	return errors.New("usage: firerunner runner register|status|concurrent|cache|unregister")
+}
+
+// parseConcurrent reads the whole argument as a positive number: fmt.Sscan
+// stopped at the first non-digit and took "4abc" as 4.
+func parseConcurrent(s string) (int, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 || strings.Trim(s, "0123456789") != "" {
+		return 0, fmt.Errorf("concurrent %q is not a number of jobs (1 or more)", s)
+	}
+	return n, nil
 }
 
 // tokenEnv carries the runner token to `runner register` (install.sh passes

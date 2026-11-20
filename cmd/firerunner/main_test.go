@@ -255,6 +255,22 @@ func TestConfigSetOnABrokenFile(t *testing.T) {
 	}
 }
 
+// The whole argument is the number: "4abc" is a typo, not 4.
+func TestParseConcurrent(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want int // 0: an error
+	}{
+		{"4", 4}, {"64", 64},
+		{"4abc", 0}, {"4 5", 0}, {"4.5", 0}, {"", 0}, {"abc", 0}, {"0", 0}, {"-2", 0}, {" 4", 0},
+	} {
+		n, err := parseConcurrent(c.in)
+		if (c.want == 0) != (err != nil) || (err == nil && n != c.want) {
+			t.Errorf("parseConcurrent(%q) = %d, %v; want %d", c.in, n, err, c.want)
+		}
+	}
+}
+
 // config set says what the change needs, from what reads the key: jobs and
 // the daemon's reload see most keys, but some are read once at a service's
 // start, and the firewall has its own copy of the egress list.
