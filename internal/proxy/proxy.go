@@ -464,9 +464,15 @@ func targetHostPort(target string, connect bool, scheme string) (string, int, er
 		if connect {
 			return "", 0, errors.New("CONNECT needs host:port")
 		}
-		host, port = target, "80"
+		// A URL without a port: the default one is added and the result split
+		// again, so [2001:db8::1] loses its brackets like [2001:db8::1]:80 does,
+		// and what is not host or host:port (2001:db8::1, a:b:c) is refused.
+		port = "80"
 		if scheme == "https" {
 			port = "443"
+		}
+		if host, port, err = net.SplitHostPort(target + ":" + port); err != nil {
+			return "", 0, errors.New("bad host")
 		}
 	}
 	p, err := strconv.Atoi(port)

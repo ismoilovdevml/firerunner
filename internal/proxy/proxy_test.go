@@ -860,3 +860,72 @@ func TestPolicyStrict(t *testing.T) {
 		t.Fatalf("strict policy refused an IP address: %s", why)
 	}
 }
+
+// A target is split like net.SplitHostPort does, so an IPv6 literal reaches
+// the policy without brackets, also when the URL leaves the port out.
+func TestTargetHostPort(t *testing.T) {
+	for _, tc := range []struct {
+		target  string
+		connect bool
+		scheme  string
+		host    string
+		port    int
+		bad     bool
+	}{
+		{target: "example.com:443", connect: true, host: "example.com", port: 443},
+		{target: "140.82.121.4:443", connect: true, host: "140.82.121.4", port: 443},
+		{target: "[2606:4700::1111]:443", connect: true, host: "2606:4700::1111", port: 443},
+		{target: "example.com", connect: true, bad: true},
+		{target: "[2606:4700::1111]", connect: true, bad: true},
+		{target: "example.com", scheme: "http", host: "example.com", port: 80},
+		{target: "example.com", scheme: "https", host: "example.com", port: 443},
+		{target: "example.com:8080", scheme: "http", host: "example.com", port: 8080},
+		{target: "140.82.121.4", scheme: "http", host: "140.82.121.4", port: 80},
+		{target: "140.82.121.4:8443", scheme: "https", host: "140.82.121.4", port: 8443},
+		{target: "[2606:4700::1111]", scheme: "http", host: "2606:4700::1111", port: 80},
+		{target: "[2606:4700::1111]", scheme: "https", host: "2606:4700::1111", port: 443},
+		{target: "[2606:4700::1111]:8080", scheme: "http", host: "2606:4700::1111", port: 8080},
+		{target: "2606:4700::1111", scheme: "http", bad: true}, // IPv6 without brackets
+		{target: "[2606:4700::1111", scheme: "http", bad: true},
+		{target: "a:b:c", scheme: "http", bad: true},
+		{target: "example.com:", scheme: "http", bad: true},
+		{target: "example.com:0", scheme: "http", bad: true},
+		{target: "example.com:65536", scheme: "http", bad: true},
+		{target: "example.com:http", scheme: "http", bad: true},
+	} {
+		host, port, err := targetHostPort(tc.target, tc.connect, tc.scheme)
+		if tc.bad {
+			if err == nil {
+				t.Errorf("targetHostPort(%q, connect=%v) = %q %d, want an error", tc.target, tc.connect, host, port)
+			}
+			continue
+		}
+		if err != nil || host != tc.host || port != tc.port {
+			t.Errorf("targetHostPort(%q, connect=%v, %q) = %q %d %v, want %q %d", tc.target, tc.connect, tc.scheme, host, port, err, tc.host, tc.port)
+		}
+	}
+
+	// Through the forwarder: a portless IPv6 URL passes the policy (and fails
+	// later only because no upstream is configured); a denied one is refused.
+	_, deny, _ := net.ParseCIDR("2001:db8::/32")
+	p := testPolicy()
+	p.Deny = append(p.Deny, deny)
+	f := &Forwarder{Upstream: func() (Upstream, error) { return Upstream{}, errors.New("none") }, Allowed: AllowNets(),
+		Policy: p, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	for url, want := range map[string]int{
+		"http://[2606:4700::1111]/":     http.StatusBadGateway,
+		"https://[2606:4700::1111]/":    http.StatusBadGateway,
+		"http://[2001:db8::1]/":         http.StatusForbidden,
+		"http://[2001:db8::1]:8080/x":   http.StatusForbidden,
+		"http://[64:ff9b::a9fe:a9fe]/":  http.StatusForbidden, // metadata through NAT64
+		"http://[2606:4700::1111]:80/x": http.StatusBadGateway,
+	} {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, url, nil)
+		r.RemoteAddr = "127.0.0.1:40000"
+		f.ServeHTTP(w, r)
+		if w.Code != want {
+			t.Errorf("GET %s: %d %q, want %d", url, w.Code, w.Body, want)
+		}
+	}
+}
