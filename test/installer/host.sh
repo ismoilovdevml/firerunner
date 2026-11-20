@@ -67,5 +67,83 @@ expect "FR_CACHE_MAX_GB=0 refused"         ! check_cache_settings 14 0
 expect "FR_CACHE_MAX_GB=10G refused"       ! check_cache_settings 14 10G
 expect "FR_CACHE_DAYS with a space refused" ! check_cache_settings "14 -delete" auto
 
+# ---- thin pool disk: only a disk nothing uses is wiped
+# Fake disks, described by files under $D: disks (lsblk -d), tree/NAME (the
+# disk and what is on it, with mount points), sig/NAME (blkid), data/NAME
+# (a first MiB that is not zeros), holders/NAME, mpath, pvs and swaps.
+D=$WORK/disks
+G=$((1024 * 1024 * 1024))
+disks_reset() {
+    rm -rf "$D"; mkdir -p "$D/tree" "$D/sig" "$D/data" "$D/holders"
+    : > "$D/disks"; : > "$D/pvs"; : > "$D/mpath"; printf 'Filename Type Size Used Priority\n' > "$D/swaps"
+}
+# disk NAME SIZE_GB [RM RO]: a whole disk with nothing on it.
+disk() {
+    echo "$1 disk ${3:-0} ${4:-0} $(($2 * G))" >> "$D/disks"
+    echo "/dev/$1 " > "$D/tree/$1"
+}
+lsblk() {
+    local last=${*: -1}
+    case "$*" in
+        "-dnbro NAME,TYPE,RM,RO,SIZE") cat "$D/disks" ;;
+        "-nrpo NAME,MOUNTPOINT "*)     cat "$D/tree/${last#/dev/}" ;;
+        "-nrpo NAME "*)                cut -d' ' -f1 "$D/tree/${last#/dev/}" ;;
+        "-dno SIZE,MODEL "*)           echo "100G FakeDisk" ;;
+    esac
+}
+blkid() { cat "$D/sig/${2#/dev/}" 2>/dev/null; }
+pvs() { cat "$D/pvs"; }
+multipath() { grep -qx "$2" "$D/mpath"; }
+udevadm() { :; }
+disk_head_zero() { [[ ! -e $D/data/${1#/dev/} ]]; }
+disk_has_holders() { [[ -e $D/holders/${1#/dev/} ]]; }
+SWAPS_FILE=$D/swaps
+# picks: what thinpool_disk does without FR_DISK (it stops at -b: the disks are fake).
+picks() { ( FR_DISK=""; die() { echo "DIE $*"; exit 1; }; log() { echo "LOG $*"; }; thinpool_disk ) 2>&1; }
+in_use() { disk_in_use "/dev/$1"; }
+
+disks_reset
+disk frt-sda 50; echo "/dev/frt-sda1 /" >> "$D/tree/frt-sda"      # the system disk
+disk frt-sdb 100
+expect "one blank disk next to the system disk is taken" grep -q "LOG using blank disk /dev/frt-sdb " <<<"$(picks)"
+disk frt-sdc 100
+expect "two blank disks: none is taken" grep -q "DIE found 2 blank disks (/dev/frt-sdb /dev/frt-sdc): choose the one to wipe" <<<"$(picks)"
+expect "...and nothing is picked" ! grep -q "LOG using" <<<"$(picks)"
+disks_reset; disk frt-sdb 100; touch "$D/data/frt-sdb"
+expect "a disk with data but no signature (raw, Ceph, detached LUKS) is not blank" grep -q "DIE no blank disk found" <<<"$(picks)"
+disks_reset; disk frt-sdb 100; echo '/dev/frt-sdb: TYPE="crypto_LUKS"' > "$D/sig/frt-sdb"
+expect "a disk with a signature is not blank" grep -q "DIE no blank disk found" <<<"$(picks)"
+disks_reset; disk frt-sdb 8
+expect "a disk under ${DISK_MIN_GB} GB is not taken" grep -q "DIE no blank disk found" <<<"$(picks)"
+disks_reset; disk frt-sdb 100 1
+expect "a removable disk is not taken" grep -q "DIE no blank disk found" <<<"$(picks)"
+disks_reset; disk frt-sdb 100 0 1
+expect "a read-only disk is not taken" grep -q "DIE no blank disk found" <<<"$(picks)"
+disks_reset; disk frt-sdb 100; echo /dev/frt-sdb > "$D/mpath"
+expect "a multipath path is not taken" grep -q "DIE no blank disk found" <<<"$(picks)"
+disks_reset; disk frt-sdb 100; touch "$D/holders/frt-sdb"
+expect "a disk with a holder is not taken" grep -q "DIE no blank disk found" <<<"$(picks)"
+disks_reset; disk frt-sdb 100; echo "/dev/frt-sdb  " >> "$D/pvs"
+expect "an LVM physical volume is not taken" grep -q "DIE no blank disk found" <<<"$(picks)"
+
+# FR_DISK set: the disk and everything on it is checked.
+disks_reset; disk frt-sdb 100
+expect "FR_DISK: an unused disk may be wiped" ! in_use frt-sdb
+echo "/dev/frt-sdb1 " >> "$D/tree/frt-sdb"
+expect "FR_DISK: a disk with an unmounted partition is refused" in_use frt-sdb
+expect "...naming the partition" grep -q "partitions or devices on it: /dev/frt-sdb1" <<<"$(in_use frt-sdb)"
+disks_reset; disk frt-sdb 100; echo "/dev/frt-sdb1 /data" >> "$D/tree/frt-sdb"
+expect "FR_DISK: a disk with a mounted partition is refused" grep -q "/dev/frt-sdb1 is mounted on /data" <<<"$(in_use frt-sdb)"
+disks_reset; disk frt-sdb 100; echo "/dev/frt-sdb2 [SWAP]" >> "$D/tree/frt-sdb"
+expect "FR_DISK: a disk with swap on a partition is refused" grep -q "/dev/frt-sdb2 is swap" <<<"$(in_use frt-sdb)"
+disks_reset; disk frt-sdb 100; echo "/dev/frt-sdb partition 4G 0 -2" >> "$D/swaps"
+expect "FR_DISK: swap listed only in /proc/swaps is refused" grep -q "/dev/frt-sdb is swap" <<<"$(in_use frt-sdb)"
+disks_reset; disk frt-sdb 100; echo "  /dev/frt-sdb" > "$D/pvs"
+expect "FR_DISK: an LVM physical volume is refused" grep -q "LVM physical volume" <<<"$(in_use frt-sdb)"
+disks_reset; disk frt-sdb 100; echo "/dev/mapper/vg-data /srv" >> "$D/tree/frt-sdb"
+expect "FR_DISK: a disk under a mounted LV is refused" grep -q "/dev/mapper/vg-data is mounted on /srv" <<<"$(in_use frt-sdb)"
+disks_reset; disk frt-sdb 100; echo /dev/frt-sdb > "$D/mpath"
+expect "FR_DISK: a multipath path is refused" grep -q "multipath" <<<"$(in_use frt-sdb)"
+
 echo "RESULT pass=$pass fail=$fail"
 [[ $fail -eq 0 ]]

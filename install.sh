@@ -12,7 +12,8 @@
 #   curl -sfL .../install.sh | sudo bash -s -- uninstall        # remove services (keeps data)
 #
 # Settings (environment variables):
-#   FR_DISK                 empty block device for the thin pool (default: auto-detect a blank disk)
+#   FR_DISK                 empty block device for the thin pool, wiped (default: the blank disk,
+#                           if there is exactly one; never a disk in use, see thinpool_disk)
 #   FR_BRIDGE               bridge for microVM taps          (default: br-fc)
 #   FR_SUBNET               /24 prefix for microVMs           (default: 10.200.0)
 #   FR_VM_DISK              root disk of every microVM, thin-provisioned (default: 40GB)
@@ -655,33 +656,114 @@ discard_blocks() {
     fi
 }
 
-# Prints the first whole disk that has no partitions, filesystem, LVM or mount.
-find_blank_disk() {
-    local name type
-    while read -r name type; do
-        [[ $type == disk ]] || continue
-        [[ $name == sr* || $name == loop* || $name == zram* ]] && continue
-        [[ $(lsblk -nro NAME "/dev/$name" | wc -l) -eq 1 ]] || continue   # has children
-        [[ -z $(blkid -p "/dev/$name" 2>/dev/null) ]] || continue           # has a signature
-        findmnt -rn -S "/dev/$name" >/dev/null && continue
-        echo "/dev/$name"
+DISK_MIN_GB=10   # a smaller disk is never taken for the thin pool on its own
+SWAPS_FILE=/proc/swaps
+
+# canonical DEV: the device node DEV is (a /dev/disk/by-id link, /dev/mapper name).
+canonical() { readlink -f -- "$1" 2>/dev/null || echo "$1"; }
+
+# disk_has_holders DEV: a device-mapper or md device sits on DEV.
+disk_has_holders() { compgen -G "/sys/class/block/$(basename "$(canonical "$1")")/holders/*" >/dev/null; }
+
+# disk_multipath_member DEV: DEV is one path of a multipath device, assembled or not.
+disk_multipath_member() {
+    if command -v multipath >/dev/null && multipath -c "$1" >/dev/null 2>&1; then
         return 0
-    done < <(lsblk -dnro NAME,TYPE)
+    fi
+    udevadm info --query=property --name="$1" 2>/dev/null | grep -qx 'DM_MULTIPATH_DEVICE_PATH=1'
+}
+
+# disk_head_zero DEV: the first MiB of DEV is zeros, as on a disk never written.
+# Data without a signature (raw, Ceph, LUKS with a detached header) is not.
+disk_head_zero() { cmp -s -n 1048576 "$1" /dev/zero; }
+
+# disk_in_use DEV: prints why DEV must not be wiped, if anything on it is in
+# use: mounted or swap (DEV or a partition, LV or mapping on it), an LVM
+# physical volume, held by device-mapper or md, or a multipath path.
+disk_in_use() {
+    local disk=$1 dev mnt pv swap
+    while read -r dev mnt; do
+        if [[ $mnt == "[SWAP]" ]]; then
+            echo "$dev is swap"
+            return 0
+        elif [[ -n $mnt ]]; then
+            echo "$dev is mounted on $mnt"
+            return 0
+        fi
+        while read -r swap; do
+            [[ -n $swap && $(canonical "$swap") == "$(canonical "$dev")" ]] && { echo "$dev is swap"; return 0; }
+        done < <(awk 'NR > 1 {print $1}' "$SWAPS_FILE" 2>/dev/null)
+        while read -r pv; do
+            [[ -n $pv && $(canonical "$pv") == "$(canonical "$dev")" ]] && { echo "$dev is an LVM physical volume"; return 0; }
+        done < <(pvs --noheadings -o pv_name 2>/dev/null)
+    done < <(lsblk -nrpo NAME,MOUNTPOINT "$disk" 2>/dev/null)
+    if [[ $(lsblk -nrpo NAME "$disk" 2>/dev/null | wc -l) -gt 1 ]]; then
+        echo "$disk has partitions or devices on it: $(lsblk -nrpo NAME "$disk" | tail -n +2 | paste -sd ' ' -)"
+        return 0
+    fi
+    if disk_has_holders "$disk"; then
+        echo "$disk is held by another device (/sys/class/block/$(basename "$(canonical "$disk")")/holders)"
+        return 0
+    fi
+    if disk_multipath_member "$disk"; then
+        echo "$disk is a path of a multipath device"
+        return 0
+    fi
     return 1
+}
+
+# blank_disks prints every whole disk that looks never used, one per line:
+# not removable or read-only, at least DISK_MIN_GB, nothing on it or in use
+# (disk_in_use), no signature blkid knows and a first MiB of zeros.
+blank_disks() {
+    local name type rm ro size dev
+    while read -r name type rm ro size; do
+        [[ $type == disk && $rm == 0 && $ro == 0 ]] || continue
+        [[ $name == sr* || $name == loop* || $name == zram* || $name == ram* || $name == nbd* ]] && continue
+        [[ $size =~ ^[0-9]+$ ]] && ((size >= DISK_MIN_GB * 1024 * 1024 * 1024)) || continue
+        dev=/dev/$name
+        disk_in_use "$dev" >/dev/null && continue
+        [[ -z $(blkid -p "$dev" 2>/dev/null) ]] || continue
+        disk_head_zero "$dev" || continue
+        echo "$dev"
+    done < <(lsblk -dnbro NAME,TYPE,RM,RO,SIZE)
+}
+
+# thinpool_disk sets FR_DISK, the disk the thin pool is made on, and checks
+# it is safe to wipe. Without FR_DISK only the one blank disk is taken: with
+# none or several, the operator chooses.
+thinpool_disk() {
+    if [[ -z $FR_DISK ]]; then
+        local disks
+        mapfile -t disks < <(blank_disks)
+        case ${#disks[@]} in
+            1)
+                FR_DISK=${disks[0]}
+                log "using blank disk $FR_DISK ($(lsblk -dno SIZE,MODEL "$FR_DISK" 2>/dev/null | tr -s ' ')) for the thin pool" ;;
+            0)
+                die "no blank disk found for the thin pool. A disk counts as blank when it is at least
+  ${DISK_MIN_GB} GB, has no partitions, signatures or holders, is not mounted, swap, an LVM or
+  multipath member, and its first MiB is zeros. Attach an empty disk (e.g. 100G+) and re-run,
+  or choose one with FR_DISK=/dev/sdX (it will be wiped)." ;;
+            *)
+                die "found ${#disks[@]} blank disks (${disks[*]}): choose the one to wipe for the
+  thin pool with FR_DISK=/dev/sdX" ;;
+        esac
+    fi
+    [[ -b $FR_DISK ]] || die "FR_DISK=$FR_DISK is not a block device"
+    local why
+    if why=$(disk_in_use "$FR_DISK"); then
+        die "FR_DISK=$FR_DISK is not wiped: $why. Choose another disk, or free this one first
+  (unmount, swapoff, vgremove/pvremove, wipefs -a)."
+    fi
+    return 0
 }
 
 setup_thinpool() {
     if lvs "$VG/thinpool" >/dev/null 2>&1; then
         log "thin pool $VG/thinpool already exists"
     else
-        if [[ -z $FR_DISK ]]; then
-            FR_DISK=$(find_blank_disk) || die "no blank disk found for the thin pool.
-  Attach an empty disk (e.g. 100G+) and re-run, or set FR_DISK=/dev/sdX (it will be wiped)."
-            log "using blank disk $FR_DISK for the thin pool"
-        fi
-        [[ -b $FR_DISK ]] || die "FR_DISK=$FR_DISK is not a block device"
-        findmnt -rn -S "$FR_DISK" >/dev/null && die "$FR_DISK is mounted"
-
+        thinpool_disk
         log "creating LVM thin pool on $FR_DISK"
         pvcreate -qy "$FR_DISK"
         vgcreate -q "$VG" "$FR_DISK"
