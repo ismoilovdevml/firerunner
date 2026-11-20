@@ -13,12 +13,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libelf-dev libssl-dev python3 xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# The tarball is checked against the release signature (.tar.sign, made over
+# the uncompressed tar) with the stable maintainers' keys, not only against a
+# checksum served from the same CDN. kernel-signing-keys.asc holds the keys of
+# Greg Kroah-Hartman (647F28654894E3BD457199BE38DBBDC86092693E) and Sasha Levin
+# (E27E5D8A3403A2EF66873BBCDEA66FF797772CDC), fetched from the kernel.org WKD;
+# the fingerprints are the ones published on https://www.kernel.org/signature.html.
+# gpgv trusts only the keys in that keyring.
 WORKDIR /src
+COPY kernel-signing-keys.asc /tmp/kernel-signing-keys.asc
 RUN major="${KERNEL_VERSION%%.*}" \
     && curl -fsSLO "https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${KERNEL_VERSION}.tar.xz" \
-    && curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v${major}.x/sha256sums.asc" \
-       | grep " linux-${KERNEL_VERSION}.tar.xz\$" | sha256sum -c - \
-    && tar -xf "linux-${KERNEL_VERSION}.tar.xz" && rm "linux-${KERNEL_VERSION}.tar.xz"
+    && curl -fsSLO "https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${KERNEL_VERSION}.tar.sign" \
+    && gpg --batch --dearmor < /tmp/kernel-signing-keys.asc > /tmp/kernel-signing-keys.gpg \
+    && xz -cd "linux-${KERNEL_VERSION}.tar.xz" \
+       | gpgv --keyring /tmp/kernel-signing-keys.gpg "linux-${KERNEL_VERSION}.tar.sign" - \
+    && tar -xf "linux-${KERNEL_VERSION}.tar.xz" && rm "linux-${KERNEL_VERSION}.tar.xz" "linux-${KERNEL_VERSION}.tar.sign"
 
 WORKDIR /src/linux-${KERNEL_VERSION}
 COPY firerunner.config /tmp/firerunner.config
