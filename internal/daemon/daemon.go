@@ -76,6 +76,7 @@ type preloadingVM struct {
 	inst   *vm.Instance
 	specID string
 	cancel context.CancelFunc
+	gen    int // Daemon.poolGen when its boot started
 }
 
 // poolRecord is how the ready pool is persisted across daemon restarts.
@@ -212,6 +213,10 @@ type Daemon struct {
 	bootingIDs map[string]bool
 	// booted pool VMs still preloading images, by uid; counted in booting
 	preloading map[string]*preloadingVM
+	// poolGen counts pool refreshes (drain). A pool VM whose boot started
+	// before the last one may run the old rootfs image: it never joins the
+	// pool nor goes to a job.
+	poolGen int
 	// staleLeases are DHCP leases of MACs flintlock does not list, by
 	// "mac ip", with when reconcile first saw them so (releaseStaleLeases).
 	staleLeases map[string]time.Time
@@ -507,7 +512,7 @@ func (d *Daemon) claim() *pooled {
 	}
 	d.metrics.poolReady.Set(0)
 	for uid, p := range d.preloading {
-		if p.specID != fp {
+		if p.specID != fp || p.gen != d.poolGen {
 			continue
 		}
 		delete(d.preloading, uid)
@@ -588,6 +593,7 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config, id string) {
 	start := time.Now()
 	d.mu.Lock()
 	d.bootingIDs[id] = true
+	gen := d.poolGen
 	d.mu.Unlock()
 
 	// The VM counts as booting until it is fully ready (including preload),
@@ -601,16 +607,25 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config, id string) {
 	if err == nil {
 		d.metrics.bootSeconds.WithLabelValues("pool").Observe(time.Since(start).Seconds())
 		static, auto := d.preloadImages(cfg)
-		if len(static)+len(auto) == 0 {
+		d.mu.Lock()
+		refreshed := d.poolGen != gen
+		d.mu.Unlock()
+		switch {
+		case refreshed:
+			// Deleted below: neither Docker nor images are worth starting.
+		case len(static)+len(auto) == 0:
 			// Docker starts on its socket's first use: that would be the job's
 			// first docker command. Start it while the VM waits in the pool.
 			if werr := warmDocker(cfg, inst); werr != nil {
 				d.log.Debug("could not start Docker ahead of the job", "vm", id, "err", werr)
 			}
-		} else {
+		default:
 			pctx, cancel := context.WithCancel(ctx)
 			d.mu.Lock()
-			d.preloading[inst.UID] = &preloadingVM{inst: inst, specID: fingerprint(cfg), cancel: cancel}
+			d.preloading[inst.UID] = &preloadingVM{inst: inst, specID: fingerprint(cfg), cancel: cancel, gen: gen}
+			if d.poolGen != gen {
+				cancel() // refreshed while it booted: no images to pull for it
+			}
 			d.mu.Unlock()
 			pullStart := time.Now()
 			failed, perr := preload(pctx, cfg, inst, static, auto)
@@ -622,6 +637,7 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config, id string) {
 			d.mu.Lock()
 			_, stillOurs := d.preloading[inst.UID]
 			delete(d.preloading, inst.UID)
+			refreshed = d.poolGen != gen
 			d.mu.Unlock()
 			switch {
 			case !stillOurs:
@@ -632,6 +648,8 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config, id string) {
 				d.metrics.poolBooting.Set(float64(d.booting))
 				d.mu.Unlock()
 				return
+			case refreshed:
+				// drain stopped the preload; the VM is deleted below.
 			case perr != nil:
 				d.preloadFailed(ctx, id, perr)
 			default:
@@ -652,6 +670,10 @@ func (d *Daemon) bootOne(ctx context.Context, cfg config.Config, id string) {
 	case ctx.Err() != nil:
 		// Shutting down: do not hand out a VM nobody will drain.
 		d.spawn(func() { d.delete(context.Background(), inst, "shutdown") })
+	case d.poolGen != gen:
+		// A pool refresh came while it booted: it may run the old image.
+		d.spawn(func() { d.delete(context.Background(), inst, "refresh") })
+		d.wakeRefill()
 	default:
 		d.ready = append(d.ready, &pooled{inst: inst, bornAt: time.Now(), specID: fingerprint(cfg)})
 		d.metrics.poolReady.Set(float64(len(d.ready)))
@@ -746,10 +768,19 @@ func (d *Daemon) expireIdle(ctx context.Context) {
 	}
 }
 
+// drain deletes every idle pool VM (POST /pool/refresh). VMs still booting
+// or preloading may run the old image too: their preloads are stopped, and
+// bootOne deletes them instead of adding them to the pool (poolGen). They
+// stay counted in booting until then, so refill does not boot twice.
 func (d *Daemon) drain(ctx context.Context, reason string) {
 	d.mu.Lock()
 	drop := d.ready
 	d.ready = nil
+	d.poolGen++
+	for _, p := range d.preloading {
+		p.cancel()
+	}
+	d.metrics.poolReady.Set(0)
 	d.savePoolLocked()
 	d.mu.Unlock()
 	for _, p := range drop {
