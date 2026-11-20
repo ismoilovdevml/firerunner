@@ -127,10 +127,10 @@ func (f *fakeNft) writes() []string {
 func stubBuilders(t *testing.T, alive func(ip string) bool) func() string {
 	t.Helper()
 	nft := stubNft(t)
-	oldTCP, oldBoot := tcpOpen, builderBoot
-	tcpOpen = func(ip string, _ int) bool { return alive(ip) }
+	oldProbe, oldBoot := buildkitdAnswers, builderBoot
+	buildkitdAnswers = func(ip string, _ int, _ string) bool { return alive(ip) }
 	builderBoot = func(*Daemon, context.Context, config.Config, string) {}
-	t.Cleanup(func() { tcpOpen, builderBoot = oldTCP, oldBoot })
+	t.Cleanup(func() { buildkitdAnswers, builderBoot = oldProbe, oldBoot })
 	// No builder VMs to copy caches from: saves fail fast unless a test stubs them.
 	stubBuilderCache(t, func(context.Context, config.Config, *vm.Instance) (int64, error) {
 		return 0, errors.New("stub: no VM")
