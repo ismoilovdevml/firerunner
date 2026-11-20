@@ -261,9 +261,12 @@ type Daemon struct {
 	cacheDropped map[string]time.Time
 	// cacheMu guards cacheReserved: the bytes that saves still being written
 	// will take, so saves side by side do not all pass the disk budget against
-	// the same free space.
+	// the same free space. It also guards cacheRefused: per project, how often
+	// tar refused its saved copy though the host reads it whole (see
+	// builderCacheRefusals). cacheMu is never held while taking mu.
 	cacheMu       sync.Mutex
 	cacheReserved int64
+	cacheRefused  map[string]cacheRefusal
 	// nftMu serializes changes to the builders port map: mapBuilderPorts
 	// decides from one listing, and no other change may land between that
 	// listing and its transaction. Taken before mu, never while holding it.
@@ -350,7 +353,8 @@ func New(cfgPath string, log *slog.Logger) (*Daemon, error) {
 		claimed: map[string]time.Time{}, deleting: map[string]bool{}, firstSee: map[string]time.Time{}, preloading: map[string]*preloadingVM{},
 		bootingIDs: map[string]bool{}, refillNow: make(chan struct{}, 1), staleLeases: map[string]time.Time{},
 		builders: map[string]*builder{}, builderFailed: map[string]time.Time{},
-		saving: map[string]*cacheSave{}, cacheDropped: map[string]time.Time{}, runCtx: context.Background(),
+		saving: map[string]*cacheSave{}, cacheDropped: map[string]time.Time{}, cacheRefused: map[string]cacheRefusal{},
+		runCtx:   context.Background(),
 		oomKills: -1}
 	fl.OnError = d.flintlockFailed
 	if fi, err := os.Stat(cfgPath); err == nil {

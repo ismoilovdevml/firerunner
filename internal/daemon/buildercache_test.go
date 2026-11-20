@@ -650,6 +650,74 @@ func TestRestoreTouchesTheCopyBeforeLoading(t *testing.T) {
 	}
 }
 
+// A whole copy that tar keeps refusing (the VM's disk cannot hold it: sparse
+// files written in full, a larger rootfs) is kept only for one retry: a
+// second refusal of the same file deletes it, so the project gets a builder
+// again instead of failing every builderRetryAfter. A failed load also gives
+// the copy its last-used time back, so the LRU can still drop a copy that
+// never loads.
+func TestRestoreRefusalsOfAWholeCopyAreBounded(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	var loadErr func() error
+	wipes := 0
+	dir := stubBuilderCache(t, nil, nil, func(_ context.Context, _ config.Config, _ *vm.Instance, r io.Reader) error {
+		_, _ = io.Copy(io.Discard, r)
+		return loadErr()
+	})
+	builderCacheWipe = func(context.Context, config.Config, *vm.Instance) error { wipes++; return nil }
+	d, _ := newTestDaemon(t)
+	file := filepath.Join(dir, "7.tar")
+	inst := &vm.Instance{ID: "bld-7"}
+	restore := func() (string, error) { return d.restoreBuilderCache(context.Background(), d.cfg, "7", inst) }
+	refused := func() error { return fmt.Errorf("stream: %w", exitErr(t, loadArchiveRefused)) }
+	usedAt := func() time.Time {
+		fi, err := os.Stat(file)
+		if err != nil {
+			return time.Time{}
+		}
+		return fi.ModTime()
+	}
+
+	whole := saved(tarArchive(t, false, 0))
+	writeFile(t, file, whole, 48*time.Hour)
+	before := usedAt()
+
+	// Not the copy's fault: never counted, the time is given back.
+	loadErr = func() error { return fmt.Errorf("stream: %w", exitErr(t, 255)) }
+	for range 3 {
+		if _, err := restore(); err == nil {
+			t.Fatal("ssh drop: want the boot failed")
+		}
+	}
+	if !usedAt().Equal(before) {
+		t.Fatalf("after failed loads the copy reads as used at %s, want %s back", usedAt(), before)
+	}
+
+	loadErr = refused
+	if _, err := restore(); err == nil || readFile(t, file) != whole {
+		t.Fatalf("first refusal of a whole copy: err %v; want it kept for one retry", err)
+	}
+	if !usedAt().Equal(before) {
+		t.Fatal("refused copy marked as used: the LRU would never drop it")
+	}
+	if res, err := restore(); res != "failed" || err != nil {
+		t.Fatalf("second refusal: %q, %v; want failed, nil (start empty)", res, err)
+	}
+	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) || wipes != 1 {
+		t.Fatalf("copy refused twice kept (stat %v) or volume not wiped (%d)", err, wipes)
+	}
+
+	// A new copy (another save) starts its own count.
+	writeFile(t, file, whole, time.Hour)
+	if _, err := restore(); err == nil || readFile(t, file) != whole {
+		t.Fatal("first refusal of a new copy: want it kept")
+	}
+	writeFile(t, file, saved(tarArchive(t, false, 0)), 2*time.Hour) // replaced by a later save
+	if _, err := restore(); err == nil || readFile(t, file) != whole {
+		t.Fatal("first refusal of a replaced copy counted against the one before")
+	}
+}
+
 // builderLoadScript's exit status tells a broken archive from a VM that
 // cannot take a cache. Run with sh, a fake docker and the host's tar.
 func TestBuilderLoadScriptExitStatus(t *testing.T) {
@@ -825,6 +893,34 @@ func TestBootBuilderDropsCacheOnlyWhenBuildkitRefusesIt(t *testing.T) {
 				t.Fatal("failed builder kept")
 			}
 		})
+	}
+}
+
+// The copy dropped because buildkitd did not come up on it is the copy that
+// was loaded: one a save renamed into place meanwhile stays.
+func TestBootBuilderDropsOnlyTheCopyItLoaded(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	dir := stubBuilderCache(t, nil, nil, func(_ context.Context, _ config.Config, _ *vm.Instance, r io.Reader) error {
+		_, err := io.ReadAll(r)
+		return err
+	})
+	boots := stubBoot(t, nil)
+	file := filepath.Join(dir, "7.tar")
+	builderSetup = func(context.Context, config.Config, *vm.Instance, *builderCreds) error {
+		// The previous builder's save finished late and renamed its copy in.
+		writeFile(t, file+".new", saved("newer"), 0)
+		if err := os.Rename(file+".new", file); err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Errorf("starting buildkitd: %w", errBuildkitDown)
+	}
+	d, srv := newTestDaemon(t)
+	writeFile(t, file, saved("warm"), time.Minute)
+	d.Builder("7", true)
+	d.bootBuilder(context.Background(), d.cfg, "7")
+	srv.WaitDeleted(t, "uid-"+boots.last(), 2*time.Second)
+	if got := readFile(t, file); got != saved("newer") {
+		t.Fatalf("saved cache %q, want the newer copy kept", got)
 	}
 }
 

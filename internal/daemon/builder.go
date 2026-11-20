@@ -516,6 +516,10 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	// The project's previous builder may still be copying its cache out. The
 	// new one booted meanwhile; only the restore needs the copy.
 	phases.end("save_wait", d.waitForSave(ctx, project, start))
+	// The copy about to be loaded, so a drop below spares one a late save
+	// renames into place meanwhile. Taken before the restore opens it: a
+	// save in between makes the drop spare the copy, never hit another.
+	loaded, _ := os.Stat(builderCacheFile(project))
 	cache, err := d.restoreBuilderCache(ctx, bcfg, project, inst)
 	if err != nil {
 		phases.end("restore", cache)
@@ -539,10 +543,10 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	phases.end("restore", cache)
 	if err := builderSetup(ctx, bcfg, inst, creds); err != nil {
 		phases.end("buildkitd", "failed")
-		if restored && errors.Is(err, errBuildkitDown) {
+		if restored && errors.Is(err, errBuildkitDown) && loaded != nil {
 			// buildkitd ran but did not come up on the restored state: do not
 			// start every later builder of the project from it.
-			_ = os.Remove(builderCacheFile(project))
+			d.dropSavedCache(project, loaded)
 			d.log.Warn("saved builder cache dropped: buildkitd did not start with it", "project", project)
 		}
 		fail(inst, err)
