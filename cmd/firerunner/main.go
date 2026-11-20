@@ -118,6 +118,8 @@ func dispatch(args []string) error {
 		return cmdConfig(rest)
 	case "upgrade":
 		return cmdUpgrade(rest)
+	case "registry-front":
+		return cmdRegistryFront(rest)
 	}
 
 	cfg, err := config.Load(config.Path())
