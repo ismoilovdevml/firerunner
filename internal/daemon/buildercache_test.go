@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"os/exec"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -715,6 +717,47 @@ func TestRestoreRefusalsOfAWholeCopyAreBounded(t *testing.T) {
 	writeFile(t, file, saved(tarArchive(t, false, 0)), 2*time.Hour) // replaced by a later save
 	if _, err := restore(); err == nil || readFile(t, file) != whole {
 		t.Fatal("first refusal of a replaced copy counted against the one before")
+	}
+}
+
+// failingReader returns its data, then err: a file whose read fails part way.
+type failingReader struct {
+	data string
+	err  error
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if r.data == "" {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// The host's own read of a copy condemns it only for what the archive holds.
+// A read error from the host's disk says nothing about the archive: could not
+// tell, the copy is kept.
+func TestVerifyArchiveTellsReadErrorsFromABrokenArchive(t *testing.T) {
+	whole := saved(tarArchive(t, false, 0))
+	eio := &fs.PathError{Op: "read", Path: "7.tar", Err: syscall.EIO}
+	for _, c := range []struct {
+		name    string
+		in      io.Reader
+		corrupt bool
+		ok      bool
+	}{
+		{"whole", strings.NewReader(whole), false, true},
+		{"cut off", strings.NewReader(whole[:2500]), true, false},
+		{"no marker", strings.NewReader(saved(tarArchive(t, true, 0))), true, false},
+		{"disk read error", &failingReader{data: whole[:2000], err: eio}, false, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			err := verifyArchive(context.Background(), c.in)
+			if (err == nil) != c.ok || errors.Is(err, errCacheCorrupt) != c.corrupt {
+				t.Fatalf("verifyArchive = %v; want ok %v, corrupt %v", err, c.ok, c.corrupt)
+			}
+		})
 	}
 }
 

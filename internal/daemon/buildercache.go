@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -105,7 +106,12 @@ func verifyCacheArchive(ctx context.Context, f *os.File) error {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	r := bufio.NewReader(f)
+	return verifyArchive(ctx, f)
+}
+
+// verifyArchive is verifyCacheArchive on a saved cache read from its start.
+func verifyArchive(ctx context.Context, in io.Reader) error {
+	r := bufio.NewReader(in)
 	readCacheHeader(r) // a legacy copy has none: nothing is consumed then
 	tr := tar.NewReader(r)
 	last := ""
@@ -116,6 +122,13 @@ func verifyCacheArchive(ctx context.Context, f *os.File) error {
 		h, err := tr.Next() // reads past the previous member's data: a cut-off file fails here
 		if errors.Is(err, io.EOF) {
 			break
+		}
+		var pathErr *fs.PathError
+		var errno syscall.Errno
+		if errors.As(err, &pathErr) || errors.As(err, &errno) {
+			// The host's disk failed the read (EIO): nothing said about
+			// the archive. tar's own errors and a cut-off file carry neither.
+			return fmt.Errorf("reading the saved copy: %w", err)
 		}
 		if err != nil {
 			return fmt.Errorf("%w: %v", errCacheCorrupt, err)
