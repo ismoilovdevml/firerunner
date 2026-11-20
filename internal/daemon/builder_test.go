@@ -1127,6 +1127,40 @@ func TestBuildersFileWriteFailureIsReported(t *testing.T) {
 	}
 }
 
+// A builder removed while it booted, after its port was mapped, does not
+// leave that mapping behind when the port already went to a builder still
+// booting: until that one maps it, the port would lead to the removed VM's
+// address, which dnsmasq hands to the next VM.
+func TestRemovedBootingBuilderUnmapsAPortAlreadyTaken(t *testing.T) {
+	stubBuilders(t, func(string) bool { return true })
+	nft := stubNft(t)
+	boots := stubBoot(t, nil)
+	d, srv := newTestDaemon(t)
+	d.Builder("3", true)
+	port := d.builders["3"].Port
+	old := nftRun
+	nftRun = func(script string, args ...string) (string, error) {
+		out, err := nft.run(script, args...)
+		if script != "" { // the boot's mapping is in place: `builder rm`, and 4 gets the port
+			d.mu.Lock()
+			delete(d.builders, "3")
+			d.builders["4"] = &builder{Project: "4", Port: port, LastUsed: time.Now()}
+			d.mu.Unlock()
+		}
+		return out, err
+	}
+	t.Cleanup(func() { nftRun = old })
+	d.bootBuilder(context.Background(), d.cfg, "3")
+	srv.WaitDeleted(t, "uid-"+boots.last(), 2*time.Second)
+	d.bg.Wait()
+	nft.mu.Lock()
+	to, mapped := nft.elems[port]
+	nft.mu.Unlock()
+	if mapped {
+		t.Fatalf("port %d still maps to %s, the removed builder's VM", port, to)
+	}
+}
+
 // When the startup listing fails, builders.json is not read then. Until it is,
 // the file keeps the previous run's builders (a new builder does not overwrite
 // it), and the first listing that works adopts them: otherwise reconcile would

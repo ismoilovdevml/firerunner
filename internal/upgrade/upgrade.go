@@ -236,7 +236,7 @@ func parseVersion(s string) (version, bool) {
 
 // compareVersions is -1, 0 or 1 as a is older than, the same as or newer
 // than b. A pre-release is older than its release; two pre-releases of the
-// same version compare as text.
+// same version compare as SemVer orders them (comparePrerelease).
 func compareVersions(a, b version) int {
 	for i := range a.num {
 		if c := cmp.Compare(a.num[i], b.num[i]); c != 0 {
@@ -251,7 +251,34 @@ func compareVersions(a, b version) int {
 	case b.pre == "":
 		return -1
 	}
-	return strings.Compare(a.pre, b.pre)
+	return comparePrerelease(a.pre, b.pre)
+}
+
+// comparePrerelease orders two pre-release strings as SemVer 2.0.0 does:
+// dot-separated identifiers left to right, numeric ones as numbers (so rc.9
+// is older than rc.10) and older than alphanumeric ones, which compare as
+// text; when all shared identifiers are equal, the shorter list is older.
+func comparePrerelease(a, b string) int {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(as) && i < len(bs); i++ {
+		an, aErr := strconv.ParseUint(as[i], 10, 64)
+		bn, bErr := strconv.ParseUint(bs[i], 10, 64)
+		var c int
+		switch {
+		case aErr == nil && bErr == nil:
+			c = cmp.Compare(an, bn)
+		case aErr == nil:
+			c = -1
+		case bErr == nil:
+			c = 1
+		default:
+			c = strings.Compare(as[i], bs[i])
+		}
+		if c != 0 {
+			return c
+		}
+	}
+	return cmp.Compare(len(as), len(bs))
 }
 
 // releaseMatches: the binary says it is the release asked for, so an older

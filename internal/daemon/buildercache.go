@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -105,7 +106,12 @@ func verifyCacheArchive(ctx context.Context, f *os.File) error {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	r := bufio.NewReader(f)
+	return verifyArchive(ctx, f)
+}
+
+// verifyArchive is verifyCacheArchive on a saved cache read from its start.
+func verifyArchive(ctx context.Context, in io.Reader) error {
+	r := bufio.NewReader(in)
 	readCacheHeader(r) // a legacy copy has none: nothing is consumed then
 	tr := tar.NewReader(r)
 	last := ""
@@ -116,6 +122,13 @@ func verifyCacheArchive(ctx context.Context, f *os.File) error {
 		h, err := tr.Next() // reads past the previous member's data: a cut-off file fails here
 		if errors.Is(err, io.EOF) {
 			break
+		}
+		var pathErr *fs.PathError
+		var errno syscall.Errno
+		if errors.As(err, &pathErr) || errors.As(err, &errno) {
+			// The host's disk failed the read (EIO): nothing said about
+			// the archive. tar's own errors and a cut-off file carry neither.
+			return fmt.Errorf("reading the saved copy: %w", err)
 		}
 		if err != nil {
 			return fmt.Errorf("%w: %v", errCacheCorrupt, err)
@@ -475,15 +488,20 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 		return "failed", nil
 	}
 	defer f.Close()
-	var size int64
-	if info, err := f.Stat(); err == nil {
-		size = info.Size()
+	// The copy as it was before this restore touched it: what the drop and
+	// the refusal count compare against, and the last-used time a failed
+	// load gives back.
+	loaded, err := f.Stat()
+	if err != nil {
+		d.log.Warn("saved builder cache unreadable", "project", project, "err", err)
+		return "failed", nil
 	}
+	size := loaded.Size()
 	r := bufio.NewReader(f)
 	magic, _ := r.Peek(len(builderCacheMagic))
 	legacy := string(magic) != builderCacheMagic && cfg.Builder.Image == legacyBuilderImage
 	if image, ok := readCacheHeader(r); !legacy && (!ok || image != cfg.Builder.Image) {
-		_ = os.Remove(file)
+		d.dropSavedCache(project, loaded)
 		d.metrics.builderCache.WithLabelValues("restore", "stale").Inc()
 		d.log.Info("saved builder cache dropped: written by another builder image, starting empty",
 			"project", project, "cache_image", image, "image", cfg.Builder.Image)
@@ -507,25 +525,35 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 		// the copy again and only deletes it if that read fails as well.
 		keep := lctx.Err() != nil || exitCode(err) != loadArchiveRefused
 		if !keep {
-			if verr := verifyCacheArchive(lctx, f); !errors.Is(verr, errCacheCorrupt) {
+			verr := verifyCacheArchive(lctx, f)
+			switch {
+			case errors.Is(verr, errCacheCorrupt):
+			case verr != nil:
 				keep = true
-				if verr != nil {
-					err = fmt.Errorf("%w (the host could not read the copy again: %v)", err, verr)
-				}
+				err = fmt.Errorf("%w (the host could not read the copy again: %v)", err, verr)
+			case d.noteRefusal(project, loaded) < builderCacheRefusals:
+				keep = true // whole, but tar refused it: maybe once
+			default:
+				// Whole, and refused again: the VM cannot hold it (a disk
+				// too small for it). Kept, it would fail every boot.
+				err = fmt.Errorf("%w (refused %d times though whole: the builder's disk cannot hold it)", err, builderCacheRefusals)
 			}
 		}
 		if keep {
 			// The copy may be fine. A builder started empty would, once deleted,
 			// save its empty cache over it: fail this boot, the next one retries.
+			// It was not used: the LRU may drop it before copies that were.
+			d.untouchSavedCache(project, loaded)
 			return "failed", fmt.Errorf("saved builder cache not restored (kept, the next builder retries it): %w", err)
 		}
-		d.dropRefusedCache(file, f)
+		d.dropSavedCache(project, loaded)
 		d.log.Warn("saved builder cache refused and deleted, starting empty", "project", project, "err", err)
 		if werr := wipeBuilderCache(ctx, cfg, inst); werr != nil {
 			return "failed", fmt.Errorf("partly restored builder cache could not be removed: %w", werr)
 		}
 		return "failed", nil
 	}
+	d.forgetRefusals(project)
 	result := "ok"
 	if legacy {
 		result = "legacy" // its next save writes the header
@@ -536,15 +564,65 @@ func (d *Daemon) restoreBuilderCache(ctx context.Context, cfg config.Config, pro
 	return result, nil
 }
 
-// dropRefusedCache deletes the saved cache file, opened as f, that a restore
-// found broken, unless a save put a new copy in its place meanwhile (the boot
-// stops waiting for a slow save after builderSaveWait). The check and the
-// rename are under mu, as saves rename under it; the blocks are freed after.
-func (d *Daemon) dropRefusedCache(file string, f *os.File) {
-	loaded, err := f.Stat()
-	if err != nil {
-		return
+// builderCacheRefusals is how many times tar may refuse a copy the host reads
+// whole before it is deleted: the first refusal may be passing (the VM's disk
+// briefly full), a second one of the same file is taken as permanent.
+const builderCacheRefusals = 2
+
+// cacheRefusal counts tar's refusals of one saved copy, known by the file's
+// identity before the restore touched it (see sameCopy).
+type cacheRefusal struct {
+	copy os.FileInfo
+	n    int
+}
+
+// sameCopy: a and b are the same saved copy, unchanged. Another save renames
+// a new file into place, which changes the inode.
+func sameCopy(a, b os.FileInfo) bool {
+	return os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
+}
+
+// noteRefusal counts one refusal of the project's copy loaded and returns
+// how many there were in a row; another copy starts at 1.
+func (d *Daemon) noteRefusal(project string, loaded os.FileInfo) int {
+	d.cacheMu.Lock()
+	defer d.cacheMu.Unlock()
+	r := d.cacheRefused[project]
+	if r.copy == nil || !sameCopy(r.copy, loaded) {
+		r = cacheRefusal{copy: loaded}
 	}
+	r.n++
+	d.cacheRefused[project] = r
+	return r.n
+}
+
+// forgetRefusals drops the project's refusal count: its copy loaded, or is
+// gone. Under cacheMu, not mu: a restore may run while a save holds mu.
+func (d *Daemon) forgetRefusals(project string) {
+	d.cacheMu.Lock()
+	defer d.cacheMu.Unlock()
+	delete(d.cacheRefused, project)
+}
+
+// untouchSavedCache gives the project's copy whose load failed the
+// last-used time it had before (loaded), unless a save put a new copy in its
+// place meanwhile.
+func (d *Daemon) untouchSavedCache(project string, loaded os.FileInfo) {
+	file := builderCacheFile(project)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if cur, err := os.Stat(file); err == nil && os.SameFile(loaded, cur) {
+		_ = os.Chtimes(file, loaded.ModTime(), loaded.ModTime())
+	}
+}
+
+// dropSavedCache deletes the project's saved cache file, as it was when a
+// boot loaded it (loaded), unless a save put a new copy in its place
+// meanwhile (the boot stops waiting for a slow save after builderSaveWait).
+// The check and the rename are under mu, as saves rename under it; the
+// blocks are freed after. The copy's refusal count goes with it.
+func (d *Daemon) dropSavedCache(project string, loaded os.FileInfo) {
+	file := builderCacheFile(project)
 	aside := ""
 	d.mu.Lock()
 	if cur, err := os.Stat(file); err == nil && os.SameFile(loaded, cur) {
@@ -552,6 +630,7 @@ func (d *Daemon) dropRefusedCache(file string, f *os.File) {
 	}
 	d.mu.Unlock()
 	if aside != "" {
+		d.forgetRefusals(project)
 		_ = unlinkCache(aside)
 	}
 }

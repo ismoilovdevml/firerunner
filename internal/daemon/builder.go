@@ -516,6 +516,10 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	// The project's previous builder may still be copying its cache out. The
 	// new one booted meanwhile; only the restore needs the copy.
 	phases.end("save_wait", d.waitForSave(ctx, project, start))
+	// The copy about to be loaded, so a drop below spares one a late save
+	// renames into place meanwhile. Taken before the restore opens it: a
+	// save in between makes the drop spare the copy, never hit another.
+	loaded, _ := os.Stat(builderCacheFile(project))
 	cache, err := d.restoreBuilderCache(ctx, bcfg, project, inst)
 	if err != nil {
 		phases.end("restore", cache)
@@ -539,10 +543,10 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	phases.end("restore", cache)
 	if err := builderSetup(ctx, bcfg, inst, creds); err != nil {
 		phases.end("buildkitd", "failed")
-		if restored && errors.Is(err, errBuildkitDown) {
+		if restored && errors.Is(err, errBuildkitDown) && loaded != nil {
 			// buildkitd ran but did not come up on the restored state: do not
 			// start every later builder of the project from it.
-			_ = os.Remove(builderCacheFile(project))
+			d.dropSavedCache(project, loaded)
 			d.log.Warn("saved builder cache dropped: buildkitd did not start with it", "project", project)
 		}
 		fail(inst, err)
@@ -584,8 +588,9 @@ func (d *Daemon) bootBuilder(ctx context.Context, cfg config.Config, project str
 	}
 	if !ok || ctx.Err() != nil {
 		// Removed while booting, or shutting down. The port leads to this VM
-		// unless another builder took it meanwhile.
-		unmap := port != 0 && (ok || !d.portUsedLocked(port))
+		// until its new holder, if any, maps it; unmapBuilderPort leaves the
+		// port alone once it leads elsewhere.
+		unmap := port != 0
 		nft := nftRun
 		d.spawn(func() {
 			if unmap {
@@ -1271,6 +1276,12 @@ func serial() *big.Int {
 	return n
 }
 
+// mirrorAddr is a registry mirror URL as buildkitd takes it: host[:port],
+// without the scheme or a trailing slash.
+func mirrorAddr(url string) string {
+	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(url, "http://"), "https://"), "/")
+}
+
 // buildkitdTOML points Docker Hub at the host's mirror (plain HTTP) and sets
 // vm.insecure_registries: http://host:port as plain HTTP, host:port as TLS
 // without a certificate check. BuildKit, unlike Docker, does not fall back
@@ -1289,7 +1300,7 @@ func buildkitdTOML(cfg config.Config) string {
 			fmt.Fprintf(&b, "[registry.%q]\n  insecure = true\n", host)
 		}
 	}
-	mirror := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(cfg.VM.RegistryMirror, "http://"), "https://"), "/")
+	mirror := mirrorAddr(cfg.VM.RegistryMirror)
 	if mirror != "" {
 		fmt.Fprintf(&b, "[registry.\"docker.io\"]\n  mirrors = [%q]\n", mirror)
 		// Only a plain-HTTP mirror needs a table; an https:// one keeps its
@@ -1300,7 +1311,7 @@ func buildkitdTOML(cfg config.Config) string {
 	}
 	for _, host := range slices.Sorted(maps.Keys(cfg.VM.RegistryMirrors)) {
 		m := cfg.VM.RegistryMirrors[host]
-		addr := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(m, "http://"), "https://"), "/")
+		addr := mirrorAddr(m)
 		fmt.Fprintf(&b, "[registry.%q]\n  mirrors = [%q]\n", host, addr)
 		if strings.HasPrefix(m, "http://") {
 			table(addr, true)

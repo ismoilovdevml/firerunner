@@ -85,7 +85,7 @@ func (d *Daemon) apiHandler() http.Handler {
 			if d.unclaim(p) {
 				d.log.Warn("pool VM claim not delivered, VM back in the pool", "vm", p.inst.ID, "job", job, "err", err)
 			} else {
-				d.log.Warn("pool VM claim not delivered; the VM's preload was stopped for it, so it is deleted",
+				d.log.Warn("pool VM claim not delivered; the VM is not ready for another job (preload stopped or pool refreshed), so it is deleted",
 					"vm", p.inst.ID, "job", job, "err", err)
 			}
 			return

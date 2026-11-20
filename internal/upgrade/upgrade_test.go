@@ -363,6 +363,12 @@ func TestLatestDoesNotDowngrade(t *testing.T) {
 		{"latest", "v1.0.0", "v0.9.9", true},
 		{"latest", "v0.2.0", "v0.3.0", false},
 		{"latest", "v0.3.0-rc1", "v0.3.0", false},
+		// Pre-releases compare per SemVer: numeric identifiers as numbers.
+		{"latest", "v0.3.0-rc.9", "v0.3.0-rc.10", false},
+		{"latest", "v0.3.0-rc.10", "v0.3.0-rc.9", true},
+		{"latest", "v0.3.0-alpha.1", "v0.3.0-alpha", true}, // fewer identifiers: older
+		{"latest", "v0.3.0-alpha", "v0.3.0-1", true},       // numeric before alphanumeric
+		{"latest", "v0.3.0-beta", "v0.3.0-alpha.2", true},
 		{"latest", "edge-abc1234", "v0.2.0", false}, // leaving edge for the stable line
 		{"latest", "dev", "v0.2.0", false},
 		{"v0.2.0", "v0.3.0", "v0.2.0", false}, // asked for by name
