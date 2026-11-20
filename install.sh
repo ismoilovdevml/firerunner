@@ -1000,7 +1000,25 @@ EOF
         ufw route allow in on "${FR_BRIDGE}" >/dev/null
         ufw allow in on "${FR_BRIDGE}" to any port 67 proto udp >/dev/null
         ufw allow in on "${FR_BRIDGE}" to any port 53 >/dev/null
+        # ufw's own input chain drops what its rules do not allow, whatever the
+        # firerunner table accepts: the registry mirrors, the cache server and
+        # the forwarder on the bridge address, the same ports net-up.sh opens.
+        local port
+        for port in $(bridge_tcp_ports); do
+            ufw allow in on "${FR_BRIDGE}" to "${FR_SUBNET}.1" port "$port" proto tcp >/dev/null
+        done
     fi
+}
+
+# bridge_tcp_ports: the TCP ports microVMs use on the bridge address besides
+# DNS: the registry mirrors, the cache server (9000) and, with a corporate
+# proxy, the forwarder (proxy.listen).
+bridge_tcp_ports() {
+    local host
+    echo 5000
+    for host in $(mirror_hosts); do echo "${MIRROR_PORT[$host]}"; done
+    echo 9000
+    if proxy_on; then echo "$PROXY_PORT"; fi
 }
 
 # --------------------------------------------------------------------------
