@@ -447,7 +447,7 @@ configure_proxy() {
         $fr config set proxy.no_proxy "$FR_NO_PROXY" >/dev/null
     fi
     $fr config set proxy.enabled true >/dev/null
-    put /etc/systemd/system/firerunner-proxy.service <<EOF
+    put "$UNIT_DIR/firerunner-proxy.service" <<EOF
 [Unit]
 Description=FireRunner proxy forwarder (microVMs and host services to the corporate proxy)
 Wants=firerunner-net.service
@@ -457,6 +457,13 @@ After=firerunner-net.service
 ExecStart=${BIN_DIR}/firerunner proxy
 Restart=always
 RestartSec=2
+# On a stop it lets open tunnels finish for proxy.shutdown_timeout (30 s by
+# default): at least that plus 15 s, so systemd does not kill it first.
+TimeoutStopSec=45
+# Its metrics socket (metrics.sock, 0600), which the daemon reads and serves on :9477.
+RuntimeDirectory=firerunner-proxy
+RuntimeDirectoryMode=0700
+ReadWritePaths=/run/firerunner-proxy
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -477,7 +484,7 @@ EOF
     systemctl enable -q firerunner-proxy
     if ! systemctl is-active -q firerunner-proxy; then
         systemctl restart firerunner-proxy
-    elif changed /etc/systemd/system/firerunner-proxy.service "$BIN_DIR/firerunner"; then
+    elif changed "$UNIT_DIR/firerunner-proxy.service" "$BIN_DIR/firerunner"; then
         # A restart cuts the open tunnels (clones, pulls) of running jobs.
         restart_when_idle firerunner-proxy
     fi
