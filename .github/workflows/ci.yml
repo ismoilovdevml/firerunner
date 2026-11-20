@@ -120,6 +120,9 @@ jobs:
             docker run --rm --privileged -e BRNF=$brnf -v "$PWD":/src:ro ubuntu:24.04 bash /src/test/network/run.sh
           done
 
+      - name: Test the installer's disk choice, binary install, pins and cache cap
+        run: bash test/installer/host.sh
+
       - name: Test the installer's proxy, CA and registry steps
         run: docker run --rm -v "$PWD":/src:ro ubuntu:24.04 bash /src/test/installer/proxy.sh
 

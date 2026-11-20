@@ -15,7 +15,7 @@ GOVULNCHECK_VERSION=v1.8.0
 # (.github/workflows/ci.yml), so this is the only list.
 SHELL_SCRIPTS=install.sh images/rootfs/firerunner-netfilter test/network/run.sh \
 	test/installer/proxy.sh test/installer/release.sh test/installer/flintlock-tls.sh \
-	test/perf/job-bench.sh
+	test/installer/host.sh test/perf/job-bench.sh
 
 # Local tag for the microVM rootfs image; CI publishes to ghcr.io (images.yml).
 ROOTFS_IMAGE?=firerunner-rootfs:local
