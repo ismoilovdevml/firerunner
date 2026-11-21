@@ -83,6 +83,9 @@ Usage:
   firerunner daemon                         pool + reconcile + metrics (systemd: firerunner.service)
   firerunner proxy                          forwards microVM traffic to the corporate proxy
                                             (systemd: firerunner-proxy.service; see proxy.*)
+  firerunner registry-front --listen A --upstream U
+                                            pull-only front of a registry mirror
+                                            (systemd: firerunner-registry-front@<mirror>.service)
   firerunner executor prepare|run|cleanup   called by gitlab-runner (custom executor)
   firerunner upgrade [--version edge|latest|vX.Y.Z] [--check]
                                             replace this binary with a release (default: edge)
