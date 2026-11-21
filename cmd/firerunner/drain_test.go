@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,7 +61,7 @@ type fakeDrainRunner struct {
 	// dropped answers DropDropIn, one entry per call, the last repeating:
 	// false while gitlab-runner still stops. Empty: always true.
 	dropped []bool
-	dropIn  bool // HasDropIn
+	dropIn  bool // SettingsLeft
 	calls   []string
 }
 
@@ -97,7 +98,7 @@ func (f *fakeDrainRunner) DropDropIn(context.Context) (bool, error) {
 	return gone, nil
 }
 
-func (f *fakeDrainRunner) HasDropIn() bool { return f.dropIn }
+func (f *fakeDrainRunner) SettingsLeft(context.Context) (bool, error) { return f.dropIn, nil }
 
 func drained(jobs int) *daemon.DrainStatus {
 	return &daemon.DrainStatus{Drained: true, Since: time.Now(), JobsRunning: jobs}
@@ -256,12 +257,12 @@ func TestUndrain(t *testing.T) {
 		runnerOp []string // checked when set
 	}{
 		{name: "gitlab-runner started", d: &fakeDrainDaemon{}, r: &fakeDrainRunner{resume: host.ResumeStarted},
-			want: []string{"gitlab-runner started", "boots pool VMs and builders again"}, runnerOp: []string{"resume"}},
+			want: []string{"boots pool VMs and builders again", "gitlab-runner started"}, runnerOp: []string{"resume"}},
 		// The drop-in goes once gitlab-runner no longer stops, not before:
 		// its stop would end by killing the jobs.
 		{name: "gitlab-runner still finishing", d: &fakeDrainDaemon{},
 			r: &fakeDrainRunner{resume: host.ResumeAfterStop, dropped: []bool{false, false, true}},
-			want: []string{"starts again once they are done", "boots pool VMs and builders again",
+			want: []string{"boots pool VMs and builders again", "starts again once they are done",
 				"waiting", "gitlab-runner finishing the jobs it ran when drained", "stop settings are removed"},
 			runnerOp: []string{"resume", "drop", "drop", "drop"}},
 		// Told exactly what to run once it has stopped.
@@ -273,13 +274,14 @@ func TestUndrain(t *testing.T) {
 		// Stopped before the drain: left alone, but the operator is told.
 		{name: "gitlab-runner not stopped by drain", d: &fakeDrainDaemon{},
 			r:    &fakeDrainRunner{resume: host.ResumeNothing, states: []string{"inactive"}},
-			want: []string{"systemctl start gitlab-runner", "boots pool VMs and builders again"}},
-		// Both sides are tried: one failing does not keep the other drained.
-		{name: "gitlab-runner fails, daemon still undrained", d: &fakeDrainDaemon{},
+			want: []string{"boots pool VMs and builders again", "systemctl start gitlab-runner"}},
+		{name: "gitlab-runner fails, daemon undrained", d: &fakeDrainDaemon{},
 			r:       &fakeDrainRunner{resumeErr: errors.New("start failed")},
 			wantErr: "gitlab-runner: start failed", want: []string{"boots pool VMs and builders again"}},
-		{name: "daemon fails", d: &fakeDrainDaemon{setErr: errDown}, r: &fakeDrainRunner{resume: host.ResumeStarted},
-			wantErr: "daemon is still drained", want: []string{"gitlab-runner started"}},
+		// The daemon's drain ends first; when it cannot, gitlab-runner is
+		// not started (a waiting drain would stop it again).
+		{name: "daemon fails: gitlab-runner untouched", d: &fakeDrainDaemon{setErr: errDown}, r: &fakeDrainRunner{resume: host.ResumeStarted},
+			wantErr: "nothing was changed", runnerOp: []string{}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -350,5 +352,101 @@ func TestCmdDrainArgs(t *testing.T) {
 		if err := cmdUndrain(cfg, args); err == nil {
 			t.Errorf("undrain %q accepted", args)
 		}
+	}
+}
+
+// A drain that sees gitlab-runner running reads the drain status again
+// before it stops it: running because an undrain started it, it is left
+// alone, and the wait ends.
+func TestDrainLeavesGitLabRunnerAnUndrainStarted(t *testing.T) {
+	d := &fakeDrainDaemon{statuses: []*daemon.DrainStatus{{Drained: true, PoolBooting: 1}, {Drained: false}}}
+	r := &fakeDrainRunner{states: []string{"active"}}
+	dr, out := testDrainer(d, r)
+	err := dr.drain(context.Background(), 5*time.Second)
+	if !errors.Is(err, errUndrained) {
+		t.Fatalf("drain = %v, want errUndrained\n%s", err, out)
+	}
+	if strings.Join(r.calls, ",") != "stop" || strings.Contains(out.String(), "stopping it again") {
+		t.Fatalf("gitlab-runner calls %v; want only the drain's first stop\n%s", r.calls, out)
+	}
+}
+
+// fakeHost is a daemon and a gitlab-runner that drain and undrain share,
+// safe to call from both at once. A pool VM stays booting, so a drain
+// keeps waiting until it sees the undrain.
+type fakeHost struct {
+	mu       sync.Mutex
+	drained  bool
+	active   string
+	stops    int
+	resumeAt chan struct{} // closed when undrain starts gitlab-runner
+}
+
+func (h *fakeHost) SetDrain(_ context.Context, on bool) (*daemon.DrainStatus, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.drained = on
+	return &daemon.DrainStatus{Drained: on}, nil
+}
+
+func (h *fakeHost) DrainStatus(context.Context) (*daemon.DrainStatus, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return &daemon.DrainStatus{Drained: h.drained, PoolBooting: 1}, nil
+}
+
+func (h *fakeHost) Stop(context.Context) (bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stops++
+	if h.active == "active" {
+		h.active = "inactive"
+		return true, nil
+	}
+	return false, nil
+}
+
+func (h *fakeHost) Resume(context.Context) (host.Resume, error) {
+	h.mu.Lock()
+	h.active = "active"
+	h.mu.Unlock()
+	close(h.resumeAt)
+	// Give a drain still polling every millisecond time to look.
+	time.Sleep(20 * time.Millisecond)
+	return host.ResumeStarted, nil
+}
+
+func (h *fakeHost) State(context.Context) (host.RunnerState, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return host.RunnerState{Active: h.active, Graceful: true}, nil
+}
+
+func (h *fakeHost) DropDropIn(context.Context) (bool, error)   { return true, nil }
+func (h *fakeHost) SettingsLeft(context.Context) (bool, error) { return false, nil }
+
+// An undrain while a drain still waits: the drain must not stop the
+// gitlab-runner the undrain starts, or the host ends up not drained with
+// gitlab-runner stopped and no job taken.
+func TestUndrainWhileDrainWaits(t *testing.T) {
+	h := &fakeHost{drained: true, active: "inactive", resumeAt: make(chan struct{})}
+	var drainOut, undrainOut bytes.Buffer
+	drainer1 := drainer{daemon: h, runner: h, out: &drainOut, poll: time.Millisecond, progressEvery: time.Hour}
+	undrainer := drainer{daemon: h, runner: h, out: &undrainOut, poll: time.Millisecond, progressEvery: time.Hour}
+
+	done := make(chan error, 1)
+	go func() { done <- drainer1.drain(context.Background(), 5*time.Second) }()
+	time.Sleep(10 * time.Millisecond) // the drain is waiting
+	if err := undrainer.undrain(context.Background(), time.Second); err != nil {
+		t.Fatalf("undrain: %v", err)
+	}
+	if err := <-done; !errors.Is(err, errUndrained) {
+		t.Fatalf("drain = %v, want errUndrained\n%s", err, drainOut.String())
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.drained || h.active != "active" || h.stops != 1 {
+		t.Fatalf("after undrain: drained %v, gitlab-runner %s, %d stops (want the drain's first only)\ndrain:\n%s",
+			h.drained, h.active, h.stops, drainOut.String())
 	}
 }

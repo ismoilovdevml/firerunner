@@ -37,7 +37,8 @@ type drainRunner interface {
 	// DropDropIn removes the drain drop-in once gitlab-runner no longer
 	// stops; false while it does.
 	DropDropIn(ctx context.Context) (bool, error)
-	HasDropIn() bool
+	// SettingsLeft: the drain's stop settings are still on disk or loaded.
+	SettingsLeft(ctx context.Context) (bool, error)
 }
 
 // hostRunner is gitlab-runner's systemd unit on this host.
@@ -51,7 +52,9 @@ func (hostRunner) State(ctx context.Context) (host.RunnerState, error) {
 	return host.ReadRunnerState(ctx)
 }
 func (hostRunner) DropDropIn(ctx context.Context) (bool, error) { return host.DropDrainDropIn(ctx) }
-func (hostRunner) HasDropIn() bool                              { return host.HasDrainDropIn() }
+func (hostRunner) SettingsLeft(ctx context.Context) (bool, error) {
+	return host.DrainSettingsLeft(ctx)
+}
 
 // drainer runs drain and undrain against a daemon and a gitlab-runner.
 type drainer struct {
@@ -157,9 +160,12 @@ func (dr drainer) wait(ctx context.Context, timeout time.Duration) error {
 	var lastAt time.Time
 	for {
 		st, rs, err := dr.look(ctx)
-		if err == nil && st.Drained && rs.Running() {
+		if err == nil && st.Drained && rs.Running() && dr.stillDrained(ctx) {
 			// Started meanwhile (by hand, or a start an undrain queued
-			// behind the stop): stop it again.
+			// behind the stop): stop it again. Not when an undrain started
+			// it: undrain ends the daemon's drain before it starts
+			// gitlab-runner, so the drain status read after seeing it run
+			// says so (stillDrained).
 			if asked, serr := dr.runner.Stop(ctx); serr != nil {
 				if serr.Error() != lastStopErr {
 					fmt.Fprintln(dr.out, "warning: gitlab-runner was started during the drain and could not be stopped:", serr)
@@ -196,6 +202,13 @@ func (dr drainer) wait(ctx context.Context, timeout time.Duration) error {
 		case <-tick.C:
 		}
 	}
+}
+
+// stillDrained reads the daemon's drain status again; an error reads as not
+// drained, so gitlab-runner is left alone when in doubt.
+func (dr drainer) stillDrained(ctx context.Context) bool {
+	st, err := dr.daemon.DrainStatus(ctx)
+	return err == nil && st.Drained
 }
 
 // look reads the daemon's drain status and gitlab-runner's state.
@@ -254,13 +267,18 @@ func plural(n int, what string) string {
 	return fmt.Sprintf("%d %ss", n, what)
 }
 
-// undrain starts gitlab-runner again if drain stopped it, and lets the
-// daemon boot again. Both are tried; it fails if either does. When
-// gitlab-runner still finishes the jobs it ran when drained, it starts once
-// they are done; undrain then waits for that, at most timeout, to remove
-// the drain's drop-in, which would make every later stop of gitlab-runner
-// wait for its jobs.
+// undrain ends the daemon's drain, then starts gitlab-runner again if
+// drain stopped it. The daemon goes first: a drain still waiting stops a
+// gitlab-runner it sees running only while the daemon is drained, so it
+// cannot stop the one undrain starts. When gitlab-runner still finishes the
+// jobs it ran when drained, it starts once they are done; undrain then waits
+// for that, at most timeout, to remove the drain's drop-in, which would make
+// every later stop of gitlab-runner wait for its jobs.
 func (dr drainer) undrain(ctx context.Context, timeout time.Duration) error {
+	if _, err := dr.daemon.SetDrain(ctx, false); err != nil {
+		return fmt.Errorf("the daemon did not end the drain; nothing was changed (systemctl status firerunner): %w", err)
+	}
+	fmt.Fprintln(dr.out, "undrain: the daemon boots pool VMs and builders again")
 	res, rerr := dr.runner.Resume(ctx)
 	switch {
 	case rerr != nil:
@@ -275,10 +293,6 @@ func (dr drainer) undrain(ctx context.Context, timeout time.Duration) error {
 			fmt.Fprintln(dr.out, "undrain: gitlab-runner was not stopped by drain and is not running; start it with: sudo systemctl start gitlab-runner")
 		}
 	}
-	if _, err := dr.daemon.SetDrain(ctx, false); err != nil {
-		return errors.Join(rerr, fmt.Errorf("the daemon is still drained (systemctl status firerunner): %w", err))
-	}
-	fmt.Fprintln(dr.out, "undrain: the daemon boots pool VMs and builders again")
 	if rerr == nil && res == host.ResumeAfterStop {
 		return dr.waitDropIn(ctx, timeout)
 	}
@@ -333,7 +347,7 @@ func drainLine(ctx context.Context, d drainDaemon, r drainRunner) string {
 		return "unknown: daemon not reachable"
 	}
 	if !st.Drained {
-		if r.HasDropIn() {
+		if left, err := r.SettingsLeft(ctx); err == nil && left {
 			return "no, but gitlab-runner keeps the drain's stop settings (" + host.DrainDropIn() +
 				"): every stop of it waits for its jobs; firerunner undrain removes them once it no longer stops"
 		}
