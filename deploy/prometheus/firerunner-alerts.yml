@@ -171,8 +171,8 @@ groups:
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerdhcpleasesexhausting
       - alert: FireRunnerDiskFilling
         # The fuller of the saved builder caches' and flintlock's microVM state
-        # file systems. Not the registry mirrors': their eviction keeps it
-        # between 80 and 90 % in use on purpose (FireRunnerRegistryDiskFull).
+        # file systems. Not the registry mirrors': their eviction keeps only
+        # 10 to 20 % of it free on purpose (FireRunnerRegistryDiskFull).
         expr: |
           min by (instance) (
             firerunner_disk_free_bytes{dir!="/var/lib/firerunner/registries"}
@@ -185,11 +185,11 @@ groups:
           description: "Below 10% no builder cache is saved; at 0 cache: uploads and flintlockd's microVM state can no longer be written. The registry mirrors' image takes at most FR_REGISTRY_GB of it. Check: df -h /var/lib/firerunner /var/lib/flintlock/vm; sudo du -xsh /var/lib/firerunner/* /var/lib/flintlock/vm. cache: archives: re-run the installer with a lower FR_CACHE_DAYS. Saved builder caches: lower builder.saved_cache_gb; firerunner builder rm --all deletes every project's saved cache, so every next build is cold."
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerdiskfilling
       - alert: FireRunnerRegistryDiskFull
-        # The eviction (every 10 min) deletes layers above 90 % in use down to
-        # 80 %: under 5 % free for 30 min means it fails. 5 %, not 10: free is
-        # what the mirrors may still write, and ext4 on a disk of your own
-        # keeps 5 % for root by default, so 10 % free there is 85 % in use,
-        # below where the eviction starts. The installer's image keeps none.
+        # The eviction (every 2 min) starts below 10 % or 1.5 GiB free and
+        # frees up to 20 % and 3 GiB: under 5 % free for 30 min means it
+        # fails. Free is what the mirrors may still write (it leaves out the
+        # blocks ext4 keeps for root on a disk of your own; the installer's
+        # image keeps none), as the eviction counts it.
         expr: |
           firerunner_disk_free_bytes{dir="/var/lib/firerunner/registries"}
             / firerunner_disk_size_bytes{dir="/var/lib/firerunner/registries"} < 0.05
@@ -197,7 +197,7 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "Only {{ $value | humanizePercentage }} of the registry mirrors' file system is free on {{ $labels.instance }}"
-          description: "Its eviction, which keeps it under 90 % in use, is failing. Full, the mirrors store nothing new: pulls of what they do not hold go to the registries themselves (slower, Docker Hub rate limits). Check: journalctl -u firerunner-registry-evict --since -1h; systemctl list-timers 'firerunner-registry-*'; df -h /var/lib/firerunner/registries; sudo du -sh /var/lib/firerunner/registries/*. Grow it: re-run the installer with a larger FR_REGISTRY_GB."
+          description: "Its eviction, which keeps at least 10 % and 1.5 GiB free, is failing. A mirror writes a layer it does not hold while it streams it to the job: on a full file system that pull breaks off, and the job can fail. Check: journalctl -u firerunner-registry-evict --since -1h; systemctl list-timers 'firerunner-registry-*'; df -h /var/lib/firerunner/registries; sudo du -sh /var/lib/firerunner/registries/*. Grow it: re-run the installer with a larger FR_REGISTRY_GB."
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerregistrydiskfull
       - alert: FireRunnerBuildersFailing
         # Builders that did not start, or died: normal removals (lru, idle,
