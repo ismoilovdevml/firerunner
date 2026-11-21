@@ -44,7 +44,8 @@ func TestMain(m *testing.M) {
 	releaseLease = func(config.Config, string, string) {}
 	alive = func(config.Config, *vm.Instance) bool { return false }
 	warmDocker = func(config.Config, *vm.Instance) error { return nil }
-	serviceActive = func(context.Context, string) bool { return false }
+	servicesActive = func(_ context.Context, names []string) []bool { return make([]bool, len(names)) }
+	registryConfDir = filepath.Join(root, "registries.d")
 	thinPoolUsage = func(context.Context) (float64, float64, error) { return 0, 0, errors.New("no lvs in tests") }
 	buildkitdAnswers = func(string, int, string) bool { return false }
 	code := m.Run()

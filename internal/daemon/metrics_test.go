@@ -490,9 +490,9 @@ func TestCollectHostRecordsThinPoolForAdmissions(t *testing.T) {
 // goes away when the forwarder is switched off: a stale 0 would page forever.
 func TestServiceUpFollowsProxyEnabled(t *testing.T) {
 	d, _ := newTestDaemon(t)
-	old := serviceActive
-	serviceActive = func(context.Context, string) bool { return false }
-	t.Cleanup(func() { serviceActive = old })
+	old := servicesActive
+	servicesActive = func(_ context.Context, names []string) []bool { return make([]bool, len(names)) }
+	t.Cleanup(func() { servicesActive = old })
 
 	d.mu.Lock()
 	d.cfg.Proxy.Enabled = true
@@ -509,5 +509,95 @@ func TestServiceUpFollowsProxyEnabled(t *testing.T) {
 	d.collectHost(context.Background())
 	if got := series(t, d.metrics.serviceUp); got != withProxy-1 {
 		t.Fatalf("%d service_up series after the proxy was switched off, want %d", got, withProxy-1)
+	}
+}
+
+// Each registry mirror's registry and front are watched apart from
+// firerunner-registry, which only starts them: one crash-looping mirror is a
+// 0. A mirror the installer removed loses its series (a stale 0 would page
+// forever); a config directory that cannot be read keeps the mirrors known.
+func TestServiceUpCoversRegistryMirrors(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	logs := captureLog(d)
+	conf := filepath.Join(t.TempDir(), "registries.d")
+	oldConf, oldActive := registryConfDir, servicesActive
+	registryConfDir = conf
+	var probed []string
+	servicesActive = func(_ context.Context, names []string) []bool {
+		probed = names
+		up := make([]bool, len(names))
+		for i, n := range names {
+			up[i] = n != "firerunner-registry-front@ghcr.io"
+		}
+		return up
+	}
+	t.Cleanup(func() { registryConfDir, servicesActive = oldConf, oldActive })
+	if err := os.Mkdir(conf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"docker.io.yml", "docker.io.env", "ghcr.io.yml", "ghcr.io.env"} {
+		if err := os.WriteFile(filepath.Join(conf, f), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mirrorSeries := func() string {
+		var out []string
+		for _, s := range seriesOf(t, d, "firerunner_service_up") {
+			if strings.HasPrefix(s, "firerunner-registry") {
+				out = append(out, s)
+			}
+		}
+		return strings.Join(out, " ")
+	}
+
+	d.collectHost(context.Background())
+	want := "firerunner-registry firerunner-registry-front@docker.io firerunner-registry-front@ghcr.io " +
+		"firerunner-registry@docker.io firerunner-registry@ghcr.io"
+	if got := mirrorSeries(); got != want {
+		t.Fatalf("service_up series %q, want %q", got, want)
+	}
+	for svc, want := range map[string]float64{"firerunner-registry@ghcr.io": 1, "firerunner-registry-front@ghcr.io": 0, "firerunner-registry": 1} {
+		if got := labelValue(t, d, "firerunner_service_up", map[string]string{"service": svc}); got != want {
+			t.Errorf("%s service_up = %v, want %v", svc, got, want)
+		}
+	}
+	if !strings.Contains(strings.Join(probed, " "), "firerunner-registry firerunner-registry@docker.io firerunner-registry-front@docker.io") {
+		t.Errorf("one probe for every unit, mirrors after firerunner-registry: %v", probed)
+	}
+
+	// The installer stopped mirroring ghcr.io.
+	for _, f := range []string{"ghcr.io.yml", "ghcr.io.env"} {
+		if err := os.Remove(filepath.Join(conf, f)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d.collectHost(context.Background())
+	want = "firerunner-registry firerunner-registry-front@docker.io firerunner-registry@docker.io"
+	if got := mirrorSeries(); got != want {
+		t.Fatalf("after ghcr.io was removed: service_up series %q, want %q", got, want)
+	}
+
+	// Unreadable: the mirrors known so far stay watched, and it is logged.
+	if err := os.RemoveAll(conf); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(conf, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d.collectHost(context.Background())
+	if got := mirrorSeries(); got != want {
+		t.Fatalf("with an unreadable %s: service_up series %q, want %q", conf, got, want)
+	}
+	if !strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("unreadable registry mirror configs not logged:\n%s", logs)
+	}
+
+	// No directory: a host whose mirrors run in firerunner-registry alone.
+	if err := os.Remove(conf); err != nil {
+		t.Fatal(err)
+	}
+	d.collectHost(context.Background())
+	if got := mirrorSeries(); got != "firerunner-registry" {
+		t.Fatalf("without %s: service_up series %q, want firerunner-registry alone", conf, got)
 	}
 }

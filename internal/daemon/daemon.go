@@ -270,6 +270,9 @@ type Daemon struct {
 
 	lastTick atomic.Int64 // unix time of the main loop's last pass (/healthz)
 	oomKills int64        // host oom_kill count at the last collectHost, -1 before the first
+	// registryUnits: the registry mirrors' units collectHost watched last
+	// (only the main loop touches it).
+	registryUnits []string
 	// saving: projects whose deleted builder is copying its cache to the host
 	// (see removeBuilderLocked). cacheDropped: when an operator last threw a
 	// project's saved cache away ("all": every project's), so a save that
@@ -1402,18 +1405,43 @@ func (d *Daemon) recordDisk(dir string) {
 
 // Probes of collectHost, bounded by host's command timeout (variables for tests).
 var (
-	serviceActive = host.ServiceActiveContext
-	thinPoolUsage = host.ThinPoolUsageContext
+	servicesActive = host.ServicesActiveContext
+	thinPoolUsage  = host.ThinPoolUsageContext
 )
+
+// registryConfDir is where install.sh writes the registry mirrors' configs
+// (a variable for tests).
+var registryConfDir = host.RegistryConfDir
+
+// collectRegistryUnits returns the registry mirrors' units to watch and drops
+// the series of those no longer configured: a stale 0 of a removed mirror
+// would page FireRunnerCacheServiceDown forever. An unreadable config
+// directory keeps the units known so far: dropping them would hide a
+// failing mirror for as long as it lasts.
+func (d *Daemon) collectRegistryUnits() []string {
+	units, err := host.RegistryUnits(registryConfDir)
+	if err != nil {
+		d.warnLimited("registry-units", "cannot list the registry mirrors; their firerunner_service_up is of the mirrors known before", "err", err)
+		return d.registryUnits
+	}
+	for _, u := range d.registryUnits {
+		if !slices.Contains(units, u) {
+			d.metrics.serviceUp.DeleteLabelValues(u)
+		}
+	}
+	d.registryUnits = units
+	return units
+}
 
 func (d *Daemon) collectHost(ctx context.Context) {
 	proxyEnabled := d.cfgSnapshot().Proxy.Enabled
-	for _, s := range host.MonitoredServices(proxyEnabled) {
+	services := host.MonitoredServices(proxyEnabled, d.collectRegistryUnits())
+	for i, active := range servicesActive(ctx, services) {
 		up := 0.0
-		if serviceActive(ctx, s) {
+		if active {
 			up = 1
 		}
-		d.metrics.serviceUp.WithLabelValues(s).Set(up)
+		d.metrics.serviceUp.WithLabelValues(services[i]).Set(up)
 	}
 	if !proxyEnabled {
 		// A forwarder switched off must not keep its last value: a stale 0

@@ -28,23 +28,88 @@ const (
 // DnsmasqConfig is the microVM DHCP/DNS configuration install.sh writes.
 const DnsmasqConfig = "/etc/firerunner/dnsmasq.conf"
 
-// Services installed by install.sh, in start order.
-var Services = []string{"containerd-flintlock", "firerunner-net", "firerunner-dnsmasq", "firerunner-registry",
+// Services installed by install.sh, in start order. firerunner-registry only
+// starts the registry mirrors (or, on hosts not yet moved to a service per
+// mirror, runs them all): see RegistryUnits for each mirror's own units.
+var Services = []string{"containerd-flintlock", "firerunner-net", "firerunner-dnsmasq", RegistryService,
 	"firerunner-cache", "flintlockd"}
+
+// RegistryService starts every registry mirror's units (their PartOf=).
+const RegistryService = "firerunner-registry"
+
+// RegistryConfDir holds, for every registry mirror install.sh runs, NAME.yml
+// (its registry) and NAME.env (its front).
+const RegistryConfDir = "/etc/firerunner/registries.d"
 
 // ProxyService is the forwarder's unit; install.sh runs it only with a
 // corporate proxy (proxy.enabled).
 const ProxyService = "firerunner-proxy"
 
+// HostServices are Services with the registry mirrors' units (RegistryUnits)
+// right after firerunner-registry. A new slice each call.
+func HostServices(registryUnits []string) []string {
+	out := make([]string, 0, len(Services)+len(registryUnits))
+	for _, s := range Services {
+		out = append(out, s)
+		if s == RegistryService {
+			out = append(out, registryUnits...)
+		}
+	}
+	return out
+}
+
 // MonitoredServices are the units status and the daemon's
-// firerunner_service_up report: Services, the forwarder where proxy.enabled
-// is on (absent, not down, elsewhere), and gitlab-runner. A new slice each call.
-func MonitoredServices(proxyEnabled bool) []string {
-	out := append([]string(nil), Services...)
+// firerunner_service_up report: HostServices, the forwarder where
+// proxy.enabled is on (absent, not down, elsewhere), and gitlab-runner. A new
+// slice each call.
+func MonitoredServices(proxyEnabled bool, registryUnits []string) []string {
+	out := HostServices(registryUnits)
 	if proxyEnabled {
 		out = append(out, ProxyService)
 	}
 	return append(out, "gitlab-runner")
+}
+
+// RegistryUnits are the systemd units of the registry mirrors configured in
+// dir (RegistryConfDir): firerunner-registry@NAME and
+// firerunner-registry-front@NAME for every NAME.env, by NAME. The files, not
+// what systemd has loaded, say which mirrors must run: a mirror whose unit
+// never started is down, not missing, and install.sh removes the files of a
+// mirror it stops. Names install.sh would not write are skipped, so a stray
+// file adds no series; the installer's port range (5000-5099) bounds them to
+// 100. No dir is no mirror: an install from before a service per mirror.
+func RegistryUnits(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("registry mirrors: %w", err)
+	}
+	var out []string
+	for _, e := range entries { // sorted by file name
+		name, ok := strings.CutSuffix(e.Name(), ".env")
+		if !ok || e.IsDir() || !registryName(name) {
+			continue
+		}
+		out = append(out, RegistryService+"@"+name, RegistryService+"-front@"+name)
+	}
+	return out, nil
+}
+
+// registryName reports whether s is a mirror name install.sh writes: docker.io
+// or a registry host name ([a-z0-9]([a-z0-9.-]*[a-z0-9])?). It is also a
+// systemd instance name and a label value, so nothing else gets through.
+func registryName(s string) bool {
+	if s == "" || strings.ContainsAny(s[:1]+s[len(s)-1:], ".-") {
+		return false
+	}
+	for _, r := range s {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '.' && r != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // commandTimeout bounds each systemctl and lvs run: systemd or LVM stuck on
@@ -70,6 +135,46 @@ func ServiceActive(name string) bool { return ServiceActiveContext(context.Backg
 func ServiceActiveContext(ctx context.Context, name string) bool {
 	_, err := probe(ctx, "systemctl", "is-active", "--quiet", name)
 	return err == nil
+}
+
+// ServicesActiveContext reports, for each of names in order, whether its
+// systemd unit is active. One systemctl run answers for all of them: the
+// daemon's main loop probes every unit, a pair per registry mirror included,
+// and a hung systemd must stall it for one commandTimeout, not one per unit.
+// A systemctl that fails or does not answer for every unit within
+// commandTimeout reads as all inactive.
+func ServicesActiveContext(ctx context.Context, names []string) []bool {
+	up := make([]bool, len(names))
+	if len(names) == 0 {
+		return up
+	}
+	// It exits non-zero unless every unit is active, and still prints one
+	// state per unit. Killed (timeout) or cut off, what it printed is not
+	// an answer.
+	out, err := probe(ctx, "systemctl", append([]string{"is-active"}, names...)...)
+	var exit *exec.ExitError
+	if err != nil && (!errors.As(err, &exit) || exit.ExitCode() < 0) {
+		return up
+	}
+	states := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
+	if len(states) != len(names) {
+		return up
+	}
+	for i, s := range states {
+		// What `systemctl is-active` itself counts as active.
+		up[i] = s == "active" || s == "reloading" || s == "refreshing"
+	}
+	return up
+}
+
+// MountPoint reports whether a file system other than its parent's is mounted
+// on dir (not "/"). A missing dir is not one.
+func MountPoint(dir string) bool {
+	var st, parent syscall.Stat_t
+	if syscall.Stat(dir, &st) != nil || syscall.Stat(filepath.Dir(dir), &parent) != nil {
+		return false
+	}
+	return st.Dev != parent.Dev
 }
 
 func KVM() error {

@@ -368,8 +368,12 @@ func cmdStatus(cfg config.Config) error {
 	}
 	fmt.Fprintf(w, "KVM\t%s\n", kvm)
 
+	mirrors, err := host.RegistryUnits(host.RegistryConfDir)
+	if err != nil {
+		fmt.Fprintf(w, "Registry mirrors\t%v\n", err)
+	}
 	var svc []string
-	for _, s := range host.MonitoredServices(cfg.Proxy.Enabled) {
+	for _, s := range host.MonitoredServices(cfg.Proxy.Enabled, mirrors) {
 		state := "down"
 		if host.ServiceActive(s) {
 			state = "up"
@@ -423,7 +427,9 @@ func cmdDoctor(cfg config.Config) error {
 
 	fmt.Println("Host")
 	check("/dev/kvm", host.KVM(), "enable VT-x/AMD-V (bare metal) or nested virtualization (VM)")
-	for _, s := range host.Services {
+	mirrors, err := host.RegistryUnits(host.RegistryConfDir)
+	check("registry mirrors listed in "+host.RegistryConfDir, err, "")
+	for _, s := range host.HostServices(mirrors) {
 		var err error
 		if !host.ServiceActive(s) {
 			err = errors.New("not running")

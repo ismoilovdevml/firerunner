@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -90,23 +91,133 @@ func TestServiceActive(t *testing.T) {
 	}
 }
 
-// The forwarder is watched like the other services, but only where it runs.
+// The forwarder is watched like the other services, but only where it runs;
+// each registry mirror's units come right after firerunner-registry.
 func TestMonitoredServices(t *testing.T) {
+	mirrors := []string{"firerunner-registry@docker.io", "firerunner-registry-front@docker.io"}
 	for _, c := range []struct {
-		proxy bool
-		want  string
+		proxy   bool
+		mirrors []string
+		want    string
 	}{
-		{false, "containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd gitlab-runner"},
-		{true, "containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd firerunner-proxy gitlab-runner"},
+		{false, nil, "containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd gitlab-runner"},
+		{true, nil, "containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd firerunner-proxy gitlab-runner"},
+		{false, mirrors, "containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry " +
+			"firerunner-registry@docker.io firerunner-registry-front@docker.io firerunner-cache flintlockd gitlab-runner"},
 	} {
-		if got := strings.Join(MonitoredServices(c.proxy), " "); got != c.want {
-			t.Errorf("MonitoredServices(%v) = %s, want %s", c.proxy, got, c.want)
+		if got := strings.Join(MonitoredServices(c.proxy, c.mirrors), " "); got != c.want {
+			t.Errorf("MonitoredServices(%v, %v) = %s, want %s", c.proxy, c.mirrors, got, c.want)
 		}
 	}
-	// The list is a copy: appending to it never changes Services.
-	_ = append(MonitoredServices(true)[:1], "x")
-	if Services[1] != "firerunner-net" {
+	// The lists are copies: appending to them never changes Services.
+	_ = append(MonitoredServices(true, mirrors)[:1], "x")
+	_ = append(HostServices(mirrors)[:4], "x")
+	if Services[1] != "firerunner-net" || Services[4] != "firerunner-cache" {
 		t.Fatalf("Services changed: %v", Services)
+	}
+}
+
+// Every NAME.env in the registries' config directory is a mirror whose
+// registry and front must run; nothing else there is.
+func TestRegistryUnits(t *testing.T) {
+	pair := func(name string) string {
+		return "firerunner-registry@" + name + " firerunner-registry-front@" + name
+	}
+	for _, c := range []struct {
+		name  string
+		files []string // created in the directory (nil: no directory); a trailing / makes a directory
+		want  string
+	}{
+		{"no directory: an install before a service per mirror", nil, ""},
+		{"empty", []string{}, ""},
+		{"mirrors by name", []string{"quay.io.env", "quay.io.yml", "docker.io.env", "docker.io.yml", "ghcr.io.env"},
+			pair("docker.io") + " " + pair("ghcr.io") + " " + pair("quay.io")},
+		{"a registry config alone is not a mirror", []string{"ghcr.io.yml"}, ""},
+		{"not a mirror's name", []string{"Ghcr.io.env", ".ghcr.io.env", "ghcr.io-.env", "a b.env", ".env",
+			"ghcr.io.env.bak", "x@y.env", "ghcr.io.env/", "docker.io.env"}, pair("docker.io")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "registries.d")
+			if c.files != nil {
+				if err := os.Mkdir(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, f := range c.files {
+				var err error
+				if d, ok := strings.CutSuffix(f, "/"); ok {
+					err = os.Mkdir(filepath.Join(dir, d), 0o755)
+				} else {
+					err = os.WriteFile(filepath.Join(dir, f), nil, 0o644)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := RegistryUnits(dir)
+			if err != nil || strings.Join(got, " ") != c.want {
+				t.Fatalf("RegistryUnits = %q, %v; want %q", got, err, c.want)
+			}
+		})
+	}
+	// A directory that cannot be read is an error, not "no mirrors".
+	file := filepath.Join(t.TempDir(), "registries.d")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := RegistryUnits(file); err == nil {
+		t.Fatalf("RegistryUnits of a file = %q, want an error", got)
+	}
+}
+
+// One systemctl run answers for every unit, in order; a systemctl that fails
+// or does not answer for all of them reads as all inactive.
+func TestServicesActive(t *testing.T) {
+	names := []string{"flintlockd", "firerunner-registry@ghcr.io", "firerunner-registry-front@ghcr.io", "firerunner-net"}
+	none := []bool{false, false, false, false}
+	for _, c := range []struct {
+		name   string
+		script string
+		want   []bool
+	}{
+		{"each unit's state", `printf 'active\nfailed\nactivating\nreloading\n'; exit 3`, []bool{true, false, false, true}},
+		{"all active", `printf 'active\nactive\nactive\nactive\n'`, []bool{true, true, true, true}},
+		{"fewer answers than units", `printf 'active\nactive\n'`, none},
+		{"no bus", `echo "Failed to connect to bus" >&2; exit 1`, none},
+		{"hung systemctl", `printf 'active\nactive\nactive\nactive\n'; sleep 30`, none},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			stubCommands(t, c.script)
+			start := time.Now()
+			got := ServicesActiveContext(context.Background(), names)
+			if took := time.Since(start); took > 5*time.Second {
+				t.Fatalf("took %s", took)
+			}
+			if !slices.Equal(got, c.want) {
+				t.Fatalf("ServicesActive = %v, want %v", got, c.want)
+			}
+		})
+	}
+	stubCommands(t, `exit 1`)
+	if got := ServicesActiveContext(context.Background(), nil); len(got) != 0 {
+		t.Fatalf("ServicesActive(nil) = %v", got)
+	}
+}
+
+// Only a directory with a file system of its own mounted on it is a mount
+// point: not one on its parent's file system, nor a missing one.
+func TestMountPoint(t *testing.T) {
+	for _, c := range []struct {
+		dir  string
+		want bool
+	}{
+		{"/dev", true}, // devtmpfs (Linux), devfs (macOS)
+		{t.TempDir(), false},
+		{filepath.Join(t.TempDir(), "missing"), false},
+	} {
+		if got := MountPoint(c.dir); got != c.want {
+			t.Errorf("MountPoint(%s) = %v, want %v", c.dir, got, c.want)
+		}
 	}
 }
 
