@@ -353,6 +353,26 @@ func TestUpstreamAuthFailingGauge(t *testing.T) {
 	}
 }
 
+// Requests the forwarder refuses itself because the upstream refused these
+// credentials a moment ago count as upstream_auth_failed too: sustained
+// traffic keeps the count rising though the upstream saw only one 407, which
+// FireRunnerProxyUpstreamAuthFailing relies on.
+func TestKnownRefusedCredentialsCounted(t *testing.T) {
+	up := startUpstream(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("bob:right")))
+	f, fwd, _ := startMetered(t, "http://bob:wrong@"+up.addr, nil, Limits{RefusedWait: time.Hour})
+	for i := 0; i < 3; i++ {
+		c, _, code := connect(t, fwd, "example.com:443")
+		c.Close()
+		if code != http.StatusBadGateway {
+			t.Fatalf("attempt %d: %d", i, code)
+		}
+	}
+	if n := len(up.requests()); n != 1 {
+		t.Fatalf("upstream asked %d times, want once", n)
+	}
+	eventually(t, "three refusals", func() bool { return requestCounts(t, f)["tunnel/upstream_auth_failed"] == 3 })
+}
+
 // Labels have a handful of fixed values: never a client address or a
 // destination, which would make a series per VM or per site.
 func TestMetricsLabelsAreBounded(t *testing.T) {
