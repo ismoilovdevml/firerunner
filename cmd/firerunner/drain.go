@@ -285,6 +285,8 @@ func (dr drainer) undrain(ctx context.Context, timeout time.Duration) error {
 		rerr = fmt.Errorf("gitlab-runner: %w", rerr)
 	case res == host.ResumeStarted:
 		fmt.Fprintln(dr.out, "undrain: gitlab-runner started; it takes jobs again")
+	case res == host.ResumeDropped:
+		fmt.Fprintln(dr.out, "undrain: the drain's stop settings an earlier undrain could not unload are removed")
 	case res == host.ResumeAfterStop:
 		fmt.Fprintln(dr.out, "undrain: gitlab-runner still finishes the jobs it ran when drained and cannot take jobs before;\n"+
 			"it starts again once they are done")

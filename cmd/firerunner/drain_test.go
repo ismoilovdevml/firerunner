@@ -450,3 +450,28 @@ func TestUndrainWhileDrainWaits(t *testing.T) {
 			h.drained, h.active, h.stops, drainOut.String())
 	}
 }
+
+// An undrain whose daemon-reload failed leaves the stop settings loaded:
+// it fails and status says so; run again, it unloads them and succeeds.
+func TestUndrainAgainAfterAFailedReload(t *testing.T) {
+	d := &fakeDrainDaemon{statuses: []*daemon.DrainStatus{{}}}
+	r := &fakeDrainRunner{resume: host.ResumeStarted, resumeErr: errors.New("systemctl daemon-reload: failed"), dropIn: true}
+	dr, out := testDrainer(d, r)
+	if err := dr.undrain(context.Background(), time.Second); err == nil || !strings.Contains(err.Error(), "daemon-reload") {
+		t.Fatalf("first undrain = %v, want the reload error\n%s", err, out)
+	}
+	if line := drainLine(context.Background(), d, r); !strings.Contains(line, "keeps the drain's stop settings") {
+		t.Fatalf("status after the failed reload: %q", line)
+	}
+	r.resume, r.resumeErr, r.dropIn = host.ResumeDropped, nil, false
+	out.Reset()
+	if err := dr.undrain(context.Background(), time.Second); err != nil {
+		t.Fatalf("second undrain = %v\n%s", err, out)
+	}
+	if !strings.Contains(out.String(), "stop settings an earlier undrain could not unload are removed") {
+		t.Fatalf("second undrain output:\n%s", out)
+	}
+	if line := drainLine(context.Background(), d, r); line != "no" {
+		t.Fatalf("status after the second undrain: %q", line)
+	}
+}

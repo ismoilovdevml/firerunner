@@ -168,6 +168,11 @@ const (
 	// once it has exited. The drain drop-in is still there: DropDrainDropIn
 	// removes it once gitlab-runner no longer stops.
 	ResumeAfterStop
+	// ResumeDropped: an earlier undrain removed the drop-in, but its
+	// daemon-reload failed and systemd still had it loaded; now it is gone.
+	// That undrain had started gitlab-runner already: it is not started
+	// again.
+	ResumeDropped
 )
 
 // DrainDropIn is the drop-in drain adds to gitlab-runner's unit.
@@ -187,9 +192,29 @@ func HasDrainDropIn() bool {
 // jobs; DropDrainDropIn removes it later. A start that fails keeps it too,
 // so undrain can be run again. The Resume tells what was done, also with an
 // error.
+//
+// Without the file, the drop-in may still be loaded: an earlier undrain
+// removed it and its daemon-reload failed. Then only that reload is
+// finished (ResumeDropped), or waited for while gitlab-runner still stops
+// (ResumeAfterStop). ResumeNothing means nothing of the drain is left, on
+// disk or loaded.
 func ResumeRunner(ctx context.Context) (Resume, error) {
 	if !HasDrainDropIn() {
-		return ResumeNothing, nil
+		st, err := ReadRunnerState(ctx)
+		switch {
+		case err != nil:
+			return ResumeNothing, err
+		case !st.DrainLoaded:
+			return ResumeNothing, nil
+		}
+		dropped, err := DropDrainDropIn(ctx)
+		switch {
+		case err != nil:
+			return ResumeNothing, err
+		case !dropped:
+			return ResumeAfterStop, nil
+		}
+		return ResumeDropped, nil
 	}
 	if err := systemctl(ctx, "start", "--no-block", RunnerUnit); err != nil {
 		return ResumeNothing, err

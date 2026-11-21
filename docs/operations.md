@@ -98,7 +98,8 @@ To stop gitlab-runner gracefully, `drain` adds a runtime drop-in,
 `KillSignal=SIGQUIT`, `TimeoutStopSec=infinity`), checks that systemd took it, and stops the unit;
 `undrain` removes it once gitlab-runner no longer stops (a reload without it during the stop would
 kill the jobs), and counts it gone only once a `daemon-reload` went through and systemd no longer
-lists it (`systemctl show gitlab-runner -p DropInPaths`). Without it, `systemctl stop gitlab-runner` sends SIGTERM to every job's processes
+lists it (`systemctl show gitlab-runner -p DropInPaths`). If that reload fails, `undrain` says so;
+run it again, and it finishes the reload. Without it, `systemctl stop gitlab-runner` sends SIGTERM to every job's processes
 and cancels the jobs.
 
 ## microVMs
