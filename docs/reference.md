@@ -43,7 +43,10 @@ Bodies stream, `Range` and redirects pass through. A transfer has no time limit 
 that moves no byte for 5 minutes is cut, as is a registry that sends no headers for 5 minutes. A
 client address may hold 256 connections, all clients 4096; a connection over that is dropped, which
 makes Docker pull from the registry itself. On `SIGTERM` it stops taking connections and gives pulls
-under way 60 seconds to finish. A refused request is logged as `registry request refused`.
+under way 60 seconds to finish. A refused request is logged as `registry request refused`, a
+dropped connection as `registry connection refused: too many connections`: the first at once,
+then, while a client keeps at it, one line a minute per client and reason, with the count in
+`repeats`.
 
 ## Metrics
 

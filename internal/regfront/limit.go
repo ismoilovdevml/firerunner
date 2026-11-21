@@ -1,7 +1,6 @@
 package regfront
 
 import (
-	"log/slog"
 	"net"
 	"sync"
 )
@@ -15,15 +14,15 @@ import (
 type limitListener struct {
 	net.Listener
 	perClient, total int
-	log              *slog.Logger
+	warns            *warnLimiter
 
 	mu   sync.Mutex
 	open map[string]int
 	all  int
 }
 
-func newLimitListener(l net.Listener, perClient, total int, log *slog.Logger) *limitListener {
-	return &limitListener{Listener: l, perClient: perClient, total: total, log: log, open: map[string]int{}}
+func newLimitListener(l net.Listener, perClient, total int, warns *warnLimiter) *limitListener {
+	return &limitListener{Listener: l, perClient: perClient, total: total, warns: warns, open: map[string]int{}}
 }
 
 func (l *limitListener) Accept() (net.Conn, error) {
@@ -36,7 +35,7 @@ func (l *limitListener) Accept() (net.Conn, error) {
 		if l.take(client) {
 			return &limitedConn{Conn: c, release: func() { l.release(client) }}, nil
 		}
-		l.log.Warn("registry connection refused: too many connections", "client", client)
+		l.warns.warn("too many connections", client, "registry connection refused: too many connections", "client", client)
 		_ = c.Close()
 	}
 }
