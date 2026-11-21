@@ -205,7 +205,7 @@ groups:
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerdiskfilling
       - alert: FireRunnerRegistryDiskFull
         # The eviction (every 2 min) starts below 10 % or 1.5 GiB free and
-        # frees up to 20 % and 3 GiB: under 5 % free for 30 min means it
+        # frees up to 20 % and 3 GiB (at most half): under 5 % free for 30 min means it
         # fails. Free is what the mirrors may still write (it leaves out the
         # blocks ext4 keeps for root on a disk of your own; the installer's
         # image keeps none), as the eviction counts it.

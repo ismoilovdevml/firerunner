@@ -303,10 +303,15 @@ apply_pending() {
         warn "still pending while jobs run: $(tr '\n' ' ' <"$PENDING_FILE")- re-run the installer when the runner is idle"
         return 0
     fi
-    local action svc
+    local action svc keep=""
     while read -r action svc; do
         if [[ $svc == gitlab-runner ]] && drained; then
             log "  gitlab-runner not restarted (pending): the host is drained (firerunner undrain starts it with the change)"
+            continue
+        fi
+        if [[ $svc == "$REGISTRY_MOUNT_UNIT" ]]; then
+            # Only registry_remount remounts it, under setup_registries' lock.
+            keep+="$action $svc"$'\n'
             continue
         fi
         case $action in
@@ -314,7 +319,7 @@ apply_pending() {
             stop)    log "  stopping $svc (pending)"; systemctl disable --now -q "$svc" ;;
         esac
     done <"$PENDING_FILE"
-    rm -f "$PENDING_FILE"
+    if [[ -n $keep ]]; then printf '%s' "$keep" >"$PENDING_FILE"; else rm -f "$PENDING_FILE"; fi
 }
 
 # The networks jobs must not reach. Remembered, so a re-run without
@@ -1840,12 +1845,32 @@ EOF
         systemctl start "$REGISTRY_MOUNT_UNIT" ||
             die "could not mount $REGISTRY_IMG on $REGISTRY_DIR (journalctl -u $REGISTRY_MOUNT_UNIT)"
     elif changed "$UNIT_DIR/$REGISTRY_MOUNT_UNIT" || registry_pending "$REGISTRY_MOUNT_UNIT"; then
-        # New options (context=) apply only to a new mount. Remounting
-        # restarts the mirrors on it (their RequiresMountsFor=): when no job
-        # runs, here under setup_registries' lock (no garbage collection runs).
-        restart_when_idle "$REGISTRY_MOUNT_UNIT"
+        registry_remount
     fi
     registry_grow
+}
+
+# registry_remount: new mount options (context=) apply only to a new mount.
+# Remounting restarts the mirrors on it (their RequiresMountsFor=), so only
+# when no job runs, and only here, under setup_registries' lock (no garbage
+# collection runs; apply_pending leaves it alone). It stays pending until it
+# succeeds: a remount that fails (busy) is tried again by the next run.
+registry_remount() {
+    local m=$REGISTRY_MOUNT_UNIT
+    pending_add "restart $m"
+    if jobs_running; then
+        warn "  $REGISTRY_DIR: new mount options wait for a run when no job runs"
+        return 0
+    fi
+    log "  remounting $REGISTRY_DIR with new options"
+    if systemctl restart "$m"; then
+        sed -i "/^restart ${m//./\\.}\$/d" "$PENDING_FILE"
+        PENDING=${PENDING//"$m "/}
+    else
+        warn "  remounting $REGISTRY_DIR failed (journalctl -u $m): left for the next run"
+        mountpoint -q "$REGISTRY_DIR" || systemctl start "$m" || true
+    fi
+    return 0
 }
 
 # selinux_on: SELinux is enabled (enforcing or permissive).
@@ -1973,10 +1998,13 @@ registry_files() {
     mkdir -p "$REGISTRY_CONF_DIR" "$REGISTRY_STATE_DIR"
     # The registries read their config as REGISTRY_USER: the directories may
     # be searched (the root-only files in CONF_DIR stay 0600).
-    chmod 0755 "$REGISTRY_CONF_DIR"
+    chmod 0755 "$REGISTRY_CONF_DIR" "$REGISTRY_STATE_DIR"
     chmod go+x "$CONF_DIR"
     for name in $(registry_names); do
-        keep+="$name.yml $name.env "
+        # NAME.env (the front's settings) is written by registry_start when it
+        # enables the front: the daemon watches the front of every NAME.env.
+        keep+="$name.yml "
+        [[ $REGISTRY_FRONT != 1 ]] || keep+="$name.env "
         port=$(registry_bridge_port "$name")
         lport=$((port + REGISTRY_LOCAL_OFFSET))
         if [[ $REGISTRY_FRONT == 1 ]]; then addr=127.0.0.1:$lport; else addr=${FR_SUBNET}.1:$port; fi
@@ -1999,10 +2027,6 @@ http:
 proxy:
   remoteurl: $(registry_upstream "$name")
   ttl: 168h
-EOF
-        put "$REGISTRY_CONF_DIR/$name.env" <<EOF
-FR_FRONT_LISTEN=${FR_SUBNET}.1:$port
-FR_FRONT_UPSTREAM=http://127.0.0.1:$lport
 EOF
     done
     for f in "$REGISTRY_CONF_DIR"/*; do
@@ -2167,6 +2191,56 @@ WantedBy=timers.target
 EOF
 }
 
+# registry_front_env NAME: the settings of NAME's front (its bridge port and
+# its registry), read by firerunner-registry-front@NAME. Written when the
+# front is enabled: the daemon reports the front of every NAME.env.
+registry_front_env() {
+    local port lport
+    port=$(registry_bridge_port "$1")
+    lport=$((port + REGISTRY_LOCAL_OFFSET))
+    put "$REGISTRY_CONF_DIR/$1.env" <<EOF
+FR_FRONT_LISTEN=${FR_SUBNET}.1:$port
+FR_FRONT_UPSTREAM=http://127.0.0.1:$lport
+EOF
+}
+
+# RUNTIME_UNIT_DIR: where `systemctl mask --runtime` links a unit to /dev/null.
+RUNTIME_UNIT_DIR=/run/systemd/system
+
+# registry_unmask_stale unmasks the mirrors a garbage collection masked and,
+# killed outright (SIGKILL: no trap ran), never unmasked: masked, every
+# `systemctl enable` of them fails and the mirror stays down. Only under
+# setup_registries' lock, when no garbage collection runs.
+registry_unmask_stale() {
+    local m unit
+    for m in "$RUNTIME_UNIT_DIR"/firerunner-registry@*.service; do
+        [[ -L $m && $(readlink "$m") == /dev/null ]] || continue
+        unit=$(basename "$m")
+        warn "  $unit was left masked by a garbage collection that was cut off: unmasking it"
+        systemctl unmask --runtime -q "$unit" || warn "  could not unmask $unit (systemctl unmask --runtime $unit)"
+    done
+    return 0
+}
+
+# pending_drop_unused drops the restarts left for mirrors no longer in
+# FR_REGISTRY_MIRRORS: apply_pending would start their units, whose config is
+# gone, and they would crash-loop unwatched.
+pending_drop_unused() {
+    [[ -f $PENDING_FILE ]] || return 0
+    local action svc name keep=""
+    while read -r action svc; do
+        if [[ $svc =~ ^firerunner-registry(-front)?@(.+)$ ]]; then
+            name=${BASH_REMATCH[2]}
+            if ! is_registry_name "$name"; then
+                log "  dropping the pending $action of $svc (no longer mirrored)"
+                continue
+            fi
+        fi
+        keep+="$action $svc"$'\n'
+    done <"$PENDING_FILE"
+    printf '%s' "$keep" >"$PENDING_FILE"
+}
+
 # registry_pending UNIT: a restart of UNIT waits for a run when no job runs,
 # left by this run or an earlier one.
 registry_pending() { [[ " $PENDING " == *" $1 "* ]] || grep -qxF "restart $1" "$PENDING_FILE" 2>/dev/null; }
@@ -2197,6 +2271,7 @@ registry_start() {
         log "  stopping $(basename "$w" .service) (no longer mirrored)"
         systemctl disable --now -q "$(basename "$w")"
     done
+    pending_drop_unused
     systemctl enable -q firerunner-registry
     for name in $(registry_names); do
         reg=firerunner-registry@$name front=firerunner-registry-front@$name
@@ -2221,6 +2296,7 @@ registry_start() {
             pending_add "restart $front"
             continue
         fi
+        registry_front_env "$name"
         systemctl enable -q "$front"
         if ! systemctl is-active -q "$front"; then
             start_now "$front"
@@ -2260,13 +2336,17 @@ setup_registries() {
     # The upkeep (firerunner-registry-maint) holds this lock while it
     # garbage-collects a mirror: no mirror is started or moved meanwhile. A
     # file outside the mirrors' file system, so a remount is not kept busy.
+    # The registry user's eviction opens it: the directory searchable, the file readable.
     mkdir -p "$REGISTRY_STATE_DIR"
+    chmod 0755 "$REGISTRY_STATE_DIR"
     [[ -e $REGISTRY_STATE_DIR/lock ]] || : >"$REGISTRY_STATE_DIR/lock"
     chmod 0644 "$REGISTRY_STATE_DIR/lock"
     local lock_fd
     exec {lock_fd}<"$REGISTRY_STATE_DIR/lock"
     flock -w 900 "$lock_fd" ||
         die "the registry mirrors' upkeep (firerunner-registry-gc) has held $REGISTRY_STATE_DIR/lock for 15 minutes: run the installer again later"
+    # With the lock no garbage collection runs: a mask now is one a cut-off one left.
+    registry_unmask_stale
     registry_storage
     if registry_legacy; then
         registry_migrate
@@ -2342,6 +2422,12 @@ evict() {
     want=$((size * stop_pct / 100))
     if ((want < stop_mib * 1024)); then want=$((stop_mib * 1024)); fi
     if ((want < 2 * largest)); then want=$((2 * largest)); fi
+    # Never more than half the file system: on a small one, STOP_MIB or one
+    # huge layer would otherwise empty every mirror at each fill.
+    if ((want > size / 2)); then
+        echo "freeing $((size / 2 / 1024)) MiB, half the file system, not the $((want / 1024)) MiB wanted (STOP_MIB, or twice the largest layer, $((largest / 1024)) MiB): FR_REGISTRY_GB is small for these layers"
+        want=$((size / 2))
+    fi
     for b in "${blobs[@]}"; do
         ((free < want)) || break
         read -r _ kb _ <<<"$b"
@@ -2408,8 +2494,11 @@ gc() {
         esac
         # Masked, nothing starts it while garbage-collect runs: not the
         # installer, a restart of firerunner-registry, nor its front's Wants=.
-        systemctl mask --runtime -q "$unit"
+        # The trap first, so a stop between the two still unmasks it. A
+        # SIGKILL (TimeoutStopSec, OOM) runs no trap: the installer unmasks
+        # what a cut-off run left (registry_unmask_stale).
         trap restore_mirror EXIT
+        systemctl mask --runtime -q "$unit"
         if ((started)); then
             systemctl stop "$unit"
         fi
@@ -2429,8 +2518,10 @@ gc() {
             failed=1
         fi
         rm -f "$out"
-        trap - EXIT
+        # Restored before the trap is cleared: a stop in between restores it
+        # twice (harmless), never not at all.
         restore_mirror
+        trap - EXIT
     done
     return "$failed"
 }
@@ -2442,8 +2533,13 @@ if ! mountpoint -q "$dir"; then
 fi
 # One at a time, and never while the installer starts or moves the mirrors:
 # evict must not delete a blob garbage-collect is sweeping. The lock is a
-# file outside the mount, so it does not keep the file system busy.
-if [[ -e $lock ]]; then exec 9<"$lock"; else exec 9<"$dir"; fi
+# file outside the mount, so it does not keep the file system busy; the
+# installer makes it, and without it nothing runs (no lock, no exclusion).
+if [[ ! -r $lock ]]; then
+    echo "cannot open the lock $lock: run the installer again (it makes it)" >&2
+    exit 1
+fi
+exec 9<"$lock"
 flock 9
 case ${1:-} in
     evict) evict "${2:?START_PCT}" "${3:?START_MIB}" "${4:?STOP_PCT}" "${5:?STOP_MIB}" ;;

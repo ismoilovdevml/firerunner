@@ -209,14 +209,15 @@ ext4 has no labels, and every file in it is then `var_lib_t`, as the rest of `/v
 A host whose image was mounted without it gets it in the next run when no job runs (the mirrors
 restart with the remount).
 
-Before any of the steps below that unmount it, stop everything that mounts it again: the two
-timers and their services (their `RequiresMountsFor=` would remount it in the middle of `e2fsck`
-or `resize2fs`) and the mirrors.
+The steps below stop the mirrors and their upkeep first (1), and some then unmount the image (2).
+Stop the upkeep's timers and services before an unmount: their `RequiresMountsFor=` would mount it
+again in the middle of `e2fsck` or `resize2fs`.
 
 ```bash
-# stop
+# 1. stop the upkeep and the mirrors (the image stays mounted)
 sudo systemctl stop firerunner-registry-evict.timer firerunner-registry-gc.timer
 sudo systemctl stop firerunner-registry-evict firerunner-registry-gc firerunner-registry   # firerunner-registry stops every mirror
+# 2. unmount the image
 sudo systemctl stop var-lib-firerunner-registries.mount
 # start again
 sudo systemctl start var-lib-firerunner-registries.mount firerunner-registry
@@ -224,22 +225,27 @@ sudo systemctl start firerunner-registry-evict.timer firerunner-registry-gc.time
 ```
 
 - Grow it: run the installer with a larger `FR_REGISTRY_GB`. It grows online; nothing restarts.
-- Shrink it: the installer does not (ext4 shrinks only unmounted). When no job runs, stop as above,
+- Shrink it: the installer does not (ext4 shrinks only unmounted). When no job runs, stop (1 and 2),
   then `sudo e2fsck -f /var/lib/firerunner/registries.img && sudo resize2fs /var/lib/firerunner/registries.img <N>G && sudo truncate -s <N>G /var/lib/firerunner/registries.img`,
   and start again. Or stop, delete the image (the mirrors start empty) and run the installer with
   the new `FR_REGISTRY_GB`.
-- Another disk: when no job runs, make its file system and mount it elsewhere (under SELinux with
-  `-o context=system_u:object_r:var_lib_t:s0`), stop as above, copy
-  (`sudo cp -a /var/lib/firerunner/registries/. /mnt/new/`), then
-  `sudo systemctl disable var-lib-firerunner-registries.mount && sudo rm /etc/systemd/system/var-lib-firerunner-registries.mount && sudo systemctl daemon-reload`
-  (it would hide the fstab entry from systemd). Unmount it from `/mnt/new`, add it to `/etc/fstab` on
-  `/var/lib/firerunner/registries` (with the same `context=` under SELinux), `sudo mount
-  /var/lib/firerunner/registries`, and run the installer: it uses that file system instead of the
-  image, and starts everything. Then delete `/var/lib/firerunner/registries.img`.
+- Another disk, when no job runs:
+    1. Make its file system and mount it on `/mnt/new` (under SELinux with
+       `-o context=system_u:object_r:var_lib_t:s0`).
+    2. Stop (1 only: the image must stay mounted to copy from it), then copy:
+       `sudo cp -a /var/lib/firerunner/registries/. /mnt/new/` and check it
+       (`sudo du -s /var/lib/firerunner/registries /mnt/new`).
+    3. Unmount the image and remove its unit, which would hide the fstab entry from systemd:
+       `sudo systemctl disable --now var-lib-firerunner-registries.mount && sudo rm /etc/systemd/system/var-lib-firerunner-registries.mount && sudo systemctl daemon-reload`.
+    4. `sudo umount /mnt/new`, add the disk to `/etc/fstab` on `/var/lib/firerunner/registries`
+       (with the same `context=` under SELinux), `sudo mount /var/lib/firerunner/registries`, and
+       check the mirrors' data is there (`ls /var/lib/firerunner/registries`).
+    5. Run the installer: it uses that file system instead of the image and starts everything.
+       Only then delete `/var/lib/firerunner/registries.img`.
 - Read-only: the image grows on the root disk as the mirrors write. If the root file system fills
   first, writes into the image fail and the kernel may switch its ext4 to read-only (`dmesg | grep
   -i ext4`; every pull of a layer the mirrors do not hold breaks off). Free space on the root disk,
-  then when no job runs stop as above, `sudo e2fsck -fy /var/lib/firerunner/registries.img`, and
+  then when no job runs stop (1 and 2), `sudo e2fsck -fy /var/lib/firerunner/registries.img`, and
   start again.
 
 ### What frees space
@@ -249,11 +255,23 @@ sudo systemctl start firerunner-registry-evict.timer firerunner-registry-gc.time
   the two below.
 - **Eviction**, every 2 minutes (`firerunner-registry-evict.timer`, `firerunner-registry-maint
   evict`): when less than 10 % or 1.5 GiB is free, the layers read longest ago (to within a day)
-  are deleted across all mirrors until 20 % and 3 GiB, and twice the largest layer, are free. The
-  headroom is absolute because a mirror writes a layer it does not hold while it streams it to the
-  job: a file system that fills during that breaks the pull off. The mirrors keep running: a pull
-  of an evicted layer fetches it again. Manifests are never evicted. A layer it cannot delete is
-  logged and skipped, and fails the run at the end.
+  are deleted across all mirrors until 20 % and 3 GiB, and twice the largest layer, are free, but
+  never more than half the file system (it logs when it stops there: `FR_REGISTRY_GB` is small for
+  those layers). The headroom is absolute because a mirror writes a layer it does not hold while it
+  streams it to the job: a file system that fills during that breaks the pull off. The mirrors keep
+  running: a pull of an evicted layer fetches it again. Manifests are never evicted. A layer it
+  cannot delete is logged and skipped, and fails the run at the end.
+
+  What that leaves for layers, by size of the file system:
+
+  | `FR_REGISTRY_GB` | eviction starts at | and stops at |
+  |---|---|---|
+  | 5 | 1.5 GiB free (70 % used) | 2.5 GiB free (half: 3 GiB would be 60 %) |
+  | 10 | 1.5 GiB free (85 % used) | 3 GiB free (70 % used) |
+  | 20 | 2 GiB free (90 % used) | 4 GiB free (80 % used) |
+  | 40 and more | 10 % free | 20 % free |
+
+  So a 5 GB image holds 2.5 to 3.5 GiB of layers, a 10 GB one 7 to 8.5 GiB.
 - **Garbage collection**, hourly (`firerunner-registry-gc.timer`): at most once a day per mirror and
   only while no job runs, it masks and stops that mirror (`systemctl mask --runtime`: nothing,
   not the installer nor its front, starts it while blobs are swept), runs `registry
@@ -283,8 +301,9 @@ unreferenced blobs then stay until the ttl or the eviction removes them.
   every `<name>.env` in `/etc/firerunner/registries.d`, `firerunner-registry@<name>` and
   `firerunner-registry-front@<name>`: one mirror that crash-loops is a 0 of its own, and
   [FireRunnerCacheServiceDown](#firerunnercacheservicedown) fires for it. A mirror the installer
-  removes (its files go) loses its series. `firerunner status` and `firerunner doctor` list the
-  same units.
+  removes (its files go) loses its series. The installer writes `<name>.env` when it enables the
+  mirror's front, so a front that waits for its registry's restart (jobs were running) is not
+  reported as down meanwhile. `firerunner status` and `firerunner doctor` list the same units.
 
 ### Upgrading from the single service
 
@@ -328,7 +347,10 @@ cd /etc/systemd/system && sudo rm -rf firerunner-registry.service.wants \
     firerunner-registry-evict.service firerunner-registry-evict.timer \
     firerunner-registry-gc.service firerunner-registry-gc.timer var-lib-firerunner-registries.mount
 sudo rm -rf /usr/local/bin/firerunner-registry-maint /etc/firerunner/registries.d
+sudo rm -f /run/systemd/system/firerunner-registry@*.service   # a mask a cut-off garbage collection left
 sudo systemctl daemon-reload
+# restarts left for the units just removed: the earlier installer would restart them and stop
+sudo sed -i -E '/ (firerunner-registry(-front)?@|var-lib-firerunner-registries\.mount)/d' /var/lib/firerunner/pending-restarts 2>/dev/null || true
 # the old data, still root's as the old single service needs (root without capabilities)
 sudo mv /var/lib/firerunner/registry.migrated /var/lib/firerunner/registry
 for d in /var/lib/firerunner/registry-mirrors/*.migrated; do sudo mv "$d" "${d%.migrated}"; done
@@ -620,8 +642,8 @@ watches it.
 
 Warning. The registry mirrors' file system (`/var/lib/firerunner/registries`, see
 [Registry mirrors](#registry-mirrors)) has had less than 5 % free for 30 minutes. Its eviction runs
-every 2 minutes, starts below 10 % or 1.5 GiB free and frees up to 20 % and 3 GiB, so it is
-failing. A mirror writes a layer it does not hold while it streams it to the job: on a full file
+every 2 minutes, starts below 10 % or 1.5 GiB free and frees up to 20 % and 3 GiB (at most half
+the file system), so it is failing. A mirror writes a layer it does not hold while it streams it to the job: on a full file
 system that pull breaks off, and the job can fail. Layers the mirrors already hold are still served.
 
 Free is what the mirrors may still write: on a disk of your own it leaves out the 5 % ext4 keeps for
@@ -629,8 +651,9 @@ root by default. The installer's image keeps none.
 
 - Check: `systemctl list-timers 'firerunner-registry-*'` (is `firerunner-registry-evict.timer`
   there?), `journalctl -u firerunner-registry-evict --since -1h`: `could not delete N layers`
-  (permissions, or SELinux: `ausearch -m avc -ts recent`), or `still under the free space wanted`
-  (what is left is not layers it may delete, such as manifests). Then
+  (permissions, or SELinux: `ausearch -m avc -ts recent`), `still under the free space wanted`
+  (what is left is not layers it may delete, such as manifests), or `freeing ... half the file
+  system` (`FR_REGISTRY_GB` is small for the layers pulled: grow it). Then
   `df -h /var/lib/firerunner/registries` and `sudo du -sh /var/lib/firerunner/registries/*` (which
   mirror holds most).
 - Fix: `sudo systemctl start firerunner-registry-evict` runs it once now. Too small for what the
