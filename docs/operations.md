@@ -196,13 +196,26 @@ rate limits, but jobs still run.
 
 The mirrors keep their data in `/var/lib/firerunner/registries/<name>`, an ext4 file system in
 `/var/lib/firerunner/registries.img` on the root disk (`var-lib-firerunner-registries.mount`).
-The image is sparse: it takes as much of the root disk as the mirrors store, never more than its
-size (`FR_REGISTRY_GB`, by default a fifth of the root file system). Deleted blobs give their space
-back to the root disk (`discard`).
+The image takes its whole size (`FR_REGISTRY_GB`, by default a fifth of the root file system) of the
+root disk from the start: it is preallocated (`fallocate`), and mounted without `discard`, so
+deleted blobs give no space back. A sparse image would grow as the mirrors write, and a root disk
+that filled first would fail the mirrors' writes (I/O errors, ext4 read-only) while
+`df /var/lib/firerunner/registries` still showed free space, with no alert. The installer refuses a
+new image, or a larger `FR_REGISTRY_GB`, that would leave less than 10 % and 4 GB of the root file
+system free; `auto` takes less instead (at least 5 GB). Each run fills in what is not yet
+allocated: an image of an earlier version (sparse), converted in place while it is mounted, if the
+root disk can spare it (else it warns and the image stays sparse). An `fstrim` (`fstrim.timer`, on
+by default on Ubuntu) punches the blocks ext4 does not use out of the image again:
+`firerunner-registry-gc` allocates them again every hour.
+
+The file system is mounted `strictatime,lazytime`: every read of a layer sets its atime, which the
+eviction goes by (`relatime` would set it at most once a day, so a layer read all day long could
+look older than one read once); `lazytime` keeps those atimes in memory and writes them with the
+next change of the file, within a day, or at unmount.
 
 ```bash
 df -h /var/lib/firerunner/registries        # what the mirrors use, of their size
-du -sh --apparent-size /var/lib/firerunner/registries.img; du -sh /var/lib/firerunner/registries.img  # size, and what it takes
+du -sh --apparent-size /var/lib/firerunner/registries.img; du -sh /var/lib/firerunner/registries.img  # size, and what it takes (the same)
 ```
 
 With SELinux enabled the installer mounts it with `context=system_u:object_r:var_lib_t:s0`: a new
@@ -227,7 +240,9 @@ sudo systemctl start var-lib-firerunner-registries.mount firerunner-registry
 sudo systemctl start firerunner-registry-evict.timer firerunner-registry-gc.timer
 ```
 
-- Grow it: run the installer with a larger `FR_REGISTRY_GB`. It grows online; nothing restarts.
+- Grow it: run the installer with a larger `FR_REGISTRY_GB`. It grows online; nothing restarts. It
+  is not grown (a warning says so) if that would leave less than 10 % and 4 GB of the root file
+  system free.
 - Shrink it: the installer does not (ext4 shrinks only unmounted). When no job runs, stop (1 and 2),
   then `sudo e2fsck -f /var/lib/firerunner/registries.img && sudo resize2fs /var/lib/firerunner/registries.img <N>G && sudo truncate -s <N>G /var/lib/firerunner/registries.img`,
   and start again. Or stop, delete the image (the mirrors start empty) and run the installer with
@@ -248,11 +263,13 @@ sudo systemctl start firerunner-registry-evict.timer firerunner-registry-gc.time
        check the mirrors' data is there (`ls /var/lib/firerunner/registries`).
     5. Run the installer: it uses that file system instead of the image and starts everything.
        Only then delete `/var/lib/firerunner/registries.img`.
-- Read-only: the image grows on the root disk as the mirrors write. If the root file system fills
-  first, writes into the image fail and the kernel may switch its ext4 to read-only (`dmesg | grep
-  -i ext4`; every pull of a layer the mirrors do not hold breaks off). Free space on the root disk,
-  then when no job runs stop (1 and 2), `sudo e2fsck -fy /var/lib/firerunner/registries.img`, and
-  start again.
+- Read-only: an image that is still sparse (an earlier version's the installer could not
+  preallocate, or one an `fstrim` punched before the hourly `firerunner-registry-gc` refilled it)
+  grows on the root disk as the mirrors write. If the root file system fills first, writes into the
+  image fail and the kernel may switch its ext4 to read-only (`dmesg | grep -i ext4`; every pull of
+  a layer the mirrors do not hold breaks off). Free space on the root disk, then when no job runs
+  stop (1 and 2), `sudo e2fsck -fy /var/lib/firerunner/registries.img`, and start again; the next
+  run of the installer preallocates the image.
 
 ### What frees space
 
@@ -260,12 +277,14 @@ sudo systemctl start firerunner-registry-evict.timer firerunner-registry-gc.time
   not (`delete.enabled: false`), so their data never expired; data they fetched is removed only by
   the two below.
 - **Eviction**, every 2 minutes (`firerunner-registry-evict.timer`, `firerunner-registry-maint
-  evict`): when less than 10 % or 1.5 GiB is free, the layers read longest ago (to within a day)
-  are deleted across all mirrors until 20 % and 3 GiB, and twice the largest layer, are free, but
+  evict`): when less than 10 % or 1.5 GiB is free, the layers read longest ago (atime, see
+  [Storage](#storage)) are deleted, with their repositories' links to them (`_layers`), across all mirrors until 20 % and 3 GiB, and twice the largest layer, are free, but
   never more than half the file system (it logs when it stops there: `FR_REGISTRY_GB` is small for
   those layers). The headroom is absolute because a mirror writes a layer it does not hold while it
   streams it to the job: a file system that fills during that breaks the pull off. The mirrors keep
-  running: a pull of an evicted layer fetches it again. Manifests are never evicted. A layer it
+  running: a pull of an evicted layer fetches it again (checked with distribution v3.1.1: the pull
+  succeeds, the layer and its link are written again, and `registry garbage-collect` afterwards
+  exits 0). Manifests are never evicted: garbage-collect fails at a manifest whose blob is gone. A layer it
   cannot delete is logged and skipped, and fails the run at the end.
 
   What that leaves for layers, by size of the file system:
@@ -284,6 +303,9 @@ sudo systemctl start firerunner-registry-evict.timer firerunner-registry-gc.time
   garbage-collect`, then unmasks and starts it again. It removes the blobs no manifest refers to
   any more. It skips a mirror that never stored an image, and one that is starting or restarting
   after a crash. The installer waits for it (up to 15 minutes) before it starts or moves mirrors.
+  It runs as root with only `CAP_SETUID` and `CAP_SETGID` (to mask, stop and start the mirror, and
+  to preallocate the image): root cannot read the mirrors' 0700 data then, so everything it looks
+  at or writes in it, and `garbage-collect` itself, runs as `firerunner-registry`.
 
 ```bash
 systemctl list-timers 'firerunner-registry-*'
@@ -291,10 +313,12 @@ journalctl -u firerunner-registry-evict -u firerunner-registry-gc --since -1d
 ```
 
 A failed garbage collection fails `firerunner-registry-gc` (`systemctl --failed`); it is tried again
-the next day, and the eviction still keeps free space. When distribution's `garbage-collect`
-stops with `Path not found` (a repository whose manifests are left but whose layers have all
-expired or been evicted), that mirror is logged as not collected, not as a failure: its
-unreferenced blobs then stay until the ttl or the eviction removes them.
+the next day, and the eviction still keeps free space. distribution v3.1.1's `garbage-collect`
+stops with `Path not found: .../_layers`, and collects nothing in that whole mirror, at a
+repository that has manifests but no `_layers` directory (only manifests were pulled: `crane
+manifest`, `docker manifest inspect`, a client that had every layer). Before it runs, the upkeep
+gives every such repository an empty `_layers` (what one whose layers all expired has); a `Path
+not found` that is left is a failure.
 
 ### Monitoring the mirrors
 
@@ -633,8 +657,8 @@ get no address and jobs fail with `got no DHCP lease`.
 
 Warning. The file system of `/var/lib/firerunner/builder-cache` or `/var/lib/flintlock/vm` has had
 less than 15 % free for 15 minutes. Below 10 % no builder cache is saved; at 0 `cache:` uploads
-and flintlockd's microVM state can no longer be written. The registry mirrors take at most
-`FR_REGISTRY_GB` of it ([Registry mirrors](#registry-mirrors)).
+and flintlockd's microVM state can no longer be written. The registry mirrors' image takes
+`FR_REGISTRY_GB` of it from the start ([Registry mirrors](#registry-mirrors)).
 
 - Check: `df -h /var/lib/firerunner /var/lib/flintlock/vm`;
   `sudo du -xsh /var/lib/firerunner/* /var/lib/flintlock/vm`.

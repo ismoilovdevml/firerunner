@@ -245,11 +245,56 @@ expect "FR_REGISTRY_GB=auto allowed"    check_registry_gb auto
 expect "FR_REGISTRY_GB=50 allowed"      check_registry_gb 50
 expect "FR_REGISTRY_GB=4 refused (below ${REGISTRY_MIN_GB})" ! check_registry_gb 4
 expect "FR_REGISTRY_GB=10G refused"   ! check_registry_gb 10G
-# gb_for SETTING ROOT_KB: the size a new image gets on a root file system of ROOT_KB.
-gb_for() { ( FR_REGISTRY_GB=$1 ROOT_KB=$2; df() { printf 'F 1024-blocks Used Available Capacity Mounted\n/dev/x %s 0 %s 0%% /\n' "$ROOT_KB" "$ROOT_KB"; }; registry_gb ); }
-expect "auto: a fifth of a 100 GiB root file system" test "$(gb_for auto $((100 * 1024 * 1024)))" = 20
-expect "auto: at least ${REGISTRY_MIN_GB} GB on a 10 GiB one" test "$(gb_for auto $((10 * 1024 * 1024)))" = "$REGISTRY_MIN_GB"
-expect "FR_REGISTRY_GB=30: 30" test "$(gb_for 30 $((100 * 1024 * 1024)))" = 30
+# root_df: df of a root file system of ROOT_KB KiB, AVAIL_KB of them free (all, if unset).
+root_df() { printf 'F 1024-blocks Used Available Capacity Mounted\n/dev/x %s 0 %s 0%% /\n' "$ROOT_KB" "${AVAIL_KB:-$ROOT_KB}"; }
+GiB=$((1024 * 1024))
+# gb_for SETTING ROOT_KB [AVAIL_KB]: the size a new image gets on a root file system of ROOT_KB.
+gb_for() { ( FR_REGISTRY_GB=$1 ROOT_KB=$2 AVAIL_KB=${3:-}; df() { root_df; }; registry_gb ); }
+expect "auto: a fifth of a 100 GiB root file system" test "$(gb_for auto $((100 * GiB)))" = 20
+expect "auto: at least ${REGISTRY_MIN_GB} GB on a 10 GiB one" test "$(gb_for auto $((10 * GiB)))" = "$REGISTRY_MIN_GB"
+expect "auto: less, to leave 10 % free (15 of 100 GiB free: 5)" test "$(gb_for auto $((100 * GiB)) $((15 * GiB)))" = 5
+expect "FR_REGISTRY_GB=30: 30" test "$(gb_for 30 $((100 * GiB)))" = 30
+
+# The image takes its whole size of the root disk at once (preallocated), and
+# only if the root disk keeps 10 % and 4 GB free. fallocate, mkfs.ext4,
+# losetup and resize2fs log to $R/img.log; the image is a sparse file.
+img_run() {
+    (
+        df() { root_df; }
+        fallocate() { echo "fallocate $*" >> "$R/img.log"; }
+        mkfs.ext4() { echo "mkfs.ext4 $*" >> "$R/img.log"; command touch "${@: -1}"; }
+        losetup() { echo "losetup $*" >> "$R/img.log"; [[ $1 != -j ]] || echo "/dev/loop7: []: ($REGISTRY_IMG)"; }
+        resize2fs() { echo "resize2fs $*" >> "$R/img.log"; }
+        mountpoint() { return 0; }
+        die() { echo "DIE $*" >> "$R/img.log"; exit 1; }
+        warn() { echo "WARN $*" >> "$R/img.log"; }
+        PENDING_FILE=$R/img-pending "$@"
+    ) >/dev/null 2>&1
+}
+: > "$R/img.log"; rm -f "$REGISTRY_IMG"
+ROOT_KB=$((100 * GiB)) AVAIL_KB=$((20 * GiB)) FR_REGISTRY_GB=30
+expect "new image: 30 GB with 20 of 100 GiB free refused" ! img_run registry_image
+expect "...saying why, nothing made" bash -c "grep -q 'DIE .*takes its whole size of the root disk' '$R/img.log' && ! grep -q fallocate '$R/img.log' && test ! -e '$REGISTRY_IMG'"
+: > "$R/img.log"; AVAIL_KB=$((50 * GiB))
+expect "new image: 30 GB with 50 GiB free made" img_run registry_image
+expect "...preallocated" grep -qx "fallocate -l 30G $REGISTRY_IMG.new" "$R/img.log"
+expect "...mkfs.ext4 told not to punch it out again" grep -q '^mkfs.ext4 .*-E nodiscard' "$R/img.log"
+expect "...mounted strictatime,lazytime, without discard" bash -c "grep -qx 'Options=loop,nodev,nosuid,noexec,nofail,strictatime,lazytime' '$u/var-lib-firerunner-registries.mount'"
+# A sparse 5 GiB image (an earlier version's): grown and preallocated if the root disk can spare it.
+rm -f "$REGISTRY_IMG"; truncate -s 5G "$REGISTRY_IMG"
+: > "$R/img.log"; AVAIL_KB=$((12 * GiB)) FR_REGISTRY_GB=10
+img_run registry_grow
+expect "grow: 10 GB more with 12 of 100 GiB free refused (10 % must stay free)" bash -c "grep -q 'WARN FR_REGISTRY_GB=10: not grown' '$R/img.log' && ! grep -q -e fallocate -e resize2fs '$R/img.log'"
+: > "$R/img.log"; AVAIL_KB=$((50 * GiB))
+img_run registry_grow
+expect "grow: preallocated to the new size, then the loop device and ext4 grown" bash -c "grep -qx 'fallocate -l 10G $REGISTRY_IMG' '$R/img.log' && grep -qx 'losetup -c /dev/loop7' '$R/img.log' && grep -qx 'resize2fs /dev/loop7' '$R/img.log'"
+: > "$R/img.log"; AVAIL_KB=$((12 * GiB))
+img_run registry_preallocate
+expect "sparse image, root disk cannot spare it: left sparse, and says so" bash -c "grep -q 'WARN .* is sparse' '$R/img.log' && ! grep -q fallocate '$R/img.log'"
+: > "$R/img.log"; AVAIL_KB=$((50 * GiB))
+img_run registry_preallocate
+expect "sparse image, room on the root disk: preallocated in place" grep -qx "fallocate -l $((5 * 1024 * GiB)) $REGISTRY_IMG" "$R/img.log"
+rm -f "$REGISTRY_IMG" "$u/var-lib-firerunner-registries.mount" "$R/img-pending"; unset ROOT_KB AVAIL_KB; FR_REGISTRY_GB=auto CHANGED=" "
 
 FR_REGISTRY_MIRRORS=ghcr.io REGISTRY_FRONT=1 CHANGED=" "
 : > "$LIB_DIR/registry-maint.sh"   # where an earlier build of this layout put the upkeep script
@@ -283,9 +328,9 @@ expect "garbage collection: root only to stop and start a mirror" grep -qx 'Capa
 expect "...the same script" grep -qx "ExecStart=$REGISTRY_MAINT gc" "$u/firerunner-registry-gc.service"
 expect "the upkeep script is in BIN_DIR (bin_t under SELinux: its units run unconfined)" test -x "$REGISTRY_MAINT"
 expect "...not in LIB_DIR (lib_t: init_t may not delete the mirrors' files)" test ! -e "$LIB_DIR/registry-maint.sh"
-expect "mount options without SELinux: no context" test "$(registry_mount_options)" = loop,discard,nodev,nosuid,noexec,nofail
+expect "mount options without SELinux: no context" test "$(registry_mount_options)" = loop,nodev,nosuid,noexec,nofail,strictatime,lazytime
 touch "$R/selinux"
-expect "with SELinux: every file var_lib_t (a new ext4 has no labels)" test "$(registry_mount_options)" = loop,discard,nodev,nosuid,noexec,nofail,context=system_u:object_r:var_lib_t:s0
+expect "with SELinux: every file var_lib_t (a new ext4 has no labels)" test "$(registry_mount_options)" = loop,nodev,nosuid,noexec,nofail,strictatime,lazytime,context=system_u:object_r:var_lib_t:s0
 rm -f "$R/selinux"
 CHANGED=" "; REGISTRY_FRONT=0
 registry_files >/dev/null 2>&1
@@ -506,7 +551,17 @@ store_fixture() {
     blob docker.io aa01 500; blob docker.io bb02 1000; blob ghcr.io cc03 2000; blob docker.io dd04 3000
     mkdir -p "$S/docker.io/docker/registry/v2/repositories/library/x/_manifests/revisions/sha256/aa01"
     echo sha256:aa01 > "$S/docker.io/docker/registry/v2/repositories/library/x/_manifests/revisions/sha256/aa01/link"
+    # library/x links to the layers bb02 and dd04; quay.io (another mirror) has a bb02 of its own.
+    layer_link docker.io library/x bb02; layer_link docker.io library/x dd04; layer_link quay.io library/q bb02
+    # library/y: manifests only (crane manifest), no _layers.
+    mkdir -p "$S/docker.io/docker/registry/v2/repositories/library/y/_manifests/tags"
 }
+# layer_link MIRROR REPO DIGEST: REPO's link to the layer DIGEST.
+layer_link() {
+    local d=$S/$1/docker/registry/v2/repositories/$2/_layers/sha256/$3
+    mkdir -p "$d"; echo "sha256:$3" > "$d/link"
+}
+has_link() { test -f "$S/$1/docker/registry/v2/repositories/$2/_layers/sha256/$3/link"; }
 has_blob() { test -f "$S/$1/docker/registry/v2/blobs/sha256/${2:0:2}/$2/data"; }
 store_fixture
 K=$(du -k "$S/docker.io/docker/registry/v2/blobs/sha256/bb/bb02/data" | cut -f1)
@@ -530,6 +585,9 @@ expect "evict: full, up to 20 % free" maint evict 10 0 20 0
 expect "...the two layers read longest ago deleted" bash -c "! test -e '$S/docker.io/docker/registry/v2/blobs/sha256/bb/bb02' && ! test -e '$S/ghcr.io/docker/registry/v2/blobs/sha256/cc/cc03'"
 expect "...across mirrors, the newest layer kept" has_blob docker.io dd04
 expect "...a manifest never evicted, however old" has_blob docker.io aa01
+expect "...an evicted layer's repository links deleted with it" test ! -e "$S/docker.io/docker/registry/v2/repositories/library/x/_layers/sha256/bb02"
+expect "...a kept layer's links kept" has_link docker.io library/x dd04
+expect "...another mirror's link to the same digest kept" has_link quay.io library/q bb02
 # Absolute headroom: half the file system free is still too little under START_MIB.
 store_fixture; MSIZE=$((100 * K)) MUSED=$((50 * K)) MIB=$((50 * K / 1024 + 1))
 out=$(maint evict 10 "$MIB" 20 "$MIB" 2>&1); rc=$?
@@ -579,19 +637,29 @@ gc_run() {
                 echo "$s"; [[ $s == active ]]
             fi
         }
+        # setpriv --reuid=U --regid=U --clear-groups -- COMMAND...: runs any
+        # command but the registry (test, find); the registry is faked.
         setpriv() {
             echo "setpriv $*" >> "$GC/log"
+            [[ $5 == */registry ]] || { "${@:5}"; return; }
             # A stop of the service (TimeoutStopSec, systemctl stop) mid-run.
             if [[ -f $GC/term ]]; then kill -TERM $$; return 0; fi
             if [[ -f $GC/fail ]]; then echo boom; return 1; fi
-            if [[ -f $GC/notfound ]]; then echo 'Path not found: /docker/registry/v2/repositories/x/_layers'; return 1; fi
+            # As distribution v3.1.1: a repository with _manifests but no _layers stops it.
+            local m
+            if [[ -f $GC/notfound ]]; then
+                while IFS= read -r m; do
+                    [[ -d ${m%/_manifests}/_layers ]] || { echo "failed to mark: filesystem: Path not found: ${m%/_manifests}/_layers"; return 1; }
+                done < <(find "$GC_STORE" -type d -name _manifests)
+            fi
+            echo "1 blobs marked, 0 blobs and 0 manifests eligible for deletion"
         }
         mountpoint() { return 0; }
         export -f systemctl setpriv mountpoint
-        export GC
+        export GC GC_STORE=$S
         FR_REGISTRY_DIR=$S FR_REGISTRY_CONF_DIR=$GC/conf FR_REGISTRY_STATE_DIR=$GC/state FR_JOBS_DIR=$GC/jobs \
-            FR_REGISTRY_LOCK=$LOCK bash "$WORK/registry-maint.sh" gc
-    ) >/dev/null 2>&1
+            FR_REGISTRY_LOCK=$LOCK FR_REGISTRY_IMG=$GC/img bash "$WORK/registry-maint.sh" gc
+    ) >"$GC/out" 2>&1
 }
 gc_line() { grep -n -m1 -- "$1" "$GC/log" | cut -d: -f1; }
 gc_fresh() { rm -rf "$GC/state" "$GC/fail" "$GC/notfound" "$GC/term"; : > "$GC/log"; }
@@ -606,6 +674,7 @@ expect "...then stopped" test "$(gc_line 'systemctl stop firerunner-registry@doc
 expect "...as the registry user, with its config" grep -q "setpriv --reuid=firerunner-registry --regid=firerunner-registry --clear-groups -- /usr/local/bin/registry garbage-collect $GC/conf/docker.io.yml" "$GC/log"
 expect "...then unmasked" test "$(gc_line 'garbage-collect')" -lt "$(gc_line 'systemctl unmask --runtime -q firerunner-registry@docker.io')"
 expect "...and started again" test "$(gc_line 'systemctl unmask --runtime -q firerunner-registry@docker.io')" -lt "$(gc_line 'systemctl start firerunner-registry@docker.io')"
+expect "...its data looked up as the registry user (root has no CAP_DAC_READ_SEARCH for its 0700 directory)" grep -qx "setpriv --reuid=firerunner-registry --regid=firerunner-registry --clear-groups -- test -d $S/docker.io/docker/registry/v2/repositories" "$GC/log"
 expect "...a mirror that never stored an image is left alone (garbage-collect fails on it)" ! grep -q 'firerunner-registry@ghcr.io\|ghcr.io.yml' "$GC/log"
 : > "$GC/log"; gc_run
 expect "gc: not again the same day" ! grep -q 'setpriv' "$GC/log"
@@ -620,12 +689,20 @@ expect "...and started again" grep -q 'systemctl start firerunner-registry@docke
 gc_fresh; touch "$GC/fail"
 gc_run
 expect "...and the mirror is unmasked and started again all the same" bash -c "grep -q 'systemctl unmask --runtime -q firerunner-registry@docker.io' '$GC/log' && grep -q 'systemctl start firerunner-registry@docker.io' '$GC/log'"
-gc_fresh; touch "$GC/notfound"
-expect "gc: distribution's 'Path not found' (manifests without layers) is no failure" gc_run
+store_fixture; gc_fresh; touch "$GC/notfound"
+expect "gc: a repository with manifests but no _layers (distribution stops there: Path not found)" gc_run
+expect "...is given an empty _layers first" test -d "$S/docker.io/docker/registry/v2/repositories/library/y/_layers"
+expect "...as the registry user, before garbage-collect" test "$(gc_line "setpriv .* -- find $S/docker.io/docker/registry/v2/repositories")" -lt "$(gc_line 'garbage-collect')"
+expect "...so garbage-collect runs through" grep -q '^docker.io: garbage-collected (1 blobs marked' "$GC/out"
 expect "...the mirror started again" grep -q 'systemctl start firerunner-registry@docker.io' "$GC/log"
+# The image, preallocated by the installer, with holes again (an fstrim).
+gc_fresh; truncate -s 8M "$GC/img"
+gc_run
+expect "gc: a sparse image (an fstrim) is preallocated again" test "$(( $(stat -c '%b * %B' "$GC/img") ))" -ge 8388608
+rm -f "$GC/img"
 gc_fresh; echo activating > "$GC/state-of-unit"
 gc_run
-expect "gc: a mirror starting or restarting after a crash is skipped" ! grep -q 'mask\|setpriv' "$GC/log"
+expect "gc: a mirror starting or restarting after a crash is skipped" ! grep -q 'mask\|garbage-collect' "$GC/log"
 gc_fresh; echo inactive > "$GC/state-of-unit"
 gc_run
 expect "gc: a mirror that is not running is collected while masked" bash -c "grep -q setpriv '$GC/log' && grep -q 'systemctl mask --runtime' '$GC/log'"
