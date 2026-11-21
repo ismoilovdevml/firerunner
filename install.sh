@@ -1605,7 +1605,8 @@ declare -A MIRROR_PORT=()
 # Hub, else the mirrored registry's host. A mirror that crashes stops no other,
 # and each one can write only its own data. firerunner-registry.service starts
 # them all, and stops or restarts them all (their PartOf=); `firerunner status`
-# and firerunner_service_up report it.
+# and firerunner_service_up report it and, for every NAME.env in
+# REGISTRY_CONF_DIR, both of that mirror's services.
 UNIT_DIR=/etc/systemd/system
 REGISTRY_CONF_DIR=$CONF_DIR/registries.d   # NAME.yml (the registry), NAME.env (its front)
 REGISTRY_USER=firerunner-registry           # runs the registries and their upkeep
