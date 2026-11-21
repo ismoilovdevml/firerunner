@@ -146,7 +146,7 @@ the keys are:
 | `proxy.upstream_file` | `/etc/firerunner/proxy-upstream` | root-only file with `http://[user:password@]host:port` |
 | `proxy.no_proxy` | none | hosts, `.domains` and CIDRs reached directly; local addresses are always added |
 | `proxy.connect_ports` | `[443]` | ports HTTPS tunnels through the proxy may go to |
-| `proxy.shutdown_timeout` | `30s` | on stop or restart the forwarder takes no new connections and lets open requests and tunnels finish this long before it cuts them; `0` cuts them at once. Up to `10m`; firerunner-proxy's `TimeoutStopSec` must be at least this plus 15 s |
+| `proxy.shutdown_timeout` | `30s` | on stop or restart the forwarder takes no new connections and lets open requests and tunnels finish this long before it cuts them; `0` cuts them at once. At most `30s`: the installer gives `firerunner-proxy` `TimeoutStopSec=45`, and systemd kills a longer stop before the forwarder cuts its connections |
 | `network.egress_deny` | none | networks jobs must not reach, directly or through the proxy (installer: `FR_EGRESS_DENY`) |
 | `vm.ca_file` | none | PEM root CA trusted by microVMs, their Docker, builders and job containers |
 | `vm.insecure_registries` | none | `host:port` (TLS without a check) or `http://host:port` (plain HTTP) |

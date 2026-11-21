@@ -65,13 +65,15 @@ type Proxy struct {
 	EgressStrict bool `yaml:"egress_strict"`
 	// ShutdownTimeout is how long a stopping forwarder lets open requests and
 	// tunnels (clones, pulls) finish before it cuts them; 0 cuts them at once.
-	// firerunner-proxy's TimeoutStopSec must leave room for it.
+	// At most MaxProxyShutdownTimeout.
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 }
 
-// MaxProxyShutdownTimeout bounds proxy.shutdown_timeout: a stop, and so a
-// host reboot, never waits longer on the forwarder.
-const MaxProxyShutdownTimeout = 10 * time.Minute
+// MaxProxyShutdownTimeout bounds proxy.shutdown_timeout. install.sh writes a
+// fixed TimeoutStopSec=45 into firerunner-proxy.service: 30 s, the up to 5 s
+// the forwarder waits after the cut, and a margin. A longer wait would be
+// SIGKILLed by systemd before the forwarder cuts its connections cleanly.
+const MaxProxyShutdownTimeout = 30 * time.Second
 
 // ProxyPort is the forwarder's port; install.sh opens it in the firewall.
 const ProxyPort = "3128"
@@ -424,7 +426,8 @@ func (c Config) Validate() error {
 		}
 	}
 	if c.Proxy.ShutdownTimeout < 0 || c.Proxy.ShutdownTimeout > MaxProxyShutdownTimeout {
-		errs = append(errs, "proxy.shutdown_timeout must be between 0 (cut open connections at once) and "+MaxProxyShutdownTimeout.String())
+		errs = append(errs, "proxy.shutdown_timeout must be between 0 (cut open connections at once) and "+MaxProxyShutdownTimeout.String()+
+			": firerunner-proxy.service stops it after TimeoutStopSec=45, and a longer wait would be killed before the forwarder cuts its connections")
 	}
 	for _, e := range SplitNoProxy(c.Proxy.NoProxy) {
 		if !noProxyEntry.MatchString(e) {

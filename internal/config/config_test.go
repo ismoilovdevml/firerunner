@@ -152,7 +152,7 @@ func TestProxyValidation(t *testing.T) {
 		"empty registry":             func(c *Config) { c.VM.InsecureRegistries = []string{""} },
 		"registry with a newline":    func(c *Config) { c.VM.InsecureRegistries = []string{"a\nb"} },
 		"negative shutdown_timeout":  func(c *Config) { c.Proxy.ShutdownTimeout = -time.Second },
-		"shutdown_timeout over 10m":  func(c *Config) { c.Proxy.ShutdownTimeout = 10*time.Minute + time.Second },
+		"shutdown_timeout over 30s":  func(c *Config) { c.Proxy.ShutdownTimeout = 30*time.Second + time.Millisecond },
 	} {
 		c := ok
 		c.VM.InsecureRegistries = append([]string(nil), ok.VM.InsecureRegistries...)
@@ -228,14 +228,27 @@ func TestSaveLeavesOutUnusedNewKeys(t *testing.T) {
 }
 
 // The forwarder lets open requests and tunnels finish for 30 s on stop by
-// default; firerunner-proxy's TimeoutStopSec is set from it (install.sh).
-func TestProxyShutdownTimeoutDefault(t *testing.T) {
+// default, and no longer: install.sh writes a fixed TimeoutStopSec=45 into
+// firerunner-proxy.service, which covers 30 s, the 5 s after the cut and a
+// margin. A longer wait would be SIGKILLed before the clean cut.
+func TestProxyShutdownTimeoutBounds(t *testing.T) {
 	if d := Default().Proxy.ShutdownTimeout; d != 30*time.Second {
 		t.Fatalf("default proxy.shutdown_timeout %v", d)
 	}
-	cfg, err := Set(Default(), "proxy.shutdown_timeout", "2m")
-	if err != nil || cfg.Proxy.ShutdownTimeout != 2*time.Minute {
-		t.Fatalf("set 2m: %v %v", cfg.Proxy.ShutdownTimeout, err)
+	for _, c := range []struct {
+		value string
+		ok    bool
+	}{{"0s", true}, {"10s", true}, {"30s", true}, {"31s", false}, {"2m", false}, {"-1s", false}} {
+		cfg, err := Set(Default(), "proxy.shutdown_timeout", c.value)
+		if err == nil {
+			err = cfg.Validate()
+		}
+		if (err == nil) != c.ok {
+			t.Errorf("proxy.shutdown_timeout %s: %v, want ok=%v", c.value, err, c.ok)
+		}
+		if err != nil && !strings.Contains(err.Error(), "TimeoutStopSec") {
+			t.Errorf("proxy.shutdown_timeout %s: %q does not say why", c.value, err)
+		}
 	}
 }
 
