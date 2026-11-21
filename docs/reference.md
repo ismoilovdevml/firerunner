@@ -17,7 +17,7 @@ All commands need root.
 | `firerunner builder list` · `rm <project> \| --all [--force]` | builders; a builder in use is kept unless `--force` |
 | `firerunner run [--keep] -- <command>` | run a command in a throwaway VM |
 | `firerunner drain [--timeout D]` | before maintenance: gitlab-runner takes no new jobs (they stay pending in GitLab), the daemon boots no VMs; returns once the running jobs finished. Waits at most `daemon.job_max_age` + `daemon.reconcile_interval` by default; a timeout or Ctrl-C ends the wait, not the drain. See [Drain](operations.md#drain) |
-| `firerunner undrain` · `drain --cancel` | take jobs again |
+| `firerunner undrain [--timeout D]` · `drain --cancel` | take jobs again; while gitlab-runner still finishes jobs it ran when drained, waits (at most `--timeout`, default as `drain`) to remove the drain's stop settings |
 | `firerunner upgrade [--version V] [--check] [--allow-unsigned]` | update the binary; the release must be signed and be the version asked for. `--allow-unsigned` only for v0.1.0 and v0.1.1, published before releases were signed |
 | `firerunner proxy` | the corporate proxy forwarder (systemd: `firerunner-proxy`), see [Corporate networks](corporate-network.md) |
 | `firerunner registry-front --listen ADDR:PORT --upstream http://127.0.0.1:PORT` | the front of one registry mirror (systemd: `firerunner-registry-front@<name>`), see below |
