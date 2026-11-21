@@ -239,7 +239,17 @@ func TestResumeRunner(t *testing.T) {
 	}{
 		// gitlab-runner was stopped before the drain: the operator's choice.
 		{name: "drain did not stop it", sd: &fakeSystemd{active: "inactive"},
-			want: ResumeNothing, active: "inactive"},
+			want: ResumeNothing, verbs: []string{"show"}, active: "inactive"},
+		// An earlier undrain removed the file but its reload failed: the
+		// settings are still loaded. Only the reload is done again; that
+		// undrain started gitlab-runner already.
+		{name: "file gone, settings still loaded", sd: &fakeSystemd{active: "active", loaded: true},
+			want: ResumeDropped, verbs: []string{"show", "show", "daemon-reload", "show"}, active: "active"},
+		{name: "file gone, settings loaded, still stopping", sd: &fakeSystemd{active: "deactivating", loaded: true},
+			want: ResumeAfterStop, verbs: []string{"show", "show"}, active: "deactivating"},
+		{name: "file gone, settings loaded, reload fails again",
+			sd:   &fakeSystemd{active: "active", loaded: true, fail: map[string]bool{"daemon-reload": true}},
+			want: ResumeNothing, wantErr: true, verbs: []string{"show", "show", "daemon-reload"}, active: "active"},
 		{name: "stopped by drain", sd: &fakeSystemd{active: "inactive", loaded: true}, dropIn: true,
 			want: ResumeStarted, verbs: []string{"start", "show", "daemon-reload", "show"}, active: "active"},
 		// The start waits behind the stop; a reload without the drop-in
@@ -440,5 +450,29 @@ func TestReadRunnerStateDrainLoaded(t *testing.T) {
 		if err != nil || st.DrainLoaded != c.want {
 			t.Errorf("DropInPaths=%q: %+v, %v; want loaded %v", c.paths, st, err, c.want)
 		}
+	}
+}
+
+// Undrain again after one whose daemon-reload failed: the file is gone but
+// systemd still has the stop settings loaded. The second undrain unloads
+// them instead of reporting that nothing is left.
+func TestUndrainAgainAfterAFailedReload(t *testing.T) {
+	sd := &fakeSystemd{active: "inactive", loaded: true, fail: map[string]bool{"daemon-reload": true}}
+	putDropIn(t, fakeRunner(t, sd))
+	ctx := context.Background()
+	if _, err := ResumeRunner(ctx); err == nil {
+		t.Fatal("first undrain with a failing reload reported no error")
+	}
+	if left, err := DrainSettingsLeft(ctx); HasDrainDropIn() || !left || err != nil {
+		t.Fatalf("after the failed reload: file there %v, settings left %v (%v); want file gone, settings loaded", HasDrainDropIn(), left, err)
+	}
+	sd.mu.Lock()
+	sd.fail = nil
+	sd.mu.Unlock()
+	if got, err := ResumeRunner(ctx); got != ResumeDropped || err != nil {
+		t.Fatalf("second undrain = %v, %v; want ResumeDropped", got, err)
+	}
+	if left, err := DrainSettingsLeft(ctx); left || err != nil || sd.active != "active" {
+		t.Fatalf("after the second undrain: settings left %v (%v), gitlab-runner %s", left, err, sd.active)
 	}
 }
