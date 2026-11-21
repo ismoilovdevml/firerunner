@@ -46,6 +46,7 @@ func TestMain(m *testing.M) {
 	warmDocker = func(config.Config, *vm.Instance) error { return nil }
 	servicesActive = func(_ context.Context, names []string) []bool { return make([]bool, len(names)) }
 	registryConfDir = filepath.Join(root, "registries.d")
+	registriesDir = filepath.Join(root, "registries")
 	thinPoolUsage = func(context.Context) (float64, float64, error) { return 0, 0, errors.New("no lvs in tests") }
 	buildkitdAnswers = func(string, int, string) bool { return false }
 	code := m.Run()

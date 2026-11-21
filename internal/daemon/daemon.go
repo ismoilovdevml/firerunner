@@ -1409,9 +1409,15 @@ var (
 	thinPoolUsage  = host.ThinPoolUsageContext
 )
 
-// registryConfDir is where install.sh writes the registry mirrors' configs
-// (a variable for tests).
-var registryConfDir = host.RegistryConfDir
+// registryConfDir is where install.sh writes the registry mirrors' configs;
+// registriesDir is where it mounts their file system, of its own (an image
+// or a disk in /etc/fstab) and kept under 90 % by an eviction. Variables
+// for tests.
+var (
+	registryConfDir   = host.RegistryConfDir
+	registriesDir     = "/var/lib/firerunner/registries"
+	registriesMounted = host.MountPoint
+)
 
 // collectRegistryUnits returns the registry mirrors' units to watch and drops
 // the series of those no longer configured: a stale 0 of a removed mirror
@@ -1463,6 +1469,14 @@ func (d *Daemon) collectHost(ctx context.Context) {
 	}
 	for _, dir := range []string{builderCacheDir, flintlockVMDir} {
 		d.recordDisk(dir)
+	}
+	if registriesMounted(registriesDir) {
+		d.recordDisk(registriesDir)
+	} else {
+		// Unmounted, the directory is on the root disk (or absent): its
+		// space under the mirrors' name would read as theirs.
+		d.metrics.diskFree.DeleteLabelValues(registriesDir)
+		d.metrics.diskSize.DeleteLabelValues(registriesDir)
 	}
 	if avail, err := host.MemAvailableMB(); err == nil {
 		d.metrics.memAvailable.Set(float64(avail) * 1024 * 1024)

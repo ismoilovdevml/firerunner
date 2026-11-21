@@ -396,6 +396,39 @@ func TestDiskSpaceMetrics(t *testing.T) {
 	}
 }
 
+// The registry mirrors' file system is measured only while it is mounted on
+// its directory: unmounted, that directory is on the root disk (or absent),
+// whose space must not show under the mirrors' name.
+func TestRegistryDiskMetrics(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	dir := filepath.Join(t.TempDir(), "registries")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldDir, oldMounted := registriesDir, registriesMounted
+	registriesDir = dir
+	mounted := true
+	registriesMounted = func(got string) bool { return got == dir && mounted }
+	t.Cleanup(func() { registriesDir, registriesMounted = oldDir, oldMounted })
+	dirs := func() string { return strings.Join(seriesOf(t, d, "firerunner_disk_free_bytes"), " ") }
+
+	d.collectHost(context.Background())
+	free := labelValue(t, d, "firerunner_disk_free_bytes", map[string]string{"dir": dir})
+	size := labelValue(t, d, "firerunner_disk_size_bytes", map[string]string{"dir": dir})
+	if size <= 0 || free < 0 || free > size {
+		t.Fatalf("%s: free %v of %v bytes", dir, free, size)
+	}
+
+	mounted = false
+	d.collectHost(context.Background())
+	if got := dirs(); strings.Contains(got, dir) {
+		t.Fatalf("unmounted %s still measured: %s", dir, got)
+	}
+	if n := series(t, d.metrics.diskSize); n != 2 {
+		t.Fatalf("%d disk size series, want 2 (builder caches, flintlock)", n)
+	}
+}
+
 // Every failed flintlock call is counted by RPC and gRPC code; successes and
 // errors that are not flintlock's (no uid in an answer) are not.
 func TestFlintlockErrorsCounted(t *testing.T) {

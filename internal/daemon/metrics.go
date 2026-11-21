@@ -181,7 +181,7 @@ func (m *Metrics) addHostMetrics() {
 	m.jobsRunning = prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_jobs_running",
 		Help: "Jobs in progress on this host: the state files prepare writes and cleanup removes."})
 	m.diskFree = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "firerunner_disk_free_bytes",
-		Help: "Bytes available on the file system holding dir: the saved builder caches and flintlock's microVM state."}, []string{"dir"})
+		Help: "Bytes available on the file system holding dir: the saved builder caches, flintlock's microVM state and, while mounted, the registry mirrors'."}, []string{"dir"})
 	m.diskSize = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "firerunner_disk_size_bytes",
 		Help: "Size of the file system holding dir."}, []string{"dir"})
 	m.flintlockErrors = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_flintlock_errors_total",
