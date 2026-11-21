@@ -78,7 +78,7 @@ Usage:
 
   firerunner drain [--timeout D]            before maintenance: take no new jobs (they stay pending
                                             in GitLab), wait until the running ones finished
-  firerunner undrain | drain --cancel       take jobs again
+  firerunner undrain [--timeout D]          take jobs again (also: drain --cancel)
 
   firerunner daemon                         pool + reconcile + metrics (systemd: firerunner.service)
   firerunner proxy                          forwards microVM traffic to the corporate proxy

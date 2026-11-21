@@ -52,14 +52,23 @@ func (f *fakeDrainDaemon) DrainStatus(context.Context) (*daemon.DrainStatus, err
 type fakeDrainRunner struct {
 	stopAsked bool
 	stopErr   error
-	resume    host.Resume
-	resumeErr error
-	states    []string // ActiveState per State call
-	calls     []string
+	// laterStopErr fails every stop after the drain's first one.
+	laterStopErr error
+	resume       host.Resume
+	resumeErr    error
+	states       []string // ActiveState per State call
+	// dropped answers DropDropIn, one entry per call, the last repeating:
+	// false while gitlab-runner still stops. Empty: always true.
+	dropped []bool
+	dropIn  bool // HasDropIn
+	calls   []string
 }
 
 func (f *fakeDrainRunner) Stop(context.Context) (bool, error) {
 	f.calls = append(f.calls, "stop")
+	if f.laterStopErr != nil && len(f.calls) > 1 {
+		return false, f.laterStopErr
+	}
 	return f.stopAsked, f.stopErr
 }
 
@@ -75,6 +84,20 @@ func (f *fakeDrainRunner) State(context.Context) (host.RunnerState, error) {
 	}
 	return host.RunnerState{Active: s, Graceful: true}, nil
 }
+
+func (f *fakeDrainRunner) DropDropIn(context.Context) (bool, error) {
+	f.calls = append(f.calls, "drop")
+	if len(f.dropped) == 0 {
+		return true, nil
+	}
+	gone := f.dropped[0]
+	if len(f.dropped) > 1 {
+		f.dropped = f.dropped[1:]
+	}
+	return gone, nil
+}
+
+func (f *fakeDrainRunner) HasDropIn() bool { return f.dropIn }
 
 func drained(jobs int) *daemon.DrainStatus {
 	return &daemon.DrainStatus{Drained: true, Since: time.Now(), JobsRunning: jobs}
@@ -95,6 +118,7 @@ func TestDrain(t *testing.T) {
 		want     []string // in the output, in this order
 		notWant  string
 		runnerOp []string
+		retries  bool // gitlab-runner calls repeat: not checked
 	}{
 		{name: "waits until the jobs finished and gitlab-runner stopped",
 			d: &fakeDrainDaemon{statuses: []*daemon.DrainStatus{drained(2), drained(1), drained(0), drained(0)}},
@@ -138,12 +162,21 @@ func TestDrain(t *testing.T) {
 			r:        &fakeDrainRunner{states: []string{"inactive"}},
 			want:     []string{"1 job running", "daemon not answering", "retrying", "drained:"},
 			runnerOp: []string{"stop"}},
+		// Started by hand, or by a start an undrain queued behind the
+		// stop: the drain stops it again and goes on waiting.
 		{name: "gitlab-runner started again meanwhile",
 			d:        &fakeDrainDaemon{statuses: []*daemon.DrainStatus{drained(0)}},
-			r:        &fakeDrainRunner{states: []string{"active"}},
-			timeout:  20 * time.Millisecond,
-			wantErr:  "takes jobs",
-			runnerOp: []string{"stop"}},
+			r:        &fakeDrainRunner{stopAsked: true, states: []string{"active", "deactivating", "inactive"}},
+			want:     []string{"started during the drain; stopping it again", "drained:"},
+			runnerOp: []string{"stop", "stop"}},
+		{name: "gitlab-runner started again and cannot be stopped",
+			d:       &fakeDrainDaemon{statuses: []*daemon.DrainStatus{drained(0)}},
+			r:       &fakeDrainRunner{stopAsked: true, laterStopErr: errors.New("not graceful"), states: []string{"active"}},
+			timeout: 20 * time.Millisecond,
+			wantErr: "takes jobs",
+			want:    []string{"could not be stopped: not graceful"},
+			notWant: "not graceful\nwarning",
+			retries: true},
 		{name: "undrained meanwhile",
 			d:        &fakeDrainDaemon{statuses: []*daemon.DrainStatus{drained(1), {Drained: false}}},
 			r:        &fakeDrainRunner{states: []string{"inactive"}},
@@ -168,6 +201,10 @@ func TestDrain(t *testing.T) {
 			err := dr.drain(context.Background(), timeout)
 			if c.wantErr == "" && err != nil || c.wantErr != "" && (err == nil || !strings.Contains(err.Error(), c.wantErr)) {
 				t.Fatalf("drain error %v, want %q\n%s", err, c.wantErr, out)
+			}
+			if c.retries {
+				// A stop that fails is tried again on every look.
+				c.runnerOp = c.r.calls
 			}
 			rest := out.String()
 			for _, w := range c.want {
@@ -210,16 +247,29 @@ func TestDrainInterrupted(t *testing.T) {
 
 func TestUndrain(t *testing.T) {
 	cases := []struct {
-		name    string
-		d       *fakeDrainDaemon
-		r       *fakeDrainRunner
-		wantErr string
-		want    []string
+		name     string
+		d        *fakeDrainDaemon
+		r        *fakeDrainRunner
+		timeout  time.Duration
+		wantErr  string
+		want     []string // in the output, in this order
+		runnerOp []string // checked when set
 	}{
 		{name: "gitlab-runner started", d: &fakeDrainDaemon{}, r: &fakeDrainRunner{resume: host.ResumeStarted},
-			want: []string{"gitlab-runner started", "boots pool VMs and builders again"}},
-		{name: "gitlab-runner still finishing", d: &fakeDrainDaemon{}, r: &fakeDrainRunner{resume: host.ResumeAfterStop},
-			want: []string{"starts again once they are done", "boots pool VMs and builders again"}},
+			want: []string{"gitlab-runner started", "boots pool VMs and builders again"}, runnerOp: []string{"resume"}},
+		// The drop-in goes once gitlab-runner no longer stops, not before:
+		// its stop would end by killing the jobs.
+		{name: "gitlab-runner still finishing", d: &fakeDrainDaemon{},
+			r: &fakeDrainRunner{resume: host.ResumeAfterStop, dropped: []bool{false, false, true}},
+			want: []string{"starts again once they are done", "boots pool VMs and builders again",
+				"waiting", "gitlab-runner finishing the jobs it ran when drained", "stop settings are removed"},
+			runnerOp: []string{"resume", "drop", "drop", "drop"}},
+		// Told exactly what to run once it has stopped.
+		{name: "gitlab-runner still finishing at the timeout", d: &fakeDrainDaemon{},
+			r:       &fakeDrainRunner{resume: host.ResumeAfterStop, dropped: []bool{false}},
+			timeout: 20 * time.Millisecond,
+			wantErr: "run: sudo firerunner undrain",
+			want:    []string{"boots pool VMs and builders again", "gitlab-runner finishing the jobs it ran when drained"}},
 		// Stopped before the drain: left alone, but the operator is told.
 		{name: "gitlab-runner not stopped by drain", d: &fakeDrainDaemon{},
 			r:    &fakeDrainRunner{resume: host.ResumeNothing, states: []string{"inactive"}},
@@ -234,14 +284,24 @@ func TestUndrain(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			dr, out := testDrainer(c.d, c.r)
-			err := dr.undrain(context.Background())
+			timeout := c.timeout
+			if timeout == 0 {
+				timeout = 5 * time.Second
+			}
+			err := dr.undrain(context.Background(), timeout)
 			if c.wantErr == "" && err != nil || c.wantErr != "" && (err == nil || !strings.Contains(err.Error(), c.wantErr)) {
 				t.Fatalf("undrain error %v, want %q\n%s", err, c.wantErr, out)
 			}
+			rest := out.String()
 			for _, w := range c.want {
-				if !strings.Contains(out.String(), w) {
-					t.Fatalf("output lacks %q:\n%s", w, out)
+				i := strings.Index(rest, w)
+				if i < 0 {
+					t.Fatalf("output lacks %q (in order):\n%s", w, out)
 				}
+				rest = rest[i+len(w):]
+			}
+			if c.runnerOp != nil && strings.Join(c.r.calls, ",") != strings.Join(c.runnerOp, ",") {
+				t.Fatalf("gitlab-runner calls %v, want %v", c.r.calls, c.runnerOp)
 			}
 			if strings.Join(c.d.calls, ",") != "undrain" {
 				t.Fatalf("daemon calls %v, want one undrain", c.d.calls)
@@ -255,17 +315,21 @@ func TestDrainLine(t *testing.T) {
 		name   string
 		status *daemon.DrainStatus
 		runner string
+		dropIn bool
 		want   string
 	}{
-		{"daemon down", nil, "active", "unknown"},
-		{"not drained", &daemon.DrainStatus{}, "active", "no"},
-		{"drained and empty", drained(0), "inactive", "safe to upgrade"},
-		{"drained, jobs left", drained(3), "deactivating", "3 jobs running, gitlab-runner finishing its jobs"},
-		{"drained but gitlab-runner back", drained(0), "active", "takes jobs"},
+		{"daemon down", nil, "active", false, "unknown"},
+		{"not drained", &daemon.DrainStatus{}, "active", false, "no"},
+		// Left by an undrain whose wait ended early: every stop of
+		// gitlab-runner would wait for its jobs.
+		{"not drained, drop-in left", &daemon.DrainStatus{}, "active", true, "no, but gitlab-runner keeps the drain's stop settings"},
+		{"drained and empty", drained(0), "inactive", true, "safe to upgrade"},
+		{"drained, jobs left", drained(3), "deactivating", true, "3 jobs running, gitlab-runner finishing its jobs"},
+		{"drained but gitlab-runner back", drained(0), "active", true, "takes jobs"},
 	}
 	for _, c := range cases {
 		d := &fakeDrainDaemon{statuses: []*daemon.DrainStatus{c.status}}
-		got := drainLine(context.Background(), d, &fakeDrainRunner{states: []string{c.runner}})
+		got := drainLine(context.Background(), d, &fakeDrainRunner{states: []string{c.runner}, dropIn: c.dropIn})
 		if !strings.Contains(got, c.want) || (c.want == "no" && got != "no") {
 			t.Errorf("%s: %q, want %q", c.name, got, c.want)
 		}
@@ -282,7 +346,9 @@ func TestCmdDrainArgs(t *testing.T) {
 			t.Errorf("drain %q accepted", args)
 		}
 	}
-	if err := cmdUndrain(cfg, []string{"now"}); err == nil {
-		t.Error("undrain with an argument accepted")
+	for _, args := range [][]string{{"now"}, {"--timeout", "0s"}} {
+		if err := cmdUndrain(cfg, args); err == nil {
+			t.Errorf("undrain %q accepted", args)
+		}
 	}
 }
