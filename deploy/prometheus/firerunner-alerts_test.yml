@@ -469,7 +469,9 @@ tests:
 # a 407 from the upstream each time -> critical from the second 407 on, and still at
 # 110m. burst: one 407 at 10m (the requests right after it are held back, not
 # 407s), then no request: the gauge stays 1 -> quiet. recovered: 407s at 10m and
-# 18m -> critical, then a request is accepted at 25m -> quiet.
+# 18m -> critical, then a request is accepted at 25m -> quiet. conc: three CONNECTs
+# on their way are refused together at 10m (three upstream_auth_failed requests, one
+# refusal: the forwarder counts a hold-back once), accepted again at 15m -> quiet.
 - interval: 1m
   input_series:
   - series: firerunner_proxy_upstream_auth_failing{instance="e8",job="firerunner"}
@@ -494,7 +496,16 @@ tests:
     values: 0x9 1x15 0x95
   - series: firerunner_proxy_upstream_auth_refusals_total{instance="recovered",job="firerunner"}
     values: 0x9 1x7 2x102
+  - series: firerunner_proxy_upstream_auth_failing{instance="conc",job="firerunner"}
+    values: 0x9 1x5 0x105
+  - series: firerunner_proxy_upstream_auth_refusals_total{instance="conc",job="firerunner"}
+    values: 0x9 1x110
+  - series: firerunner_proxy_requests_total{instance="conc",job="firerunner",kind="tunnel",outcome="upstream_auth_failed"}
+    values: 0x9 3x110
   alert_rule_test:
+  - eval_time: 11m
+    alertname: FireRunnerProxyUpstreamAuthFailing
+    exp_alerts: []
   - eval_time: 15m
     alertname: FireRunnerProxyUpstreamAuthFailing
     exp_alerts: []
