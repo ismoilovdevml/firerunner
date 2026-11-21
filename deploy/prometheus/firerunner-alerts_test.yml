@@ -91,6 +91,16 @@ tests:
     values: 1x5 0x20
   - series: firerunner_service_up{instance="h3",job="firerunner",service="firerunner-net"}
     values: 1x25
+  # One mirror's front crash-loops; its registry, the other mirror and
+  # firerunner-registry (which only starts them) stay up.
+  - series: firerunner_service_up{instance="h3",job="firerunner",service="firerunner-registry-front@ghcr.io"}
+    values: 1x5 0x20
+  - series: firerunner_service_up{instance="h3",job="firerunner",service="firerunner-registry@ghcr.io"}
+    values: 1x25
+  - series: firerunner_service_up{instance="h3",job="firerunner",service="firerunner-registry@docker.io"}
+    values: 1x25
+  - series: firerunner_service_up{instance="h3",job="firerunner",service="firerunner-registry"}
+    values: 1x25
   - series: firerunner_thinpool_usage_ratio{instance="h3",job="firerunner",type="data"}
     values: 0.5x25
   - series: firerunner_thinpool_usage_ratio{instance="h3",job="firerunner",type="metadata"}
@@ -135,8 +145,18 @@ tests:
         service: firerunner-cache
       exp_annotations:
         summary: firerunner-cache is down on h3
-        description: 'Jobs run but slower: image pulls bypass the mirror (Docker Hub rate limits) or cache: is not restored. Check: journalctl -u firerunner-cache -n 100; df -h /var/lib/firerunner.'
-        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnercacheservicedown
+        description: 'Jobs run but slower: they start without their cache:. Check: journalctl -u firerunner-cache -n 100; df -h /var/lib/firerunner/cache.'
+        runbook_url: &cache_down_runbook https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnercacheservicedown
+    - exp_labels:
+        severity: warning
+        instance: h3
+        job: firerunner
+        service: firerunner-registry-front@ghcr.io
+      exp_annotations:
+        summary: firerunner-registry-front@ghcr.io is down on h3
+        description: 'Jobs run but slower: image pulls bypass the mirror, to the registry itself (Docker Hub rate limits). Check: journalctl -u firerunner-registry-front@ghcr.io -n 100; systemctl list-units ''firerunner-registry*'';
+          df -h /var/lib/firerunner/registries; systemctl status var-lib-firerunner-registries.mount.'
+        runbook_url: *cache_down_runbook
   # The forwarder is down from 6m: quiet before its 3 minutes, critical after.
   - eval_time: 8m
     alertname: FireRunnerProxyDown
@@ -308,8 +328,19 @@ tests:
         runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerdaemonunhealthy
 # Disk: on k the builder cache file system drops to 10 % free (the other has 60 %)
 # -> one alert per host after 15 min; k2 has 50 % free -> quiet.
+# Registry mirrors' file system: k2's at 12 % free is where the eviction keeps
+# it -> neither alert; k3's at 3 % free from 6m (the eviction fails) ->
+# FireRunnerRegistryDiskFull after 30 min, not FireRunnerDiskFilling.
 - interval: 1m
   input_series:
+  - series: firerunner_disk_free_bytes{instance="k2",job="firerunner",dir="/var/lib/firerunner/registries"}
+    values: 12x45
+  - series: firerunner_disk_size_bytes{instance="k2",job="firerunner",dir="/var/lib/firerunner/registries"}
+    values: 100x45
+  - series: firerunner_disk_free_bytes{instance="k3",job="firerunner",dir="/var/lib/firerunner/registries"}
+    values: 20x5 3x40
+  - series: firerunner_disk_size_bytes{instance="k3",job="firerunner",dir="/var/lib/firerunner/registries"}
+    values: 100x45
   - series: firerunner_disk_free_bytes{instance="k",job="firerunner",dir="/var/lib/firerunner/builder-cache"}
     values: 20x5 10x30
   - series: firerunner_disk_size_bytes{instance="k",job="firerunner",dir="/var/lib/firerunner/builder-cache"}
@@ -334,10 +365,27 @@ tests:
         instance: k
       exp_annotations:
         summary: Only 10% disk space left for FireRunner data on k
-        description: 'Below 10% no builder cache is saved; at 0 the registry mirror, cache: uploads and flintlockd''s microVM state can no longer be written. Check: df -h /var/lib/firerunner /var/lib/flintlock/vm;
-          sudo du -xsh /var/lib/firerunner/* /var/lib/flintlock/vm. cache: archives: re-run the installer with a lower FR_CACHE_DAYS. Saved builder caches: lower builder.saved_cache_gb; firerunner
-          builder rm --all deletes every project''s saved cache, so every next build is cold.'
+        description: 'Below 10% no builder cache is saved; at 0 cache: uploads and flintlockd''s microVM state can no longer be written. The registry mirrors'' image takes at most FR_REGISTRY_GB of it.
+          Check: df -h /var/lib/firerunner /var/lib/flintlock/vm; sudo du -xsh /var/lib/firerunner/* /var/lib/flintlock/vm. cache: archives: re-run the installer with a lower FR_CACHE_DAYS. Saved builder
+          caches: lower builder.saved_cache_gb; firerunner builder rm --all deletes every project''s saved cache, so every next build is cold.'
         runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerdiskfilling
+  - eval_time: 30m
+    alertname: FireRunnerRegistryDiskFull
+    exp_alerts: []
+  - eval_time: 40m
+    alertname: FireRunnerRegistryDiskFull
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        instance: k3
+        job: firerunner
+        dir: /var/lib/firerunner/registries
+      exp_annotations:
+        summary: Only 3% of the registry mirrors' file system is free on k3
+        description: 'Its eviction, which keeps it under 90 % in use, is failing. Full, the mirrors store nothing new: pulls of what they do not hold go to the registries themselves (slower, Docker Hub rate
+          limits). Check: journalctl -u firerunner-registry-evict --since -1h; systemctl list-timers ''firerunner-registry-*''; df -h /var/lib/firerunner/registries; sudo du -sh /var/lib/firerunner/registries/*.
+          Grow it: re-run the installer with a larger FR_REGISTRY_GB.'
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerregistrydiskfull
 # Builders: on h a boot failure and two builders not answering within the hour -> fires;
 # its many lru removals are normal and never count. q: 2 events -> quiet.
 - interval: 1m

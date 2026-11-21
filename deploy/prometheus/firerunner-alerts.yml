@@ -34,12 +34,15 @@ groups:
           description: "Jobs fail or are not picked up. Check: journalctl -u {{ $labels.service }} -n 100; firerunner doctor."
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerservicedown
       - alert: FireRunnerCacheServiceDown
-        expr: firerunner_service_up{service=~"firerunner-registry|firerunner-cache"} == 0
+        # firerunner-registry only starts the mirrors; each mirror is a
+        # firerunner-registry@NAME (the registry) and a
+        # firerunner-registry-front@NAME (what microVMs pull from).
+        expr: firerunner_service_up{service=~"firerunner-cache|firerunner-registry|firerunner-registry(-front)?@.+"} == 0
         for: 10m
         labels: {severity: warning}
         annotations:
           summary: "{{ $labels.service }} is down on {{ $labels.instance }}"
-          description: "Jobs run but slower: image pulls bypass the mirror (Docker Hub rate limits) or cache: is not restored. Check: journalctl -u {{ $labels.service }} -n 100; df -h /var/lib/firerunner."
+          description: "{{ if match \"^firerunner-registry\" $labels.service }}Jobs run but slower: image pulls bypass the mirror, to the registry itself (Docker Hub rate limits). Check: journalctl -u {{ $labels.service }} -n 100; systemctl list-units 'firerunner-registry*'; df -h /var/lib/firerunner/registries; systemctl status var-lib-firerunner-registries.mount.{{ else }}Jobs run but slower: they start without their cache:. Check: journalctl -u {{ $labels.service }} -n 100; df -h /var/lib/firerunner/cache.{{ end }}"
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnercacheservicedown
       - alert: FireRunnerProxyDown
         # Only hosts with proxy.enabled report the forwarder; elsewhere the series is absent.
@@ -167,14 +170,35 @@ groups:
           description: "At 100% jobs fail with 'got no DHCP lease'. If state=\"stale\" dominates, leases of deleted VMs are not released: check that dhcp_release (dnsmasq-utils) is installed and journalctl -u firerunner | grep 'delete failed'."
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerdhcpleasesexhausting
       - alert: FireRunnerDiskFilling
-        # The fuller of the saved builder caches' and flintlock's microVM state file systems.
-        expr: min by (instance) (firerunner_disk_free_bytes / firerunner_disk_size_bytes) < 0.15
+        # The fuller of the saved builder caches' and flintlock's microVM state
+        # file systems. Not the registry mirrors': their eviction keeps it
+        # between 80 and 90 % in use on purpose (FireRunnerRegistryDiskFull).
+        expr: |
+          min by (instance) (
+            firerunner_disk_free_bytes{dir!="/var/lib/firerunner/registries"}
+              / firerunner_disk_size_bytes{dir!="/var/lib/firerunner/registries"}
+          ) < 0.15
         for: 15m
         labels: {severity: warning}
         annotations:
           summary: "Only {{ $value | humanizePercentage }} disk space left for FireRunner data on {{ $labels.instance }}"
-          description: "Below 10% no builder cache is saved; at 0 the registry mirror, cache: uploads and flintlockd's microVM state can no longer be written. Check: df -h /var/lib/firerunner /var/lib/flintlock/vm; sudo du -xsh /var/lib/firerunner/* /var/lib/flintlock/vm. cache: archives: re-run the installer with a lower FR_CACHE_DAYS. Saved builder caches: lower builder.saved_cache_gb; firerunner builder rm --all deletes every project's saved cache, so every next build is cold."
+          description: "Below 10% no builder cache is saved; at 0 cache: uploads and flintlockd's microVM state can no longer be written. The registry mirrors' image takes at most FR_REGISTRY_GB of it. Check: df -h /var/lib/firerunner /var/lib/flintlock/vm; sudo du -xsh /var/lib/firerunner/* /var/lib/flintlock/vm. cache: archives: re-run the installer with a lower FR_CACHE_DAYS. Saved builder caches: lower builder.saved_cache_gb; firerunner builder rm --all deletes every project's saved cache, so every next build is cold."
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerdiskfilling
+      - alert: FireRunnerRegistryDiskFull
+        # The eviction (every 10 min) deletes layers above 90 % in use down to
+        # 80 %: under 5 % free for 30 min means it fails. 5 %, not 10: free is
+        # what the mirrors may still write, and ext4 on a disk of your own
+        # keeps 5 % for root by default, so 10 % free there is 85 % in use,
+        # below where the eviction starts. The installer's image keeps none.
+        expr: |
+          firerunner_disk_free_bytes{dir="/var/lib/firerunner/registries"}
+            / firerunner_disk_size_bytes{dir="/var/lib/firerunner/registries"} < 0.05
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Only {{ $value | humanizePercentage }} of the registry mirrors' file system is free on {{ $labels.instance }}"
+          description: "Its eviction, which keeps it under 90 % in use, is failing. Full, the mirrors store nothing new: pulls of what they do not hold go to the registries themselves (slower, Docker Hub rate limits). Check: journalctl -u firerunner-registry-evict --since -1h; systemctl list-timers 'firerunner-registry-*'; df -h /var/lib/firerunner/registries; sudo du -sh /var/lib/firerunner/registries/*. Grow it: re-run the installer with a larger FR_REGISTRY_GB."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerregistrydiskfull
       - alert: FireRunnerBuildersFailing
         # Builders that did not start, or died: normal removals (lru, idle,
         # max_age, config_changed, operator, disabled) do not count.
