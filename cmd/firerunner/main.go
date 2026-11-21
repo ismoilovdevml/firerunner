@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -360,6 +361,60 @@ func showConfig(w io.Writer, path string, cfg config.Config) error {
 // ---------------------------------------------------------------------------
 // status / doctor
 
+// serviceStates are the states of systemd units read in one systemctl run
+// (host.ServicesActiveContext): status and doctor ask about some 20 units,
+// a pair per registry mirror included, and a systemctl each cost as many
+// processes and, with systemd hung, as many timeouts.
+type serviceStates struct {
+	probe func(context.Context, []string) []bool
+	up    map[string]bool
+}
+
+// probeServices reads the states of names with one run of probe.
+func probeServices(ctx context.Context, probe func(context.Context, []string) []bool, names []string) serviceStates {
+	s := serviceStates{probe: probe, up: make(map[string]bool, len(names))}
+	for i, up := range probe(ctx, names) {
+		if i < len(names) {
+			s.up[names[i]] = up
+		}
+	}
+	return s
+}
+
+// active reports whether unit name is active. A unit probeServices was not
+// asked about is probed now: a name missed up front must not read as down.
+func (s serviceStates) active(ctx context.Context, name string) bool {
+	if up, ok := s.up[name]; ok {
+		return up
+	}
+	up := s.probe(ctx, []string{name})
+	return len(up) == 1 && up[0]
+}
+
+// servicesLine is status's list of units with their state, in order.
+func servicesLine(ctx context.Context, s serviceStates, names []string) string {
+	svc := make([]string, 0, len(names))
+	for _, n := range names {
+		state := "down"
+		if s.active(ctx, n) {
+			state = "up"
+		}
+		svc = append(svc, n+" "+state)
+	}
+	return strings.Join(svc, ", ")
+}
+
+// doctorUnits are the units doctor checks: the host's (hostUnits, which
+// hold firerunner-cache), the daemon, gitlab-runner and, with proxy.enabled,
+// the forwarder. One systemctl run answers for all of them.
+func doctorUnits(hostUnits []string, proxyEnabled bool) []string {
+	units := append(slices.Clone(hostUnits), "firerunner", "gitlab-runner")
+	if proxyEnabled {
+		units = append(units, host.ProxyService)
+	}
+	return units
+}
+
 func cmdStatus(cfg config.Config) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	defer w.Flush()
@@ -375,15 +430,9 @@ func cmdStatus(cfg config.Config) error {
 	if err != nil {
 		fmt.Fprintf(w, "Registry mirrors\t%v\n", err)
 	}
-	var svc []string
-	for _, s := range host.MonitoredServices(cfg.Proxy.Enabled, mirrors) {
-		state := "down"
-		if host.ServiceActive(s) {
-			state = "up"
-		}
-		svc = append(svc, s+" "+state)
-	}
-	fmt.Fprintf(w, "Services\t%s\n", strings.Join(svc, ", "))
+	units := host.MonitoredServices(cfg.Proxy.Enabled, mirrors)
+	ctx := context.Background()
+	fmt.Fprintf(w, "Services\t%s\n", servicesLine(ctx, probeServices(ctx, host.ServicesActiveContext, units), units))
 
 	if data, meta, err := host.ThinPoolUsage(); err == nil {
 		fmt.Fprintf(w, "Thin pool\tdata %.1f%%, metadata %.1f%%\n", data, meta)
@@ -432,9 +481,12 @@ func cmdDoctor(cfg config.Config) error {
 	check("/dev/kvm", host.KVM(), "enable VT-x/AMD-V (bare metal) or nested virtualization (VM)")
 	mirrors, err := host.RegistryUnits(host.RegistryConfDir)
 	check("registry mirrors listed in "+host.RegistryConfDir, err, "")
-	for _, s := range host.HostServices(mirrors) {
+	ctx := context.Background()
+	hostUnits := host.HostServices(mirrors)
+	svc := probeServices(ctx, host.ServicesActiveContext, doctorUnits(hostUnits, cfg.Proxy.Enabled))
+	for _, s := range hostUnits {
 		var err error
-		if !host.ServiceActive(s) {
+		if !svc.active(ctx, s) {
 			err = errors.New("not running")
 		}
 		check("service "+s, err, "journalctl -u "+s+" -n 50")
@@ -450,7 +502,7 @@ func cmdDoctor(cfg config.Config) error {
 	}
 	check("thin pool below 80%", err, "remove unused images or extend the flintlock volume group")
 
-	if cfg.Builder.Enabled && cfg.Builder.SavedCacheGB > 0 && host.ServiceActive("firerunner") {
+	if cfg.Builder.Enabled && cfg.Builder.SavedCacheGB > 0 && svc.active(ctx, "firerunner") {
 		// Hosts upgraded with `firerunner upgrade` alone keep an older unit.
 		out, _ := exec.Command("systemctl", "show", "firerunner", "-p", "ReadWritePaths", "--value").Output()
 		var err error
@@ -491,7 +543,7 @@ func cmdDoctor(cfg config.Config) error {
 		fmt.Println("        -> firerunner runner register --url <gitlab-url> --token -   # paste the glrt-... token")
 	} else {
 		var err error
-		if !host.ServiceActive("gitlab-runner") {
+		if !svc.active(ctx, "gitlab-runner") {
 			err = errors.New("not running")
 		}
 		check("service gitlab-runner", err, "journalctl -u gitlab-runner -n 50")
@@ -501,7 +553,7 @@ func cmdDoctor(cfg config.Config) error {
 			fmt.Println("        -> firerunner runner cache local")
 		case local != nil && r.CacheServer == local.Server:
 			var err error
-			if !host.ServiceActive("firerunner-cache") {
+			if !svc.active(ctx, "firerunner-cache") {
 				err = errors.New("not running")
 			}
 			check("cache server "+local.Server, err, "journalctl -u firerunner-cache -n 50")
@@ -511,7 +563,7 @@ func cmdDoctor(cfg config.Config) error {
 	if cfg.Proxy.Enabled {
 		fmt.Println("Proxy")
 		var err error
-		if !host.ServiceActive("firerunner-proxy") {
+		if !svc.active(ctx, host.ProxyService) {
 			err = errors.New("not running")
 		}
 		check("service firerunner-proxy", err, "journalctl -u firerunner-proxy -n 50")
