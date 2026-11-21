@@ -38,6 +38,10 @@ type Limits struct {
 	Stall time.Duration
 	// ShutdownWait is how long pulls under way may finish after a stop.
 	ShutdownWait time.Duration
+	// WarnEvery is how often a problem that repeats (a refused request or
+	// connection from one client, a registry that does not answer) is logged:
+	// the first time at once, then one line with the count per WarnEvery.
+	WarnEvery time.Duration
 }
 
 // DefaultLimits suit one host running tens of jobs. PerClient and Total are
@@ -46,6 +50,7 @@ type Limits struct {
 // UpstreamHeader and Stall are the forwarder's wait for an upstream answer,
 // since a cache miss goes out the same corporate links. ShutdownWait stays
 // under systemd's default stop timeout (90s), so a stop never ends in a kill.
+// WarnEvery keeps a looping client to one line a minute per problem.
 func DefaultLimits() Limits {
 	return Limits{
 		PerClient:      256,
@@ -56,6 +61,7 @@ func DefaultLimits() Limits {
 		UpstreamHeader: 5 * time.Minute,
 		Stall:          5 * time.Minute,
 		ShutdownWait:   60 * time.Second,
+		WarnEvery:      time.Minute,
 	}
 }
 
@@ -74,6 +80,7 @@ type Front struct {
 	upstream  *url.URL
 	limits    Limits
 	log       *slog.Logger
+	warns     *warnLimiter
 	transport *http.Transport
 	proxy     *httputil.ReverseProxy
 }
@@ -84,7 +91,7 @@ func New(upstream string, limits Limits, log *slog.Logger) (*Front, error) {
 	if err != nil {
 		return nil, err
 	}
-	f := &Front{upstream: up, limits: limits, log: log}
+	f := &Front{upstream: up, limits: limits, log: log, warns: newWarnLimiter(log, limits.WarnEvery)}
 	f.transport = &http.Transport{
 		// Proxy is nil: the registry is local, never reached through
 		// HTTP_PROXY from the environment.
@@ -133,7 +140,8 @@ type cancelKey struct{}
 func (f *Front) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w = newStallWriter(w, f.limits.Stall)
 	if why := refusal(r); why != "" {
-		f.log.Warn("registry request refused", "client", hostOf(r.RemoteAddr), "method", clip(r.Method),
+		client := hostOf(r.RemoteAddr)
+		f.warns.warn(why, client, "registry request refused", "client", client, "method", clip(r.Method),
 			"target", clip(r.RequestURI), "reason", why)
 		writeError(w, http.StatusNotFound, "UNSUPPORTED", "this registry mirror serves image pulls only")
 		return
@@ -175,8 +183,8 @@ func (f *Front) watchBody(resp *http.Response) error {
 func (f *Front) registryFailed(w http.ResponseWriter, r *http.Request, err error) {
 	// A client that hung up is not the registry's failure.
 	if r.Context().Err() == nil {
-		f.log.Warn("registry did not answer", "upstream", f.upstream.Host, "method", r.Method,
-			"path", clip(r.URL.Path), "err", err)
+		f.warns.warn("registry did not answer", "", "registry did not answer", "upstream", f.upstream.Host,
+			"method", r.Method, "path", clip(r.URL.Path), "err", err)
 	}
 	writeError(w, http.StatusBadGateway, "UNAVAILABLE", "the registry behind this mirror did not answer")
 }
@@ -220,8 +228,12 @@ func (f *Front) Serve(ctx context.Context, l net.Listener) error {
 		ErrorLog:                     slog.NewLogLogger(f.log.Handler(), slog.LevelWarn),
 	}
 	served := make(chan error, 1)
-	go func() { served <- srv.Serve(newLimitListener(l, f.limits.PerClient, f.limits.Total, f.log)) }()
+	go func() { served <- srv.Serve(newLimitListener(l, f.limits.PerClient, f.limits.Total, f.warns)) }()
 	defer f.transport.CloseIdleConnections()
+	// The repeats counted since the last line are logged before Serve returns.
+	stopWarns, warnsDone := make(chan struct{}), make(chan struct{})
+	go func() { defer close(warnsDone); f.warns.run(stopWarns) }()
+	defer func() { close(stopWarns); <-warnsDone; f.warns.flush(true) }()
 	f.log.Info("registry front listening", "addr", l.Addr().String(), "upstream", f.upstream.String())
 
 	select {

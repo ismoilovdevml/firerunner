@@ -47,7 +47,13 @@ func startUpstream(t *testing.T, h http.HandlerFunc) string {
 // early and returns what Serve returned.
 func startFront(t *testing.T, upstream string, lim regfront.Limits) (addr string, stop func() error) {
 	t.Helper()
-	f, err := regfront.New(upstream, lim, discardLog())
+	return startFrontLog(t, upstream, lim, discardLog())
+}
+
+// startFrontLog is startFront logging to log.
+func startFrontLog(t *testing.T, upstream string, lim regfront.Limits, log *slog.Logger) (addr string, stop func() error) {
+	t.Helper()
+	f, err := regfront.New(upstream, lim, log)
 	if err != nil {
 		t.Fatal(err)
 	}
