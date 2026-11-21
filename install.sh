@@ -520,7 +520,9 @@ proxy_dropins_apply() {
     done
     systemctl daemon-reload
     for svc in containerd-flintlock firerunner-registry@ gitlab-runner; do
-        [[ $svc == firerunner-registry@ && $REGISTRY_DEFERRED == 1 ]] && continue
+        # The mirrors' drop-in: setup_registries applied it already (registry_start),
+        # or they still run as the single service of earlier versions.
+        [[ $svc == firerunner-registry@ && ($REGISTRY_DEFERRED == 1 || $REGISTRY_DROPIN_DONE == 1) ]] && continue
         if changed "/etc/systemd/system/$svc.service.d/firerunner-proxy.conf" && systemctl is-active -q "${svc%@}"; then
             restart_when_idle "${svc%@}"
         fi
@@ -1614,6 +1616,7 @@ CACHE_USER=firerunner-cache                 # runs the cache: server
 REGISTRY_LOCAL_OFFSET=10000                 # behind a front, a registry listens on 127.0.0.1:<bridge port + this>
 REGISTRY_FRONT=0                            # the installed firerunner has `registry-front` (setup_registries)
 REGISTRY_DEFERRED=0                         # leaving the single service of earlier versions waits for no job to run
+REGISTRY_DROPIN_DONE=0                      # setup_registries wrote (and applied) the mirrors' proxy drop-in
 # The mirrors' data is an ext4 file system in REGISTRY_IMG, mounted on
 # REGISTRY_DIR. It takes at most its size (FR_REGISTRY_GB) of the root disk:
 # the image is sparse, and the space of blobs deleted in it goes back to the
@@ -1624,8 +1627,22 @@ REGISTRY_IMG=/var/lib/firerunner/registries.img
 REGISTRY_MOUNT_UNIT=var-lib-firerunner-registries.mount  # systemd-escape -p --suffix=mount $REGISTRY_DIR
 REGISTRY_MIN_GB=5
 REGISTRY_STATE_DIR=/var/lib/firerunner/registry-maint    # when each mirror was last garbage-collected
-REGISTRY_EVICT_HIGH=90   # % of the file system in use that starts an eviction
-REGISTRY_EVICT_LOW=80    # % in use the eviction stops at
+# The eviction starts when less than START_PCT % or START_MIB MiB is free, and
+# deletes until STOP_PCT % and STOP_MIB MiB (and twice the largest layer) are
+# free. A mirror writes a layer it does not hold while it streams it to the
+# client: a file system that fills during that breaks the pull off, so the
+# headroom is absolute too, and checked every 2 minutes.
+REGISTRY_EVICT_START_PCT=10
+REGISTRY_EVICT_START_MIB=1536
+REGISTRY_EVICT_STOP_PCT=20
+REGISTRY_EVICT_STOP_MIB=3072
+# The upkeep script, in BIN_DIR: there SELinux labels it bin_t, so its units
+# run unconfined (unconfined_service_t) like the other services; from
+# LIB_DIR (lib_t) they would run as init_t, which may not delete the mirrors' files.
+REGISTRY_MAINT=$BIN_DIR/firerunner-registry-maint
+# Under SELinux every file of the mirrors' file system is var_lib_t, as the
+# rest of /var/lib/firerunner: a new ext4 has no labels (unlabeled_t).
+REGISTRY_SELINUX_CONTEXT=system_u:object_r:var_lib_t:s0
 # Earlier versions: one firerunner-registry.service ran every mirror from
 # registries.sh, as root, its data on the root disk without a limit.
 LEGACY_REGISTRIES_SH=$LIB_DIR/registries.sh
@@ -1811,8 +1828,8 @@ Type=ext4
 # wanted by multi-user.target rather than local-fs.target: a damaged image
 # does not hold up the boot (the mirrors stay down, microVMs pull from the
 # registries themselves). relatime (the default) keeps the atimes the
-# eviction goes by (registry-maint.sh).
-Options=loop,discard,nodev,nosuid,noexec,nofail
+# eviction goes by (firerunner-registry-maint).$(if selinux_on; then printf '\n# context=: under SELinux every file in it is var_lib_t (a new ext4 has no labels).'; fi)
+Options=$(registry_mount_options)
 
 [Install]
 WantedBy=multi-user.target
@@ -1822,8 +1839,23 @@ EOF
     if ! mountpoint -q "$REGISTRY_DIR"; then
         systemctl start "$REGISTRY_MOUNT_UNIT" ||
             die "could not mount $REGISTRY_IMG on $REGISTRY_DIR (journalctl -u $REGISTRY_MOUNT_UNIT)"
+    elif changed "$UNIT_DIR/$REGISTRY_MOUNT_UNIT" || registry_pending "$REGISTRY_MOUNT_UNIT"; then
+        # New options (context=) apply only to a new mount. Remounting
+        # restarts the mirrors on it (their RequiresMountsFor=): when no job
+        # runs, here under setup_registries' lock (no garbage collection runs).
+        restart_when_idle "$REGISTRY_MOUNT_UNIT"
     fi
     registry_grow
+}
+
+# selinux_on: SELinux is enabled (enforcing or permissive).
+selinux_on() { command -v selinuxenabled >/dev/null && selinuxenabled; }
+
+# registry_mount_options: the mount options of the mirrors' file system.
+registry_mount_options() {
+    local o=loop,discard,nodev,nosuid,noexec,nofail
+    selinux_on && o+=",context=$REGISTRY_SELINUX_CONTEXT"
+    echo "$o"
 }
 
 # registry_grow grows the image to a larger FR_REGISTRY_GB, online. It is
@@ -1864,13 +1896,15 @@ registry_legacy() {
     return 1
 }
 
-# registry_fits KB: KB more data keeps the mirrors' file system at most
-# REGISTRY_EVICT_LOW % full, and a copy of it fits on the root disk with 1 GiB to spare.
+# registry_fits KB: with KB more data the mirrors' file system still has the
+# free space an eviction leaves (REGISTRY_EVICT_STOP_PCT and _MIB), and a copy
+# of it fits on the root disk with 1 GiB to spare.
 registry_fits() {
     local kb=$1 size used avail
     read -r size used < <(df -Pk "$REGISTRY_DIR" | awk 'NR == 2 {print $2, $3}')
     avail=$(df -Pk "$(dirname "$REGISTRY_IMG")" | awk 'NR == 2 {print $4}')
-    (( (used + kb) * 100 <= size * REGISTRY_EVICT_LOW && kb + 1048576 <= avail ))
+    (( (used + kb) * 100 <= size * (100 - REGISTRY_EVICT_STOP_PCT) &&
+        size - used - kb >= REGISTRY_EVICT_STOP_MIB * 1024 && kb + 1048576 <= avail ))
 }
 
 # legacy_keep DIR: renames DIR to DIR.migrated (DIR.migrated-<time> if that is
@@ -1957,7 +1991,7 @@ storage:
   filesystem:
     rootdirectory: $REGISTRY_DIR/$name
   # So the ttl deletes what expires (a proxy refuses DELETE from clients all
-  # the same), and registry garbage-collect the rest (registry-maint.sh).
+  # the same), and registry garbage-collect the rest (firerunner-registry-maint).
   delete:
     enabled: true
 http:
@@ -2065,17 +2099,20 @@ CapabilityBoundingSet=
 WantedBy=firerunner-registry.service
 EOF
 
-    registry_maint_script | put "$LIB_DIR/registry-maint.sh" 0755
+    registry_maint_script | put "$REGISTRY_MAINT" 0755
+    # Where earlier runs of this version put it (lib_t under SELinux).
+    rm -f "$LIB_DIR/registry-maint.sh"
     put "$UNIT_DIR/firerunner-registry-evict.service" <<EOF
 [Unit]
-Description=Evict the FireRunner registry mirrors' least read layers above ${REGISTRY_EVICT_HIGH}% of their file system
+Description=Evict the FireRunner registry mirrors' least read layers when their file system runs short of free space
 RequiresMountsFor=${REGISTRY_DIR}
 
 [Service]
 Type=oneshot
 User=${REGISTRY_USER}
 Group=${REGISTRY_USER}
-ExecStart=${LIB_DIR}/registry-maint.sh evict ${REGISTRY_EVICT_HIGH} ${REGISTRY_EVICT_LOW}
+# Starts below ${REGISTRY_EVICT_START_PCT} % or ${REGISTRY_EVICT_START_MIB} MiB free, stops at ${REGISTRY_EVICT_STOP_PCT} % and ${REGISTRY_EVICT_STOP_MIB} MiB free.
+ExecStart=${REGISTRY_MAINT} evict ${REGISTRY_EVICT_START_PCT} ${REGISTRY_EVICT_START_MIB} ${REGISTRY_EVICT_STOP_PCT} ${REGISTRY_EVICT_STOP_MIB}
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=${REGISTRY_DIR}
@@ -2087,11 +2124,12 @@ CapabilityBoundingSet=
 EOF
     put "$UNIT_DIR/firerunner-registry-evict.timer" <<EOF
 [Unit]
-Description=Check the FireRunner registry mirrors' file system every 10 minutes
+Description=Check the FireRunner registry mirrors' free space every 2 minutes
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=10min
+# One df while there is room; pulls can fill gigabytes within minutes.
+OnBootSec=2min
+OnUnitActiveSec=2min
 
 [Install]
 WantedBy=timers.target
@@ -2103,7 +2141,7 @@ RequiresMountsFor=${REGISTRY_DIR}
 
 [Service]
 Type=oneshot
-ExecStart=${LIB_DIR}/registry-maint.sh gc
+ExecStart=${REGISTRY_MAINT} gc
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=${REGISTRY_DIR} ${REGISTRY_STATE_DIR}
@@ -2111,8 +2149,8 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateNetwork=yes
-# Root only to stop and start a mirror; garbage-collect runs as
-# ${REGISTRY_USER} (setpriv).
+# Root only to mask, stop and start a mirror (systemd does that); garbage-collect
+# runs as ${REGISTRY_USER} (setpriv).
 CapabilityBoundingSet=CAP_SETUID CAP_SETGID
 EOF
     put "$UNIT_DIR/firerunner-registry-gc.timer" <<EOF
@@ -2129,13 +2167,27 @@ WantedBy=timers.target
 EOF
 }
 
+# registry_pending UNIT: a restart of UNIT waits for a run when no job runs,
+# left by this run or an earlier one.
+registry_pending() { [[ " $PENDING " == *" $1 "* ]] || grep -qxF "restart $1" "$PENDING_FILE" 2>/dev/null; }
+
+# start_now UNIT: starts UNIT, which does not run, and drops a restart an
+# earlier run left for it. A mirror that does not start only costs pulls.
+start_now() {
+    log "  starting $1"
+    systemctl restart "$1" || warn "  $1 did not start (journalctl -u $1)"
+    if [[ -f $PENDING_FILE ]]; then sed -i "/^restart $1\$/d" "$PENDING_FILE"; fi
+    return 0
+}
+
 # registry_start starts what does not run, restarts (when no job runs) the
 # mirrors whose config, unit or binary changed, and stops a mirror no longer
 # in FR_REGISTRY_MIRRORS (its data stays until evicted).
 registry_start() {
     local name reg front w all_reg=0 all_front=0 timer
     systemctl daemon-reload
-    changed "$UNIT_DIR/firerunner-registry@.service" "$BIN_DIR/registry" && all_reg=1
+    changed "$UNIT_DIR/firerunner-registry@.service" "$BIN_DIR/registry" \
+        "$UNIT_DIR/firerunner-registry@.service.d/firerunner-proxy.conf" && all_reg=1
     changed "$UNIT_DIR/firerunner-registry-front@.service" "$BIN_DIR/firerunner" && all_front=1
     for w in "$UNIT_DIR"/firerunner-registry.service.wants/firerunner-registry{,-front}@*.service; do
         [[ -L $w || -e $w ]] || continue
@@ -2155,23 +2207,24 @@ registry_start() {
         fi
         systemctl enable -q "$reg"
         if ! systemctl is-active -q "$reg"; then
-            log "  starting $reg"
-            systemctl restart "$reg" || warn "  $reg did not start (journalctl -u $reg)"
-        elif [[ $all_reg == 1 ]] || changed "$REGISTRY_CONF_DIR/$name.yml"; then
+            start_now "$reg"
+        elif [[ $all_reg == 1 ]] || changed "$REGISTRY_CONF_DIR/$name.yml" || registry_pending "$reg"; then
+            # A restart an earlier run left (its config moved it off the
+            # bridge port, say) is done here, before its front starts.
             restart_when_idle "$reg"
         fi
         [[ $REGISTRY_FRONT == 1 ]] || continue
+        if registry_pending "$reg" && ! systemctl is-active -q "$front"; then
+            # Its registry may still hold the bridge port: the front is not
+            # even enabled (firerunner-registry would start it) until a run
+            # when no job runs has restarted the registry.
+            pending_add "restart $front"
+            continue
+        fi
         systemctl enable -q "$front"
         if ! systemctl is-active -q "$front"; then
-            if [[ " $PENDING " == *" $reg "* ]]; then
-                # Its registry may still hold the bridge port: the front starts
-                # after the registry's restart, when no job runs.
-                pending_add "restart $front"
-            else
-                log "  starting $front"
-                systemctl restart "$front" || warn "  $front did not start (journalctl -u $front)"
-            fi
-        elif [[ $all_front == 1 ]] || changed "$REGISTRY_CONF_DIR/$name.env"; then
+            start_now "$front"
+        elif [[ $all_front == 1 ]] || changed "$REGISTRY_CONF_DIR/$name.env" || registry_pending "$front"; then
             restart_when_idle "$front"
         fi
     done
@@ -2204,51 +2257,77 @@ setup_registries() {
     fi
     log "registry mirrors: $(registry_names | paste -sd ' ' -)"
     system_user "$REGISTRY_USER" "FireRunner registry mirrors"
+    # The upkeep (firerunner-registry-maint) holds this lock while it
+    # garbage-collects a mirror: no mirror is started or moved meanwhile. A
+    # file outside the mirrors' file system, so a remount is not kept busy.
+    mkdir -p "$REGISTRY_STATE_DIR"
+    [[ -e $REGISTRY_STATE_DIR/lock ]] || : >"$REGISTRY_STATE_DIR/lock"
+    chmod 0644 "$REGISTRY_STATE_DIR/lock"
+    local lock_fd
+    exec {lock_fd}<"$REGISTRY_STATE_DIR/lock"
+    flock -w 900 "$lock_fd" ||
+        die "the registry mirrors' upkeep (firerunner-registry-gc) has held $REGISTRY_STATE_DIR/lock for 15 minutes: run the installer again later"
     registry_storage
     if registry_legacy; then
         registry_migrate
     fi
     registry_files
+    # The mirrors' proxy settings before their first start (a first run
+    # after the move), not only in proxy_dropins_apply at the end.
+    proxy_dropin firerunner-registry@
+    REGISTRY_DROPIN_DONE=1
     registry_start
+    exec {lock_fd}<&-
 }
 
 # registry_maint_script: the mirrors' upkeep the evict and gc timers run.
 registry_maint_script() {
     cat <<'EOF'
 #!/bin/bash
-# registry-maint.sh evict HIGH LOW | gc: upkeep of the registry mirrors' file
-# system (written by install.sh).
+# firerunner-registry-maint evict START_PCT START_MIB STOP_PCT STOP_MIB | gc:
+# upkeep of the registry mirrors' file system (written by install.sh).
 #
-# evict (every 10 minutes, as the registry user): above HIGH % in use, deletes
-#   the layer blobs read longest ago until LOW % is in use. The file system is
-#   mounted relatime, so a blob's atime is its last read to within a day. Safe
-#   while the mirrors run: a mirror asked for a blob it no longer has pulls it
-#   from its registry again. Manifests stay: registry garbage-collect stops at
-#   a manifest whose blob is gone, and the mirrors' ttl expires them.
+# evict (every 2 minutes, as the registry user): when less than START_PCT %
+#   or START_MIB MiB is free, deletes the layer blobs read longest ago until
+#   STOP_PCT % and STOP_MIB MiB, and twice the largest layer, are free. The
+#   file system is mounted relatime, so a blob's atime is its last read to
+#   within a day. Safe while the mirrors run: a mirror asked for a blob it no
+#   longer has pulls it from its registry again. Manifests stay: registry
+#   garbage-collect stops at a manifest whose blob is gone, and the mirrors'
+#   ttl expires them. A layer it cannot delete is reported and skipped.
 # gc (hourly, as root): at most once a day per mirror, and only while no job
-#   runs, stops the mirror, runs registry garbage-collect as the registry user
-#   (it must not run next to a registry that writes) and starts it again.
+#   runs, masks and stops the mirror (nothing may start it: garbage-collect
+#   must not run next to a registry that writes), runs registry
+#   garbage-collect as the registry user, then unmasks and starts it again.
 #   Meanwhile microVMs pull from the registries themselves.
 set -euo pipefail
 export LC_ALL=C
 dir=${FR_REGISTRY_DIR:-/var/lib/firerunner/registries}
 conf=${FR_REGISTRY_CONF_DIR:-/etc/firerunner/registries.d}
 state=${FR_REGISTRY_STATE_DIR:-/var/lib/firerunner/registry-maint}
+lock=${FR_REGISTRY_LOCK:-$state/lock}
 jobs=${FR_JOBS_DIR:-/run/firerunner/jobs}
 user=${FR_REGISTRY_USER:-firerunner-registry}
 registry=${FR_REGISTRY_BIN:-/usr/local/bin/registry}
 day=$((24 * 3600 - 600))   # an hourly timer that fires a little early still counts
-# A stop or Ctrl-C ends the script through the EXIT trap (gc starts the mirror again).
+# A stop or Ctrl-C ends the script through the EXIT trap (gc unmasks and
+# starts the mirror again).
 trap 'exit 143' TERM INT HUP
 
 jobs_running() { compgen -G "$jobs/*.json" >/dev/null; }
 
 evict() {
-    local high=$1 low=$2 size used target d b kb path deleted=0 freed=0
-    read -r size used < <(df -Pk "$dir" | awk 'NR == 2 {print $2, $3}')
-    [[ $size =~ ^[0-9]+$ && $used =~ ^[0-9]+$ ]] && ((size > 0)) || { echo "cannot read the size of $dir" >&2; return 1; }
-    ((used * 100 > size * high)) || return 0
-    target=$((size * low / 100))
+    local start_pct=$1 start_mib=$2 stop_pct=$3 stop_mib=$4
+    local size free want d b kb path largest=0 deleted=0 freed=0 failed=0 first=""
+    read -r size free < <(df -Pk "$dir" | awk 'NR == 2 {print $2, $4}')
+    if ! [[ $size =~ ^[0-9]+$ && $free =~ ^[0-9]+$ ]] || ((size == 0)); then
+        echo "cannot read the size of $dir" >&2
+        return 1
+    fi
+    # Room enough: this one df is all.
+    if ((free * 100 >= size * start_pct && free >= start_mib * 1024)); then
+        return 0
+    fi
     local -A manifest=()
     while IFS= read -r -d '' d; do
         manifest[${d##*/}]=1
@@ -2257,18 +2336,49 @@ evict() {
     local -a blobs=()
     mapfile -d '' blobs < <(find "$dir" -path '*/docker/registry/v2/blobs/sha256/*' -name data -type f -printf '%A@ %k %h\0' | sort -z -n)
     for b in "${blobs[@]}"; do
-        ((used > target)) || break
+        read -r _ kb _ <<<"$b"
+        if ((kb > largest)); then largest=$kb; fi
+    done
+    want=$((size * stop_pct / 100))
+    if ((want < stop_mib * 1024)); then want=$((stop_mib * 1024)); fi
+    if ((want < 2 * largest)); then want=$((2 * largest)); fi
+    for b in "${blobs[@]}"; do
+        ((free < want)) || break
         read -r _ kb _ <<<"$b"
         path=${b#* * }
         [[ -z ${manifest[${path##*/}]:-} ]] || continue
-        rm -rf -- "$path"
-        used=$((used - kb)) deleted=$((deleted + 1)) freed=$((freed + kb))
+        if ! rm -rf -- "$path" 2>/dev/null; then
+            failed=$((failed + 1))
+            [[ -n $first ]] || first=$path
+            continue
+        fi
+        free=$((free + kb)) deleted=$((deleted + 1)) freed=$((freed + kb))
     done
-    echo "evicted the $deleted layers read longest ago ($((freed / 1024)) MiB): about $((used * 100 / size))% of $((size / 1024)) MiB in use"
+    echo "evicted the $deleted layers read longest ago ($((freed / 1024)) MiB): about $((free / 1024)) of $((size / 1024)) MiB free, $((want / 1024)) MiB wanted"
+    if ((failed > 0)); then
+        echo "could not delete $failed layers, the first: $first" >&2
+        return 1
+    fi
+    if ((free < want)); then
+        echo "still under the free space wanted: what is left is not layers it may delete (manifests, uploads)" >&2
+    fi
+    return 0
+}
+
+# Set by gc for restore_mirror, which also runs from the EXIT trap.
+unit="" started=0
+
+# restore_mirror: unmasks the mirror gc masked and starts it if it ran.
+restore_mirror() {
+    systemctl unmask --runtime -q "$unit" || echo "could not unmask $unit: systemctl unmask --runtime $unit" >&2
+    if ((started)); then
+        systemctl start "$unit" || echo "could not start $unit again" >&2
+    fi
+    return 0
 }
 
 gc() {
-    local c name stamp unit out failed=0 stopped
+    local c name stamp out now failed=0
     mkdir -p "$state"
     for c in "$conf"/*.yml; do
         [[ -f $c ]] || continue
@@ -2281,12 +2391,27 @@ gc() {
             echo "garbage collection waits while jobs run"
             return "$failed"
         fi
-        stopped=0
-        if systemctl is-active -q "$unit"; then
+        # A mirror that never stored an image has nothing to collect, and
+        # garbage-collect fails on it (no repositories directory).
+        if [[ ! -d $dir/$name/docker/registry/v2/repositories ]]; then
+            touch "$stamp"
+            echo "$name: nothing stored yet, nothing to collect"
+            continue
+        fi
+        now=$(systemctl is-active "$unit" 2>/dev/null || true)
+        case $now in
+            active) started=1 ;;
+            inactive|failed) started=0 ;;
+            *)  # starting, restarting after a crash (auto-restart), stopping
+                echo "$name: skipped, $unit is ${now:-in an unknown state}"
+                continue ;;
+        esac
+        # Masked, nothing starts it while garbage-collect runs: not the
+        # installer, a restart of firerunner-registry, nor its front's Wants=.
+        systemctl mask --runtime -q "$unit"
+        trap restore_mirror EXIT
+        if ((started)); then
             systemctl stop "$unit"
-            stopped=1
-            # shellcheck disable=SC2064
-            trap "systemctl start '$unit'" EXIT
         fi
         # Tried once a day, whatever the outcome: a failing one does not stop
         # the mirror every hour.
@@ -2294,15 +2419,18 @@ gc() {
         out=$(mktemp)
         if setpriv --reuid="$user" --regid="$user" --clear-groups -- "$registry" garbage-collect "$c" >"$out" 2>&1; then
             echo "$name: garbage-collected ($(grep -E 'eligible for deletion' "$out" | tail -n 1 | sed 's/^[[:space:]]*//' || true))"
+        elif grep -q 'Path not found' "$out"; then
+            # distribution v3.1.1 stops so at a repository that has manifests
+            # but no layers (all expired or evicted). Nothing was deleted; the
+            # eviction and the ttl still free this mirror's space.
+            echo "$name: garbage-collect stopped at a path that is gone, nothing collected: $(grep -m 1 'Path not found' "$out")"
         else
             echo "$name: registry garbage-collect failed: $(tail -n 5 "$out" | tr '\n' ' ')" >&2
             failed=1
         fi
         rm -f "$out"
-        if ((stopped)); then
-            trap - EXIT
-            systemctl start "$unit"
-        fi
+        trap - EXIT
+        restore_mirror
     done
     return "$failed"
 }
@@ -2312,13 +2440,15 @@ if ! mountpoint -q "$dir"; then
     echo "$dir is not mounted: nothing to do"
     exit 0
 fi
-# One at a time: evict must not delete a blob garbage-collect is sweeping.
-exec 9<"$dir"
+# One at a time, and never while the installer starts or moves the mirrors:
+# evict must not delete a blob garbage-collect is sweeping. The lock is a
+# file outside the mount, so it does not keep the file system busy.
+if [[ -e $lock ]]; then exec 9<"$lock"; else exec 9<"$dir"; fi
 flock 9
 case ${1:-} in
-    evict) evict "${2:?HIGH}" "${3:?LOW}" ;;
+    evict) evict "${2:?START_PCT}" "${3:?START_MIB}" "${4:?STOP_PCT}" "${5:?STOP_MIB}" ;;
     gc)    gc ;;
-    *)     echo "usage: registry-maint.sh evict HIGH LOW | gc" >&2; exit 2 ;;
+    *)     echo "usage: firerunner-registry-maint evict START_PCT START_MIB STOP_PCT STOP_MIB | gc" >&2; exit 2 ;;
 esac
 EOF
 }
@@ -2706,8 +2836,13 @@ verify_install() {
     for svc in $services; do
         if systemctl is-active -q "$svc"; then
             log "  $svc: active"
-        elif [[ " $PENDING " == *" $svc "* ]]; then
+        elif [[ " $PENDING " == *" $svc "* ]] || registry_pending "$svc"; then
             log "  $svc: starts when no job runs (pending)"
+        elif [[ $svc == firerunner-registry*@* ]]; then
+            # One mirror down only costs pulls past it (FireRunnerCacheServiceDown
+            # reports it). Not an error: the run goes on to apply_pending, and a
+            # later run is not stopped here before it could fix it.
+            warn "  $svc: NOT active (journalctl -u $svc); microVMs pull past it from the registry itself"
         else
             warn "  $svc: NOT active (journalctl -u $svc)"; ok=0
         fi
@@ -2799,7 +2934,7 @@ uninstall() {
     systemctl daemon-reload
     [[ -L /usr/bin/firerunner ]] && rm -f /usr/bin/firerunner
     rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry" \
-        "$BIN_DIR/versitygw" "$BIN_DIR/firecracker" "$BIN_DIR/jailer"
+        "$BIN_DIR/versitygw" "$BIN_DIR/firecracker" "$BIN_DIR/jailer" "$REGISTRY_MAINT"
     rm -rf "$LIB_DIR" /etc/opt/flintlockd   # flintlockd's config holds the API token
     rm -f "$FLINTLOCK_TLS_MARKER"
     log "done. containerd binaries in $BIN_DIR are kept (another containerd may use them)."
