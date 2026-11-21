@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -61,6 +62,10 @@ type RunnerState struct {
 	// Graceful: a stop now would let the running jobs finish (the drain
 	// drop-in is in effect).
 	Graceful bool
+	// DrainLoaded: systemd has the drain drop-in loaded (DropInPaths). It
+	// stays loaded after the file is removed until a daemon-reload went
+	// through.
+	DrainLoaded bool
 }
 
 // Running reports whether gitlab-runner takes jobs or is about to.
@@ -79,7 +84,8 @@ func (s RunnerState) Stopping() bool { return s.Active == "deactivating" }
 // ReadRunnerState asks systemd for gitlab-runner's state. A host without
 // the unit reads as inactive.
 func ReadRunnerState(ctx context.Context) (RunnerState, error) {
-	out, err := probe(ctx, "systemctl", "show", RunnerUnit, "-p", "ActiveState", "-p", "KillMode", "-p", "KillSignal", "-p", "TimeoutStopUSec")
+	out, err := probe(ctx, "systemctl", "show", RunnerUnit, "-p", "ActiveState", "-p", "KillMode", "-p", "KillSignal",
+		"-p", "TimeoutStopUSec", "-p", "DropInPaths")
 	if err != nil {
 		return RunnerState{}, fmt.Errorf("systemctl show %s: %w", RunnerUnit, err)
 	}
@@ -97,6 +103,7 @@ func ReadRunnerState(ctx context.Context) (RunnerState, error) {
 		Active: props["ActiveState"],
 		Graceful: props["KillMode"] == "mixed" && props["KillSignal"] == strconv.Itoa(int(syscall.SIGQUIT)) &&
 			props["TimeoutStopUSec"] == "infinity",
+		DrainLoaded: slices.Contains(strings.Fields(props["DropInPaths"]), DrainDropIn()),
 	}, nil
 }
 
@@ -198,24 +205,44 @@ func ResumeRunner(ctx context.Context) (Resume, error) {
 }
 
 // DropDrainDropIn removes the drain drop-in once gitlab-runner no longer
-// stops, and reports whether it is gone. While gitlab-runner stops it stays:
-// a reload without it would set the stop timeout back to 90 s and kill the
-// jobs at its end.
+// stops, and reports whether it is gone: neither on disk nor loaded by
+// systemd. While gitlab-runner stops it stays: a reload without it would set
+// the stop timeout back to 90 s and kill the jobs at its end. A file removed
+// whose daemon-reload failed is still loaded: the next call reloads again.
 func DropDrainDropIn(ctx context.Context) (bool, error) {
-	if !HasDrainDropIn() {
-		return true, nil
-	}
 	st, err := ReadRunnerState(ctx)
 	if err != nil {
 		return false, err
 	}
-	if st.Stopping() {
+	onDisk := HasDrainDropIn()
+	switch {
+	case !onDisk && !st.DrainLoaded:
+		return true, nil
+	case st.Stopping():
 		return false, nil
 	}
-	if err := os.Remove(DrainDropIn()); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if onDisk {
+		if err := os.Remove(DrainDropIn()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	if err := systemctl(ctx, "daemon-reload"); err != nil {
 		return false, err
 	}
-	return true, systemctl(ctx, "daemon-reload")
+	if st, err = ReadRunnerState(ctx); err != nil {
+		return false, err
+	}
+	return !st.DrainLoaded, nil
+}
+
+// DrainSettingsLeft reports whether gitlab-runner still has the drain's stop
+// settings, on disk or loaded: every stop of it then waits for its jobs.
+func DrainSettingsLeft(ctx context.Context) (bool, error) {
+	if HasDrainDropIn() {
+		return true, nil
+	}
+	st, err := ReadRunnerState(ctx)
+	return st.DrainLoaded, err
 }
 
 // systemctl runs systemctl with commandTimeout; the error carries its output.

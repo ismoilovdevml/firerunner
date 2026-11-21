@@ -148,9 +148,9 @@ func ServicesActiveContext(ctx context.Context, names []string) []bool {
 	if len(names) == 0 {
 		return up
 	}
-	// It exits non-zero unless every unit is active, and still prints one
-	// state per unit. Killed (timeout) or cut off, what it printed is not
-	// an answer.
+	// It exits 0 if any unit is active (3 or 4 when none is), and prints
+	// one state per unit either way. Killed (timeout) or cut off, what it
+	// printed is not an answer.
 	out, err := probe(ctx, "systemctl", append([]string{"is-active"}, names...)...)
 	var exit *exec.ExitError
 	if err != nil && (!errors.As(err, &exit) || exit.ExitCode() < 0) {
