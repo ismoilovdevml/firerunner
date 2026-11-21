@@ -418,6 +418,23 @@ and jobs fail on pulls, clones and downloads. Sites the corporate proxy blocks
   corporate proxy or the network to it is down: its owners fix it.
 - Recovered: `upstream_error` stays at 0 in *Proxy requests per second by outcome*.
 
+### FireRunnerProxyMetricsMissing
+
+Warning. Only on hosts with `proxy.enabled`. For 10 minutes `firerunner-proxy` has been running but
+the daemon could not read its metrics (`firerunner_proxy_metrics_up` 0), so
+[FireRunnerProxyUpstreamAuthFailing](#firerunnerproxyupstreamauthfailing),
+[FireRunnerProxyUpstreamErrors](#firerunnerproxyupstreamerrors) and
+[FireRunnerProxyAtLimit](#firerunnerproxyatlimit) cannot fire. A stopped forwarder is
+[FireRunnerProxyDown](#firerunnerproxydown) instead.
+
+- Check: `sudo ls -l /run/firerunner-proxy/metrics.sock`;
+  `journalctl -u firerunner-proxy | grep 'proxy metrics not exported'`;
+  `journalctl -u firerunner | grep "cannot read the forwarder's metrics"`.
+- Fix: usually the unit predates the metrics socket, after a binary-only `firerunner upgrade`:
+  it has no `RuntimeDirectory=firerunner-proxy`. Run the installer again; it rewrites the unit
+  and restarts the forwarder when no job runs.
+- Recovered: *metrics read* in *Upstream credentials and file* is back at 1.
+
 ### FireRunnerProxyAtLimit
 
 Warning. For 5 minutes the forwarder's connections have been over 80 % of a limit, or it refused

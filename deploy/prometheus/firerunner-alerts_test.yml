@@ -485,6 +485,38 @@ tests:
         summary: 16.67% of proxied requests on p1 fail at the corporate proxy
         description: "The forwarder answers them 502: the corporate proxy is unreachable, does not answer within 15 s, or the upstream file is unusable. Jobs fail on pulls, clones and downloads, or are slow while retrying. Check: sudo firerunner doctor (upstream reachable, HTTPS through the proxy); journalctl -u firerunner-proxy | grep -E 'upstream proxy (unreachable|did not answer|did not take)|no upstream'. A new proxy address goes in /etc/firerunner/proxy-upstream (no restart)."
         runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxyupstreamerrors
+# Proxy metrics unread: m1's forwarder runs, its metrics are not read from 5m ->
+# warning after 10 more minutes. m2's forwarder is stopped (FireRunnerProxyDown's) ->
+# quiet. m3 is read -> quiet.
+- interval: 1m
+  input_series:
+  - series: firerunner_proxy_metrics_up{instance="m1",job="firerunner"}
+    values: 1x4 0x30
+  - series: firerunner_service_up{instance="m1",job="firerunner",service="firerunner-proxy"}
+    values: 1x35
+  - series: firerunner_proxy_metrics_up{instance="m2",job="firerunner"}
+    values: 0x35
+  - series: firerunner_service_up{instance="m2",job="firerunner",service="firerunner-proxy"}
+    values: 0x35
+  - series: firerunner_proxy_metrics_up{instance="m3",job="firerunner"}
+    values: 1x35
+  - series: firerunner_service_up{instance="m3",job="firerunner",service="firerunner-proxy"}
+    values: 1x35
+  alert_rule_test:
+  - eval_time: 13m
+    alertname: FireRunnerProxyMetricsMissing
+    exp_alerts: []
+  - eval_time: 20m
+    alertname: FireRunnerProxyMetricsMissing
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        instance: m1
+        job: firerunner
+      exp_annotations:
+        summary: The daemon on m1 cannot read the proxy forwarder's metrics
+        description: "FireRunnerProxyUpstreamAuthFailing, FireRunnerProxyUpstreamErrors and FireRunnerProxyAtLimit are blind on this host. Usually firerunner-proxy.service predates its metrics socket (a binary-only firerunner upgrade): it lacks RuntimeDirectory=firerunner-proxy, and journalctl -u firerunner-proxy says 'proxy metrics not exported'. Fix: run the installer again; it restarts the forwarder when no job runs. Check: sudo ls -l /run/firerunner-proxy/metrics.sock; journalctl -u firerunner | grep \"cannot read the forwarder's metrics\"."
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxymetricsmissing
 # Connection limits: p1's busiest microVM holds 230 of 256 (90 %) -> warning per scope.
 # p2's host services hold 1000 with no limit (0) and its microVMs 1000 of 4096 -> quiet.
 # p3 refused one request at 10m -> warning while it is in the last 10 minutes.
