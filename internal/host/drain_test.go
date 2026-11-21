@@ -13,16 +13,27 @@ import (
 	"testing"
 )
 
-// fakeSystemd plays systemctl for gitlab-runner's unit: a drop-in counts
-// once a daemon-reload has read it, stop leaves the unit stopping (its jobs
-// still run), start starts it unless it is still stopping.
+// fakeSystemd plays systemd for gitlab-runner's unit, with the job rules a
+// drain relies on. They are modelled from systemd's behaviour, not run: the
+// test hosts allow no unit changes.
+//   - A drop-in counts once a daemon-reload has read it.
+//   - stop on a running unit leaves it stopping (deactivating) while its
+//     jobs still run; a stop that is not graceful kills them (jobsKilled).
+//   - start on a stopping unit does not start it: the start job waits
+//     behind the stop (queued) and runs once the process exited (exit).
+//   - stop on a stopping or stopped unit replaces a waiting start job and
+//     changes nothing else.
+//   - A daemon-reload while stopping applies the new settings to that stop:
+//     without the drop-in its timeout is 90 s again and the jobs die.
 type fakeSystemd struct {
-	mu       sync.Mutex
-	active   string
-	loaded   bool            // the drain drop-in was in place at the last daemon-reload
-	override bool            // another drop-in overrides it: never graceful
-	fail     map[string]bool // systemctl verbs that fail
-	verbs    []string
+	mu         sync.Mutex
+	active     string
+	queued     bool            // a start job waits behind the stop
+	loaded     bool            // the drain drop-in was in place at the last daemon-reload
+	override   bool            // another drop-in overrides it: never graceful
+	jobsKilled bool            // a stop or reload would have killed the running jobs
+	fail       map[string]bool // systemctl verbs that fail
+	verbs      []string
 }
 
 func (f *fakeSystemd) command(ctx context.Context, name string, args ...string) *exec.Cmd {
@@ -41,10 +52,24 @@ func (f *fakeSystemd) command(ctx context.Context, name string, args ...string) 
 	case "daemon-reload":
 		_, err := os.Stat(filepath.Join(runnerDropInDir, runnerDropInName))
 		f.loaded = err == nil && !f.override
+		if f.active == "deactivating" && !f.loaded {
+			f.jobsKilled = true
+		}
 	case "stop":
-		f.active = "deactivating"
+		f.queued = false
+		switch f.active {
+		case "deactivating", "inactive", "failed":
+		default:
+			if !f.loaded {
+				f.jobsKilled = true
+			}
+			f.active = "deactivating"
+		}
 	case "start":
-		if f.active != "deactivating" {
+		switch f.active {
+		case "deactivating":
+			f.queued = true
+		case "inactive", "failed":
 			f.active = "active"
 		}
 	case "show":
@@ -59,14 +84,33 @@ func (f *fakeSystemd) command(ctx context.Context, name string, args ...string) 
 	return cmd
 }
 
+// exit is gitlab-runner exiting once its last job finished: a start job
+// waiting behind the stop runs now.
+func (f *fakeSystemd) exit() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.active != "deactivating" {
+		return
+	}
+	f.active = "inactive"
+	if f.queued {
+		f.active, f.queued = "active", false
+	}
+}
+
 // fakeRunner points the drop-in directory at a temporary one and systemctl
-// at f.
+// at f. Every test ends with the jobs alive: no stop or reload may kill them.
 func fakeRunner(t *testing.T, f *fakeSystemd) string {
 	t.Helper()
 	oldCmd, oldDir := command, runnerDropInDir
 	command = f.command
 	runnerDropInDir = filepath.Join(t.TempDir(), "gitlab-runner.service.d")
-	t.Cleanup(func() { command, runnerDropInDir = oldCmd, oldDir })
+	t.Cleanup(func() {
+		command, runnerDropInDir = oldCmd, oldDir
+		if f.jobsKilled {
+			t.Error("a stop or daemon-reload killed gitlab-runner's running jobs")
+		}
+	})
 	return filepath.Join(runnerDropInDir, runnerDropInName)
 }
 
@@ -97,8 +141,12 @@ func TestStopRunnerGracefully(t *testing.T) {
 			asked: true, verbs: []string{"show", "daemon-reload", "show", "stop"}, active: "deactivating", wantDropIn: true},
 		{name: "drop-in already loaded: no reload", sd: &fakeSystemd{active: "active", loaded: true}, dropIn: true,
 			asked: true, verbs: []string{"show", "show", "stop"}, active: "deactivating", wantDropIn: true},
+		// Asked again: an undrain meanwhile may have queued a start behind
+		// the stop (TestDrainAgainCancelsAQueuedStart).
 		{name: "already stopping gracefully (drain again)", sd: &fakeSystemd{active: "deactivating", loaded: true}, dropIn: true,
-			verbs: []string{"show"}, active: "deactivating", wantDropIn: true},
+			asked: true, verbs: []string{"show", "stop"}, active: "deactivating", wantDropIn: true},
+		{name: "already stopping, a start queued by undrain", sd: &fakeSystemd{active: "deactivating", loaded: true, queued: true}, dropIn: true,
+			asked: true, verbs: []string{"show", "stop"}, active: "deactivating", wantDropIn: true},
 		{name: "already stopped by drain", sd: &fakeSystemd{active: "inactive", loaded: true}, dropIn: true,
 			verbs: []string{"show"}, active: "inactive", wantDropIn: true},
 		{name: "not running: left alone", sd: &fakeSystemd{active: "inactive"},
@@ -130,8 +178,8 @@ func TestStopRunnerGracefully(t *testing.T) {
 			if !slices.Equal(sd.verbs, c.verbs) {
 				t.Errorf("systemctl calls %v, want %v", sd.verbs, c.verbs)
 			}
-			if sd.active != c.active {
-				t.Errorf("gitlab-runner %s, want %s", sd.active, c.active)
+			if sd.active != c.active || sd.queued {
+				t.Errorf("gitlab-runner %s (start queued: %v), want %s and none queued", sd.active, sd.queued, c.active)
 			}
 			got, rerr := os.ReadFile(path)
 			if (rerr == nil) != c.wantDropIn {
@@ -178,19 +226,21 @@ func TestResumeRunner(t *testing.T) {
 		wantErr    bool
 		verbs      []string
 		active     string
+		queued     bool
 		wantDropIn bool
 	}{
 		// gitlab-runner was stopped before the drain: the operator's choice.
 		{name: "drain did not stop it", sd: &fakeSystemd{active: "inactive"},
 			want: ResumeNothing, active: "inactive"},
 		{name: "stopped by drain", sd: &fakeSystemd{active: "inactive", loaded: true}, dropIn: true,
-			want: ResumeStarted, verbs: []string{"show", "start", "daemon-reload"}, active: "active"},
-		// A reload without the drop-in would end the stop by killing the jobs.
+			want: ResumeStarted, verbs: []string{"start", "show", "daemon-reload"}, active: "active"},
+		// The start waits behind the stop; a reload without the drop-in
+		// would end the stop by killing the jobs, so it stays.
 		{name: "still finishing its jobs", sd: &fakeSystemd{active: "deactivating", loaded: true}, dropIn: true,
-			want: ResumeAfterStop, verbs: []string{"show", "start"}, active: "deactivating", wantDropIn: true},
+			want: ResumeAfterStop, verbs: []string{"start", "show"}, active: "deactivating", queued: true, wantDropIn: true},
 		// Kept, so undrain can be run again.
 		{name: "start fails", sd: &fakeSystemd{active: "inactive", loaded: true, fail: map[string]bool{"start": true}}, dropIn: true,
-			want: ResumeNothing, wantErr: true, verbs: []string{"show", "start"}, active: "inactive", wantDropIn: true},
+			want: ResumeNothing, wantErr: true, verbs: []string{"start"}, active: "inactive", wantDropIn: true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -206,8 +256,8 @@ func TestResumeRunner(t *testing.T) {
 			if !slices.Equal(sd.verbs, c.verbs) {
 				t.Errorf("systemctl calls %v, want %v", sd.verbs, c.verbs)
 			}
-			if sd.active != c.active {
-				t.Errorf("gitlab-runner %s, want %s", sd.active, c.active)
+			if sd.active != c.active || sd.queued != c.queued {
+				t.Errorf("gitlab-runner %s (start queued: %v), want %s (%v)", sd.active, sd.queued, c.active, c.queued)
 			}
 			if _, err := os.Stat(path); (err == nil) != c.wantDropIn {
 				t.Errorf("drop-in there: %v, want %v", err == nil, c.wantDropIn)
@@ -216,21 +266,107 @@ func TestResumeRunner(t *testing.T) {
 	}
 }
 
+func TestDropDrainDropIn(t *testing.T) {
+	cases := []struct {
+		name       string
+		sd         *fakeSystemd
+		dropIn     bool
+		gone       bool
+		wantErr    bool
+		verbs      []string
+		wantDropIn bool
+	}{
+		{name: "none there", sd: &fakeSystemd{active: "active"}, gone: true},
+		{name: "still stopping: kept", sd: &fakeSystemd{active: "deactivating", loaded: true}, dropIn: true,
+			verbs: []string{"show"}, wantDropIn: true},
+		{name: "started again: removed", sd: &fakeSystemd{active: "active", loaded: true}, dropIn: true,
+			gone: true, verbs: []string{"show", "daemon-reload"}},
+		{name: "stopped: removed", sd: &fakeSystemd{active: "inactive", loaded: true}, dropIn: true,
+			gone: true, verbs: []string{"show", "daemon-reload"}},
+		{name: "systemctl show fails: kept", sd: &fakeSystemd{active: "active", loaded: true, fail: map[string]bool{"show": true}}, dropIn: true,
+			wantErr: true, verbs: []string{"show"}, wantDropIn: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sd := c.sd
+			path := fakeRunner(t, sd)
+			if c.dropIn {
+				putDropIn(t, path)
+			}
+			gone, err := DropDrainDropIn(context.Background())
+			if gone != c.gone || (err != nil) != c.wantErr {
+				t.Errorf("DropDrainDropIn = %v, %v; want %v, error %v", gone, err, c.gone, c.wantErr)
+			}
+			if !slices.Equal(sd.verbs, c.verbs) {
+				t.Errorf("systemctl calls %v, want %v", sd.verbs, c.verbs)
+			}
+			if HasDrainDropIn() != c.wantDropIn {
+				t.Errorf("drop-in there: %v, want %v", HasDrainDropIn(), c.wantDropIn)
+			}
+		})
+	}
+}
+
 // A drain then an undrain leave gitlab-runner as it was, drop-in gone.
 func TestDrainThenResumeRunner(t *testing.T) {
-	sd := fakeSystemd{active: "active"}
-	path := fakeRunner(t, &sd)
+	sd := &fakeSystemd{active: "active"}
+	path := fakeRunner(t, sd)
 	if asked, err := StopRunnerGracefully(context.Background()); !asked || err != nil {
 		t.Fatalf("StopRunnerGracefully = %v, %v", asked, err)
 	}
-	sd.mu.Lock()
-	sd.active = "inactive" // its jobs finished, it exited
-	sd.mu.Unlock()
+	sd.exit() // its jobs finished
 	if got, err := ResumeRunner(context.Background()); got != ResumeStarted || err != nil {
 		t.Fatalf("ResumeRunner = %v, %v", got, err)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) || sd.active != "active" || sd.loaded {
 		t.Fatalf("after undrain: drop-in %v, gitlab-runner %s, drop-in loaded %v", err, sd.active, sd.loaded)
+	}
+}
+
+// Undrain while gitlab-runner still finishes its jobs: it starts once they
+// are done, and only then does the drop-in go, so its stops after that wait
+// for no jobs.
+func TestUndrainWhileStoppingDropsTheDropInAfterwards(t *testing.T) {
+	sd := &fakeSystemd{active: "active"}
+	fakeRunner(t, sd)
+	ctx := context.Background()
+	if _, err := StopRunnerGracefully(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ResumeRunner(ctx); got != ResumeAfterStop || err != nil {
+		t.Fatalf("ResumeRunner while stopping = %v, %v", got, err)
+	}
+	if gone, err := DropDrainDropIn(ctx); gone || err != nil || !HasDrainDropIn() {
+		t.Fatalf("DropDrainDropIn while stopping = %v, %v; want the drop-in kept", gone, err)
+	}
+	sd.exit()
+	if sd.active != "active" {
+		t.Fatalf("gitlab-runner %s after its stop, want started by the queued start", sd.active)
+	}
+	if gone, err := DropDrainDropIn(ctx); !gone || err != nil || HasDrainDropIn() || sd.loaded {
+		t.Fatalf("DropDrainDropIn after the stop = %v, %v; drop-in there %v, loaded %v", gone, err, HasDrainDropIn(), sd.loaded)
+	}
+}
+
+// Drain again after an undrain that queued a start behind the stop: the
+// stop replaces that start, so gitlab-runner does not come back on a
+// drained host when its jobs are done.
+func TestDrainAgainCancelsAQueuedStart(t *testing.T) {
+	sd := &fakeSystemd{active: "active"}
+	fakeRunner(t, sd)
+	ctx := context.Background()
+	if _, err := StopRunnerGracefully(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ResumeRunner(ctx); got != ResumeAfterStop || !sd.queued {
+		t.Fatalf("undrain while stopping = %v, start queued %v", got, sd.queued)
+	}
+	if asked, err := StopRunnerGracefully(ctx); !asked || err != nil {
+		t.Fatalf("drain again = %v, %v", asked, err)
+	}
+	sd.exit()
+	if sd.active != "inactive" {
+		t.Fatalf("gitlab-runner %s after its jobs finished on a drained host, want inactive", sd.active)
 	}
 }
 
