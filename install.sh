@@ -42,7 +42,10 @@
 #                           (default: ghcr.io,quay.io,registry.k8s.io,mcr.microsoft.com; remembered
 #                           for later re-runs, none for no others). A pull the mirror cannot serve
 #                           (a private image) goes to the registry itself
-#   VERSITYGW_VERSION       S3 server for the runner's cache: (default: 1.8.0)
+#   FR_REGISTRY_GB          most the registry mirrors may store, in a file system of its own on the
+#                           root disk (default: auto, a fifth of the root file system, at least 5).
+#                           Only a larger value changes an existing one (grown online)
+#   VERSITYGW_VERSION      S3 server for the runner's cache: (default: 1.8.0)
 #   FR_CACHE_DAYS           delete cache: archives not written for this many days (default: 14)
 #   FR_CACHE_MAX_GB         above this size the oldest cache: archives are deleted, checked hourly
 #                           (default: auto, a fifth of the file system the cache is on)
@@ -110,6 +113,7 @@ FR_NO_PROXY="${FR_NO_PROXY:-}"
 FR_CA_FILE="${FR_CA_FILE:-}"
 FR_INSECURE_REGISTRIES="${FR_INSECURE_REGISTRIES:-}"
 FR_REGISTRY_MIRRORS="${FR_REGISTRY_MIRRORS:-}"
+FR_REGISTRY_GB="${FR_REGISTRY_GB:-auto}"
 PROXY_PORT=3128                       # the forwarder (proxy.listen); opened on the bridge
 FR_REPO=ismoilovdevml/firerunner
 
@@ -203,6 +207,8 @@ default_vcpu() {
 preflight_settings() {
     [[ $FR_CACHE_DAYS =~ ^[0-9]{1,4}$ ]] || die "FR_CACHE_DAYS must be a whole number of days"
     [[ $FR_CACHE_MAX_GB == auto || $FR_CACHE_MAX_GB =~ ^[1-9][0-9]{0,5}$ ]] || die "FR_CACHE_MAX_GB must be auto or a whole number of GB from 1"
+    [[ $FR_REGISTRY_GB == auto ]] || { [[ $FR_REGISTRY_GB =~ ^[1-9][0-9]{0,5}$ ]] && ((FR_REGISTRY_GB >= REGISTRY_MIN_GB)); } ||
+        die "FR_REGISTRY_GB must be auto or a whole number of GB from ${REGISTRY_MIN_GB}"
     [[ $FR_THIN_CHUNK =~ ^(64|128|256|512|1024)[Kk]$ ]] || die "FR_THIN_CHUNK must be 64K, 128K, 256K, 512K or 1024K"
     [[ $FR_RUNNER_CONCURRENT =~ ^[1-9][0-9]{0,2}$ ]] || die "FR_RUNNER_CONCURRENT must be a whole number from 1"
     [[ -n $FR_POOL_SIZE_GIVEN ]] || ((FR_POOL_SIZE <= 32)) || FR_POOL_SIZE=32
@@ -259,12 +265,23 @@ EGRESS_FILE="$CONF_DIR/egress-deny"
 # jobs_running: microVM jobs are in progress on this host.
 jobs_running() { compgen -G "/run/firerunner/jobs/*.json" >/dev/null; }
 
+# drained: `firerunner drain` stopped (or is stopping) gitlab-runner on
+# purpose; only `firerunner undrain` starts it again. The installer never
+# starts or restarts it then: its next start picks up what changed.
+DRAIN_FILE=/run/firerunner/drain.json
+drained() { [[ -f $DRAIN_FILE ]]; }
+
 # restart_when_idle SERVICE: restart now or, while jobs run, remember it in
 # PENDING_FILE, so a later run of the installer when idle does it
 # (containerd, flintlockd, the registry mirror and gitlab-runner serve jobs).
 PENDING_FILE=/var/lib/firerunner/pending-restarts
 PENDING=""
 restart_when_idle() {
+    if [[ $1 == gitlab-runner ]] && drained; then
+        log "  gitlab-runner not restarted: the host is drained (firerunner undrain starts it with the change)"
+        [[ -f $PENDING_FILE ]] && sed -i "/^restart $1\$/d" "$PENDING_FILE"
+        return 0
+    fi
     if systemctl is-active -q "$1" && jobs_running; then
         warn "  $1 not restarted: jobs are running (re-run the installer when the runner is idle)"
         PENDING+="$1 "
@@ -288,6 +305,10 @@ apply_pending() {
     fi
     local action svc
     while read -r action svc; do
+        if [[ $svc == gitlab-runner ]] && drained; then
+            log "  gitlab-runner not restarted (pending): the host is drained (firerunner undrain starts it with the change)"
+            continue
+        fi
         case $action in
             restart) log "  restarting $svc (pending)"; systemctl restart "$svc" ;;
             stop)    log "  stopping $svc (pending)"; systemctl disable --now -q "$svc" ;;
@@ -426,7 +447,7 @@ configure_proxy() {
         $fr config set proxy.no_proxy "$FR_NO_PROXY" >/dev/null
     fi
     $fr config set proxy.enabled true >/dev/null
-    put /etc/systemd/system/firerunner-proxy.service <<EOF
+    put "$UNIT_DIR/firerunner-proxy.service" <<EOF
 [Unit]
 Description=FireRunner proxy forwarder (microVMs and host services to the corporate proxy)
 Wants=firerunner-net.service
@@ -436,6 +457,13 @@ After=firerunner-net.service
 ExecStart=${BIN_DIR}/firerunner proxy
 Restart=always
 RestartSec=2
+# On a stop it lets open tunnels finish for proxy.shutdown_timeout (30 s by
+# default): at least that plus 15 s, so systemd does not kill it first.
+TimeoutStopSec=45
+# Its metrics socket (metrics.sock, 0600), which the daemon reads and serves on :9477.
+RuntimeDirectory=firerunner-proxy
+RuntimeDirectoryMode=0700
+ReadWritePaths=/run/firerunner-proxy
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -456,7 +484,7 @@ EOF
     systemctl enable -q firerunner-proxy
     if ! systemctl is-active -q firerunner-proxy; then
         systemctl restart firerunner-proxy
-    elif changed /etc/systemd/system/firerunner-proxy.service "$BIN_DIR/firerunner"; then
+    elif changed "$UNIT_DIR/firerunner-proxy.service" "$BIN_DIR/firerunner"; then
         # A restart cuts the open tunnels (clones, pulls) of running jobs.
         restart_when_idle firerunner-proxy
     fi
@@ -466,7 +494,7 @@ EOF
 # it; while one's restart is pending, the stop waits in PENDING_FILE too.
 STOP_FORWARDER=0
 stop_forwarder() {
-    if grep -qE '^restart (containerd-flintlock|firerunner-registry|gitlab-runner)$' "$PENDING_FILE" 2>/dev/null; then
+    if grep -qE '^restart (containerd-flintlock|firerunner-registry(@[^ ]+)?|gitlab-runner)$' "$PENDING_FILE" 2>/dev/null; then
         grep -qx "stop firerunner-proxy" "$PENDING_FILE" || echo "stop firerunner-proxy" >> "$PENDING_FILE"
         PENDING+="firerunner-proxy(stop) "
         return 0
@@ -477,17 +505,30 @@ stop_forwarder() {
 
 # proxy_dropins_apply writes or removes the host services' proxy drop-ins and
 # restarts the services whose drop-in changed (later, while jobs run).
+# firerunner-registry@ is the template of every registry mirror: its drop-in
+# applies to all of them, and restarting firerunner-registry restarts them all
+# (PartOf=). The mirrors' fronts only talk to 127.0.0.1 and need none.
 proxy_dropins_apply() {
     local svc
-    for svc in containerd-flintlock firerunner-registry gitlab-runner; do
+    # Until its mirrors move to firerunner-registry@ (setup_registries), the
+    # single service of earlier versions keeps its own drop-in.
+    if [[ $REGISTRY_DEFERRED == 1 ]]; then
+        proxy_dropin firerunner-registry
+    fi
+    for svc in containerd-flintlock firerunner-registry@ gitlab-runner; do
         proxy_dropin "$svc"
     done
     systemctl daemon-reload
-    for svc in containerd-flintlock firerunner-registry gitlab-runner; do
-        if changed "/etc/systemd/system/$svc.service.d/firerunner-proxy.conf" && systemctl is-active -q "$svc"; then
-            restart_when_idle "$svc"
+    for svc in containerd-flintlock firerunner-registry@ gitlab-runner; do
+        [[ $svc == firerunner-registry@ && $REGISTRY_DEFERRED == 1 ]] && continue
+        if changed "/etc/systemd/system/$svc.service.d/firerunner-proxy.conf" && systemctl is-active -q "${svc%@}"; then
+            restart_when_idle "${svc%@}"
         fi
     done
+    if [[ $REGISTRY_DEFERRED == 1 ]] && changed /etc/systemd/system/firerunner-registry.service.d/firerunner-proxy.conf &&
+        systemctl is-active -q firerunner-registry; then
+        restart_when_idle firerunner-registry
+    fi
 }
 
 install_packages() {
@@ -495,9 +536,9 @@ install_packages() {
     if [[ $PKG == apt ]]; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq curl tar openssl lvm2 thin-provisioning-tools dnsmasq-base dnsmasq-utils nftables iproute2 openssh-client >/dev/null
+        apt-get install -y -qq curl tar openssl lvm2 thin-provisioning-tools dnsmasq-base dnsmasq-utils nftables iproute2 openssh-client e2fsprogs >/dev/null
     else
-        dnf install -y -q curl tar openssl lvm2 device-mapper-persistent-data dnsmasq dnsmasq-utils nftables iproute openssh-clients >/dev/null
+        dnf install -y -q curl tar openssl lvm2 device-mapper-persistent-data dnsmasq dnsmasq-utils nftables iproute openssh-clients e2fsprogs >/dev/null
     fi
 }
 
@@ -1556,9 +1597,41 @@ EOF
 DEFAULT_REGISTRY_MIRRORS=ghcr.io,quay.io,registry.k8s.io,mcr.microsoft.com
 MIRRORS_FILE=$CONF_DIR/registry-mirrors          # FR_REGISTRY_MIRRORS of the last run
 MIRROR_PORTS_FILE=$CONF_DIR/registry-mirror-ports # "host port" lines, see assign_mirror_ports
-MIRROR_CONF_DIR=$CONF_DIR/registry-mirrors.d
-MIRROR_DATA_DIR=/var/lib/firerunner/registry-mirrors
 declare -A MIRROR_PORT=()
+
+# Every mirror is a pair of services: firerunner-registry@NAME (the registry,
+# on 127.0.0.1) and firerunner-registry-front@NAME (`firerunner registry-front`
+# on the mirror's bridge port, the pull API only). NAME is docker.io for Docker
+# Hub, else the mirrored registry's host. A mirror that crashes stops no other,
+# and each one can write only its own data. firerunner-registry.service starts
+# them all, and stops or restarts them all (their PartOf=); `firerunner status`
+# and firerunner_service_up report it.
+UNIT_DIR=/etc/systemd/system
+REGISTRY_CONF_DIR=$CONF_DIR/registries.d   # NAME.yml (the registry), NAME.env (its front)
+REGISTRY_USER=firerunner-registry           # runs the registries and their upkeep
+CACHE_USER=firerunner-cache                 # runs the cache: server
+REGISTRY_LOCAL_OFFSET=10000                 # behind a front, a registry listens on 127.0.0.1:<bridge port + this>
+REGISTRY_FRONT=0                            # the installed firerunner has `registry-front` (setup_registries)
+REGISTRY_DEFERRED=0                         # leaving the single service of earlier versions waits for no job to run
+# The mirrors' data is an ext4 file system in REGISTRY_IMG, mounted on
+# REGISTRY_DIR. It takes at most its size (FR_REGISTRY_GB) of the root disk:
+# the image is sparse, and the space of blobs deleted in it goes back to the
+# root disk (discard). When it is full only the mirrors fail, and microVMs pull
+# from the registries themselves (internal/vm: hosts.toml, registry-mirrors).
+REGISTRY_DIR=/var/lib/firerunner/registries
+REGISTRY_IMG=/var/lib/firerunner/registries.img
+REGISTRY_MOUNT_UNIT=var-lib-firerunner-registries.mount  # systemd-escape -p --suffix=mount $REGISTRY_DIR
+REGISTRY_MIN_GB=5
+REGISTRY_STATE_DIR=/var/lib/firerunner/registry-maint    # when each mirror was last garbage-collected
+REGISTRY_EVICT_HIGH=90   # % of the file system in use that starts an eviction
+REGISTRY_EVICT_LOW=80    # % in use the eviction stops at
+# Earlier versions: one firerunner-registry.service ran every mirror from
+# registries.sh, as root, its data on the root disk without a limit.
+LEGACY_REGISTRIES_SH=$LIB_DIR/registries.sh
+LEGACY_REGISTRY_CONF=$CONF_DIR/registry.yml
+LEGACY_MIRROR_CONF_DIR=$CONF_DIR/registry-mirrors.d
+LEGACY_REGISTRY_DATA=/var/lib/firerunner/registry
+LEGACY_MIRROR_DATA_DIR=/var/lib/firerunner/registry-mirrors
 
 # mirror_hosts: the registries mirrored besides Docker Hub, one per line.
 mirror_hosts() {
@@ -1605,94 +1678,338 @@ mirrors_json() {
     echo "{$out}"
 }
 
-install_registry_mirror() {
+# registry_names: every mirror's instance name, Docker Hub's first.
+registry_names() {
+    echo docker.io
+    mirror_hosts
+}
+
+# is_registry_name NAME: NAME is mirrored by this run (no pipe: grep -q could
+# end it early, a SIGPIPE under pipefail).
+is_registry_name() { [[ $'\n'$(registry_names)$'\n' == *$'\n'"$1"$'\n'* ]]; }
+
+# registry_bridge_port NAME: the port microVMs pull NAME's images from.
+registry_bridge_port() {
+    if [[ $1 == docker.io ]]; then echo 5000; else echo "${MIRROR_PORT[$1]}"; fi
+}
+
+# registry_upstream NAME: the registry NAME's mirror pulls from.
+registry_upstream() {
+    if [[ $1 == docker.io ]]; then echo https://registry-1.docker.io; else echo "https://$1"; fi
+}
+
+# registry_front_available: the installed firerunner has `registry-front`.
+# Without it (an older release) each registry listens on its bridge port
+# itself, as before, and a later run with a newer firerunner adds the fronts.
+registry_front_available() { "$BIN_DIR/firerunner" registry-front --help >/dev/null 2>&1; }
+
+# system_user NAME DESCRIPTION: a system user and group NAME, no login, no home.
+system_user() {
+    getent passwd "$1" >/dev/null && return 0
+    log "  adding system user $1"
+    useradd --system --user-group --no-create-home --home-dir / \
+        --shell "$(command -v nologin || echo /usr/sbin/nologin)" --comment "$2" "$1"
+}
+
+# own_tree DIR USER: DIR and everything in it belong to USER. DIR changes
+# last and is what is checked, so a run cut short does all of it again.
+own_tree() {
+    [[ $(stat -c %U "$1") == "$2" ]] && return 0
+    find "$1" -mindepth 1 -exec chown -h "$2:$2" {} + && chown "$2:$2" "$1"
+}
+
+# pending_add "ACTION UNIT": ACTION (restart, stop) waits in PENDING_FILE
+# for a run when no job runs (apply_pending), after the ones already there.
+pending_add() {
+    PENDING+="${1#* } "
+    mkdir -p "$(dirname "$PENDING_FILE")"
+    grep -qxF "$1" "$PENDING_FILE" 2>/dev/null || echo "$1" >>"$PENDING_FILE"
+}
+
+# install_registry_binary installs distribution's registry. The mirrors are
+# set up by setup_registries, once firerunner (their fronts) is installed.
+install_registry_binary() {
     local have=""
     [[ -x $BIN_DIR/registry ]] && have=$($BIN_DIR/registry --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
-    if [[ "$have" != "${REGISTRY_VERSION}" ]]; then
-        log "installing Docker Hub mirror (distribution v${REGISTRY_VERSION})"
-        local base="https://github.com/distribution/distribution/releases/download/v${REGISTRY_VERSION}"
-        local tgz="registry_${REGISTRY_VERSION}_linux_amd64.tar.gz"
-        local want
-        fetch "$base/$tgz" "$TMP_DIR/$tgz"
-        want=$(pinned "v${REGISTRY_VERSION}/$tgz") || {
-            fetch "$base/$tgz.sha256" "$TMP_DIR/$tgz.sha256"
-            want=$(awk '{print $1}' "$TMP_DIR/$tgz.sha256")
-        }
-        verify "$TMP_DIR/$tgz" "$want"
-        tar -xzf "$TMP_DIR/$tgz" -C "$TMP_DIR" registry
-        install -m 0755 "$TMP_DIR/registry" "$BIN_DIR/registry"
-        installed "$BIN_DIR/registry"
+    [[ "$have" != "${REGISTRY_VERSION}" ]] || return 0
+    log "installing the registry mirrors (distribution v${REGISTRY_VERSION})"
+    local base="https://github.com/distribution/distribution/releases/download/v${REGISTRY_VERSION}"
+    local tgz="registry_${REGISTRY_VERSION}_linux_amd64.tar.gz"
+    local want
+    fetch "$base/$tgz" "$TMP_DIR/$tgz"
+    want=$(pinned "v${REGISTRY_VERSION}/$tgz") || {
+        fetch "$base/$tgz.sha256" "$TMP_DIR/$tgz.sha256"
+        want=$(awk '{print $1}' "$TMP_DIR/$tgz.sha256")
+    }
+    verify "$TMP_DIR/$tgz" "$want"
+    tar -xzf "$TMP_DIR/$tgz" -C "$TMP_DIR" registry
+    install -m 0755 "$TMP_DIR/registry" "$BIN_DIR/registry"
+    installed "$BIN_DIR/registry"
+}
+
+# registry_gb: the size, in GB, of a new mirrors' file system: FR_REGISTRY_GB,
+# or a fifth of the file system the image is on (as FR_CACHE_MAX_GB=auto), at
+# least REGISTRY_MIN_GB.
+registry_gb() {
+    if [[ $FR_REGISTRY_GB != auto ]]; then
+        echo "$FR_REGISTRY_GB"
+        return 0
     fi
-    mkdir -p /var/lib/firerunner/registry
-    # Images of private projects' pulls: root only (the mirror runs as root).
-    chmod 0700 /var/lib/firerunner/registry
-    put "$CONF_DIR/registry.yml" <<EOF
+    local kb gb
+    kb=$(df -Pk "$(dirname "$REGISTRY_IMG")" | awk 'NR == 2 {print $2}')
+    gb=$((kb / 5 / 1024 / 1024))
+    ((gb >= REGISTRY_MIN_GB)) || gb=$REGISTRY_MIN_GB
+    echo "$gb"
+}
+
+# registry_storage mounts the mirrors' file system on REGISTRY_DIR: an image
+# made on the first run, or a file system the operator put in /etc/fstab for
+# REGISTRY_DIR (another disk; then it is used as it is, not grown).
+registry_storage() {
+    mkdir -p "$(dirname "$REGISTRY_IMG")" "$REGISTRY_DIR"
+    if findmnt -s -n -M "$REGISTRY_DIR" >/dev/null 2>&1; then
+        log "  registry mirrors' file system: the one /etc/fstab mounts on $REGISTRY_DIR"
+        if [[ -f $UNIT_DIR/$REGISTRY_MOUNT_UNIT ]]; then
+            warn "$UNIT_DIR/$REGISTRY_MOUNT_UNIT (the image an earlier run made) hides the /etc/fstab entry from systemd: once its data is copied, remove it (docs/operations.md, Registry mirrors > Storage)"
+        fi
+        mountpoint -q "$REGISTRY_DIR" || mount "$REGISTRY_DIR" || die "could not mount $REGISTRY_DIR (its /etc/fstab entry)"
+    else
+        registry_image
+    fi
+    mountpoint -q "$REGISTRY_DIR" || die "$REGISTRY_DIR is not mounted (systemctl status $REGISTRY_MOUNT_UNIT)"
+    # Root's, so no registry can write to it, mounted or not.
+    chown root:root "$REGISTRY_DIR"
+    chmod 0755 "$REGISTRY_DIR"
+}
+
+# registry_image makes REGISTRY_IMG once, mounts it with REGISTRY_MOUNT_UNIT
+# and grows it to a larger FR_REGISTRY_GB.
+registry_image() {
+    local gb
+    if [[ ! -f $REGISTRY_IMG ]]; then
+        gb=$(registry_gb)
+        log "  making the registry mirrors' file system: at most ${gb} GB of the root disk, in $REGISTRY_IMG"
+        # Made under another name: REGISTRY_IMG always holds a whole file system.
+        rm -f "$REGISTRY_IMG.new"
+        truncate -s "${gb}G" "$REGISTRY_IMG.new"
+        # -m 0: no blocks kept for root (the registries are not root); -i 64K:
+        # one inode per 64 KiB, registry blobs are mostly much larger.
+        mkfs.ext4 -q -F -m 0 -i 65536 -L fr-registries "$REGISTRY_IMG.new"
+        chmod 0600 "$REGISTRY_IMG.new"
+        mv -f "$REGISTRY_IMG.new" "$REGISTRY_IMG"
+    fi
+    put "$UNIT_DIR/$REGISTRY_MOUNT_UNIT" <<EOF
+[Unit]
+Description=FireRunner registry mirrors' file system (at most the size of ${REGISTRY_IMG})
+
+[Mount]
+What=${REGISTRY_IMG}
+Where=${REGISTRY_DIR}
+Type=ext4
+# discard: the space of deleted blobs goes back to the root disk. nofail, and
+# wanted by multi-user.target rather than local-fs.target: a damaged image
+# does not hold up the boot (the mirrors stay down, microVMs pull from the
+# registries themselves). relatime (the default) keeps the atimes the
+# eviction goes by (registry-maint.sh).
+Options=loop,discard,nodev,nosuid,noexec,nofail
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable -q "$REGISTRY_MOUNT_UNIT"
+    if ! mountpoint -q "$REGISTRY_DIR"; then
+        systemctl start "$REGISTRY_MOUNT_UNIT" ||
+            die "could not mount $REGISTRY_IMG on $REGISTRY_DIR (journalctl -u $REGISTRY_MOUNT_UNIT)"
+    fi
+    registry_grow
+}
+
+# registry_grow grows the image to a larger FR_REGISTRY_GB, online. It is
+# never shrunk: ext4 shrinks only unmounted (docs/operations.md).
+registry_grow() {
+    [[ $FR_REGISTRY_GB != auto ]] || return 0
+    local have want dev
+    have=$(stat -c %s "$REGISTRY_IMG")
+    want=$((FR_REGISTRY_GB * 1024 * 1024 * 1024))
+    if ((want < have)); then
+        warn "FR_REGISTRY_GB=$FR_REGISTRY_GB is below the mirrors' $((have / 1024 / 1024 / 1024)) GB: not shrunk (docs/operations.md, Registry mirrors > Storage, says how)"
+        return 0
+    fi
+    ((want > have)) || return 0
+    dev=$(losetup -j "$REGISTRY_IMG" | head -n 1 | cut -d: -f1)
+    [[ -n $dev ]] || die "no loop device for $REGISTRY_IMG: is $REGISTRY_DIR mounted?"
+    log "  growing the registry mirrors' file system to ${FR_REGISTRY_GB} GB"
+    truncate -s "${FR_REGISTRY_GB}G" "$REGISTRY_IMG"
+    losetup -c "$dev"
+    resize2fs "$dev" >/dev/null 2>&1 || die "resize2fs $dev failed (run it by hand to see why); $REGISTRY_IMG is ${FR_REGISTRY_GB} GB, its file system not yet"
+}
+
+# legacy_registry_data NAME: where earlier versions kept mirror NAME's data.
+legacy_registry_data() {
+    if [[ $1 == docker.io ]]; then echo "$LEGACY_REGISTRY_DATA"; else echo "$LEGACY_MIRROR_DATA_DIR/$1"; fi
+}
+
+# registry_legacy: earlier versions' mirrors are on this host: their service,
+# or data of a mirror this run serves.
+registry_legacy() {
+    local name
+    if [[ -f $UNIT_DIR/firerunner-registry.service ]] && ! grep -qx 'Type=oneshot' "$UNIT_DIR/firerunner-registry.service"; then
+        return 0
+    fi
+    for name in $(registry_names); do
+        [[ -d $(legacy_registry_data "$name") ]] && return 0
+    done
+    return 1
+}
+
+# registry_fits KB: KB more data keeps the mirrors' file system at most
+# REGISTRY_EVICT_LOW % full, and a copy of it fits on the root disk with 1 GiB to spare.
+registry_fits() {
+    local kb=$1 size used avail
+    read -r size used < <(df -Pk "$REGISTRY_DIR" | awk 'NR == 2 {print $2, $3}')
+    avail=$(df -Pk "$(dirname "$REGISTRY_IMG")" | awk 'NR == 2 {print $4}')
+    (( (used + kb) * 100 <= size * REGISTRY_EVICT_LOW && kb + 1048576 <= avail ))
+}
+
+# legacy_keep DIR: renames DIR to DIR.migrated (DIR.migrated-<time> if that is
+# taken) and prints the new name.
+legacy_keep() {
+    local to=$1.migrated
+    [[ ! -e $to ]] || to=$1.migrated-$(date +%Y%m%d%H%M%S)
+    mv -T -- "$1" "$to"
+    echo "$to"
+}
+
+# registry_migrate moves earlier versions' mirrors (one root service, data on
+# the root disk) to firerunner-registry@ instances; setup_registries runs it
+# only while no job runs, as the mirrors are down meanwhile (microVMs pull
+# from the registries themselves). Each mirror's data is copied under a
+# temporary name and renamed when complete, so a run cut short copies it
+# again; the old directory is then renamed to <dir>.migrated and kept until the
+# operator deletes it. Data that does not fit (FR_REGISTRY_GB, or the root
+# disk's free space for the copy) is not copied: that mirror starts empty and
+# fills from its registry again.
+registry_migrate() {
+    local name src dest tmp kb kept=""
+    log "  moving the registry mirrors to a service each (firerunner-registry@), data into $REGISTRY_DIR"
+    if systemctl is-active -q firerunner-registry; then
+        log "  stopping the single firerunner-registry service of earlier versions"
+        systemctl stop firerunner-registry
+    fi
+    for name in $(registry_names); do
+        src=$(legacy_registry_data "$name")
+        [[ -d $src ]] || continue
+        dest=$REGISTRY_DIR/$name tmp=$REGISTRY_DIR/.$name.migrating
+        if [[ -e $dest ]]; then
+            log "  $name: already in $dest"
+        else
+            rm -rf -- "$tmp"
+            kb=$(du -sk -- "$src" | awk '{print $1}')
+            if ! registry_fits "$kb"; then
+                warn "  $name: its $((kb / 1024)) MiB do not fit (FR_REGISTRY_GB, or the root disk's free space for a copy): this mirror starts empty"
+            elif mkdir -- "$tmp" && cp -a -- "$src/." "$tmp/" && own_tree "$tmp" "$REGISTRY_USER" && mv -T -- "$tmp" "$dest"; then
+                log "  $name: $((kb / 1024)) MiB copied from $src"
+            else
+                rm -rf -- "$tmp"
+                warn "  $name: copying $src failed: this mirror starts empty"
+            fi
+        fi
+        kept+=" $(legacy_keep "$src")"
+    done
+    for src in "$LEGACY_MIRROR_DATA_DIR"/*; do
+        [[ -d $src && $src != *.migrated* ]] || continue
+        log "  $(basename "$src") is no longer mirrored: its old data can go (rm -rf $src)"
+    done
+    # Last: until here a run cut short still finds the old service and goes on.
+    rm -f "$LEGACY_REGISTRIES_SH" "$LEGACY_REGISTRY_CONF" "$UNIT_DIR/firerunner-registry.service.d/firerunner-proxy.conf"
+    rm -rf "$LEGACY_MIRROR_CONF_DIR"
+    rmdir "$UNIT_DIR/firerunner-registry.service.d" 2>/dev/null || true
+    if [[ -n $kept ]]; then
+        log "  the old data stays in:$kept"
+        log "  once the mirrors serve pulls (docs/operations.md), free the root disk: rm -rf$kept"
+    fi
+}
+
+# registry_files writes every mirror's registry config and front settings,
+# the units and the upkeep, and removes a dropped mirror's config.
+registry_files() {
+    local name port lport addr f keep=" "
+    mkdir -p "$REGISTRY_CONF_DIR" "$REGISTRY_STATE_DIR"
+    # The registries read their config as REGISTRY_USER: the directories may
+    # be searched (the root-only files in CONF_DIR stay 0600).
+    chmod 0755 "$REGISTRY_CONF_DIR"
+    chmod go+x "$CONF_DIR"
+    for name in $(registry_names); do
+        keep+="$name.yml $name.env "
+        port=$(registry_bridge_port "$name")
+        lport=$((port + REGISTRY_LOCAL_OFFSET))
+        if [[ $REGISTRY_FRONT == 1 ]]; then addr=127.0.0.1:$lport; else addr=${FR_SUBNET}.1:$port; fi
+        mkdir -p "$REGISTRY_DIR/$name"
+        chmod 0700 "$REGISTRY_DIR/$name"
+        own_tree "$REGISTRY_DIR/$name" "$REGISTRY_USER"
+        put "$REGISTRY_CONF_DIR/$name.yml" <<EOF
 version: 0.1
 log:
   level: warn
 storage:
   filesystem:
-    rootdirectory: /var/lib/firerunner/registry
+    rootdirectory: $REGISTRY_DIR/$name
+  # So the ttl deletes what expires (a proxy refuses DELETE from clients all
+  # the same), and registry garbage-collect the rest (registry-maint.sh).
   delete:
-    enabled: false
+    enabled: true
 http:
-  addr: ${FR_SUBNET}.1:5000
+  addr: $addr
 proxy:
-  remoteurl: https://registry-1.docker.io
+  remoteurl: $(registry_upstream "$name")
   ttl: 168h
 EOF
-    # One more pull-through registry per mirrored registry, each on its own port.
-    mkdir -p "$MIRROR_CONF_DIR" "$MIRROR_DATA_DIR"
-    chmod 0700 "$MIRROR_DATA_DIR"
-    local host f keep=" "
-    for host in $(mirror_hosts); do
-        keep+="$host.yml "
-        put "$MIRROR_CONF_DIR/$host.yml" <<EOF
-version: 0.1
-log:
-  level: warn
-storage:
-  filesystem:
-    rootdirectory: $MIRROR_DATA_DIR/$host
-  delete:
-    enabled: false
-http:
-  addr: ${FR_SUBNET}.1:${MIRROR_PORT[$host]}
-proxy:
-  remoteurl: https://$host
-  ttl: 168h
+        put "$REGISTRY_CONF_DIR/$name.env" <<EOF
+FR_FRONT_LISTEN=${FR_SUBNET}.1:$port
+FR_FRONT_UPSTREAM=http://127.0.0.1:$lport
 EOF
     done
-    for f in "$MIRROR_CONF_DIR"/*.yml; do
+    for f in "$REGISTRY_CONF_DIR"/*; do
         [[ -f $f && $keep != *" $(basename "$f") "* ]] || continue
         rm -f "$f"
-        CHANGED+="$MIRROR_CONF_DIR "
     done
-    put "$LIB_DIR/registries.sh" 0755 <<EOF
-#!/bin/bash
-# The Docker Hub mirror and one mirror per registry in $MIRROR_CONF_DIR.
-# One that exits ends the service; systemd restarts them all.
-for c in $CONF_DIR/registry.yml $MIRROR_CONF_DIR/*.yml; do
-    [[ -f \$c ]] && $BIN_DIR/registry serve "\$c" &
-done
-wait -n
-exit 1
-EOF
-    put /etc/systemd/system/firerunner-registry.service <<EOF
+
+    put "$UNIT_DIR/firerunner-registry.service" <<EOF
 [Unit]
-Description=FireRunner pull-through registry mirrors for microVMs
-Requires=firerunner-net.service
-After=firerunner-net.service
+Description=FireRunner registry mirrors for microVMs (every firerunner-registry@ and firerunner-registry-front@)
+# Starting it starts every mirror enabled for it; stopping or restarting it
+# stops or restarts them all (their PartOf=).
 
 [Service]
-ExecStart=${LIB_DIR}/registries.sh
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    put "$UNIT_DIR/firerunner-registry@.service" <<EOF
+[Unit]
+Description=FireRunner registry mirror %i (pull-through cache for microVMs)
+Requires=firerunner-net.service
+After=firerunner-net.service
+# Its data is on the mirrors' file system only, never on the disk below it.
+RequiresMountsFor=${REGISTRY_DIR}
+PartOf=firerunner-registry.service
+
+[Service]
+ExecStart=${BIN_DIR}/registry serve ${REGISTRY_CONF_DIR}/%i.yml
+User=${REGISTRY_USER}
+Group=${REGISTRY_USER}
+UMask=0077
 Restart=always
 RestartSec=5
-# Serves untrusted microVMs: no capabilities (ports above 1024, its data is
-# root's own), only its data writable, no devices, kernel knobs or namespaces.
+# Serves untrusted microVMs: not root, no capabilities (ports above 1024),
+# only its own mirror's data writable, no devices, kernel knobs or namespaces.
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/firerunner/registry ${MIRROR_DATA_DIR}
+ReadWritePaths=${REGISTRY_DIR}/%i
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -1707,7 +2024,301 @@ LockPersonality=yes
 CapabilityBoundingSet=
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=firerunner-registry.service
+EOF
+    # \${...}: expanded by systemd from the instance's .env file, not here.
+    put "$UNIT_DIR/firerunner-registry-front@.service" <<EOF
+[Unit]
+Description=FireRunner registry mirror %i: the pull API on the bridge address
+Requires=firerunner-net.service
+Wants=firerunner-registry@%i.service
+After=firerunner-net.service firerunner-registry@%i.service
+PartOf=firerunner-registry.service
+
+[Service]
+EnvironmentFile=${REGISTRY_CONF_DIR}/%i.env
+ExecStart=${BIN_DIR}/firerunner registry-front --listen \${FR_FRONT_LISTEN} --upstream \${FR_FRONT_UPSTREAM}
+Restart=always
+RestartSec=5
+# On SIGTERM it takes no new connections and gives running pulls 60 s.
+TimeoutStopSec=75s
+# Serves untrusted microVMs and keeps no data: a user of its own for each
+# run, no capabilities (ports above 1024), no devices, kernel knobs or namespaces.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=firerunner-registry.service
+EOF
+
+    registry_maint_script | put "$LIB_DIR/registry-maint.sh" 0755
+    put "$UNIT_DIR/firerunner-registry-evict.service" <<EOF
+[Unit]
+Description=Evict the FireRunner registry mirrors' least read layers above ${REGISTRY_EVICT_HIGH}% of their file system
+RequiresMountsFor=${REGISTRY_DIR}
+
+[Service]
+Type=oneshot
+User=${REGISTRY_USER}
+Group=${REGISTRY_USER}
+ExecStart=${LIB_DIR}/registry-maint.sh evict ${REGISTRY_EVICT_HIGH} ${REGISTRY_EVICT_LOW}
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=${REGISTRY_DIR}
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+CapabilityBoundingSet=
+EOF
+    put "$UNIT_DIR/firerunner-registry-evict.timer" <<EOF
+[Unit]
+Description=Check the FireRunner registry mirrors' file system every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
+    put "$UNIT_DIR/firerunner-registry-gc.service" <<EOF
+[Unit]
+Description=Garbage-collect the FireRunner registry mirrors (once a day each, only while no job runs)
+RequiresMountsFor=${REGISTRY_DIR}
+
+[Service]
+Type=oneshot
+ExecStart=${LIB_DIR}/registry-maint.sh gc
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=${REGISTRY_DIR} ${REGISTRY_STATE_DIR}
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+# Root only to stop and start a mirror; garbage-collect runs as
+# ${REGISTRY_USER} (setpriv).
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+EOF
+    put "$UNIT_DIR/firerunner-registry-gc.timer" <<EOF
+[Unit]
+Description=Hourly chance to garbage-collect the FireRunner registry mirrors
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# registry_start starts what does not run, restarts (when no job runs) the
+# mirrors whose config, unit or binary changed, and stops a mirror no longer
+# in FR_REGISTRY_MIRRORS (its data stays until evicted).
+registry_start() {
+    local name reg front w all_reg=0 all_front=0 timer
+    systemctl daemon-reload
+    changed "$UNIT_DIR/firerunner-registry@.service" "$BIN_DIR/registry" && all_reg=1
+    changed "$UNIT_DIR/firerunner-registry-front@.service" "$BIN_DIR/firerunner" && all_front=1
+    for w in "$UNIT_DIR"/firerunner-registry.service.wants/firerunner-registry{,-front}@*.service; do
+        [[ -L $w || -e $w ]] || continue
+        name=${w##*@}
+        name=${name%.service}
+        is_registry_name "$name" && continue
+        log "  stopping $(basename "$w" .service) (no longer mirrored)"
+        systemctl disable --now -q "$(basename "$w")"
+    done
+    systemctl enable -q firerunner-registry
+    for name in $(registry_names); do
+        reg=firerunner-registry@$name front=firerunner-registry-front@$name
+        if [[ $REGISTRY_FRONT != 1 ]] && systemctl is-enabled -q "$front" 2>/dev/null; then
+            # The front leaves the bridge port before its registry takes it back.
+            log "  stopping $front (this firerunner has no registry-front)"
+            systemctl disable --now -q "$front"
+        fi
+        systemctl enable -q "$reg"
+        if ! systemctl is-active -q "$reg"; then
+            log "  starting $reg"
+            systemctl restart "$reg" || warn "  $reg did not start (journalctl -u $reg)"
+        elif [[ $all_reg == 1 ]] || changed "$REGISTRY_CONF_DIR/$name.yml"; then
+            restart_when_idle "$reg"
+        fi
+        [[ $REGISTRY_FRONT == 1 ]] || continue
+        systemctl enable -q "$front"
+        if ! systemctl is-active -q "$front"; then
+            if [[ " $PENDING " == *" $reg "* ]]; then
+                # Its registry may still hold the bridge port: the front starts
+                # after the registry's restart, when no job runs.
+                pending_add "restart $front"
+            else
+                log "  starting $front"
+                systemctl restart "$front" || warn "  $front did not start (journalctl -u $front)"
+            fi
+        elif [[ $all_front == 1 ]] || changed "$REGISTRY_CONF_DIR/$name.env"; then
+            restart_when_idle "$front"
+        fi
+    done
+    systemctl start firerunner-registry
+    for timer in firerunner-registry-evict firerunner-registry-gc; do
+        systemctl enable -q --now "$timer.timer"
+        # A changed schedule applies from the timer's next start.
+        if changed "$UNIT_DIR/$timer.timer"; then
+            systemctl restart "$timer.timer"
+        fi
+    done
+}
+
+# setup_registries runs the registry mirrors, after install_firerunner (the
+# fronts are firerunner). Leaving the single service of earlier versions
+# stops every mirror while their data is copied: it waits for a run when no
+# job runs, and until then that service keeps serving as it is.
+setup_registries() {
+    if registry_legacy && systemctl is-active -q firerunner-registry && jobs_running; then
+        warn "  registry mirrors: moving to a service each waits until no job runs (re-run the installer then)"
+        REGISTRY_DEFERRED=1
+        PENDING+="firerunner-registry(move) "
+        return 0
+    fi
+    REGISTRY_FRONT=0
+    if registry_front_available; then
+        REGISTRY_FRONT=1
+    else
+        warn "  firerunner $("$BIN_DIR/firerunner" version 2>/dev/null | awk '{print $2}') has no registry-front: each registry mirror listens on the bridge itself"
+    fi
+    log "registry mirrors: $(registry_names | paste -sd ' ' -)"
+    system_user "$REGISTRY_USER" "FireRunner registry mirrors"
+    registry_storage
+    if registry_legacy; then
+        registry_migrate
+    fi
+    registry_files
+    registry_start
+}
+
+# registry_maint_script: the mirrors' upkeep the evict and gc timers run.
+registry_maint_script() {
+    cat <<'EOF'
+#!/bin/bash
+# registry-maint.sh evict HIGH LOW | gc: upkeep of the registry mirrors' file
+# system (written by install.sh).
+#
+# evict (every 10 minutes, as the registry user): above HIGH % in use, deletes
+#   the layer blobs read longest ago until LOW % is in use. The file system is
+#   mounted relatime, so a blob's atime is its last read to within a day. Safe
+#   while the mirrors run: a mirror asked for a blob it no longer has pulls it
+#   from its registry again. Manifests stay: registry garbage-collect stops at
+#   a manifest whose blob is gone, and the mirrors' ttl expires them.
+# gc (hourly, as root): at most once a day per mirror, and only while no job
+#   runs, stops the mirror, runs registry garbage-collect as the registry user
+#   (it must not run next to a registry that writes) and starts it again.
+#   Meanwhile microVMs pull from the registries themselves.
+set -euo pipefail
+export LC_ALL=C
+dir=${FR_REGISTRY_DIR:-/var/lib/firerunner/registries}
+conf=${FR_REGISTRY_CONF_DIR:-/etc/firerunner/registries.d}
+state=${FR_REGISTRY_STATE_DIR:-/var/lib/firerunner/registry-maint}
+jobs=${FR_JOBS_DIR:-/run/firerunner/jobs}
+user=${FR_REGISTRY_USER:-firerunner-registry}
+registry=${FR_REGISTRY_BIN:-/usr/local/bin/registry}
+day=$((24 * 3600 - 600))   # an hourly timer that fires a little early still counts
+# A stop or Ctrl-C ends the script through the EXIT trap (gc starts the mirror again).
+trap 'exit 143' TERM INT HUP
+
+jobs_running() { compgen -G "$jobs/*.json" >/dev/null; }
+
+evict() {
+    local high=$1 low=$2 size used target d b kb path deleted=0 freed=0
+    read -r size used < <(df -Pk "$dir" | awk 'NR == 2 {print $2, $3}')
+    [[ $size =~ ^[0-9]+$ && $used =~ ^[0-9]+$ ]] && ((size > 0)) || { echo "cannot read the size of $dir" >&2; return 1; }
+    ((used * 100 > size * high)) || return 0
+    target=$((size * low / 100))
+    local -A manifest=()
+    while IFS= read -r -d '' d; do
+        manifest[${d##*/}]=1
+    done < <(find "$dir" -path '*/_manifests/revisions/sha256/*' -name link -type f -printf '%h\0')
+    # "atime KiB blob-directory", read longest ago first; KiB is what it takes on disk.
+    local -a blobs=()
+    mapfile -d '' blobs < <(find "$dir" -path '*/docker/registry/v2/blobs/sha256/*' -name data -type f -printf '%A@ %k %h\0' | sort -z -n)
+    for b in "${blobs[@]}"; do
+        ((used > target)) || break
+        read -r _ kb _ <<<"$b"
+        path=${b#* * }
+        [[ -z ${manifest[${path##*/}]:-} ]] || continue
+        rm -rf -- "$path"
+        used=$((used - kb)) deleted=$((deleted + 1)) freed=$((freed + kb))
+    done
+    echo "evicted the $deleted layers read longest ago ($((freed / 1024)) MiB): about $((used * 100 / size))% of $((size / 1024)) MiB in use"
+}
+
+gc() {
+    local c name stamp unit out failed=0 stopped
+    mkdir -p "$state"
+    for c in "$conf"/*.yml; do
+        [[ -f $c ]] || continue
+        name=$(basename "$c" .yml)
+        stamp=$state/gc-$name unit=firerunner-registry@$name
+        if [[ -f $stamp ]] && (($(date +%s) - $(stat -c %Y "$stamp") < day)); then
+            continue
+        fi
+        if jobs_running; then
+            echo "garbage collection waits while jobs run"
+            return "$failed"
+        fi
+        stopped=0
+        if systemctl is-active -q "$unit"; then
+            systemctl stop "$unit"
+            stopped=1
+            # shellcheck disable=SC2064
+            trap "systemctl start '$unit'" EXIT
+        fi
+        # Tried once a day, whatever the outcome: a failing one does not stop
+        # the mirror every hour.
+        touch "$stamp"
+        out=$(mktemp)
+        if setpriv --reuid="$user" --regid="$user" --clear-groups -- "$registry" garbage-collect "$c" >"$out" 2>&1; then
+            echo "$name: garbage-collected ($(grep -E 'eligible for deletion' "$out" | tail -n 1 | sed 's/^[[:space:]]*//' || true))"
+        else
+            echo "$name: registry garbage-collect failed: $(tail -n 5 "$out" | tr '\n' ' ')" >&2
+            failed=1
+        fi
+        rm -f "$out"
+        if ((stopped)); then
+            trap - EXIT
+            systemctl start "$unit"
+        fi
+    done
+    return "$failed"
+}
+
+# Never on the disk below an unmounted file system.
+if ! mountpoint -q "$dir"; then
+    echo "$dir is not mounted: nothing to do"
+    exit 0
+fi
+# One at a time: evict must not delete a blob garbage-collect is sweeping.
+exec 9<"$dir"
+flock 9
+case ${1:-} in
+    evict) evict "${2:?HIGH}" "${3:?LOW}" ;;
+    gc)    gc ;;
+    *)     echo "usage: registry-maint.sh evict HIGH LOW | gc" >&2; exit 2 ;;
+esac
 EOF
 }
 
@@ -1772,8 +2383,19 @@ install_cache_server() {
     fi
     # The top-level directory is the S3 root; each sub-directory is a bucket.
     mkdir -p /var/lib/firerunner/cache/runner-cache
-    # Every project's cache: archives, which may hold secrets: root only.
+    system_user "$CACHE_USER" "FireRunner cache: server"
+    # Every project's cache: archives, which may hold secrets: the cache user only.
     chmod 0700 /var/lib/firerunner/cache
+    if [[ $(stat -c %U /var/lib/firerunner/cache) != "$CACHE_USER" ]]; then
+        # Earlier versions ran it as root. Its files change hands with it
+        # stopped (start_services starts it again): an upload or download of a
+        # running job fails, which a job only warns about (cache: is best effort).
+        if systemctl is-active -q firerunner-cache 2>/dev/null; then
+            log "  stopping firerunner-cache to give its files to $CACHE_USER"
+            systemctl stop firerunner-cache
+        fi
+        own_tree /var/lib/firerunner/cache "$CACHE_USER" || die "could not give /var/lib/firerunner/cache to $CACHE_USER"
+    fi
     local key secret
     key=$(sed -n 's/^ROOT_ACCESS_KEY_ID=//p' "$CONF_DIR/cache.env" 2>/dev/null || true)
     secret=$(sed -n 's/^ROOT_SECRET_ACCESS_KEY=//p' "$CONF_DIR/cache.env" 2>/dev/null || true)
@@ -1795,10 +2417,13 @@ After=firerunner-net.service
 [Service]
 EnvironmentFile=${CONF_DIR}/cache.env
 ExecStart=${BIN_DIR}/versitygw posix /var/lib/firerunner/cache
+User=${CACHE_USER}
+Group=${CACHE_USER}
+UMask=0077
 Restart=always
 RestartSec=5
-# Serves untrusted microVMs: no capabilities (port 9000, the cache is root's
-# own), only the cache writable, no devices, kernel knobs or namespaces.
+# Serves untrusted microVMs: not root, no capabilities (port 9000), only the
+# cache writable, no devices, kernel knobs or namespaces.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/firerunner/cache
@@ -1826,6 +2451,8 @@ Description=Delete FireRunner cache: archives older than ${FR_CACHE_DAYS} days, 
 [Service]
 Type=oneshot
 ExecStart=${LIB_DIR}/cache-clean.sh ${FR_CACHE_DAYS} ${FR_CACHE_MAX_GB}
+User=${CACHE_USER}
+Group=${CACHE_USER}
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/firerunner/cache
@@ -1968,11 +2595,18 @@ EOF
 
     local have=""
     [[ -x $BIN_DIR/gitlab-runner ]] && have=$($BIN_DIR/gitlab-runner --version 2>/dev/null | awk '/^Version:/ {print $2}' || true)
-    if [[ -n $have && "$have" != "${GITLAB_RUNNER_VERSION}" ]] && systemctl is-active -q gitlab-runner && jobs_running; then
+    if [[ "$have" == "${GITLAB_RUNNER_VERSION}" ]]; then
+        :
+    elif drained && [[ $(systemctl is-active gitlab-runner 2>/dev/null || true) =~ ^(active|activating|deactivating|reloading)$ ]]; then
+        # Draining: gitlab-runner finishes its jobs and stops by itself (a stop
+        # now would wait for them, a start would undo the drain).
+        warn "gitlab-runner $have not upgraded to v${GITLAB_RUNNER_VERSION}: the host is being drained (re-run the installer once it is)"
+        PENDING+="gitlab-runner(upgrade) "
+    elif [[ -n $have ]] && systemctl is-active -q gitlab-runner && jobs_running; then
         # Stopping gitlab-runner would abort the running jobs; the next run when idle upgrades it.
         warn "gitlab-runner $have not upgraded to v${GITLAB_RUNNER_VERSION}: jobs are running"
         PENDING+="gitlab-runner(upgrade) "
-    elif [[ "$have" != "${GITLAB_RUNNER_VERSION}" ]]; then
+    else
         log "installing gitlab-runner v${GITLAB_RUNNER_VERSION}"
         local base="https://gitlab-runner-downloads.s3.amazonaws.com/v${GITLAB_RUNNER_VERSION}"
         local bin="gitlab-runner-linux-${ARCH}"
@@ -1983,9 +2617,15 @@ EOF
             want=$(awk -v f="binaries/$bin" '$2==f {print $1}' "$TMP_DIR/runner.sums")
         }
         verify "$TMP_DIR/$bin" "$want"
-        systemctl stop gitlab-runner 2>/dev/null || true
-        install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/gitlab-runner"
-        systemctl start gitlab-runner 2>/dev/null || true
+        if drained; then
+            # Stopped by the drain: the new binary runs from `firerunner undrain`.
+            install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/gitlab-runner"
+            log "  gitlab-runner stays stopped: the host is drained (firerunner undrain starts it)"
+        else
+            systemctl stop gitlab-runner 2>/dev/null || true
+            install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/gitlab-runner"
+            systemctl start gitlab-runner 2>/dev/null || true
+        fi
     fi
 }
 
@@ -2007,16 +2647,14 @@ register_runner() {
 
 start_services() {
     systemctl daemon-reload
-    local svc files f
-    for svc in containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd; do
+    local svc files
+    # The registry mirrors start later, in setup_registries.
+    for svc in containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-cache flintlockd; do
         systemctl enable -q "$svc"
         case $svc in
             containerd-flintlock) files="$CONF_DIR/containerd.toml $BIN_DIR/containerd" ;;
             firerunner-net)       files="$LIB_DIR/net-up.sh" ;;
             firerunner-dnsmasq)   files="$CONF_DIR/dnsmasq.conf" ;;
-            firerunner-registry)
-                files="$CONF_DIR/registry.yml $BIN_DIR/registry $LIB_DIR/registries.sh $MIRROR_CONF_DIR"
-                for f in "$MIRROR_CONF_DIR"/*.yml; do files+=" $f"; done ;;
             firerunner-cache)     files="$CONF_DIR/cache.env $BIN_DIR/versitygw" ;;
             flintlockd)
                 files="/etc/opt/flintlockd/config.yaml $BIN_DIR/flintlockd $BIN_DIR/firecracker"
@@ -2038,7 +2676,7 @@ start_services() {
                     # A restart would delete the bridge and cut every running microVM off.
                     log "  reloading $svc rules"
                     systemctl reload "$svc" ;;
-                containerd-flintlock|flintlockd|firerunner-registry)
+                containerd-flintlock|flintlockd)
                     restart_when_idle "$svc" ;;
                 *)
                     log "  restarting $svc"
@@ -2055,16 +2693,38 @@ start_services() {
 
 verify_install() {
     log "verifying"
-    local ok=1 svc
+    local ok=1 svc name
     local services="containerd-flintlock firerunner-net firerunner-dnsmasq firerunner-registry firerunner-cache flintlockd firerunner"
     proxy_on && services+=" firerunner-proxy"
+    if [[ $REGISTRY_DEFERRED != 1 ]]; then
+        for name in $(registry_names); do
+            services+=" firerunner-registry@$name"
+            [[ $REGISTRY_FRONT == 1 ]] && services+=" firerunner-registry-front@$name"
+        done
+    fi
     for svc in $services; do
         if systemctl is-active -q "$svc"; then
             log "  $svc: active"
+        elif [[ " $PENDING " == *" $svc "* ]]; then
+            log "  $svc: starts when no job runs (pending)"
         else
             warn "  $svc: NOT active (journalctl -u $svc)"; ok=0
         fi
     done
+    if [[ $REGISTRY_DEFERRED != 1 ]]; then
+        if mountpoint -q "$REGISTRY_DIR"; then
+            log "  registry mirrors' file system: $(df -h --output=used,size "$REGISTRY_DIR" | tail -n 1 | awk '{print $1 " of " $2}') used"
+        else
+            warn "  $REGISTRY_DIR is not mounted (systemctl status $REGISTRY_MOUNT_UNIT)"; ok=0
+        fi
+        # A mirror that does not answer only costs pulls from Docker Hub itself.
+        for _ in $(seq 1 10); do
+            curl -fsS -m 3 -o /dev/null "http://${FR_SUBNET}.1:5000/v2/" 2>/dev/null && break
+            sleep 1
+        done
+        curl -fsS -m 3 -o /dev/null "http://${FR_SUBNET}.1:5000/v2/" 2>/dev/null ||
+            warn "  the Docker Hub mirror does not answer on ${FR_SUBNET}.1:5000 (journalctl -u firerunner-registry@docker.io -u firerunner-registry-front@docker.io)"
+    fi
     local _
     for _ in $(seq 1 15); do
         ss -ltn | grep -q " ${FLINTLOCK_ENDPOINT} " && break
@@ -2116,10 +2776,17 @@ uninstall() {
     fi
     systemctl disable --now -q firerunner-cache-clean.timer 2>/dev/null || true
     rm -f /etc/systemd/system/firerunner-cache-clean.{service,timer}
+    # The registry mirrors, their upkeep and their file system (its image stays).
+    systemctl disable --now -q firerunner-registry-evict.timer firerunner-registry-gc.timer 2>/dev/null || true
+    systemctl stop 'firerunner-registry-front@*' 'firerunner-registry@*' 2>/dev/null || true
+    rm -rf "$UNIT_DIR"/firerunner-registry.service.wants "$UNIT_DIR"/firerunner-registry{,-front}@.service{,.d} \
+        "$UNIT_DIR"/firerunner-registry-{evict,gc}.{service,timer}
     for svc in firerunner-proxy firerunner flintlockd firerunner-cache firerunner-registry firerunner-dnsmasq firerunner-net containerd-flintlock; do
         systemctl disable --now -q "$svc" 2>/dev/null || true
         rm -f "/etc/systemd/system/$svc.service" "/etc/systemd/system/$svc.service.d/firerunner-proxy.conf"
     done
+    systemctl disable --now -q "$REGISTRY_MOUNT_UNIT" 2>/dev/null || true
+    rm -f "$UNIT_DIR/$REGISTRY_MOUNT_UNIT"
     rm -f /etc/systemd/system/gitlab-runner.service.d/firerunner-proxy.conf
     # The host stops trusting the company CA it was given.
     if [[ -f /etc/pki/ca-trust/source/anchors/firerunner-ca.pem ]]; then
@@ -2135,6 +2802,7 @@ uninstall() {
     rm -rf "$LIB_DIR" /etc/opt/flintlockd   # flintlockd's config holds the API token
     rm -f "$FLINTLOCK_TLS_MARKER"
     log "done. containerd binaries in $BIN_DIR are kept (another containerd may use them)."
+    log "The users $REGISTRY_USER and $CACHE_USER stay (userdel removes them); the registry mirrors' data is in $REGISTRY_IMG."
     log "To also drop data: vgremove $VG && rm -rf $CONTAINERD_ROOT /var/lib/flintlock /var/lib/firerunner $CONF_DIR /etc/lvm/profile/${THINPOOL}.profile"
 }
 
@@ -2154,7 +2822,7 @@ main() {
     assign_mirror_ports
     setup_network
     install_flintlock
-    install_registry_mirror
+    install_registry_binary
     install_cache_server
     start_services
     apply_vm_disk_size
@@ -2167,6 +2835,8 @@ main() {
         systemctl restart firerunner
     fi
     [[ $FLINTLOCK_TLS_RESET == 1 ]] && rm -f "$FLINTLOCK_TLS_MARKER"
+    # After install_firerunner: the mirrors' fronts are `firerunner registry-front`.
+    setup_registries
     flintlock_tls_switch
     configure_proxy
     open_metrics_port
