@@ -57,7 +57,8 @@ var outcomes = [...]string{outcomeAllowed, outcomePolicyDenied, outcomeLimitRefu
 func MetricNames() []string {
 	return []string{"firerunner_proxy_active", "firerunner_proxy_requests_total", "firerunner_proxy_bytes_total",
 		"firerunner_proxy_upstream_connect_seconds", "firerunner_proxy_upstream_reloads_total",
-		"firerunner_proxy_upstream_auth_failing", "firerunner_proxy_connections", "firerunner_proxy_connections_limit"}
+		"firerunner_proxy_upstream_auth_failing", "firerunner_proxy_upstream_auth_refusals_total",
+		"firerunner_proxy_connections", "firerunner_proxy_connections_limit"}
 }
 
 // metrics are one Forwarder's. They have a registry of their own, without
@@ -73,6 +74,11 @@ type metrics struct {
 	handshake   prometheus.Observer
 	reloads     *prometheus.CounterVec
 	authFailing prometheus.Gauge
+	// authRefusals counts the upstream's own 407s. Not the requests held back
+	// after one (those are upstream_auth_failed too): two of these are at
+	// least Limits.RefusedWait apart, so two in a while mean the retry was
+	// refused again rather than one transient refusal.
+	authRefusals prometheus.Counter
 }
 
 func newMetrics(f *Forwarder) *metrics {
@@ -93,6 +99,8 @@ func newMetrics(f *Forwarder) *metrics {
 			[]string{"result"}),
 		authFailing: prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_proxy_upstream_auth_failing",
 			Help: "1 while the upstream's last answer refused the credentials (407): requests fail until the upstream file is fixed or, after a while, one request tries them again."}),
+		authRefusals: prometheus.NewCounter(prometheus.CounterOpts{Name: "firerunner_proxy_upstream_auth_refusals_total",
+			Help: "407 answers of the upstream to the forwarder's credentials. Requests the forwarder holds back after one, until it tries the credentials again, are not counted here."}),
 	}
 	bytes := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_proxy_bytes_total",
 		Help: "Bytes carried, counted as they move, by direction: up (client to upstream), down (upstream to client). Tunnels' bytes and requests' and answers' bodies, without headers."},
@@ -115,7 +123,7 @@ func newMetrics(f *Forwarder) *metrics {
 	}
 	m.reloads.WithLabelValues("ok")
 	m.reloads.WithLabelValues("failed")
-	m.reg.MustRegister(m.active, m.requests, bytes, upstream, m.reloads, m.authFailing, connCollector{f: f,
+	m.reg.MustRegister(m.active, m.requests, bytes, upstream, m.reloads, m.authFailing, m.authRefusals, connCollector{f: f,
 		conns: prometheus.NewDesc("firerunner_proxy_connections",
 			"Requests and tunnels holding a slot, by scope: microvms (all microVMs together), busiest_microvm (the microVM holding most), host (host services on 127.0.0.1).",
 			[]string{"scope"}, nil),

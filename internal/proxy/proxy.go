@@ -844,6 +844,7 @@ func (f *Forwarder) relay(w http.ResponseWriter, o *outcome, resp *http.Response
 func (f *Forwarder) upstreamRefused(w http.ResponseWriter, o *outcome, up Upstream, target string, code int) int {
 	if code == http.StatusProxyAuthRequired {
 		o.set(outcomeAuthFailed)
+		f.m.authRefusals.Inc()
 		f.setRefused(up, true)
 		http.Error(w, "firerunner proxy: the upstream proxy refused this host's credentials", http.StatusBadGateway)
 		return http.StatusBadGateway
