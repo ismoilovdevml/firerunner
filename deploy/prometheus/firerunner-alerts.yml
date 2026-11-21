@@ -54,12 +54,16 @@ groups:
           description: "microVMs, builders, gitlab-runner, containerd-flintlock and the registry mirrors reach the outside through it: jobs fail on pulls, clones and downloads (hosts in proxy.no_proxy still work). Check: journalctl -u firerunner-proxy -n 100; firerunner doctor (a 407 means the upstream refused the credentials). Fix: systemctl start firerunner-proxy."
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxydown
       - alert: FireRunnerProxyUpstreamAuthFailing
-        # The upstream's own 407s: after one the forwarder holds requests back
-        # for 5 minutes, then tries the credentials again, so two in an hour
-        # mean the retry was refused too, however sparse the jobs are. One
-        # transient 407 on a host that then goes idle leaves the gauge at 1
-        # but never makes a second. The gauge drops the alert as soon as a
-        # request is accepted. No "for": the second 407 is the confirmation.
+        # Refusals of the credentials: a 407 that starts the forwarder's
+        # 5-minute hold-back counts, the 407s of requests already on their way
+        # with it do not. After the hold-back the forwarder tries the
+        # credentials again, so two refusals in an hour mean the retry was
+        # refused too, however sparse the jobs are. One transient refusal on a
+        # host that then goes idle leaves the gauge at 1 but never makes a
+        # second. The gauge drops the alert as soon as a request is accepted.
+        # No "for": the second refusal is the confirmation. A forwarder
+        # restart right after a refusal forgets the hold-back and can count a
+        # second one at the next request.
         expr: |
           firerunner_proxy_upstream_auth_failing == 1
           and on (instance)

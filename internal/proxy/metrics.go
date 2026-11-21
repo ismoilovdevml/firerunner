@@ -74,10 +74,14 @@ type metrics struct {
 	handshake   prometheus.Observer
 	reloads     *prometheus.CounterVec
 	authFailing prometheus.Gauge
-	// authRefusals counts the upstream's own 407s. Not the requests held back
-	// after one (those are upstream_auth_failed too): two of these are at
-	// least Limits.RefusedWait apart, so two in a while mean the retry was
-	// refused again rather than one transient refusal.
+	// authRefusals counts the upstream's refusals of the credentials: a 407
+	// that starts a hold-back (setRefused). Not the requests held back
+	// during one, nor the other 407s of requests that were already on their
+	// way: two of these are at least Limits.RefusedWait apart, so two in a
+	// while mean the retry was refused again rather than one transient
+	// refusal. The hold-back lives in memory: a restart right after a 407
+	// lets the next request try the credentials again, which can count a
+	// second time.
 	authRefusals prometheus.Counter
 }
 
@@ -100,7 +104,7 @@ func newMetrics(f *Forwarder) *metrics {
 		authFailing: prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_proxy_upstream_auth_failing",
 			Help: "1 while the upstream's last answer refused the credentials (407): requests fail until the upstream file is fixed or, after a while, one request tries them again."}),
 		authRefusals: prometheus.NewCounter(prometheus.CounterOpts{Name: "firerunner_proxy_upstream_auth_refusals_total",
-			Help: "407 answers of the upstream to the forwarder's credentials. Requests the forwarder holds back after one, until it tries the credentials again, are not counted here."}),
+			Help: "Refusals of the forwarder's credentials by the upstream: 407s that start a hold-back (new credentials, a refused retry, or the last hold-back over). Requests held back until the forwarder tries the credentials again, and the 407s of requests already on their way, are not counted again."}),
 	}
 	bytes := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_proxy_bytes_total",
 		Help: "Bytes carried, counted as they move, by direction: up (client to upstream), down (upstream to client). Tunnels' bytes and requests' and answers' bodies, without headers."},
