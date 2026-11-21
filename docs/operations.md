@@ -82,9 +82,11 @@ firerunner undrain takes jobs again (a reboot starts gitlab-runner and ends the 
 - gitlab-runner started during the drain, by hand or otherwise, is stopped again while `drain`
   waits; `status` says when it runs on a drained host.
 
-`sudo firerunner undrain` (or `drain --cancel`) starts gitlab-runner again, if `drain` stopped it,
-and lets the daemon boot again. While gitlab-runner still finishes jobs it ran when drained, it
-cannot take new ones: it starts again once they are done, and `undrain` waits for that (at most
+`sudo firerunner undrain` (or `drain --cancel`) lets the daemon boot again, then starts gitlab-runner
+again if `drain` stopped it; if the daemon does not answer, it changes nothing. A `drain` still
+waiting then ends and leaves gitlab-runner running. While gitlab-runner still finishes jobs it ran
+when drained, it cannot take new ones: it starts again once they are done, and `undrain` waits for
+that (at most
 `--timeout`, by default as long as `drain`) to remove the drain's drop-in below. If that wait ends
 first (timeout, Ctrl-C), `undrain` says so and the drop-in stays, so every stop of gitlab-runner
 still waits for its jobs; `status` then says `no, but gitlab-runner keeps the drain's stop
@@ -95,7 +97,8 @@ To stop gitlab-runner gracefully, `drain` adds a runtime drop-in,
 `/run/systemd/system/gitlab-runner.service.d/zz-firerunner-drain.conf` (`KillMode=mixed`,
 `KillSignal=SIGQUIT`, `TimeoutStopSec=infinity`), checks that systemd took it, and stops the unit;
 `undrain` removes it once gitlab-runner no longer stops (a reload without it during the stop would
-kill the jobs). Without it, `systemctl stop gitlab-runner` sends SIGTERM to every job's processes
+kill the jobs), and counts it gone only once a `daemon-reload` went through and systemd no longer
+lists it (`systemctl show gitlab-runner -p DropInPaths`). Without it, `systemctl stop gitlab-runner` sends SIGTERM to every job's processes
 and cancels the jobs.
 
 ## microVMs
