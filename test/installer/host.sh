@@ -405,13 +405,32 @@ expect "a dropped mirror's pending restarts are dropped" ! grep -q 'quay.io' "$P
 expect "...the others kept, in order" test "$(tr '\n' ' ' < "$PENDING_FILE")" = "restart containerd-flintlock restart firerunner-registry@ghcr.io "
 
 # A mask a garbage collection killed outright (SIGKILL) left: every enable of
-# the mirror would fail. Only masks (links to /dev/null) are undone.
-RUNTIME_UNIT_DIR=$R/run; mkdir -p "$RUNTIME_UNIT_DIR"
-ln -sfn /dev/null "$RUNTIME_UNIT_DIR/firerunner-registry@ghcr.io.service"
-echo '[Service]' > "$RUNTIME_UNIT_DIR/firerunner-registry@docker.io.service"
+# the mirror would fail. Only the masks gc recorded (masked-NAME) are undone,
+# never an operator's, and only masks (links to /dev/null).
+RUNTIME_UNIT_DIR=$R/run; mkdir -p "$RUNTIME_UNIT_DIR" "$REGISTRY_STATE_DIR"
+ln -sfn /dev/null "$RUNTIME_UNIT_DIR/firerunner-registry@ghcr.io.service"; : > "$REGISTRY_STATE_DIR/masked-ghcr.io"
+ln -sfn /dev/null "$RUNTIME_UNIT_DIR/firerunner-registry@quay.io.service"     # the operator's
+echo '[Service]' > "$RUNTIME_UNIT_DIR/firerunner-registry@docker.io.service"; : > "$REGISTRY_STATE_DIR/masked-docker.io"
 : > "$SC_LOG"; registry_unmask_stale >/dev/null 2>&1
-expect "a stale mask is undone" grep -qx 'unmask --runtime -q firerunner-registry@ghcr.io.service' "$SC_LOG"
+expect "a stale mask gc left is undone" grep -qx 'unmask --runtime -q firerunner-registry@ghcr.io.service' "$SC_LOG"
+expect "...and its record removed" test ! -e "$REGISTRY_STATE_DIR/masked-ghcr.io"
+expect "...an operator's mask is left alone" ! grep -q 'quay.io' "$SC_LOG"
 expect "...a runtime unit that is not a mask is left alone" ! grep -q 'docker.io' "$SC_LOG"
+expect "...and its stale record dropped" test ! -e "$REGISTRY_STATE_DIR/masked-docker.io"
+: > "$REGISTRY_STATE_DIR/masked-ghcr.io"; touch "$R/fail-unmask"
+systemctl() { echo "$*" >> "$SC_LOG"; [[ $1 != unmask || ! -f $R/fail-unmask ]]; }
+registry_unmask_stale >/dev/null 2>&1
+expect "...a record whose unmask failed is kept for the next run" test -e "$REGISTRY_STATE_DIR/masked-ghcr.io"
+rm -f "$R/fail-unmask" "$REGISTRY_STATE_DIR/masked-ghcr.io"
+systemctl() {
+    echo "$*" >> "$SC_LOG"
+    case $1 in
+        is-active)  [[ -f $R/active/${*: -1} ]] ;;
+        is-enabled) [[ -f $R/enabled/${*: -1} ]] ;;
+        restart)    [[ ! -f $R/fail-${*: -1} ]] ;;   # fails while $R/fail-UNIT exists
+        *)          return 0 ;;
+    esac
+}
 
 # The mirrors' mount: new options remount it when no job runs, pending until it succeeds.
 mountpoint() { [[ -f $R/mounted ]]; }
@@ -428,7 +447,7 @@ expect "...no longer pending" ! grep -q "$M" "$PENDING_FILE"
 pending_add "restart $M" >/dev/null; touch "$R/fail-$M"; PENDING=""; : > "$SC_LOG"
 registry_image >/dev/null 2>&1
 expect "remount that fails (busy) stays pending for the next run" grep -qx "restart $M" "$PENDING_FILE"
-expect "...and says so" test "$PENDING" = "$M "
+expect "...in the file only: the run's other pending restarts are not held back" test -z "$PENDING"
 rm -f "$R/fail-$M"
 printf 'restart %s\nrestart containerd-flintlock\n' "$M" > "$PENDING_FILE"; : > "$SC_LOG"
 apply_pending >/dev/null 2>&1
@@ -513,7 +532,9 @@ expect "...across mirrors, the newest layer kept" has_blob docker.io dd04
 expect "...a manifest never evicted, however old" has_blob docker.io aa01
 # Absolute headroom: half the file system free is still too little under START_MIB.
 store_fixture; MSIZE=$((100 * K)) MUSED=$((50 * K)) MIB=$((50 * K / 1024 + 1))
-expect "evict: 50 % free but under START_MIB" maint evict 10 "$MIB" 20 "$MIB"
+out=$(maint evict 10 "$MIB" 20 "$MIB" 2>&1); rc=$?
+expect "evict: 50 % free but under START_MIB" test "$rc" = 0
+expect "...capped, but nothing deleted: it does not say FR_REGISTRY_GB is small" ! grep -q 'FR_REGISTRY_GB is small' <<<"$out"
 # STOP_MIB is more than half the file system: the target is capped at half,
 # which is already free, so no layer goes (not all of them, as before the cap).
 expect "...target capped at half the file system: no layer deleted" bash -c "test \$(find '$S' -name data | wc -l) = 4"
@@ -579,6 +600,7 @@ gc_run
 expect "gc: nothing while a job runs" ! grep -q 'mask\|stop\|setpriv' "$GC/log"
 rm -f "$GC/jobs/job-1.json"; : > "$GC/log"
 expect "gc: idle, a mirror is garbage-collected" gc_run
+expect "...its mask recorded while it lasted, the record gone after" bash -c "grep -q 'systemctl mask --runtime -q firerunner-registry@docker.io' '$GC/log' && test ! -e '$GC/state/masked-docker.io'"
 expect "...masked first: nothing may start it meanwhile" test "$(gc_line 'systemctl mask --runtime -q firerunner-registry@docker.io')" -lt "$(gc_line 'systemctl stop firerunner-registry@docker.io')"
 expect "...then stopped" test "$(gc_line 'systemctl stop firerunner-registry@docker.io')" -lt "$(gc_line 'garbage-collect')"
 expect "...as the registry user, with its config" grep -q "setpriv --reuid=firerunner-registry --regid=firerunner-registry --clear-groups -- /usr/local/bin/registry garbage-collect $GC/conf/docker.io.yml" "$GC/log"
@@ -593,6 +615,7 @@ expect "...and the mirror is unmasked and started again all the same" bash -c "g
 gc_fresh; touch "$GC/term"
 expect "gc: stopped (SIGTERM) while garbage-collect runs, it ends" ! gc_run
 expect "...through the trap: the mirror unmasked" test "$(gc_line 'garbage-collect')" -lt "$(gc_line 'systemctl unmask --runtime -q firerunner-registry@docker.io')"
+expect "...its mask record removed" test ! -e "$GC/state/masked-docker.io"
 expect "...and started again" grep -q 'systemctl start firerunner-registry@docker.io' "$GC/log"
 gc_fresh; touch "$GC/fail"
 gc_run
