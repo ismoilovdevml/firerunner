@@ -721,5 +721,22 @@ expect "gitlab-runner ${GITLAB_RUNNER_VERSION} pinned" pin_ok "v${GITLAB_RUNNER_
 expect "another version has no pin" ! pin_ok "v9.9.9/flintlockd_amd64"
 expect "...and says so" grep -q "no pinned checksum for v9.9.9/flintlockd_amd64" <<<"$(pinned v9.9.9/flintlockd_amd64 2>&1)"
 
+# ---- system users: useradd refuses a GECOS comment with ':' (it broke a real install)
+UA_LOG=$WORK/useradd.log
+gecos_ok() {
+    (
+        getent() { return 2; }   # the user does not exist yet
+        useradd() { printf '%s\n' "$@" > "$UA_LOG"; }
+        system_user "$1" "$2" >/dev/null
+    )
+    local comment
+    comment=$(grep -A1 -- '^--comment$' "$UA_LOG" | tail -n 1)
+    [[ -n $comment && $comment != *:* ]]
+}
+expect "system user comment: a ':' never reaches useradd" gecos_ok fr-test "FireRunner cache: server"
+for u in "$REGISTRY_USER" "$CACHE_USER"; do
+    expect "the installer's own user comments for $u have no ':'" bash -c "! grep -E 'system_user \"\\\$(REGISTRY|CACHE)_USER\" \"[^\"]*:' '$WORK/install-lib.sh'"
+done
+
 echo "RESULT pass=$pass fail=$fail"
 [[ $fail -eq 0 ]]

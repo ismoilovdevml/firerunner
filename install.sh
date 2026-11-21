@@ -1737,8 +1737,10 @@ registry_front_available() { "$BIN_DIR/firerunner" registry-front --help >/dev/n
 system_user() {
     getent passwd "$1" >/dev/null && return 0
     log "  adding system user $1"
+    # A GECOS field may not hold ':' or a newline: useradd refuses it.
+    local comment=${2//[:$'\n']/ }
     useradd --system --user-group --no-create-home --home-dir / \
-        --shell "$(command -v nologin || echo /usr/sbin/nologin)" --comment "$2" "$1"
+        --shell "$(command -v nologin || echo /usr/sbin/nologin)" --comment "$comment" "$1"
 }
 
 # own_tree DIR USER: DIR and everything in it belong to USER. DIR changes
@@ -2737,7 +2739,7 @@ install_cache_server() {
     fi
     # The top-level directory is the S3 root; each sub-directory is a bucket.
     mkdir -p /var/lib/firerunner/cache/runner-cache
-    system_user "$CACHE_USER" "FireRunner cache: server"
+    system_user "$CACHE_USER" "FireRunner cache server"
     # Every project's cache: archives, which may hold secrets: the cache user only.
     chmod 0700 /var/lib/firerunner/cache
     if [[ $(stat -c %U /var/lib/firerunner/cache) != "$CACHE_USER" ]]; then
