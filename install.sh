@@ -43,8 +43,9 @@
 #                           for later re-runs, none for no others). A pull the mirror cannot serve
 #                           (a private image) goes to the registry itself
 #   FR_REGISTRY_GB          most the registry mirrors may store, in a file system of its own on the
-#                           root disk (default: auto, a fifth of the root file system, at least 5).
-#                           Only a larger value changes an existing one (grown online)
+#                           root disk, which takes all of it from the start (default: auto, a fifth
+#                           of the root file system, at least 5, less if 10 % and 4 GB of it would
+#                           not stay free). Only a larger value changes an existing one (grown online)
 #   VERSITYGW_VERSION      S3 server for the runner's cache: (default: 1.8.0)
 #   FR_CACHE_DAYS           delete cache: archives not written for this many days (default: 14)
 #   FR_CACHE_MAX_GB         above this size the oldest cache: archives are deleted, checked hourly
@@ -1623,14 +1624,20 @@ REGISTRY_FRONT=0                            # the installed firerunner has `regi
 REGISTRY_DEFERRED=0                         # leaving the single service of earlier versions waits for no job to run
 REGISTRY_DROPIN_DONE=0                      # setup_registries wrote (and applied) the mirrors' proxy drop-in
 # The mirrors' data is an ext4 file system in REGISTRY_IMG, mounted on
-# REGISTRY_DIR. It takes at most its size (FR_REGISTRY_GB) of the root disk:
-# the image is sparse, and the space of blobs deleted in it goes back to the
-# root disk (discard). When it is full only the mirrors fail, and microVMs pull
-# from the registries themselves (internal/vm: hosts.toml, registry-mirrors).
+# REGISTRY_DIR. The image takes its whole size (FR_REGISTRY_GB) of the root
+# disk from the start (preallocated, no discard): a sparse one would grow as
+# the mirrors write, and a root disk that filled first would fail its writes
+# (I/O errors, ext4 read-only) while its own df still showed free space. When
+# it is full only the mirrors fail, and microVMs pull from the registries
+# themselves (internal/vm: hosts.toml, registry-mirrors).
 REGISTRY_DIR=/var/lib/firerunner/registries
 REGISTRY_IMG=/var/lib/firerunner/registries.img
 REGISTRY_MOUNT_UNIT=var-lib-firerunner-registries.mount  # systemd-escape -p --suffix=mount $REGISTRY_DIR
 REGISTRY_MIN_GB=5
+# A new or grown image leaves at least ROOT_KEEP_PCT % and ROOT_KEEP_GB GB of
+# the root file system free; FR_REGISTRY_GB=auto takes less to leave that.
+REGISTRY_ROOT_KEEP_PCT=10
+REGISTRY_ROOT_KEEP_GB=4
 REGISTRY_STATE_DIR=/var/lib/firerunner/registry-maint    # when each mirror was last garbage-collected
 # The eviction starts when less than START_PCT % or START_MIB MiB is free, and
 # deletes until STOP_PCT % and STOP_MIB MiB (and twice the largest layer) are
@@ -1770,17 +1777,30 @@ install_registry_binary() {
     installed "$BIN_DIR/registry"
 }
 
+# registry_root_spare: the KiB of the root file system (the one the image is
+# on) an image may take and still leave REGISTRY_ROOT_KEEP_PCT % and
+# REGISTRY_ROOT_KEEP_GB GB of it free.
+registry_root_spare() {
+    local size avail keep
+    read -r size avail < <(df -Pk "$(dirname "$REGISTRY_IMG")" | awk 'NR == 2 {print $2, $4}')
+    keep=$((size * REGISTRY_ROOT_KEEP_PCT / 100))
+    ((keep >= REGISTRY_ROOT_KEEP_GB * 1024 * 1024)) || keep=$((REGISTRY_ROOT_KEEP_GB * 1024 * 1024))
+    echo $((avail > keep ? avail - keep : 0))
+}
+
 # registry_gb: the size, in GB, of a new mirrors' file system: FR_REGISTRY_GB,
-# or a fifth of the file system the image is on (as FR_CACHE_MAX_GB=auto), at
-# least REGISTRY_MIN_GB.
+# or a fifth of the file system the image is on (as FR_CACHE_MAX_GB=auto) but
+# no more than it can spare (registry_root_spare), at least REGISTRY_MIN_GB.
 registry_gb() {
     if [[ $FR_REGISTRY_GB != auto ]]; then
         echo "$FR_REGISTRY_GB"
         return 0
     fi
-    local kb gb
+    local kb gb spare
     kb=$(df -Pk "$(dirname "$REGISTRY_IMG")" | awk 'NR == 2 {print $2}')
     gb=$((kb / 5 / 1024 / 1024))
+    spare=$(($(registry_root_spare) / 1024 / 1024))
+    ((gb <= spare)) || gb=$spare
     ((gb >= REGISTRY_MIN_GB)) || gb=$REGISTRY_MIN_GB
     echo "$gb"
 }
@@ -1807,19 +1827,25 @@ registry_storage() {
     chmod 0755 "$REGISTRY_DIR"
 }
 
-# registry_image makes REGISTRY_IMG once, mounts it with REGISTRY_MOUNT_UNIT
-# and grows it to a larger FR_REGISTRY_GB.
+# registry_image makes REGISTRY_IMG once, mounts it with REGISTRY_MOUNT_UNIT,
+# grows it to a larger FR_REGISTRY_GB and keeps it preallocated.
 registry_image() {
-    local gb
+    local gb spare
     if [[ ! -f $REGISTRY_IMG ]]; then
         gb=$(registry_gb)
-        log "  making the registry mirrors' file system: at most ${gb} GB of the root disk, in $REGISTRY_IMG"
+        spare=$(registry_root_spare)
+        if ((gb * 1024 * 1024 > spare)); then
+            die "the registry mirrors' file system takes its whole size of the root disk from the start: ${gb} GB would leave less than ${REGISTRY_ROOT_KEEP_PCT} % and ${REGISTRY_ROOT_KEEP_GB} GB of it free ($((spare / 1024 / 1024)) GB to spare). Free space on $(dirname "$REGISTRY_IMG")'s file system, or set FR_REGISTRY_GB lower (at least ${REGISTRY_MIN_GB})"
+        fi
+        log "  making the registry mirrors' file system: ${gb} GB of the root disk, taken now (preallocated), in $REGISTRY_IMG"
         # Made under another name: REGISTRY_IMG always holds a whole file system.
         rm -f "$REGISTRY_IMG.new"
-        truncate -s "${gb}G" "$REGISTRY_IMG.new"
+        fallocate -l "${gb}G" "$REGISTRY_IMG.new" ||
+            die "could not preallocate ${gb} GB for $REGISTRY_IMG (fallocate): the root file system must support it (ext4, xfs)"
         # -m 0: no blocks kept for root (the registries are not root); -i 64K:
-        # one inode per 64 KiB, registry blobs are mostly much larger.
-        mkfs.ext4 -q -F -m 0 -i 65536 -L fr-registries "$REGISTRY_IMG.new"
+        # one inode per 64 KiB, registry blobs are mostly much larger;
+        # nodiscard: mke2fs would punch the preallocated blocks out again.
+        mkfs.ext4 -q -F -m 0 -i 65536 -E nodiscard -L fr-registries "$REGISTRY_IMG.new"
         chmod 0600 "$REGISTRY_IMG.new"
         mv -f "$REGISTRY_IMG.new" "$REGISTRY_IMG"
     fi
@@ -1831,11 +1857,14 @@ Description=FireRunner registry mirrors' file system (at most the size of ${REGI
 What=${REGISTRY_IMG}
 Where=${REGISTRY_DIR}
 Type=ext4
-# discard: the space of deleted blobs goes back to the root disk. nofail, and
-# wanted by multi-user.target rather than local-fs.target: a damaged image
-# does not hold up the boot (the mirrors stay down, microVMs pull from the
-# registries themselves). relatime (the default) keeps the atimes the
-# eviction goes by (firerunner-registry-maint).$(if selinux_on; then printf '\n# context=: under SELinux every file in it is var_lib_t (a new ext4 has no labels).'; fi)
+# No discard: the image stays preallocated (deleted blobs give no space back
+# to the root disk). nofail, and wanted by multi-user.target rather than
+# local-fs.target: a damaged image does not hold up the boot (the mirrors stay
+# down, microVMs pull from the registries themselves). strictatime: every read
+# of a layer sets its atime, which the eviction goes by
+# (firerunner-registry-maint; relatime sets it once a day at most); lazytime:
+# those atimes are kept in memory and written to the image with the next
+# change of the file, within a day, or at unmount.$(if selinux_on; then printf '\n# context=: under SELinux every file in it is var_lib_t (a new ext4 has no labels).'; fi)
 Options=$(registry_mount_options)
 
 [Install]
@@ -1850,6 +1879,7 @@ EOF
         registry_remount
     fi
     registry_grow
+    registry_preallocate
 }
 
 # registry_remount: new mount options (context=) apply only to a new mount.
@@ -1884,16 +1914,20 @@ selinux_on() { command -v selinuxenabled >/dev/null && selinuxenabled; }
 
 # registry_mount_options: the mount options of the mirrors' file system.
 registry_mount_options() {
-    local o=loop,discard,nodev,nosuid,noexec,nofail
+    local o=loop,nodev,nosuid,noexec,nofail,strictatime,lazytime
     selinux_on && o+=",context=$REGISTRY_SELINUX_CONTEXT"
     echo "$o"
 }
 
-# registry_grow grows the image to a larger FR_REGISTRY_GB, online. It is
-# never shrunk: ext4 shrinks only unmounted (docs/operations.md).
+# registry_allocated_kb: the KiB of the root disk REGISTRY_IMG takes now.
+registry_allocated_kb() { echo $(($(stat -c '%b * %B' "$REGISTRY_IMG") / 1024)); }
+
+# registry_grow grows the image to a larger FR_REGISTRY_GB, online, if the
+# root disk can spare it (registry_root_spare). It is never shrunk: ext4
+# shrinks only unmounted (docs/operations.md).
 registry_grow() {
     [[ $FR_REGISTRY_GB != auto ]] || return 0
-    local have want dev
+    local have want dev more spare
     have=$(stat -c %s "$REGISTRY_IMG")
     want=$((FR_REGISTRY_GB * 1024 * 1024 * 1024))
     if ((want < have)); then
@@ -1901,12 +1935,37 @@ registry_grow() {
         return 0
     fi
     ((want > have)) || return 0
+    more=$((want / 1024 - $(registry_allocated_kb)))
+    spare=$(registry_root_spare)
+    if ((more > spare)); then
+        warn "FR_REGISTRY_GB=$FR_REGISTRY_GB: not grown, it would take $((more / 1024 / 1024)) GB more of the root disk and leave less than ${REGISTRY_ROOT_KEEP_PCT} % and ${REGISTRY_ROOT_KEEP_GB} GB of it free ($((spare / 1024 / 1024)) GB to spare)"
+        return 0
+    fi
     dev=$(losetup -j "$REGISTRY_IMG" | head -n 1 | cut -d: -f1)
     [[ -n $dev ]] || die "no loop device for $REGISTRY_IMG: is $REGISTRY_DIR mounted?"
-    log "  growing the registry mirrors' file system to ${FR_REGISTRY_GB} GB"
-    truncate -s "${FR_REGISTRY_GB}G" "$REGISTRY_IMG"
+    log "  growing the registry mirrors' file system to ${FR_REGISTRY_GB} GB (preallocated)"
+    fallocate -l "${FR_REGISTRY_GB}G" "$REGISTRY_IMG" || die "could not grow $REGISTRY_IMG to ${FR_REGISTRY_GB} GB (fallocate)"
     losetup -c "$dev"
     resize2fs "$dev" >/dev/null 2>&1 || die "resize2fs $dev failed (run it by hand to see why); $REGISTRY_IMG is ${FR_REGISTRY_GB} GB, its file system not yet"
+}
+
+# registry_preallocate gives the image every block of its size it does not
+# have yet: an image an earlier version made sparse (truncate, discard), one
+# an fstrim punched holes in since (firerunner-registry-gc does the same
+# hourly), the few blocks resize2fs leaves. Safe while it is mounted and
+# written to: fallocate only fills the holes. Not if the root disk cannot
+# spare it: then it stays sparse, and says so.
+registry_preallocate() {
+    local more spare
+    more=$(($(stat -c %s "$REGISTRY_IMG") / 1024 - $(registry_allocated_kb)))
+    ((more > 0)) || return 0
+    spare=$(registry_root_spare)
+    if ((more > spare)); then
+        warn "  $REGISTRY_IMG is sparse: $((more / 1024)) MiB of it is not yet on the root disk, which cannot spare that and keep ${REGISTRY_ROOT_KEEP_PCT} % and ${REGISTRY_ROOT_KEEP_GB} GB free. Should the root disk fill first, the mirrors' writes fail (docs/operations.md, Registry mirrors > Storage): free space on it and run the installer again"
+        return 0
+    fi
+    ((more < 1024)) || log "  preallocating the registry mirrors' file system: $((more / 1024)) MiB more of the root disk"
+    fallocate -l "$(stat -c %s "$REGISTRY_IMG")" "$REGISTRY_IMG" || warn "  could not preallocate $REGISTRY_IMG (fallocate): it stays sparse"
 }
 
 # legacy_registry_data NAME: where earlier versions kept mirror NAME's data.
@@ -2174,13 +2233,15 @@ Type=oneshot
 ExecStart=${REGISTRY_MAINT} gc
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=${REGISTRY_DIR} ${REGISTRY_STATE_DIR}
+# The image: to preallocate it again after an fstrim (absent on another disk).
+ReadWritePaths=${REGISTRY_DIR} ${REGISTRY_STATE_DIR} -${REGISTRY_IMG}
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateNetwork=yes
-# Root only to mask, stop and start a mirror (systemd does that); garbage-collect
-# runs as ${REGISTRY_USER} (setpriv).
+# Root only to mask, stop and start a mirror (systemd does that) and to
+# preallocate the image (its owner); garbage-collect, and every look into the
+# mirrors' 0700 data, run as ${REGISTRY_USER} (setpriv): no CAP_DAC_READ_SEARCH.
 CapabilityBoundingSet=CAP_SETUID CAP_SETGID
 EOF
     put "$UNIT_DIR/firerunner-registry-gc.timer" <<EOF
@@ -2384,18 +2445,27 @@ registry_maint_script() {
 # evict (every 2 minutes, as the registry user): when less than START_PCT %
 #   or START_MIB MiB is free, deletes the layer blobs read longest ago until
 #   STOP_PCT % and STOP_MIB MiB, and twice the largest layer, are free. The
-#   file system is mounted relatime, so a blob's atime is its last read to
-#   within a day. Safe while the mirrors run: a mirror asked for a blob it no
-#   longer has pulls it from its registry again. Manifests stay: registry
-#   garbage-collect stops at a manifest whose blob is gone, and the mirrors'
-#   ttl expires them. A layer it cannot delete is reported and skipped.
-# gc (hourly, as root): at most once a day per mirror, and only while no job
+#   file system is mounted strictatime, so a blob's atime is its last read.
+#   With a blob go the repositories' links to it (_layers): neither the ttl
+#   nor garbage-collect removes a link to a blob that is gone. Safe while the
+#   mirrors run: a mirror asked for a blob it no longer has pulls it from its
+#   registry again. Manifests stay: registry garbage-collect fails at a
+#   manifest whose blob is gone, and the mirrors' ttl expires them. A layer
+#   it cannot delete is reported and skipped.
+# gc (hourly, as root): gives the image back the blocks an fstrim took
+#   (fallocate). Then at most once a day per mirror, and only while no job
 #   runs, masks and stops the mirror (nothing may start it: garbage-collect
 #   must not run next to a registry that writes), runs registry
 #   garbage-collect as the registry user, then unmasks and starts it again.
-#   Meanwhile microVMs pull from the registries themselves.
+#   Meanwhile microVMs pull from the registries themselves. Root has no
+#   capability to read other users' files here (CAP_SETUID and CAP_SETGID
+#   only), and a mirror's data is the registry user's alone (0700): whatever
+#   gc reads or writes in it, it does as that user.
 set -euo pipefail
 export LC_ALL=C
+# As the units do: find, run as the registry user, fails when it cannot get
+# back to a working directory that user may not enter.
+cd /
 dir=${FR_REGISTRY_DIR:-/var/lib/firerunner/registries}
 conf=${FR_REGISTRY_CONF_DIR:-/etc/firerunner/registries.d}
 state=${FR_REGISTRY_STATE_DIR:-/var/lib/firerunner/registry-maint}
@@ -2403,12 +2473,16 @@ lock=${FR_REGISTRY_LOCK:-$state/lock}
 jobs=${FR_JOBS_DIR:-/run/firerunner/jobs}
 user=${FR_REGISTRY_USER:-firerunner-registry}
 registry=${FR_REGISTRY_BIN:-/usr/local/bin/registry}
+img=${FR_REGISTRY_IMG:-/var/lib/firerunner/registries.img}
 day=$((24 * 3600 - 600))   # an hourly timer that fires a little early still counts
 # A stop or Ctrl-C ends the script through the EXIT trap (gc unmasks and
 # starts the mirror again).
 trap 'exit 143' TERM INT HUP
 
 jobs_running() { compgen -G "$jobs/*.json" >/dev/null; }
+
+# as_user COMMAND...: runs COMMAND as the registry user (gc runs as root).
+as_user() { setpriv --reuid="$user" --regid="$user" --clear-groups -- "$@"; }
 
 evict() {
     local start_pct=$1 start_mib=$2 stop_pct=$3 stop_mib=$4
@@ -2422,13 +2496,21 @@ evict() {
     if ((free * 100 >= size * start_pct && free >= start_mib * 1024)); then
         return 0
     fi
+    # Every find leaves out lost+found: root's, the registry user may not read it.
     local -A manifest=()
     while IFS= read -r -d '' d; do
         manifest[${d##*/}]=1
-    done < <(find "$dir" -path '*/_manifests/revisions/sha256/*' -name link -type f -printf '%h\0')
+    done < <(find "$dir" -name lost+found -prune -o -path '*/_manifests/revisions/sha256/*' -name link -type f -printf '%h\0')
+    # Every repository's link to a blob (_layers/sha256/DIGEST), by "mirror
+    # DIGEST" (a mirror's links are to its own blobs), newline-separated.
+    local -A links=()
+    local -a gone=()
+    while IFS= read -r -d '' d; do
+        links["${d%%/docker/registry/v2/*} ${d##*/}"]+=$d$'\n'
+    done < <(find "$dir" -name lost+found -prune -o -path '*/docker/registry/v2/repositories/*/_layers/sha256/*' -prune -type d -print0)
     # "atime KiB blob-directory", read longest ago first; KiB is what it takes on disk.
     local -a blobs=()
-    mapfile -d '' blobs < <(find "$dir" -path '*/docker/registry/v2/blobs/sha256/*' -name data -type f -printf '%A@ %k %h\0' | sort -z -n)
+    mapfile -d '' blobs < <(find "$dir" -name lost+found -prune -o -path '*/docker/registry/v2/blobs/sha256/*' -name data -type f -printf '%A@ %k %h\0' | sort -z -n)
     for b in "${blobs[@]}"; do
         read -r _ kb _ <<<"$b"
         if ((kb > largest)); then largest=$kb; fi
@@ -2448,7 +2530,8 @@ evict() {
         read -r _ kb _ <<<"$b"
         path=${b#* * }
         [[ -z ${manifest[${path##*/}]:-} ]] || continue
-        if ! rm -rf -- "$path" 2>/dev/null; then
+        mapfile -t gone < <(printf '%s' "${links["${path%%/docker/registry/v2/*} ${path##*/}"]:-}")
+        if ! rm -rf -- "$path" "${gone[@]}" 2>/dev/null; then
             failed=$((failed + 1))
             [[ -n $first ]] || first=$path
             continue
@@ -2486,8 +2569,18 @@ restore_mirror() {
 }
 
 gc() {
-    local c name stamp out now failed=0
+    local c name stamp out now repos size failed=0
     mkdir -p "$state"
+    # Preallocated by the installer, but an fstrim (fstrim.timer) punches the
+    # blocks the file system does not use out of it, and the root disk could
+    # then fill first. fallocate fills only those holes, the data untouched.
+    if [[ -f $img ]]; then
+        size=$(stat -c %s "$img")
+        if (($(stat -c '%b * %B' "$img") < size)) && ! fallocate -l "$size" "$img"; then
+            echo "could not preallocate $img again (fallocate): is the root disk full?" >&2
+            failed=1
+        fi
+    fi
     for c in "$conf"/*.yml; do
         [[ -f $c ]] || continue
         name=$(basename "$c" .yml)
@@ -2500,8 +2593,10 @@ gc() {
             return "$failed"
         fi
         # A mirror that never stored an image has nothing to collect, and
-        # garbage-collect fails on it (no repositories directory).
-        if [[ ! -d $dir/$name/docker/registry/v2/repositories ]]; then
+        # garbage-collect fails on it (no repositories directory). Looked up
+        # as the registry user: root cannot search its 0700 directory here.
+        repos=$dir/$name/docker/registry/v2/repositories
+        if ! as_user test -d "$repos"; then
             touch "$stamp"
             echo "$name: nothing stored yet, nothing to collect"
             continue
@@ -2530,14 +2625,18 @@ gc() {
         # Tried once a day, whatever the outcome: a failing one does not stop
         # the mirror every hour.
         touch "$stamp"
+        # distribution v3.1.1's garbage-collect stops at a repository with
+        # manifests but no _layers directory (only manifests were pulled:
+        # crane manifest, a client that had every layer) with "Path not
+        # found", and collects nothing in the whole mirror. An empty _layers
+        # is what a repository whose layers all expired has.
+        if ! as_user find "$repos" \( -name _layers -o -name _uploads \) -prune -o \
+            -name _manifests -type d -prune -execdir mkdir -p -m 0700 _layers \;; then
+            echo "$name: could not give every repository a _layers directory: garbage-collect may stop at one" >&2
+        fi
         out=$(mktemp)
-        if setpriv --reuid="$user" --regid="$user" --clear-groups -- "$registry" garbage-collect "$c" >"$out" 2>&1; then
-            echo "$name: garbage-collected ($(grep -E 'eligible for deletion' "$out" | tail -n 1 | sed 's/^[[:space:]]*//' || true))"
-        elif grep -q 'Path not found' "$out"; then
-            # distribution v3.1.1 stops so at a repository that has manifests
-            # but no layers (all expired or evicted). Nothing was deleted; the
-            # eviction and the ttl still free this mirror's space.
-            echo "$name: garbage-collect stopped at a path that is gone, nothing collected: $(grep -m 1 'Path not found' "$out")"
+        if as_user "$registry" garbage-collect "$c" >"$out" 2>&1; then
+            echo "$name: garbage-collected ($(grep -E 'blobs marked, .* eligible for deletion' "$out" | tail -n 1 | sed 's/^[[:space:]]*//' || true))"
         else
             echo "$name: registry garbage-collect failed: $(tail -n 5 "$out" | tr '\n' ' ')" >&2
             failed=1
@@ -2973,7 +3072,10 @@ verify_install() {
     done
     if [[ $REGISTRY_DEFERRED != 1 ]]; then
         if mountpoint -q "$REGISTRY_DIR"; then
-            log "  registry mirrors' file system: $(df -h --output=used,size "$REGISTRY_DIR" | tail -n 1 | awk '{print $1 " of " $2}') used"
+            log "  registry mirrors' file system: $(df -h --output=used,size "$REGISTRY_DIR" | tail -n 1 | awk '{print $1 " of " $2}') used$(
+                if [[ -f $REGISTRY_IMG ]] && ! findmnt -s -n -M "$REGISTRY_DIR" >/dev/null 2>&1; then
+                    echo "; its image takes $(du -h "$REGISTRY_IMG" | cut -f1) of the root disk, all of it from the start"
+                fi)"
         else
             warn "  $REGISTRY_DIR is not mounted (systemctl status $REGISTRY_MOUNT_UNIT)"; ok=0
         fi
