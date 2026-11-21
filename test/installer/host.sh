@@ -514,7 +514,9 @@ expect "...a manifest never evicted, however old" has_blob docker.io aa01
 # Absolute headroom: half the file system free is still too little under START_MIB.
 store_fixture; MSIZE=$((100 * K)) MUSED=$((50 * K)) MIB=$((50 * K / 1024 + 1))
 expect "evict: 50 % free but under START_MIB" maint evict 10 "$MIB" 20 "$MIB"
-expect "...every layer it may delete is deleted, the manifest kept" bash -c "test \$(find '$S' -name data | wc -l) = 1 && test -f '$S/docker.io/docker/registry/v2/blobs/sha256/aa/aa01/data'"
+# STOP_MIB is more than half the file system: the target is capped at half,
+# which is already free, so no layer goes (not all of them, as before the cap).
+expect "...target capped at half the file system: no layer deleted" bash -c "test \$(find '$S' -name data | wc -l) = 4"
 # A layer it cannot delete (EACCES under SELinux, say) is skipped, not the end of the run.
 store_fixture; MSIZE=$((10 * K)) MUSED=$((10 * K))
 RM_FAILS=bb02
