@@ -155,7 +155,8 @@ func TestStopCutsWhatOutlastsTheWait(t *testing.T) {
 	t.Cleanup(upstream.Close)
 	t.Cleanup(func() { close(stuck) }) // runs first: lets upstream.Close return
 
-	addr, stop, done := stoppable(t, forwarderTo(t, "http://"+upstream.Listener.Addr().String(), 300*time.Millisecond))
+	f := forwarderTo(t, "http://"+upstream.Listener.Addr().String(), 300*time.Millisecond)
+	addr, stop, done := stoppable(t, f)
 	c, br, code := connect(t, addr, echo)
 	if code != 200 {
 		t.Fatal(code)
@@ -193,6 +194,10 @@ func TestStopCutsWhatOutlastsTheWait(t *testing.T) {
 	case <-reqDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("request to a silent upstream not cut")
+	}
+	// The cut request is the stop's doing, not the upstream's.
+	if got := requestCounts(t, f); got["request/stopping"] != 1 || got["request/upstream_error"] != 0 {
+		t.Fatalf("counted %v, want the cut request as request/stopping", got)
 	}
 }
 

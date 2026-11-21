@@ -137,6 +137,9 @@ func (f *Forwarder) stop(servers []*http.Server, wait time.Duration) {
 	wg.Wait()
 	defer f.transport.CloseIdleConnections()
 	if f.waitHandlers(ctx) {
+		// Nothing is open: the cut only marks the forwarder stopped, so a
+		// request that still gets through is refused as stopping.
+		f.cut()
 		f.Log.Info("proxy stopped", "seconds", time.Since(start).Round(time.Millisecond).Seconds())
 		return
 	}
