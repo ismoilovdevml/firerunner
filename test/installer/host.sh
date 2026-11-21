@@ -220,7 +220,8 @@ UNIT_DIR=$R/units CONF_DIR=$R/conf REGISTRY_CONF_DIR=$R/conf/registries.d LIB_DI
 REGISTRY_DIR=$R/registries REGISTRY_IMG=$R/registries.img REGISTRY_STATE_DIR=$R/maint PENDING_FILE=$R/pending-restarts
 LEGACY_REGISTRIES_SH=$R/lib/registries.sh LEGACY_REGISTRY_CONF=$R/conf/registry.yml LEGACY_MIRROR_CONF_DIR=$R/conf/registry-mirrors.d
 LEGACY_REGISTRY_DATA=$R/data/registry LEGACY_MIRROR_DATA_DIR=$R/data/registry-mirrors DRAIN_FILE=$R/drain.json
-FR_SUBNET=10.200.0 MIRROR_PORT=([ghcr.io]=5001 [quay.io]=5002)
+FR_SUBNET=10.200.0
+declare -A MIRROR_PORT=([ghcr.io]=5001 [quay.io]=5002)
 mkdir -p "$UNIT_DIR" "$CONF_DIR" "$LIB_DIR" "$REGISTRY_DIR"
 SC_LOG=$R/systemctl.log; : > "$SC_LOG"
 systemctl() {
@@ -443,7 +444,8 @@ gc_run() {
         setpriv() { echo "setpriv $*" >> "$GC/log"; [[ ! -f $GC/fail ]]; }
         mountpoint() { return 0; }
         export -f systemctl setpriv mountpoint
-        GC=$GC FR_REGISTRY_DIR=$S FR_REGISTRY_CONF_DIR=$GC/conf FR_REGISTRY_STATE_DIR=$GC/state FR_JOBS_DIR=$GC/jobs \
+        export GC
+        FR_REGISTRY_DIR=$S FR_REGISTRY_CONF_DIR=$GC/conf FR_REGISTRY_STATE_DIR=$GC/state FR_JOBS_DIR=$GC/jobs \
             bash "$WORK/registry-maint.sh" gc
     ) >/dev/null 2>&1
 }
