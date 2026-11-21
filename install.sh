@@ -2124,6 +2124,9 @@ PartOf=firerunner-registry.service
 
 [Service]
 ExecStart=${BIN_DIR}/registry serve ${REGISTRY_CONF_DIR}/%i.yml
+# distribution v3 exports OTel traces to localhost:4318 by default; nothing
+# listens there, so every export logs a "connection refused" error.
+Environment=OTEL_TRACES_EXPORTER=none
 User=${REGISTRY_USER}
 Group=${REGISTRY_USER}
 UMask=0077
