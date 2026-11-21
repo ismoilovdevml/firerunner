@@ -271,6 +271,90 @@ func TestSlowBodyIsNotCut(t *testing.T) {
 	}
 }
 
+// TestPausingBodyIsNotCut: the stall bounds do not restart on every read
+// and write, only now and then, yet a body that moves in bursts with pauses
+// well over that step (a tenth of Stall at most) but under Stall arrives
+// whole, whether the registry or the client pauses.
+func TestPausingBodyIsNotCut(t *testing.T) {
+	const (
+		stall       = 400 * time.Millisecond
+		pause       = 250 * time.Millisecond
+		bursts      = 6
+		clientBurst = 16 << 20
+	)
+	for _, c := range []struct {
+		name string
+		// registry sends size bytes; client reads them.
+		registry func(w http.ResponseWriter, r *http.Request)
+		client   func(body io.Reader) (int64, error)
+		size     int
+	}{
+		{
+			name: "registry pauses",
+			size: bursts * 100,
+			registry: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", strconv.Itoa(bursts*100))
+				for range bursts {
+					_, _ = w.Write(pattern(100))
+					http.NewResponseController(w).Flush()
+					select {
+					case <-time.After(pause):
+					case <-r.Context().Done():
+						return
+					}
+				}
+			},
+			client: func(body io.Reader) (int64, error) { return io.Copy(io.Discard, body) },
+		},
+		{
+			// The registry sends at once: the socket buffers fill and the
+			// front's write to the client waits out each pause of the client.
+			// A burst is more than the socket buffers hold (Linux wakes a
+			// writer only once half its send buffer is free): smaller ones
+			// leave the write waiting through several pauses, a real stall.
+			name: "client pauses",
+			size: (bursts + 1) * clientBurst,
+			registry: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", strconv.Itoa((bursts+1)*clientBurst))
+				chunk := pattern(1 << 20)
+				for range (bursts + 1) * clientBurst / len(chunk) {
+					if _, err := w.Write(chunk); err != nil {
+						return
+					}
+				}
+			},
+			client: func(body io.Reader) (int64, error) {
+				var n int64
+				for range bursts {
+					m, err := io.CopyN(io.Discard, body, clientBurst)
+					n += m
+					if err != nil {
+						return n, err
+					}
+					time.Sleep(pause)
+				}
+				m, err := io.Copy(io.Discard, body)
+				return n + m, err
+			},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			lim := testLimits()
+			lim.Stall = stall
+			addr, _ := startFront(t, startUpstream(t, c.registry), lim)
+			resp, err := client(t).Get("http://" + addr + blobPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			n, err := c.client(resp.Body)
+			if err != nil || n != int64(c.size) {
+				t.Fatalf("got %d bytes (%v), want %d", n, err, c.size)
+			}
+		})
+	}
+}
+
 // TestClientGoneCancelsRegistryRequest: a client that hangs up mid-blob
 // frees the registry request at once.
 func TestClientGoneCancelsRegistryRequest(t *testing.T) {

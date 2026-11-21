@@ -35,7 +35,7 @@ func testLimits() regfront.Limits {
 func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 // startUpstream runs h as the registry and returns its URL.
-func startUpstream(t *testing.T, h http.HandlerFunc) string {
+func startUpstream(t testing.TB, h http.HandlerFunc) string {
 	t.Helper()
 	up := httptest.NewServer(h)
 	t.Cleanup(up.Close)
@@ -45,13 +45,13 @@ func startUpstream(t *testing.T, h http.HandlerFunc) string {
 // startFront runs a front for upstream on a loopback port through Serve,
 // as the command does, and stops it when the test ends. stop cancels it
 // early and returns what Serve returned.
-func startFront(t *testing.T, upstream string, lim regfront.Limits) (addr string, stop func() error) {
+func startFront(t testing.TB, upstream string, lim regfront.Limits) (addr string, stop func() error) {
 	t.Helper()
 	return startFrontLog(t, upstream, lim, discardLog())
 }
 
 // startFrontLog is startFront logging to log.
-func startFrontLog(t *testing.T, upstream string, lim regfront.Limits, log *slog.Logger) (addr string, stop func() error) {
+func startFrontLog(t testing.TB, upstream string, lim regfront.Limits, log *slog.Logger) (addr string, stop func() error) {
 	t.Helper()
 	f, err := regfront.New(upstream, lim, log)
 	if err != nil {
@@ -87,7 +87,7 @@ func startFrontLog(t *testing.T, upstream string, lim regfront.Limits, log *slog
 
 // client is an HTTP client that never follows redirects and drops its
 // connections when the test ends.
-func client(t *testing.T) *http.Client {
+func client(t testing.TB) *http.Client {
 	t.Helper()
 	tr := &http.Transport{DisableCompression: true}
 	t.Cleanup(tr.CloseIdleConnections)
