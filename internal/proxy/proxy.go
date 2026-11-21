@@ -450,6 +450,13 @@ func (f *Forwarder) setRefused(up Upstream, refused bool) {
 	defer f.mu.Unlock()
 	if refused {
 		f.m.authFailing.Set(1)
+		// A refusal counts when it starts a hold-back: new credentials, a
+		// refused retry, or the last hold-back over. Requests that were
+		// already on their way when it started get 407s of their own, which
+		// are the same refusal.
+		if f.refused.key != key || f.refused.probing || time.Since(f.refused.at) >= f.Limits.RefusedWait {
+			f.m.authRefusals.Inc()
+		}
 	} else {
 		f.m.authFailing.Set(0)
 	}
@@ -844,7 +851,6 @@ func (f *Forwarder) relay(w http.ResponseWriter, o *outcome, resp *http.Response
 func (f *Forwarder) upstreamRefused(w http.ResponseWriter, o *outcome, up Upstream, target string, code int) int {
 	if code == http.StatusProxyAuthRequired {
 		o.set(outcomeAuthFailed)
-		f.m.authRefusals.Inc()
 		f.setRefused(up, true)
 		http.Error(w, "firerunner proxy: the upstream proxy refused this host's credentials", http.StatusBadGateway)
 		return http.StatusBadGateway

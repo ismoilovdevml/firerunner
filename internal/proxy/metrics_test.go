@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -430,8 +431,65 @@ func TestKnownRefusedCredentialsCounted(t *testing.T) {
 	eventually(t, "three refusals", func() bool { return requestCounts(t, f)["tunnel/upstream_auth_failed"] == 3 })
 }
 
-// firerunner_proxy_upstream_auth_refusals_total counts the 407s the upstream
-// itself sent, not the requests the forwarder held back after one: two of
+// Requests already on their way when the first 407 comes each get a 407 of
+// their own; they are one refusal of the credentials, not several, or one
+// transient refusal under load would look like a refused retry.
+func TestConcurrentRefusalsCountOnce(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	asked := 0
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		asked++
+		mu.Unlock()
+		<-release
+		w.WriteHeader(http.StatusProxyAuthRequired)
+	}))
+	t.Cleanup(up.Close)
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	f, fwd, _ := startMetered(t, "http://bob:wrong@"+up.Listener.Addr().String(), nil, Limits{RefusedWait: time.Hour})
+	const n = 3
+	codes := make(chan int, n)
+	for range n {
+		go func() {
+			c, err := net.Dial("tcp", fwd)
+			if err != nil {
+				codes <- 0
+				return
+			}
+			defer c.Close()
+			_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+			fmt.Fprint(c, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+			resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodConnect})
+			if err != nil {
+				codes <- 0
+				return
+			}
+			codes <- resp.StatusCode
+		}()
+	}
+	eventually(t, "all CONNECTs at the upstream", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return asked == n
+	})
+	once.Do(func() { close(release) })
+	for range n {
+		if code := <-codes; code != http.StatusBadGateway {
+			t.Fatalf("refused CONNECT: %d, want 502", code)
+		}
+	}
+	if v, _ := series(t, f, "firerunner_proxy_upstream_auth_refusals_total", nil); v != 1 {
+		t.Fatalf("refusals after %d concurrent 407s: %v, want 1", n, v)
+	}
+	if got := requestCounts(t, f)["tunnel/upstream_auth_failed"]; got != n {
+		t.Fatalf("upstream_auth_failed %v, want %d", got, n)
+	}
+}
+
+// firerunner_proxy_upstream_auth_refusals_total counts refusals of the
+// credentials, not the requests the forwarder held back after one: two of
 // them are at least Limits.RefusedWait apart, the retry refused again, which
 // FireRunnerProxyUpstreamAuthFailing pages on. Plain requests count too.
 func TestUpstreamAuthRefusalsCounted(t *testing.T) {
