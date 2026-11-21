@@ -222,13 +222,19 @@ journalctl -u firerunner-registry-evict -u firerunner-registry-gc --since -1d
 A failed garbage collection fails `firerunner-registry-gc` (`systemctl --failed`); it is tried again
 the next day, and the eviction still keeps the file system under 90 %.
 
-The daemon's `firerunner_disk_*` metrics do not cover this file system. With node_exporter,
-`node_filesystem_avail_bytes{mountpoint="/var/lib/firerunner/registries"}` does. No alert rule
-covers it: the eviction keeps it under 90 %, and full only slows pulls.
+### Monitoring the mirrors
 
-`firerunner_service_up{service="firerunner-registry"}` (and the alert on it) reports
-`firerunner-registry`, which only starts the mirrors: it stays up while one mirror's service fails.
-Check them one by one with `systemctl list-units 'firerunner-registry*'`.
+- `firerunner_disk_free_bytes` and `firerunner_disk_size_bytes` with
+  `dir="/var/lib/firerunner/registries"` measure this file system while it is mounted (absent
+  otherwise: the directory is then on the root disk). Between 80 and 90 % in use is normal: that is
+  where the eviction keeps it, so [FireRunnerDiskFilling](#firerunnerdiskfilling) leaves it out and
+  [FireRunnerRegistryDiskFull](#firerunnerregistrydiskfull) warns only when the eviction fails.
+- `firerunner_service_up` reports `firerunner-registry` (which only starts the mirrors) and, for
+  every `<name>.env` in `/etc/firerunner/registries.d`, `firerunner-registry@<name>` and
+  `firerunner-registry-front@<name>`: one mirror that crash-loops is a 0 of its own, and
+  [FireRunnerCacheServiceDown](#firerunnercacheservicedown) fires for it. A mirror the installer
+  removes (its files go) loses its series. `firerunner status` and `firerunner doctor` list the
+  same units.
 
 ### Upgrading from the single service
 
@@ -290,7 +296,8 @@ failures FireRunner or the host caused, never for failing project scripts. Watch
   memory is full.
 - **Docker layer cache** row: builders against their slots, why builders were removed, and cache
   copies that fail or are skipped for lack of room.
-- **Disk free**: the saved builder caches and flintlock's microVM state.
+- **Disk free**: the saved builder caches, flintlock's microVM state and the registry mirrors' file
+  system (80 to 90 % in use is normal for that one: [Registry mirrors](#monitoring-the-mirrors)).
 - **Flintlock errors**: failed flintlock calls by RPC and gRPC code.
 - **Corporate proxy** row (hosts with `proxy.enabled`): what became of the forwarder's requests
   (*Proxy requests per second by outcome*), tunnels open, connections against their limits,
@@ -356,14 +363,16 @@ taken from GitLab.
 
 ### FireRunnerCacheServiceDown
 
-Warning. `firerunner-registry` (it starts the registry mirrors) or `firerunner-cache` (`cache:`
-storage) has been down for 10 minutes. Jobs still run, but pull from the registries directly
-(Docker Hub rate limits) or start without their `cache:`. One mirror's failing service does not
-fire it: see [Registry mirrors](#registry-mirrors).
+Warning. A registry mirror's unit (`firerunner-registry@<name>`, `firerunner-registry-front@<name>`),
+`firerunner-registry` (it starts them all) or `firerunner-cache` (`cache:` storage) has been down
+for 10 minutes. Jobs still run, but pull past that mirror from the registry itself (Docker Hub rate
+limits) or start without their `cache:`. See [Registry mirrors](#registry-mirrors).
 
-- Check: `journalctl -u <service> -n 100`; for the mirrors `systemctl list-units 'firerunner-registry*'`,
+- Check: `journalctl -u <service> -n 100`. For the mirrors: `systemctl list-units 'firerunner-registry*'`,
   `df -h /var/lib/firerunner/registries` and `systemctl status var-lib-firerunner-registries.mount`
-  (the mirrors do not start without their file system).
+  (the mirrors do not start without their file system). microVMs pull from the front: with it
+  down the mirror is unused even while its registry runs. For `cache:`:
+  `df -h /var/lib/firerunner/cache`.
 - Fix: `sudo systemctl start <service>` (`firerunner-registry` starts every mirror).
 - Recovered: *Services* shows it up, and `systemctl list-units 'firerunner-registry*'` shows every
   mirror and front `active`.
@@ -516,6 +525,33 @@ and flintlockd's microVM state can no longer be written. The registry mirrors ta
   `sudo firerunner builder rm --all` deletes every project's saved cache at once, so every next
   build is cold.
 - Recovered: *Disk free* is above 15 % of the file system.
+
+The registry mirrors' own file system (`/var/lib/firerunner/registries`) is left out: its eviction
+keeps it between 80 and 90 % in use. [FireRunnerRegistryDiskFull](#firerunnerregistrydiskfull)
+watches it.
+
+### FireRunnerRegistryDiskFull
+
+Warning. The registry mirrors' file system (`/var/lib/firerunner/registries`, see
+[Registry mirrors](#registry-mirrors)) has had less than 5 % free for 30 minutes. Its eviction runs
+every 10 minutes and deletes layers above 90 % in use down to 80 %, so it is failing. Jobs still
+run: what the mirrors cannot store, microVMs pull from the registries themselves (slower, Docker
+Hub rate limits).
+
+5 %, not 10: free is what the mirrors may still write, and ext4 on a disk of your own keeps 5 % for
+root by default, so 10 % free there is 85 % in use, below where the eviction starts. The installer's
+image keeps none.
+
+- Check: `systemctl list-timers 'firerunner-registry-*'` (is `firerunner-registry-evict.timer`
+  there?), `journalctl -u firerunner-registry-evict --since -1h` (an error, or `evicted the N layers
+  ...` still above 90 % in use: what is left is not layers it may delete, such as manifests),
+  `df -h /var/lib/firerunner/registries`, `sudo du -sh /var/lib/firerunner/registries/*` (which
+  mirror holds most).
+- Fix: `sudo systemctl start firerunner-registry-evict` runs it once now. Too small for what the
+  mirrors keep: run the installer again with a larger `FR_REGISTRY_GB` (it grows online), or grow
+  your own disk's file system.
+- Recovered: `df -h /var/lib/firerunner/registries` shows it back under 90 % in use, and the alert
+  resolves.
 
 ### FireRunnerBuildersFailing
 
