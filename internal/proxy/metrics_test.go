@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -83,7 +85,8 @@ func requestCounts(t *testing.T, f *Forwarder) map[string]float64 {
 	t.Helper()
 	out := map[string]float64{}
 	for _, kind := range []string{"tunnel", "request"} {
-		for _, o := range []string{"allowed", "policy_denied", "limit_refused", "upstream_auth_failed", "upstream_error", "upstream_refused", "bad_request"} {
+		for _, o := range []string{"allowed", "policy_denied", "limit_refused", "upstream_auth_failed", "upstream_error",
+			"upstream_refused", "bad_request", "client_gone", "internal_error", "stopping"} {
 			v, found := series(t, f, "firerunner_proxy_requests_total", map[string]string{"kind": kind, "outcome": o})
 			if !found {
 				t.Fatalf("firerunner_proxy_requests_total{kind=%q,outcome=%q} missing: every combination is created at start", kind, o)
@@ -125,6 +128,23 @@ func raw(req string) func(t *testing.T, fwd string) {
 	}
 }
 
+// brokenUpload announces a 100-byte body, sends 3 bytes and closes its side:
+// the forwarder cannot read the body, which is the client's failure.
+func brokenUpload(target string) func(t *testing.T, fwd string) {
+	return func(t *testing.T, fwd string) {
+		c, err := net.Dial("tcp", fwd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		u, _ := url.Parse(target)
+		fmt.Fprintf(c, "POST %s/up HTTP/1.1\r\nHost: %s\r\nContent-Length: 100\r\n\r\nabc", target, u.Host)
+		_ = c.(*net.TCPConn).CloseWrite()
+		_, _ = io.Copy(io.Discard, c) // whatever answer, until the forwarder closes
+	}
+}
+
 // Every request is counted once, by kind and by what became of it.
 func TestRequestOutcomesCounted(t *testing.T) {
 	right := "Basic " + base64.StdEncoding.EncodeToString([]byte("bob:right"))
@@ -162,6 +182,8 @@ func TestRequestOutcomesCounted(t *testing.T) {
 		{"upstream cannot reach the destination", "http://" + open.addr, nil, tunnelTo(dead), "tunnel/upstream_refused"},
 		{"origin-form request", "http://" + open.addr, nil, raw("GET /x HTTP/1.1\r\nHost: x\r\n\r\n"), "request/bad_request"},
 		{"CONNECT without a port", "http://" + open.addr, nil, raw("CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n"), "tunnel/bad_request"},
+		{"client breaks off its request body", "http://" + open.addr, nil, brokenUpload(web.URL), "request/client_gone"},
+		{"client breaks off an https:// upload", "http://" + open.addr, nil, brokenUpload("https://" + strings.TrimPrefix(web.URL, "http://")), "request/client_gone"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			f, fwd, _ := startMetered(t, c.upstream, c.policy, Limits{})
@@ -353,6 +375,61 @@ func TestUpstreamAuthFailingGauge(t *testing.T) {
 	}
 }
 
+// A tunnel the forwarder cannot take over from the HTTP server is its own
+// failure, not the client's: internal_error, 500.
+func TestTunnelWithoutHijackIsInternalError(t *testing.T) {
+	up := startUpstream(t, "")
+	f, _, _ := startMetered(t, "http://"+up.addr, nil, Limits{})
+	f.Allowed = func(net.IP) bool { return true } // httptest's client is 192.0.2.1
+	rec := httptest.NewRecorder()                 // not an http.Hijacker
+	f.ServeHTTP(rec, httptest.NewRequest(http.MethodConnect, echoServer(t), nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status %d, want 500", rec.Code)
+	}
+	if got := requestCounts(t, f); len(got) != 1 || got["tunnel/internal_error"] != 1 {
+		t.Fatalf("counted %v, want tunnel/internal_error once", got)
+	}
+}
+
+// Requests refused because the forwarder has cut everything on a stop count
+// as stopping, not as a connection limit.
+func TestRequestsAfterTheCutCountAsStopping(t *testing.T) {
+	up := startUpstream(t, "")
+	f := forwarderTo(t, "http://"+up.addr, 0)
+	_, stop, done := stoppable(t, f)
+	stop()
+	<-done
+	f.Allowed = func(net.IP) bool { return true }
+	rec := httptest.NewRecorder()
+	f.ServeHTTP(rec, httptest.NewRequest(http.MethodConnect, echoServer(t), nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d, want 503", rec.Code)
+	}
+	if got := requestCounts(t, f); len(got) != 1 || got["tunnel/stopping"] != 1 {
+		t.Fatalf("counted %v, want tunnel/stopping once", got)
+	}
+}
+
+// Requests the forwarder refuses itself because the upstream refused these
+// credentials a moment ago count as upstream_auth_failed too: sustained
+// traffic keeps the count rising though the upstream saw only one 407, which
+// FireRunnerProxyUpstreamAuthFailing relies on.
+func TestKnownRefusedCredentialsCounted(t *testing.T) {
+	up := startUpstream(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("bob:right")))
+	f, fwd, _ := startMetered(t, "http://bob:wrong@"+up.addr, nil, Limits{RefusedWait: time.Hour})
+	for i := 0; i < 3; i++ {
+		c, _, code := connect(t, fwd, "example.com:443")
+		c.Close()
+		if code != http.StatusBadGateway {
+			t.Fatalf("attempt %d: %d", i, code)
+		}
+	}
+	if n := len(up.requests()); n != 1 {
+		t.Fatalf("upstream asked %d times, want once", n)
+	}
+	eventually(t, "three refusals", func() bool { return requestCounts(t, f)["tunnel/upstream_auth_failed"] == 3 })
+}
+
 // Labels have a handful of fixed values: never a client address or a
 // destination, which would make a series per VM or per site.
 func TestMetricsLabelsAreBounded(t *testing.T) {
@@ -388,10 +465,10 @@ func TestMetricsLabelsAreBounded(t *testing.T) {
 		}
 	}
 	sort.Strings(names)
-	want := []string{"firerunner_proxy_active", "firerunner_proxy_bytes_total", "firerunner_proxy_connections",
-		"firerunner_proxy_connections_limit", "firerunner_proxy_requests_total", "firerunner_proxy_upstream_auth_failing",
-		"firerunner_proxy_upstream_connect_seconds", "firerunner_proxy_upstream_reloads_total"}
+	// MetricNames is the daemon's allow-list: it must name every family.
+	want := MetricNames()
+	sort.Strings(want)
 	if strings.Join(names, " ") != strings.Join(want, " ") {
-		t.Fatalf("metrics %v, want %v", names, want)
+		t.Fatalf("metrics %v, MetricNames %v", names, want)
 	}
 }

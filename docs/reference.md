@@ -107,7 +107,7 @@ Counters restart from 0 when the forwarder restarts.
 | `firerunner_proxy_connections` | gauge | `scope`: `microvms` (all together), `busiest_microvm` (the microVM holding most), `host` (host services on 127.0.0.1) | requests and tunnels holding a slot of that scope's limit |
 | `firerunner_proxy_connections_limit` | gauge | `scope` | the limit of each scope: 4096, 256, 1024; 0 is none. Past it requests get 503 (`limit_refused`) |
 | `firerunner_proxy_bytes_total` | counter | `direction`: `up` (to the corporate proxy), `down` | bytes carried, counted as they move: tunnels, and request and answer bodies without headers |
-| `firerunner_proxy_upstream_connect_seconds` | histogram | `step`: `dial` (TCP connect, every kind), `handshake` (the answer to CONNECT, tunnels) | time to reach the corporate proxy; failed dials are not observed (they count as `upstream_error`) |
+| `firerunner_proxy_upstream_connect_seconds` | histogram | `step`: `dial` (each new TCP connection to the upstream: one per tunnel and per `https://` request; plain `http://` requests reuse kept-alive connections), `handshake` (the answer to CONNECT, tunnels) | time to reach the corporate proxy; failed dials are not observed (they count as `upstream_error`) |
 | `firerunner_proxy_upstream_auth_failing` | gauge | | 1 from a 407 of the corporate proxy until it accepts the credentials again |
 | `firerunner_proxy_upstream_reloads_total` | counter | `result`: `ok`, `failed` | changes of the upstream file the forwarder took up (it reads the file for every request): `ok` a new address or password in use, `failed` the file became unusable (unreadable, wrong owner or mode, not a proxy URL, the forwarder itself), once until it is fixed |
 
@@ -115,12 +115,14 @@ Outcomes in `firerunner_proxy_requests_total`: `allowed` (the corporate proxy op
 or answered the request: its answer is passed on whatever its status), `policy_denied` (403: a
 client outside the bridge and loopback, or a destination the forwarder refuses: the host,
 microVMs, cloud metadata, `network.egress_deny`, a port not in `proxy.connect_ports`),
-`limit_refused` (503: a connection limit, or the forwarder stopping), `upstream_auth_failed`
+`limit_refused` (503: a connection limit), `upstream_auth_failed`
 (502: the corporate proxy answered 407, or refused these credentials less than 5 minutes ago so
 they were not sent), `upstream_error` (502: no usable upstream file, the corporate proxy
 unreachable or silent), `upstream_refused` (502: the corporate proxy answered CONNECT with another
 status: it blocks or cannot reach that site), `bad_request` (400: not a proxy request or a bad
-target).
+target), `client_gone` (the client broke off the body of its request before it was sent on),
+`internal_error` (500: the forwarder could not take the connection over for a tunnel),
+`stopping` (a request refused or cut by a stop of the forwarder, see `proxy.shutdown_timeout`).
 
 System failure reasons in `firerunner_jobs_total`: `admission_timeout` (no host memory for a
 microVM within `vm.boot_timeout`, or other admissions held the admission lock that long), `flintlock_error`, `vm_boot` (no DHCP lease or no SSH in time),

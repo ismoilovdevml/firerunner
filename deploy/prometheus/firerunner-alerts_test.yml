@@ -464,14 +464,24 @@ tests:
         summary: gitlab-runner is down on d3
         description: 'Jobs fail or are not picked up. Check: journalctl -u gitlab-runner -n 100; firerunner doctor.'
         runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerservicedown
-# Proxy credentials: p1 refused from 6m on -> critical after 10 more minutes.
-# p2 refused once, accepted again 5 minutes later (the retry) -> quiet.
+# Proxy credentials: p1 refused from 6m on while jobs keep asking -> critical after
+# 10 more minutes, and still at 40m. p2 refused once, accepted again 5 minutes later
+# (the retry) -> quiet. p3 refused once, then no request came: the gauge stays 1
+# but nothing is refused any more -> quiet.
 - interval: 1m
   input_series:
   - series: firerunner_proxy_upstream_auth_failing{instance="p1",job="firerunner"}
-    values: 0x5 1x30
+    values: 0x5 1x40
+  - series: firerunner_proxy_requests_total{instance="p1",job="firerunner",kind="tunnel",outcome="upstream_auth_failed"}
+    values: 0x5 1+3x40
   - series: firerunner_proxy_upstream_auth_failing{instance="p2",job="firerunner"}
-    values: 0x5 1x5 0x25
+    values: 0x5 1x5 0x35
+  - series: firerunner_proxy_requests_total{instance="p2",job="firerunner",kind="tunnel",outcome="upstream_auth_failed"}
+    values: 0x5 1+1x4 5x35
+  - series: firerunner_proxy_upstream_auth_failing{instance="p3",job="firerunner"}
+    values: 0x5 1x40
+  - series: firerunner_proxy_requests_total{instance="p3",job="firerunner",kind="request",outcome="upstream_auth_failed"}
+    values: 0x5 1x40
   alert_rule_test:
   - eval_time: 14m
     alertname: FireRunnerProxyUpstreamAuthFailing
@@ -479,14 +489,19 @@ tests:
   - eval_time: 20m
     alertname: FireRunnerProxyUpstreamAuthFailing
     exp_alerts:
-    - exp_labels:
+    - exp_labels: &auth_failing_p1
         severity: critical
         instance: p1
         job: firerunner
-      exp_annotations:
+      exp_annotations: &auth_failing_p1_annotations
         summary: The corporate proxy refuses the credentials of p1
         description: "Every pull, clone and download of jobs, builders, gitlab-runner and the registry mirrors through the proxy fails with 502 (hosts in proxy.no_proxy still work). The password in proxy.upstream_file (/etc/firerunner/proxy-upstream) expired or was changed, or the account is locked. Check: journalctl -u firerunner-proxy | grep 'refused the credentials'. Fix: sudoedit /etc/firerunner/proxy-upstream with the new password, %-encoded; the next request uses it, no restart. The forwarder sends refused credentials again only every 5 minutes, so it does not lock the account."
         runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxyupstreamauthfailing
+  - eval_time: 40m
+    alertname: FireRunnerProxyUpstreamAuthFailing
+    exp_alerts:
+    - exp_labels: *auth_failing_p1
+      exp_annotations: *auth_failing_p1_annotations
 # Upstream errors from 10m: p1 100 requests/min answered and 20 failed (17 %) -> warning.
 # p2 fails everything but only 5 in 10 minutes -> quiet. p3: the upstream blocks
 # half the sites (upstream_refused), none failed -> quiet.
@@ -518,6 +533,38 @@ tests:
         summary: 16.67% of proxied requests on p1 fail at the corporate proxy
         description: "The forwarder answers them 502: the corporate proxy is unreachable, does not answer within 15 s, or the upstream file is unusable. Jobs fail on pulls, clones and downloads, or are slow while retrying. Check: sudo firerunner doctor (upstream reachable, HTTPS through the proxy); journalctl -u firerunner-proxy | grep -E 'upstream proxy (unreachable|did not answer|did not take)|no upstream'. A new proxy address goes in /etc/firerunner/proxy-upstream (no restart)."
         runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxyupstreamerrors
+# Proxy metrics unread: m1's forwarder runs, its metrics are not read from 5m ->
+# warning after 10 more minutes. m2's forwarder is stopped (FireRunnerProxyDown's) ->
+# quiet. m3 is read -> quiet.
+- interval: 1m
+  input_series:
+  - series: firerunner_proxy_metrics_up{instance="m1",job="firerunner"}
+    values: 1x4 0x30
+  - series: firerunner_service_up{instance="m1",job="firerunner",service="firerunner-proxy"}
+    values: 1x35
+  - series: firerunner_proxy_metrics_up{instance="m2",job="firerunner"}
+    values: 0x35
+  - series: firerunner_service_up{instance="m2",job="firerunner",service="firerunner-proxy"}
+    values: 0x35
+  - series: firerunner_proxy_metrics_up{instance="m3",job="firerunner"}
+    values: 1x35
+  - series: firerunner_service_up{instance="m3",job="firerunner",service="firerunner-proxy"}
+    values: 1x35
+  alert_rule_test:
+  - eval_time: 13m
+    alertname: FireRunnerProxyMetricsMissing
+    exp_alerts: []
+  - eval_time: 20m
+    alertname: FireRunnerProxyMetricsMissing
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        instance: m1
+        job: firerunner
+      exp_annotations:
+        summary: The daemon on m1 cannot read the proxy forwarder's metrics
+        description: "FireRunnerProxyUpstreamAuthFailing, FireRunnerProxyUpstreamErrors and FireRunnerProxyAtLimit are blind on this host. Usually firerunner-proxy.service predates its metrics socket (a binary-only firerunner upgrade): it lacks RuntimeDirectory=firerunner-proxy, and journalctl -u firerunner-proxy says 'proxy metrics not exported'. Fix: run the installer again; it restarts the forwarder when no job runs. Check: sudo ls -l /run/firerunner-proxy/metrics.sock; journalctl -u firerunner | grep \"cannot read the forwarder's metrics\"."
+        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxymetricsmissing
 # Connection limits: p1's busiest microVM holds 230 of 256 (90 %) -> warning per scope.
 # p2's host services hold 1000 with no limit (0) and its microVMs 1000 of 4096 -> quiet.
 # p3 refused one request at 10m -> warning while it is in the last 10 minutes.

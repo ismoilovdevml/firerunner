@@ -474,7 +474,7 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		o.kind = kindTunnel
 	}
 	if !f.enter() {
-		o.set(outcomeLimitRefused)
+		o.set(outcomeStopping)
 		http.Error(w, "firerunner proxy: stopping", http.StatusServiceUnavailable)
 		return
 	}
@@ -585,7 +585,7 @@ func targetHostPort(target string, connect bool, scheme string) (string, int, er
 func (f *Forwarder) tunnel(w http.ResponseWriter, o *outcome, up Upstream, target string) (int, int64) {
 	upConn, err := f.dialUpstream(f.upstreamCtx, up.Addr)
 	if err != nil {
-		o.set(outcomeUpstreamError)
+		o.set(f.failedOutcome(nil))
 		f.Log.Warn("upstream proxy unreachable", "upstream", up.Addr, "err", err)
 		http.Error(w, "firerunner proxy: upstream proxy unreachable", http.StatusBadGateway)
 		return http.StatusBadGateway, 0
@@ -606,7 +606,7 @@ func (f *Forwarder) tunnel(w http.ResponseWriter, o *outcome, up Upstream, targe
 	}()
 	if err != nil {
 		_ = upConn.Close()
-		o.set(outcomeUpstreamError)
+		o.set(f.failedOutcome(nil))
 		f.Log.Warn("upstream proxy did not answer CONNECT", "upstream", up.Addr, "target", target, "err", err)
 		http.Error(w, "firerunner proxy: upstream proxy did not answer", http.StatusBadGateway)
 		return http.StatusBadGateway, 0
@@ -621,14 +621,14 @@ func (f *Forwarder) tunnel(w http.ResponseWriter, o *outcome, up Upstream, targe
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		_ = upConn.Close()
-		o.set(outcomeBadRequest)
+		o.set(outcomeInternalError)
 		http.Error(w, "firerunner proxy: cannot tunnel", http.StatusInternalServerError)
 		return http.StatusInternalServerError, 0
 	}
 	client, cbuf, err := hj.Hijack()
 	if err != nil {
 		_ = upConn.Close()
-		o.set(outcomeBadRequest)
+		o.set(outcomeInternalError)
 		return http.StatusInternalServerError, 0
 	}
 	o.set(outcomeAllowed)
@@ -714,14 +714,15 @@ func (f *Forwarder) forward(w http.ResponseWriter, r *http.Request, o *outcome, 
 	defer cancel()
 	out := r.Clone(ctx)
 	out.RequestURI = ""
-	out.Body = countBody(out.Body, f.m.bytesUp)
+	var clientFailed func() bool
+	out.Body, clientFailed = f.sendBody(out.Body)
 	removeHopHeaders(out.Header)
 	if up.Auth != "" {
 		out.Header.Set("Proxy-Authorization", up.Auth)
 	}
 	resp, err := f.transport.RoundTrip(out)
 	if err != nil {
-		o.set(outcomeUpstreamError)
+		o.set(f.failedOutcome(clientFailed))
 		f.Log.Warn("upstream proxy request failed", "upstream", up.Addr, "url", r.URL.Host, "err", err)
 		http.Error(w, "firerunner proxy: upstream proxy unreachable", http.StatusBadGateway)
 		return http.StatusBadGateway, 0
@@ -780,7 +781,7 @@ func (w idleWriter) Write(p []byte) (int, error) {
 func (f *Forwarder) passThrough(w http.ResponseWriter, r *http.Request, o *outcome, up Upstream) (int, int64) {
 	conn, err := f.dialUpstream(f.upstreamCtx, up.Addr)
 	if err != nil {
-		o.set(outcomeUpstreamError)
+		o.set(f.failedOutcome(nil))
 		f.Log.Warn("upstream proxy unreachable", "upstream", up.Addr, "err", err)
 		http.Error(w, "firerunner proxy: upstream proxy unreachable", http.StatusBadGateway)
 		return http.StatusBadGateway, 0
@@ -788,7 +789,8 @@ func (f *Forwarder) passThrough(w http.ResponseWriter, r *http.Request, o *outco
 	defer conn.Close()
 	defer f.track(func() { _ = conn.Close() })()
 	out := r.Clone(context.Background())
-	out.Body = countBody(out.Body, f.m.bytesUp)
+	var clientFailed func() bool
+	out.Body, clientFailed = f.sendBody(out.Body)
 	removeHopHeaders(out.Header)
 	if up.Auth != "" {
 		out.Header.Set("Proxy-Authorization", up.Auth)
@@ -798,7 +800,7 @@ func (f *Forwarder) passThrough(w http.ResponseWriter, r *http.Request, o *outco
 	// included, may take as long as it keeps moving: an upstream that takes
 	// nothing for HeaderWait is given up, like one that answers nothing.
 	if err := out.WriteProxy(idleWriter{conn: conn, idle: f.Limits.HeaderWait}); err != nil {
-		o.set(outcomeUpstreamError)
+		o.set(f.failedOutcome(clientFailed))
 		f.Log.Warn("upstream proxy did not take the request", "upstream", up.Addr, "url", r.URL.Host, "err", err)
 		http.Error(w, "firerunner proxy: upstream proxy unreachable", http.StatusBadGateway)
 		return http.StatusBadGateway, 0
@@ -810,7 +812,7 @@ func (f *Forwarder) passThrough(w http.ResponseWriter, r *http.Request, o *outco
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(conn), out)
 	if err != nil {
-		o.set(outcomeUpstreamError)
+		o.set(f.failedOutcome(nil))
 		f.Log.Warn("upstream proxy did not answer", "upstream", up.Addr, "url", r.URL.Host, "err", err)
 		http.Error(w, "firerunner proxy: upstream proxy did not answer", http.StatusBadGateway)
 		return http.StatusBadGateway, 0

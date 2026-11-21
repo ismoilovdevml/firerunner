@@ -3079,7 +3079,7 @@
       "id": 70,
       "type": "timeseries",
       "title": "Proxy requests per second by outcome",
-      "description": "Requests to the forwarder (firerunner-proxy) by outcome, tunnels and plain requests together. upstream_auth_failed: the corporate proxy refused the credentials (FireRunnerProxyUpstreamAuthFailing); upstream_error: unreachable or silent upstream, or an unusable upstream file (FireRunnerProxyUpstreamErrors); upstream_refused: the corporate proxy blocks or cannot reach the site; limit_refused: a connection limit (FireRunnerProxyAtLimit); policy_denied: a destination network.egress_deny or the host's own addresses refuse. Only hosts with proxy.enabled.",
+      "description": "Requests to the forwarder (firerunner-proxy) by outcome, tunnels and plain requests together. upstream_auth_failed: the corporate proxy refused the credentials (FireRunnerProxyUpstreamAuthFailing); upstream_error: unreachable or silent upstream, or an unusable upstream file (FireRunnerProxyUpstreamErrors); upstream_refused: the corporate proxy blocks or cannot reach the site; limit_refused: a connection limit (FireRunnerProxyAtLimit); policy_denied: a destination network.egress_deny or the host's own addresses refuse; client_gone: the client broke off its upload; stopping: refused or cut by a stop or restart of the forwarder. Only hosts with proxy.enabled.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3313,7 +3313,7 @@
       "id": 74,
       "type": "timeseries",
       "title": "Upstream connect time p50 / p95",
-      "description": "Time to reach the corporate proxy, the slowest host: dial is the TCP connect (every request and tunnel), handshake the proxy's answer to CONNECT. Buckets 5 ms, 25 ms, 100 ms, 250 ms, 1 s, 5 s, 15 s (the dial timeout).",
+      "description": "Time to reach the corporate proxy, the slowest host: dial is each new TCP connection to the upstream (one per tunnel and https:// request; plain http:// requests reuse kept-alive connections), handshake the proxy's answer to CONNECT. Buckets 5 ms, 25 ms, 100 ms, 250 ms, 1 s, 5 s, 15 s (the dial timeout).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

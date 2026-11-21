@@ -54,10 +54,15 @@ groups:
           description: "microVMs, builders, gitlab-runner, containerd-flintlock and the registry mirrors reach the outside through it: jobs fail on pulls, clones and downloads (hosts in proxy.no_proxy still work). Check: journalctl -u firerunner-proxy -n 100; firerunner doctor (a 407 means the upstream refused the credentials). Fix: systemctl start firerunner-proxy."
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxydown
       - alert: FireRunnerProxyUpstreamAuthFailing
-        # 1 from a 407 until the upstream accepts the credentials again. The
-        # forwarder retries refused credentials once after 5 minutes (when a
-        # request comes): a one-off refusal clears well within the 10 minutes.
-        expr: firerunner_proxy_upstream_auth_failing == 1
+        # The gauge is 1 from a 407 until the upstream accepts the credentials
+        # again, which only a request can show: on an idle host it stays 1
+        # after a one-off refusal. Requests refused for the credentials in
+        # the last 10 minutes (sent, or held back while the forwarder waits
+        # 5 minutes before trying them again) make it current.
+        expr: |
+          firerunner_proxy_upstream_auth_failing == 1
+          and on (instance)
+          sum by (instance) (increase(firerunner_proxy_requests_total{outcome="upstream_auth_failed"}[10m])) > 0
         for: 10m
         labels: {severity: critical}
         annotations:
@@ -80,6 +85,20 @@ groups:
           summary: "{{ $value | humanizePercentage }} of proxied requests on {{ $labels.instance }} fail at the corporate proxy"
           description: "The forwarder answers them 502: the corporate proxy is unreachable, does not answer within 15 s, or the upstream file is unusable. Jobs fail on pulls, clones and downloads, or are slow while retrying. Check: sudo firerunner doctor (upstream reachable, HTTPS through the proxy); journalctl -u firerunner-proxy | grep -E 'upstream proxy (unreachable|did not answer|did not take)|no upstream'. A new proxy address goes in /etc/firerunner/proxy-upstream (no restart)."
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxyupstreamerrors
+      - alert: FireRunnerProxyMetricsMissing
+        # The forwarder runs but the daemon cannot read its metrics: the
+        # other FireRunnerProxy* alerts cannot fire. A stopped forwarder is
+        # FireRunnerProxyDown's.
+        expr: |
+          firerunner_proxy_metrics_up == 0
+          unless on (instance)
+          firerunner_service_up{service="firerunner-proxy"} == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "The daemon on {{ $labels.instance }} cannot read the proxy forwarder's metrics"
+          description: "FireRunnerProxyUpstreamAuthFailing, FireRunnerProxyUpstreamErrors and FireRunnerProxyAtLimit are blind on this host. Usually firerunner-proxy.service predates its metrics socket (a binary-only firerunner upgrade): it lacks RuntimeDirectory=firerunner-proxy, and journalctl -u firerunner-proxy says 'proxy metrics not exported'. Fix: run the installer again; it restarts the forwarder when no job runs. Check: sudo ls -l /run/firerunner-proxy/metrics.sock; journalctl -u firerunner | grep \"cannot read the forwarder's metrics\"."
+          runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxymetricsmissing
       - alert: FireRunnerProxyAtLimit
         # The busiest microVM, all microVMs or the host services over 80 % of
         # their connection limit, or requests refused for it (503), which a

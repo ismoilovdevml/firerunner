@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"errors"
 	"io"
 	"net"
 	"net/http"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -24,6 +26,10 @@ const (
 	outcomePolicyDenied = "policy_denied"
 	// 503: the client, all microVMs or the host services hold their limit.
 	outcomeLimitRefused = "limit_refused"
+	// The forwarder is stopping: a request refused after the cut (503), or
+	// one the cut ended. Apart from the outcomes above so a restart is not
+	// read as a limit or an upstream failure.
+	outcomeStopping = "stopping"
 	// 502: the upstream answered 407, or refused these credentials within
 	// Limits.RefusedWait so they were not sent again.
 	outcomeAuthFailed = "upstream_auth_failed"
@@ -33,13 +39,26 @@ const (
 	// 407: it blocks or cannot reach that destination. Apart from
 	// upstream_error so a blocked site does not look like a broken upstream.
 	outcomeUpstreamRefused = "upstream_refused"
-	// 400: not a proxy request, a bad target, or the client went away before
-	// its tunnel opened.
+	// 400: not a proxy request or a bad target.
 	outcomeBadRequest = "bad_request"
+	// The client broke off the body of its request before the forwarder had
+	// sent it on: the upstream is not to blame.
+	outcomeClientGone = "client_gone"
+	// 500: the forwarder could not take the connection over for a tunnel.
+	outcomeInternalError = "internal_error"
 )
 
 var outcomes = [...]string{outcomeAllowed, outcomePolicyDenied, outcomeLimitRefused, outcomeAuthFailed,
-	outcomeUpstreamError, outcomeUpstreamRefused, outcomeBadRequest}
+	outcomeUpstreamError, outcomeUpstreamRefused, outcomeBadRequest, outcomeClientGone, outcomeInternalError,
+	outcomeStopping}
+
+// MetricNames are the names of every family Metrics gathers. The daemon
+// re-exports these and no others.
+func MetricNames() []string {
+	return []string{"firerunner_proxy_active", "firerunner_proxy_requests_total", "firerunner_proxy_bytes_total",
+		"firerunner_proxy_upstream_connect_seconds", "firerunner_proxy_upstream_reloads_total",
+		"firerunner_proxy_upstream_auth_failing", "firerunner_proxy_connections", "firerunner_proxy_connections_limit"}
+}
 
 // metrics are one Forwarder's. They have a registry of their own, without
 // the Go runtime collectors: the daemon re-exports every family under its
@@ -65,7 +84,8 @@ func newMetrics(f *Forwarder) *metrics {
 			Help: "Requests to the forwarder, by kind (tunnel, request) and outcome: allowed (the upstream opened the tunnel or answered), " +
 				"policy_denied (403), limit_refused (503), upstream_auth_failed (the upstream refused the credentials: 407), " +
 				"upstream_error (502: no usable upstream file, upstream unreachable or silent), " +
-				"upstream_refused (502: the upstream answered CONNECT with another status, it blocks or cannot reach that site), bad_request (400)."},
+				"upstream_refused (502: the upstream answered CONNECT with another status, it blocks or cannot reach that site), bad_request (400), " +
+				"client_gone (the client broke off its request body), internal_error (500), stopping (refused or cut by a stop of the forwarder)."},
 			[]string{"kind", "outcome"}),
 		reloads: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_proxy_upstream_reloads_total",
 			Help: "Changes of the upstream file the forwarder took up (it reads the file for every request), by result: " +
@@ -206,17 +226,66 @@ func (r countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// countingBody is countingReader for a request body, which must stay a
-// ReadCloser; a request without a body keeps http.NoBody so it is still sent
-// with no body rather than chunked.
-type countingBody struct {
-	countingReader
-	io.Closer
+// clientBody is a request body on its way to the upstream. What is read from
+// the client is counted as it moves, and a failed read is kept: a request
+// that fails because the client broke off its body is not the upstream's
+// failure. The transport reads it on a goroutine of its own.
+type clientBody struct {
+	r io.ReadCloser
+	c prometheus.Counter
+
+	mu  sync.Mutex
+	err error
 }
 
-func countBody(b io.ReadCloser, c prometheus.Counter) io.ReadCloser {
-	if b == nil || b == http.NoBody {
-		return b
+func (b *clientBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if n > 0 {
+		b.c.Add(float64(n))
 	}
-	return countingBody{countingReader{b, c}, b}
+	// A read after the transport closed the body (it does on a failed
+	// request) is not the client's doing.
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, http.ErrBodyReadAfterClose) {
+		b.mu.Lock()
+		if b.err == nil {
+			b.err = err
+		}
+		b.mu.Unlock()
+	}
+	return n, err
+}
+
+func (b *clientBody) Close() error { return b.r.Close() }
+
+func (b *clientBody) failed() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.err != nil
+}
+
+// sendBody wraps a request body for the upstream (see clientBody) and returns
+// the func that tells whether reading it from the client failed. A request
+// without a body keeps http.NoBody, so it is still sent with no body rather
+// than chunked.
+func (f *Forwarder) sendBody(b io.ReadCloser) (io.ReadCloser, func() bool) {
+	if b == nil || b == http.NoBody {
+		return b, func() bool { return false }
+	}
+	cb := &clientBody{r: b, c: f.m.bytesUp}
+	return cb, cb.failed
+}
+
+// failedOutcome tells why a request to the upstream failed: the client broke
+// off its body, the forwarder is cutting everything on a stop, or else the
+// upstream. The client's request context is not asked: a client that
+// half-closes after its request (busybox wget) cancels it and still waits
+// for the answer.
+func (f *Forwarder) failedOutcome(clientFailed func() bool) string {
+	switch {
+	case clientFailed != nil && clientFailed():
+		return outcomeClientGone
+	case f.upstreamCtx.Err() != nil:
+		return outcomeStopping
+	}
+	return outcomeUpstreamError
 }

@@ -400,13 +400,16 @@ work).
 
 ### FireRunnerProxyUpstreamAuthFailing
 
-Critical. Only on hosts with `proxy.enabled`. The corporate proxy has refused the credentials in
-`proxy.upstream_file` (`/etc/firerunner/proxy-upstream`) with a 407 for 10 minutes: the password
-expired or was changed, or the account is locked. Every pull, clone and download of jobs,
-builders, `gitlab-runner` and the registry mirrors through the proxy fails with 502; hosts in
-`proxy.no_proxy` still work. The forwarder sends refused credentials again only once every
-5 minutes, so it does not lock the account further; a one-off refusal clears at that retry,
-before the alert fires.
+Critical. Only on hosts with `proxy.enabled`. For 10 minutes the corporate proxy's last answer to
+the credentials in `proxy.upstream_file` (`/etc/firerunner/proxy-upstream`) has been a 407, and
+requests kept failing for it: the password expired or was changed, or the account is locked.
+Every pull, clone and download of jobs, builders, `gitlab-runner` and the registry mirrors through
+the proxy fails with 502; hosts in `proxy.no_proxy` still work. The forwarder sends refused
+credentials again only once every 5 minutes, so it does not lock the account further; requests in
+between are refused by the forwarder itself and count as `upstream_auth_failed` too. A one-off
+refusal clears at the next accepted request. On an idle host *credentials refused* can stay at 1
+after one, since only a request shows the credentials work again; the alert stays quiet then,
+because nothing was refused in the last 10 minutes.
 
 - Check: `journalctl -u firerunner-proxy | grep 'refused the credentials'`; *Upstream credentials
   and file* shows *credentials refused* at 1.
@@ -431,6 +434,23 @@ and jobs fail on pulls, clones and downloads. Sites the corporate proxy blocks
 - Fix: a new proxy address goes in `/etc/firerunner/proxy-upstream` (no restart). Otherwise the
   corporate proxy or the network to it is down: its owners fix it.
 - Recovered: `upstream_error` stays at 0 in *Proxy requests per second by outcome*.
+
+### FireRunnerProxyMetricsMissing
+
+Warning. Only on hosts with `proxy.enabled`. For 10 minutes `firerunner-proxy` has been running but
+the daemon could not read its metrics (`firerunner_proxy_metrics_up` 0), so
+[FireRunnerProxyUpstreamAuthFailing](#firerunnerproxyupstreamauthfailing),
+[FireRunnerProxyUpstreamErrors](#firerunnerproxyupstreamerrors) and
+[FireRunnerProxyAtLimit](#firerunnerproxyatlimit) cannot fire. A stopped forwarder is
+[FireRunnerProxyDown](#firerunnerproxydown) instead.
+
+- Check: `sudo ls -l /run/firerunner-proxy/metrics.sock`;
+  `journalctl -u firerunner-proxy | grep 'proxy metrics not exported'`;
+  `journalctl -u firerunner | grep "cannot read the forwarder's metrics"`.
+- Fix: usually the unit predates the metrics socket, after a binary-only `firerunner upgrade`:
+  it has no `RuntimeDirectory=firerunner-proxy`. Run the installer again; it rewrites the unit
+  and restarts the forwarder when no job runs.
+- Recovered: *metrics read* in *Upstream credentials and file* is back at 1.
 
 ### FireRunnerProxyAtLimit
 

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -122,7 +123,9 @@ func TestMetricsIncludeTheForwarders(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	requests := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "firerunner_proxy_requests_total", Help: "h"}, []string{"kind", "outcome"})
 	requests.WithLabelValues("tunnel", "allowed").Add(3)
-	reg.MustRegister(requests, collectors.NewGoCollector())
+	// A family the daemon does not know is not taken either.
+	unknown := prometheus.NewGauge(prometheus.GaugeOpts{Name: "firerunner_proxy_unknown", Help: "h"})
+	reg.MustRegister(requests, unknown, collectors.NewGoCollector())
 	forwarder := filepath.Join(dir, "fwd.sock")
 	serveSocket(t, forwarder, promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	// One that accepts and never answers.
@@ -136,7 +139,16 @@ func TestMetricsIncludeTheForwarders(t *testing.T) {
 	broken := filepath.Join(dir, "broken.sock")
 	serveSocket(t, broken, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		_, _ = io.WriteString(w, "# TYPE firerunner_proxy_x counter\nfirerunner_proxy_x 1\nfirerunner_proxy_x 2\n")
+		_, _ = io.WriteString(w, "# TYPE firerunner_proxy_upstream_auth_failing gauge\nfirerunner_proxy_upstream_auth_failing 1\nfirerunner_proxy_upstream_auth_failing 0\n")
+	}))
+	// One that sends more series of a family than the forwarder ever has.
+	flood := filepath.Join(dir, "flood.sock")
+	serveSocket(t, flood, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = io.WriteString(w, "# TYPE firerunner_proxy_active gauge\n")
+		for i := 0; i <= maxProxySeriesPerFamily; i++ {
+			_, _ = fmt.Fprintf(w, "firerunner_proxy_active{kind=\"k%d\"} 1\n", i)
+		}
 	}))
 
 	for _, c := range []struct {
@@ -149,13 +161,16 @@ func TestMetricsIncludeTheForwarders(t *testing.T) {
 	}{
 		{"proxy off", false, forwarder, nil, []string{"firerunner_proxy_"}, time.Second},
 		{"forwarder serving", true, forwarder,
-			[]string{`firerunner_proxy_requests_total{kind="tunnel",outcome="allowed"} 3`, "firerunner_proxy_metrics_up 1"}, nil, time.Second},
+			[]string{`firerunner_proxy_requests_total{kind="tunnel",outcome="allowed"} 3`, "firerunner_proxy_metrics_up 1"},
+			[]string{"firerunner_proxy_unknown"}, time.Second},
+		{"forwarder sends too many series", true, flood,
+			[]string{"firerunner_proxy_metrics_up 0"}, []string{"firerunner_proxy_active"}, time.Second},
 		{"forwarder not running", true, filepath.Join(dir, "missing.sock"),
 			[]string{"firerunner_proxy_metrics_up 0"}, []string{"firerunner_proxy_requests_total"}, time.Second},
 		{"forwarder hangs", true, hung,
 			[]string{"firerunner_proxy_metrics_up 0"}, nil, proxyMetricsTimeout + time.Second},
 		{"forwarder output inconsistent", true, broken,
-			[]string{"firerunner_proxy_metrics_up 0"}, []string{"firerunner_proxy_x"}, time.Second},
+			[]string{"firerunner_proxy_metrics_up 0"}, []string{"firerunner_proxy_upstream_auth_failing"}, time.Second},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			setProxy(c.on, c.socket)
