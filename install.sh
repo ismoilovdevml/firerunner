@@ -1796,6 +1796,8 @@ registry_storage() {
             warn "$UNIT_DIR/$REGISTRY_MOUNT_UNIT (the image an earlier run made) hides the /etc/fstab entry from systemd: once its data is copied, remove it (docs/operations.md, Registry mirrors > Storage)"
         fi
         mountpoint -q "$REGISTRY_DIR" || mount "$REGISTRY_DIR" || die "could not mount $REGISTRY_DIR (its /etc/fstab entry)"
+        # A remount of the image an earlier run left is moot: apply_pending would keep it for good.
+        if [[ -f $PENDING_FILE ]]; then sed -i "/^restart ${REGISTRY_MOUNT_UNIT//./\\.}\$/d" "$PENDING_FILE"; fi
     else
         registry_image
     fi
@@ -1867,7 +1869,11 @@ registry_remount() {
         sed -i "/^restart ${m//./\\.}\$/d" "$PENDING_FILE"
         PENDING=${PENDING//"$m "/}
     else
-        warn "  remounting $REGISTRY_DIR failed (journalctl -u $m): left for the next run"
+        # Pending in the file only (apply_pending keeps it for the next run):
+        # in PENDING it would hold back every other pending restart of this
+        # run, as if jobs ran.
+        PENDING=${PENDING//"$m "/}
+        warn "  remounting $REGISTRY_DIR failed (journalctl -u $m): the next run of the installer tries again"
         mountpoint -q "$REGISTRY_DIR" || systemctl start "$m" || true
     fi
     return 0
@@ -2209,15 +2215,23 @@ RUNTIME_UNIT_DIR=/run/systemd/system
 
 # registry_unmask_stale unmasks the mirrors a garbage collection masked and,
 # killed outright (SIGKILL: no trap ran), never unmasked: masked, every
-# `systemctl enable` of them fails and the mirror stays down. Only under
-# setup_registries' lock, when no garbage collection runs.
+# `systemctl enable` of them fails and the mirror stays down. Only the masks
+# gc recorded (REGISTRY_STATE_DIR/masked-NAME), never one an operator set.
+# Only under setup_registries' lock, when no garbage collection runs.
 registry_unmask_stale() {
-    local m unit
-    for m in "$RUNTIME_UNIT_DIR"/firerunner-registry@*.service; do
-        [[ -L $m && $(readlink "$m") == /dev/null ]] || continue
-        unit=$(basename "$m")
-        warn "  $unit was left masked by a garbage collection that was cut off: unmasking it"
-        systemctl unmask --runtime -q "$unit" || warn "  could not unmask $unit (systemctl unmask --runtime $unit)"
+    local f name unit
+    for f in "$REGISTRY_STATE_DIR"/masked-*; do
+        [[ -f $f ]] || continue
+        name=${f##*/masked-}
+        unit=firerunner-registry@$name.service
+        if [[ -L $RUNTIME_UNIT_DIR/$unit && $(readlink "$RUNTIME_UNIT_DIR/$unit") == /dev/null ]]; then
+            warn "  $unit was left masked by a garbage collection that was cut off: unmasking it"
+            if ! systemctl unmask --runtime -q "$unit"; then
+                warn "  could not unmask $unit (systemctl unmask --runtime $unit)"
+                continue
+            fi
+        fi
+        rm -f "$f"
     done
     return 0
 }
@@ -2424,8 +2438,9 @@ evict() {
     if ((want < 2 * largest)); then want=$((2 * largest)); fi
     # Never more than half the file system: on a small one, STOP_MIB or one
     # huge layer would otherwise empty every mirror at each fill.
+    local capped=0
     if ((want > size / 2)); then
-        echo "freeing $((size / 2 / 1024)) MiB, half the file system, not the $((want / 1024)) MiB wanted (STOP_MIB, or twice the largest layer, $((largest / 1024)) MiB): FR_REGISTRY_GB is small for these layers"
+        capped=$want
         want=$((size / 2))
     fi
     for b in "${blobs[@]}"; do
@@ -2441,6 +2456,9 @@ evict() {
         free=$((free + kb)) deleted=$((deleted + 1)) freed=$((freed + kb))
     done
     echo "evicted the $deleted layers read longest ago ($((freed / 1024)) MiB): about $((free / 1024)) of $((size / 1024)) MiB free, $((want / 1024)) MiB wanted"
+    if ((capped > 0 && deleted > 0)); then
+        echo "freed up to $((want / 1024)) MiB, half the file system, not the $((capped / 1024)) MiB wanted (STOP_MIB, or twice the largest layer, $((largest / 1024)) MiB): FR_REGISTRY_GB is small for these layers"
+    fi
     if ((failed > 0)); then
         echo "could not delete $failed layers, the first: $first" >&2
         return 1
@@ -2456,7 +2474,11 @@ unit="" started=0
 
 # restore_mirror: unmasks the mirror gc masked and starts it if it ran.
 restore_mirror() {
-    systemctl unmask --runtime -q "$unit" || echo "could not unmask $unit: systemctl unmask --runtime $unit" >&2
+    if systemctl unmask --runtime -q "$unit"; then
+        rm -f "$state/masked-${unit#firerunner-registry@}"
+    else
+        echo "could not unmask $unit: systemctl unmask --runtime $unit (the installer tries again)" >&2
+    fi
     if ((started)); then
         systemctl start "$unit" || echo "could not start $unit again" >&2
     fi
@@ -2498,6 +2520,9 @@ gc() {
         # SIGKILL (TimeoutStopSec, OOM) runs no trap: the installer unmasks
         # what a cut-off run left (registry_unmask_stale).
         trap restore_mirror EXIT
+        # Recorded first: the installer undoes this mask if no trap does,
+        # and never a mask an operator set.
+        touch "$state/masked-$name"
         systemctl mask --runtime -q "$unit"
         if ((started)); then
             systemctl stop "$unit"
