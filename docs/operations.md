@@ -214,9 +214,11 @@ Stop the upkeep's timers and services before an unmount: their `RequiresMountsFo
 again in the middle of `e2fsck` or `resize2fs`.
 
 ```bash
-# 1. stop the upkeep and the mirrors (the image stays mounted)
+# 1. stop the upkeep, then the mirrors (the image stays mounted). The upkeep first and on its
+#    own: a garbage collection stopped later would start its mirror again from its trap.
 sudo systemctl stop firerunner-registry-evict.timer firerunner-registry-gc.timer
-sudo systemctl stop firerunner-registry-evict firerunner-registry-gc firerunner-registry   # firerunner-registry stops every mirror
+sudo systemctl stop firerunner-registry-evict firerunner-registry-gc
+sudo systemctl stop firerunner-registry   # every mirror
 # 2. unmount the image
 sudo systemctl stop var-lib-firerunner-registries.mount
 # start again
@@ -235,8 +237,11 @@ sudo systemctl start firerunner-registry-evict.timer firerunner-registry-gc.time
     2. Stop (1 only: the image must stay mounted to copy from it), then copy:
        `sudo cp -a /var/lib/firerunner/registries/. /mnt/new/` and check it
        (`sudo du -s /var/lib/firerunner/registries /mnt/new`).
-    3. Unmount the image and remove its unit, which would hide the fstab entry from systemd:
-       `sudo systemctl disable --now var-lib-firerunner-registries.mount && sudo rm /etc/systemd/system/var-lib-firerunner-registries.mount && sudo systemctl daemon-reload`.
+    3. Unmount the image and remove its unit, which would hide the fstab entry from systemd, and
+       a remount of it an earlier run left pending (the installer would restart a unit that is
+       gone):
+       `sudo systemctl disable --now var-lib-firerunner-registries.mount && sudo rm /etc/systemd/system/var-lib-firerunner-registries.mount && sudo systemctl daemon-reload`,
+       then `sudo sed -i '/ var-lib-firerunner-registries\.mount$/d' /var/lib/firerunner/pending-restarts`.
     4. `sudo umount /mnt/new`, add the disk to `/etc/fstab` on `/var/lib/firerunner/registries`
        (with the same `context=` under SELinux), `sudo mount /var/lib/firerunner/registries`, and
        check the mirrors' data is there (`ls /var/lib/firerunner/registries`).
@@ -652,7 +657,7 @@ root by default. The installer's image keeps none.
 - Check: `systemctl list-timers 'firerunner-registry-*'` (is `firerunner-registry-evict.timer`
   there?), `journalctl -u firerunner-registry-evict --since -1h`: `could not delete N layers`
   (permissions, or SELinux: `ausearch -m avc -ts recent`), `still under the free space wanted`
-  (what is left is not layers it may delete, such as manifests), or `freeing ... half the file
+  (what is left is not layers it may delete, such as manifests), or `freed up to ... half the file
   system` (`FR_REGISTRY_GB` is small for the layers pulled: grow it). Then
   `df -h /var/lib/firerunner/registries` and `sudo du -sh /var/lib/firerunner/registries/*` (which
   mirror holds most).
