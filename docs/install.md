@@ -44,7 +44,7 @@ Options go before `bash`, for example `sudo FR_DISK=/dev/sdb bash`:
 | `FR_THIN_CHUNK` | `64K` | chunk size of a new thin pool: a VM's first write to a chunk copies or zeroes all of it; an existing pool keeps its size |
 | `FR_POOL_SIZE` | `FR_RUNNER_CONCURRENT` | pre-booted microVMs; given on a re-run, it replaces `pool.size` |
 | `FR_REGISTRY_MIRRORS` | `ghcr.io,quay.io,registry.k8s.io,mcr.microsoft.com` | registries mirrored on the host besides Docker Hub; remembered for later runs, `none` for none |
-| `FR_REGISTRY_GB` | `auto` | most the registry mirrors store, in a file system of their own on the root disk; `auto` is a fifth of the root file system, at least 5. A larger value grows an existing one online; a smaller one is not applied |
+| `FR_REGISTRY_GB` | `auto` | most the registry mirrors store, in a file system of their own on the root disk; `auto` is a fifth of the root file system, at least 5. Their eviction keeps 10 % or 1.5 GiB free at least, and frees up to 20 % and 3 GiB (at most half), so layers fill 2.5 to 3.5 GiB of 5, 7 to 8.5 GiB of 10, 80 to 90 % from 20 up ([Registry mirrors](operations.md#what-frees-space)). A larger value grows an existing one online; a smaller one is not applied |
 | `FR_VM_VCPU` | host CPUs / `FR_RUNNER_CONCURRENT`, 2 to 16 | vCPUs of each job microVM; given on a re-run, it replaces `vm.vcpu` |
 | `FR_VERSION` | `edge` | firerunner release to install: `edge` (the latest `main`), `latest` (the newest release) or a version tag |
 | `FR_ALLOW_UNSIGNED` | none | `1` installs v0.1.0 or v0.1.1, published before releases were signed. Every other release needs a valid signature |
