@@ -7,9 +7,9 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
+	"github.com/ismoilovdevml/firerunner/internal/proxy"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
@@ -31,6 +31,11 @@ const proxyMetricsTimeout = 2 * time.Second
 const maxProxyMetricsBytes = 1 << 20
 
 const proxyMetricsUp = "firerunner_proxy_metrics_up"
+
+// maxProxySeriesPerFamily caps the series of one re-exported family. The
+// forwarder's largest has 20 (2 kinds by 10 outcomes); a forwarder sending
+// more is broken, and its output must not grow the daemon's scrape.
+const maxProxySeriesPerFamily = 64
 
 // proxyGatherer gathers the forwarder's metrics within ctx (the scrape's)
 // when proxy.enabled: its firerunner_proxy_* families, and
@@ -58,8 +63,9 @@ func (d *Daemon) proxyGatherer(ctx context.Context) prometheus.Gatherer {
 }
 
 // readProxyMetrics fetches the forwarder's metric families from its socket.
-// Only firerunner_proxy_* families are kept, so none can clash with the
-// daemon's, and they must be consistent (no series twice) on their own.
+// Only the families proxy.MetricNames lists are kept, so none can clash with
+// the daemon's; each may have at most maxProxySeriesPerFamily series, and
+// they must be consistent (no series twice) on their own.
 func readProxyMetrics(ctx context.Context, socket string) ([]*dto.MetricFamily, error) {
 	ctx, cancel := context.WithTimeout(ctx, proxyMetricsTimeout)
 	defer cancel()
@@ -86,6 +92,10 @@ func readProxyMetrics(ctx context.Context, socket string) ([]*dto.MetricFamily, 
 		return nil, fmt.Errorf("forwarder metrics: %s", resp.Status)
 	}
 	dec := expfmt.NewDecoder(io.LimitReader(resp.Body, maxProxyMetricsBytes), expfmt.ResponseFormat(resp.Header))
+	known := map[string]bool{}
+	for _, name := range proxy.MetricNames() {
+		known[name] = true
+	}
 	var fams []*dto.MetricFamily
 	for {
 		mf := &dto.MetricFamily{}
@@ -94,9 +104,13 @@ func readProxyMetrics(ctx context.Context, socket string) ([]*dto.MetricFamily, 
 		} else if err != nil {
 			return nil, fmt.Errorf("forwarder metrics: %w", err)
 		}
-		if strings.HasPrefix(mf.GetName(), "firerunner_proxy_") && mf.GetName() != proxyMetricsUp {
-			fams = append(fams, mf)
+		if !known[mf.GetName()] {
+			continue
 		}
+		if n := len(mf.GetMetric()); n > maxProxySeriesPerFamily {
+			return nil, fmt.Errorf("forwarder metrics: %s has %d series, more than the %d it can have", mf.GetName(), n, maxProxySeriesPerFamily)
+		}
+		fams = append(fams, mf)
 	}
 	// Gatherers checks what it merges; an inconsistent family would fail the
 	// whole scrape there, so it is checked here, alone.
