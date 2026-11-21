@@ -54,20 +54,20 @@ groups:
           description: "microVMs, builders, gitlab-runner, containerd-flintlock and the registry mirrors reach the outside through it: jobs fail on pulls, clones and downloads (hosts in proxy.no_proxy still work). Check: journalctl -u firerunner-proxy -n 100; firerunner doctor (a 407 means the upstream refused the credentials). Fix: systemctl start firerunner-proxy."
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxydown
       - alert: FireRunnerProxyUpstreamAuthFailing
-        # The gauge is 1 from a 407 until the upstream accepts the credentials
-        # again, which only a request can show: on an idle host it stays 1
-        # after a one-off refusal. Requests refused for the credentials in
-        # the last 10 minutes (sent, or held back while the forwarder waits
-        # 5 minutes before trying them again) make it current.
+        # The upstream's own 407s: after one the forwarder holds requests back
+        # for 5 minutes, then tries the credentials again, so two in an hour
+        # mean the retry was refused too, however sparse the jobs are. One
+        # transient 407 on a host that then goes idle leaves the gauge at 1
+        # but never makes a second. The gauge drops the alert as soon as a
+        # request is accepted. No "for": the second 407 is the confirmation.
         expr: |
           firerunner_proxy_upstream_auth_failing == 1
           and on (instance)
-          sum by (instance) (increase(firerunner_proxy_requests_total{outcome="upstream_auth_failed"}[10m])) > 0
-        for: 10m
+          sum by (instance) (increase(firerunner_proxy_upstream_auth_refusals_total[1h])) >= 2
         labels: {severity: critical}
         annotations:
           summary: "The corporate proxy refuses the credentials of {{ $labels.instance }}"
-          description: "Every pull, clone and download of jobs, builders, gitlab-runner and the registry mirrors through the proxy fails with 502 (hosts in proxy.no_proxy still work). The password in proxy.upstream_file (/etc/firerunner/proxy-upstream) expired or was changed, or the account is locked. Check: journalctl -u firerunner-proxy | grep 'refused the credentials'. Fix: sudoedit /etc/firerunner/proxy-upstream with the new password, %-encoded; the next request uses it, no restart. The forwarder sends refused credentials again only every 5 minutes, so it does not lock the account."
+          description: "The corporate proxy refused the credentials again when the forwarder retried them (two 407s in the last hour, at least 5 minutes apart). Every pull, clone and download of jobs, builders, gitlab-runner and the registry mirrors through the proxy fails with 502 (hosts in proxy.no_proxy still work). The password in proxy.upstream_file (/etc/firerunner/proxy-upstream) expired or was changed, or the account is locked. Check: journalctl -u firerunner-proxy | grep 'refused the credentials'. Fix: sudoedit /etc/firerunner/proxy-upstream with the new password, %-encoded; the next request uses it, no restart. The forwarder sends refused credentials again only every 5 minutes, so it does not lock the account."
           runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxyupstreamauthfailing
       - alert: FireRunnerProxyUpstreamErrors
         # Requests that went for the upstream: opened or answered (allowed) or

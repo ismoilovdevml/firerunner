@@ -3380,7 +3380,7 @@
       "id": 75,
       "type": "timeseries",
       "title": "Upstream credentials and file",
-      "description": "credentials refused: 1 while the corporate proxy refuses the host's credentials (407). file changes: the upstream file took a new address or password (ok) or became unusable (failed). metrics read: 0 when the daemon could not read the forwarder's metrics (the other proxy panels are then empty).",
+      "description": "credentials refused: 1 while the corporate proxy refuses the host's credentials (407). 407s from the proxy: its own refusals; after one the forwarder holds requests back for 5 minutes, then tries again, so two mean the retry was refused too (FireRunnerProxyUpstreamAuthFailing). file changes: the upstream file took a new address or password (ok) or became unusable (failed). metrics read: 0 when the daemon could not read the forwarder's metrics (the other proxy panels are then empty).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3414,6 +3414,15 @@
           "refId": "C",
           "expr": "min(firerunner_proxy_metrics_up{instance=~\"$instance\"})",
           "legendFormat": "metrics read",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(increase(firerunner_proxy_upstream_auth_refusals_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "407s from the proxy",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"

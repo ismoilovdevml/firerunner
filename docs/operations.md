@@ -452,19 +452,22 @@ work).
 
 ### FireRunnerProxyUpstreamAuthFailing
 
-Critical. Only on hosts with `proxy.enabled`. For 10 minutes the corporate proxy's last answer to
-the credentials in `proxy.upstream_file` (`/etc/firerunner/proxy-upstream`) has been a 407, and
-requests kept failing for it: the password expired or was changed, or the account is locked.
-Every pull, clone and download of jobs, builders, `gitlab-runner` and the registry mirrors through
-the proxy fails with 502; hosts in `proxy.no_proxy` still work. The forwarder sends refused
-credentials again only once every 5 minutes, so it does not lock the account further; requests in
-between are refused by the forwarder itself and count as `upstream_auth_failed` too. A one-off
-refusal clears at the next accepted request. On an idle host *credentials refused* can stay at 1
-after one, since only a request shows the credentials work again; the alert stays quiet then,
-because nothing was refused in the last 10 minutes.
+Critical. Only on hosts with `proxy.enabled`. The corporate proxy refused the credentials in
+`proxy.upstream_file` (`/etc/firerunner/proxy-upstream`) with a 407, and refused them again when
+the forwarder retried them: two 407s in the last hour, and none accepted since. The password
+expired or was changed, or the account is locked. Every pull, clone and download of jobs,
+builders, `gitlab-runner` and the registry mirrors through the proxy fails with 502; hosts in
+`proxy.no_proxy` still work.
+
+After a 407 the forwarder holds requests back for 5 minutes without sending the credentials (so it
+does not lock the account further; they count as `upstream_auth_failed`), and the first request
+after that tries them again. Two 407s are therefore at least 5 minutes apart, and it pages
+however rarely jobs run, as long as two of them come within the hour. A one-off refusal on a host
+that then goes idle leaves *credentials refused* at 1 (only a request shows the credentials work
+again) but makes no second 407, so it stays quiet.
 
 - Check: `journalctl -u firerunner-proxy | grep 'refused the credentials'`; *Upstream credentials
-  and file* shows *credentials refused* at 1.
+  and file* shows *credentials refused* at 1 and *407s from the proxy*.
 - Fix: `sudoedit /etc/firerunner/proxy-upstream` with the new password, %-encoded (see
   [A proxy with a password](corporate-network.md#a-proxy-with-a-password)). The next request uses
   it, no restart; *file changes ok* counts it.

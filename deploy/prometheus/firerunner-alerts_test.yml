@@ -464,44 +464,81 @@ tests:
         summary: gitlab-runner is down on d3
         description: 'Jobs fail or are not picked up. Check: journalctl -u gitlab-runner -n 100; firerunner doctor.'
         runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerservicedown
-# Proxy credentials: p1 refused from 6m on while jobs keep asking -> critical after
-# 10 more minutes, and still at 40m. p2 refused once, accepted again 5 minutes later
-# (the retry) -> quiet. p3 refused once, then no request came: the gauge stays 1
-# but nothing is refused any more -> quiet.
+# Proxy credentials refused from 10m on; a job asks every 8, 12 or 30 minutes
+# (e8, e12, e30). Each ask after 5 minutes is the forwarder's retry, refused again:
+# a 407 from the upstream each time -> critical from the second 407 on, and still at
+# 110m. burst: one 407 at 10m (the requests right after it are held back, not
+# 407s), then no request: the gauge stays 1 -> quiet. recovered: 407s at 10m and
+# 18m -> critical, then a request is accepted at 25m -> quiet.
 - interval: 1m
   input_series:
-  - series: firerunner_proxy_upstream_auth_failing{instance="p1",job="firerunner"}
-    values: 0x5 1x40
-  - series: firerunner_proxy_requests_total{instance="p1",job="firerunner",kind="tunnel",outcome="upstream_auth_failed"}
-    values: 0x5 1+3x40
-  - series: firerunner_proxy_upstream_auth_failing{instance="p2",job="firerunner"}
-    values: 0x5 1x5 0x35
-  - series: firerunner_proxy_requests_total{instance="p2",job="firerunner",kind="tunnel",outcome="upstream_auth_failed"}
-    values: 0x5 1+1x4 5x35
-  - series: firerunner_proxy_upstream_auth_failing{instance="p3",job="firerunner"}
-    values: 0x5 1x40
-  - series: firerunner_proxy_requests_total{instance="p3",job="firerunner",kind="request",outcome="upstream_auth_failed"}
-    values: 0x5 1x40
+  - series: firerunner_proxy_upstream_auth_failing{instance="e8",job="firerunner"}
+    values: 0x9 1x110
+  - series: firerunner_proxy_upstream_auth_refusals_total{instance="e8",job="firerunner"}
+    values: 0x9 1x7 2x7 3x7 4x7 5x7 6x7 7x7 8x7 9x7 10x7 11x7 12x7 13x7 14x7
+  - series: firerunner_proxy_upstream_auth_failing{instance="e12",job="firerunner"}
+    values: 0x9 1x110
+  - series: firerunner_proxy_upstream_auth_refusals_total{instance="e12",job="firerunner"}
+    values: 0x9 1x11 2x11 3x11 4x11 5x11 6x11 7x11 8x11 9x11
+  - series: firerunner_proxy_upstream_auth_failing{instance="e30",job="firerunner"}
+    values: 0x9 1x110
+  - series: firerunner_proxy_upstream_auth_refusals_total{instance="e30",job="firerunner"}
+    values: 0x9 1x29 2x29 3x29 4x20
+  - series: firerunner_proxy_upstream_auth_failing{instance="burst",job="firerunner"}
+    values: 0x9 1x110
+  - series: firerunner_proxy_upstream_auth_refusals_total{instance="burst",job="firerunner"}
+    values: 0x9 1x110
+  - series: firerunner_proxy_requests_total{instance="burst",job="firerunner",kind="tunnel",outcome="upstream_auth_failed"}
+    values: 0x9 1+10x3 31x106
+  - series: firerunner_proxy_upstream_auth_failing{instance="recovered",job="firerunner"}
+    values: 0x9 1x15 0x95
+  - series: firerunner_proxy_upstream_auth_refusals_total{instance="recovered",job="firerunner"}
+    values: 0x9 1x7 2x102
   alert_rule_test:
-  - eval_time: 14m
+  - eval_time: 15m
     alertname: FireRunnerProxyUpstreamAuthFailing
     exp_alerts: []
   - eval_time: 20m
     alertname: FireRunnerProxyUpstreamAuthFailing
     exp_alerts:
-    - exp_labels: &auth_failing_p1
-        severity: critical
-        instance: p1
-        job: firerunner
-      exp_annotations: &auth_failing_p1_annotations
-        summary: The corporate proxy refuses the credentials of p1
-        description: "Every pull, clone and download of jobs, builders, gitlab-runner and the registry mirrors through the proxy fails with 502 (hosts in proxy.no_proxy still work). The password in proxy.upstream_file (/etc/firerunner/proxy-upstream) expired or was changed, or the account is locked. Check: journalctl -u firerunner-proxy | grep 'refused the credentials'. Fix: sudoedit /etc/firerunner/proxy-upstream with the new password, %-encoded; the next request uses it, no restart. The forwarder sends refused credentials again only every 5 minutes, so it does not lock the account."
-        runbook_url: https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxyupstreamauthfailing
-  - eval_time: 40m
+    - exp_labels: {severity: critical, instance: e8, job: firerunner}
+      exp_annotations:
+        summary: The corporate proxy refuses the credentials of e8
+        description: &auth_failing_description "The corporate proxy refused the credentials again when the forwarder retried them (two 407s in the last hour, at least 5 minutes apart). Every pull, clone and download of jobs, builders, gitlab-runner and the registry mirrors through the proxy fails with 502 (hosts in proxy.no_proxy still work). The password in proxy.upstream_file (/etc/firerunner/proxy-upstream) expired or was changed, or the account is locked. Check: journalctl -u firerunner-proxy | grep 'refused the credentials'. Fix: sudoedit /etc/firerunner/proxy-upstream with the new password, %-encoded; the next request uses it, no restart. The forwarder sends refused credentials again only every 5 minutes, so it does not lock the account."
+        runbook_url: &auth_failing_runbook https://github.com/ismoilovdevml/firerunner/blob/main/docs/operations.md#firerunnerproxyupstreamauthfailing
+    - exp_labels: {severity: critical, instance: recovered, job: firerunner}
+      exp_annotations:
+        summary: The corporate proxy refuses the credentials of recovered
+        description: *auth_failing_description
+        runbook_url: *auth_failing_runbook
+  - eval_time: 30m
     alertname: FireRunnerProxyUpstreamAuthFailing
     exp_alerts:
-    - exp_labels: *auth_failing_p1
-      exp_annotations: *auth_failing_p1_annotations
+    - exp_labels: {severity: critical, instance: e8, job: firerunner}
+      exp_annotations: &auth_failing_e8
+        summary: The corporate proxy refuses the credentials of e8
+        description: *auth_failing_description
+        runbook_url: *auth_failing_runbook
+    - exp_labels: {severity: critical, instance: e12, job: firerunner}
+      exp_annotations: &auth_failing_e12
+        summary: The corporate proxy refuses the credentials of e12
+        description: *auth_failing_description
+        runbook_url: *auth_failing_runbook
+  - eval_time: 45m
+    alertname: FireRunnerProxyUpstreamAuthFailing
+    exp_alerts: &auth_failing_all
+    - exp_labels: {severity: critical, instance: e8, job: firerunner}
+      exp_annotations: *auth_failing_e8
+    - exp_labels: {severity: critical, instance: e12, job: firerunner}
+      exp_annotations: *auth_failing_e12
+    - exp_labels: {severity: critical, instance: e30, job: firerunner}
+      exp_annotations:
+        summary: The corporate proxy refuses the credentials of e30
+        description: *auth_failing_description
+        runbook_url: *auth_failing_runbook
+  - eval_time: 110m
+    alertname: FireRunnerProxyUpstreamAuthFailing
+    exp_alerts: *auth_failing_all
 # Upstream errors from 10m: p1 100 requests/min answered and 20 failed (17 %) -> warning.
 # p2 fails everything but only 5 in 10 minutes -> quiet. p3: the upstream blocks
 # half the sites (upstream_refused), none failed -> quiet.

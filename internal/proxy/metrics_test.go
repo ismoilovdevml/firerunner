@@ -430,6 +430,49 @@ func TestKnownRefusedCredentialsCounted(t *testing.T) {
 	eventually(t, "three refusals", func() bool { return requestCounts(t, f)["tunnel/upstream_auth_failed"] == 3 })
 }
 
+// firerunner_proxy_upstream_auth_refusals_total counts the 407s the upstream
+// itself sent, not the requests the forwarder held back after one: two of
+// them are at least Limits.RefusedWait apart, the retry refused again, which
+// FireRunnerProxyUpstreamAuthFailing pages on. Plain requests count too.
+func TestUpstreamAuthRefusalsCounted(t *testing.T) {
+	up := startUpstream(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("bob:right")))
+	web := origin(t)
+	const wait = 300 * time.Millisecond
+	f, fwd, _ := startMetered(t, "http://bob:wrong@"+up.addr, nil, Limits{RefusedWait: wait})
+	refusals := func() float64 {
+		v, found := series(t, f, "firerunner_proxy_upstream_auth_refusals_total", nil)
+		if !found {
+			t.Fatal("no firerunner_proxy_upstream_auth_refusals_total")
+		}
+		return v
+	}
+	if refusals() != 0 {
+		t.Fatal("refusals before any request")
+	}
+	tunnel := func() {
+		c, _, code := connect(t, fwd, "example.com:443")
+		c.Close()
+		if code != http.StatusBadGateway {
+			t.Fatalf("CONNECT with refused credentials: %d", code)
+		}
+	}
+	tunnel() // the upstream's 407
+	tunnel() // held back: not sent
+	tunnel()
+	if r := refusals(); r != 1 {
+		t.Fatalf("refusals after one 407 and two held back: %v, want 1", r)
+	}
+	time.Sleep(wait + 100*time.Millisecond)
+	resp, err := client(fwd).Get(web.URL) // the retry, as a plain request
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if r, n := refusals(), len(up.requests()); r != 2 || n != 2 {
+		t.Fatalf("after the retry was refused: %v refusals, upstream asked %d times; want 2, 2", r, n)
+	}
+}
+
 // Labels have a handful of fixed values: never a client address or a
 // destination, which would make a series per VM or per site.
 func TestMetricsLabelsAreBounded(t *testing.T) {
