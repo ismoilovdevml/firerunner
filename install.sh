@@ -2457,7 +2457,7 @@ EOF
 cache_clean_script() {
     cat <<'EOF'
 #!/bin/bash
-# cache-clean.sh DAYS MAX_GB: deletes cache: archives not written for DAYS
+# firerunner-cache-clean DAYS MAX_GB: deletes cache: archives not written for DAYS
 # days, then the oldest ones until the cache takes at most MAX_GB (auto: a
 # fifth of the file system it is on), so jobs cannot fill the host's disk.
 set -euo pipefail
@@ -2574,14 +2574,17 @@ CapabilityBoundingSet=
 [Install]
 WantedBy=multi-user.target
 EOF
-    cache_clean_script | put "$LIB_DIR/cache-clean.sh" 0755
+    # In BIN_DIR (bin_t), not LIB_DIR (lib_t): under SELinux a lib_t script
+    # runs in init_t, which may not rmdir the cache's emptied directories.
+    cache_clean_script | put "$BIN_DIR/firerunner-cache-clean" 0755
+    rm -f "$LIB_DIR/cache-clean.sh"
     put /etc/systemd/system/firerunner-cache-clean.service <<EOF
 [Unit]
 Description=Delete FireRunner cache: archives older than ${FR_CACHE_DAYS} days, then the oldest above the size cap
 
 [Service]
 Type=oneshot
-ExecStart=${LIB_DIR}/cache-clean.sh ${FR_CACHE_DAYS} ${FR_CACHE_MAX_GB}
+ExecStart=${BIN_DIR}/firerunner-cache-clean ${FR_CACHE_DAYS} ${FR_CACHE_MAX_GB}
 User=${CACHE_USER}
 Group=${CACHE_USER}
 NoNewPrivileges=yes
@@ -2911,7 +2914,7 @@ uninstall() {
         rm -f "$BIN_DIR/gitlab-runner"
     fi
     systemctl disable --now -q firerunner-cache-clean.timer 2>/dev/null || true
-    rm -f /etc/systemd/system/firerunner-cache-clean.{service,timer}
+    rm -f /etc/systemd/system/firerunner-cache-clean.{service,timer} "$BIN_DIR/firerunner-cache-clean"
     # The registry mirrors, their upkeep and their file system (its image stays).
     systemctl disable --now -q firerunner-registry-evict.timer firerunner-registry-gc.timer 2>/dev/null || true
     systemctl stop 'firerunner-registry-front@*' 'firerunner-registry@*' 2>/dev/null || true
