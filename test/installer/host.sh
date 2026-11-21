@@ -232,6 +232,7 @@ systemctl() {
     case $1 in
         is-active)  [[ -f $R/active/${*: -1} ]] ;;
         is-enabled) [[ -f $R/enabled/${*: -1} ]] ;;
+        restart)    [[ ! -f $R/fail-${*: -1} ]] ;;   # fails while $R/fail-UNIT exists
         *)          return 0 ;;
     esac
 }
@@ -259,6 +260,8 @@ expect "...into a directory of its own" grep -qx "    rootdirectory: $REGISTRY_D
 expect "...that the ttl may delete from" grep -qx '    enabled: true' "$y/docker.io.yml"
 expect "ghcr.io: 127.0.0.1:15001, pulling from ghcr.io" grep -qx '  addr: 127.0.0.1:15001' "$y/ghcr.io.yml"
 expect "...from ghcr.io" grep -qx '  remoteurl: https://ghcr.io' "$y/ghcr.io.yml"
+expect "registry_files writes no front settings (the daemon watches the front of every .env)" test ! -e "$y/ghcr.io.env" -a ! -e "$y/docker.io.env"
+registry_front_env ghcr.io >/dev/null 2>&1; registry_front_env docker.io >/dev/null 2>&1
 expect "ghcr.io's front on the bridge port microVMs use (5001)" grep -qx 'FR_FRONT_LISTEN=10.200.0.1:5001' "$y/ghcr.io.env"
 expect "...in front of its registry" grep -qx 'FR_FRONT_UPSTREAM=http://127.0.0.1:15001' "$y/ghcr.io.env"
 expect "Docker Hub's front on 5000, as before" grep -qx 'FR_FRONT_LISTEN=10.200.0.1:5000' "$y/docker.io.env"
@@ -288,7 +291,10 @@ CHANGED=" "; REGISTRY_FRONT=0
 registry_files >/dev/null 2>&1
 expect "without registry-front: each registry on its bridge port, as before" grep -qx '  addr: 10.200.0.1:5000' "$y/docker.io.yml"
 expect "...and its config changed (it restarts)" changed "$y/docker.io.yml"
-FR_REGISTRY_MIRRORS=none REGISTRY_FRONT=1
+expect "...no front settings left (no front runs)" test ! -e "$y/docker.io.env" -a ! -e "$y/ghcr.io.env"
+REGISTRY_FRONT=1
+registry_files >/dev/null 2>&1; registry_front_env ghcr.io >/dev/null 2>&1; registry_front_env docker.io >/dev/null 2>&1
+FR_REGISTRY_MIRRORS=none
 registry_files >/dev/null 2>&1
 expect "a dropped mirror's config and front settings are removed" test ! -e "$y/ghcr.io.yml" -a ! -e "$y/ghcr.io.env"
 expect "...Docker Hub's stay" test -f "$y/docker.io.yml" -a -f "$y/docker.io.env"
@@ -371,11 +377,12 @@ expect "...a registry before its front" test "$(line_of 'restart firerunner-regi
 expect "...then firerunner-registry started, not restarted" bash -c "grep -qx 'start firerunner-registry' '$SC_LOG' && ! grep -qx 'restart firerunner-registry' '$SC_LOG'"
 # Jobs run; docker.io's registry runs with a changed config (moving off the bridge port), its front is new.
 touch "$R/active/firerunner-registry@docker.io" "$R/jobs-running"
-CHANGED=" $y/docker.io.yml " PENDING=""; rm -f "$PENDING_FILE"; : > "$SC_LOG"
+CHANGED=" $y/docker.io.yml " PENDING=""; rm -f "$PENDING_FILE" "$y/docker.io.env"; : > "$SC_LOG"
 registry_start >/dev/null 2>&1
 expect "jobs running: a changed registry is not restarted" ! grep -qx 'restart firerunner-registry@docker.io' "$SC_LOG"
 expect "...nor its new front started (the registry may hold its port)" ! grep -qx 'restart firerunner-registry-front@docker.io' "$SC_LOG"
 expect "...nor even enabled (firerunner-registry would start it)" ! grep -qx 'enable -q firerunner-registry-front@docker.io' "$SC_LOG"
+expect "...nor its settings written (the daemon would report a front that cannot run yet)" test ! -e "$y/docker.io.env"
 expect "...both wait, the registry first" test "$(grep 'docker.io' "$PENDING_FILE" | tr '\n' ' ')" = "restart firerunner-registry@docker.io restart firerunner-registry-front@docker.io "
 expect "...a mirror that did not run starts now" grep -qx 'restart firerunner-registry-front@ghcr.io' "$SC_LOG"
 # The next run, when no job runs, with nothing changed since: the restart left
@@ -387,7 +394,48 @@ expect "idle again: the registry's left restart is done" grep -qx 'restart firer
 expect "...before its front is enabled" test "$(line_of 'restart firerunner-registry@docker.io')" -lt "$(line_of 'enable -q firerunner-registry-front@docker.io')"
 expect "...and started" test "$(line_of 'enable -q firerunner-registry-front@docker.io')" -lt "$(line_of 'restart firerunner-registry-front@docker.io')"
 expect "...nothing left pending for docker.io" ! grep -q 'docker.io' "$PENDING_FILE"
+expect "...its front settings written with it" grep -qx 'FR_FRONT_LISTEN=10.200.0.1:5000' "$y/docker.io.env"
 expect "...a running mirror with nothing changed is left alone" ! grep -q 'restart firerunner-registry.*@ghcr.io' "$SC_LOG"
+
+# A mirror dropped from FR_REGISTRY_MIRRORS takes its pending restarts along:
+# apply_pending would start units whose config is gone.
+printf 'restart firerunner-registry@quay.io\nrestart firerunner-registry-front@quay.io\nrestart containerd-flintlock\nrestart firerunner-registry@ghcr.io\n' > "$PENDING_FILE"
+pending_drop_unused >/dev/null 2>&1
+expect "a dropped mirror's pending restarts are dropped" ! grep -q 'quay.io' "$PENDING_FILE"
+expect "...the others kept, in order" test "$(tr '\n' ' ' < "$PENDING_FILE")" = "restart containerd-flintlock restart firerunner-registry@ghcr.io "
+
+# A mask a garbage collection killed outright (SIGKILL) left: every enable of
+# the mirror would fail. Only masks (links to /dev/null) are undone.
+RUNTIME_UNIT_DIR=$R/run; mkdir -p "$RUNTIME_UNIT_DIR"
+ln -sfn /dev/null "$RUNTIME_UNIT_DIR/firerunner-registry@ghcr.io.service"
+echo '[Service]' > "$RUNTIME_UNIT_DIR/firerunner-registry@docker.io.service"
+: > "$SC_LOG"; registry_unmask_stale >/dev/null 2>&1
+expect "a stale mask is undone" grep -qx 'unmask --runtime -q firerunner-registry@ghcr.io.service' "$SC_LOG"
+expect "...a runtime unit that is not a mask is left alone" ! grep -q 'docker.io' "$SC_LOG"
+
+# The mirrors' mount: new options remount it when no job runs, pending until it succeeds.
+mountpoint() { [[ -f $R/mounted ]]; }
+: > "$REGISTRY_IMG"; touch "$R/mounted"; rm -f "$UNIT_DIR/$REGISTRY_MOUNT_UNIT" "$PENDING_FILE"
+M=$REGISTRY_MOUNT_UNIT
+touch "$R/jobs-running"; CHANGED=" " PENDING=""; : > "$SC_LOG"
+registry_image >/dev/null 2>&1
+expect "remount: new options while jobs run wait" ! grep -qx "restart $M" "$SC_LOG"
+expect "...pending" grep -qx "restart $M" "$PENDING_FILE"
+rm -f "$R/jobs-running"; CHANGED=" " PENDING=""; : > "$SC_LOG"
+registry_image >/dev/null 2>&1
+expect "remount: done in the next run when no job runs (unit unchanged, pending)" grep -qx "restart $M" "$SC_LOG"
+expect "...no longer pending" ! grep -q "$M" "$PENDING_FILE"
+pending_add "restart $M" >/dev/null; touch "$R/fail-$M"; PENDING=""; : > "$SC_LOG"
+registry_image >/dev/null 2>&1
+expect "remount that fails (busy) stays pending for the next run" grep -qx "restart $M" "$PENDING_FILE"
+expect "...and says so" test "$PENDING" = "$M "
+rm -f "$R/fail-$M"
+printf 'restart %s\nrestart containerd-flintlock\n' "$M" > "$PENDING_FILE"; : > "$SC_LOG"
+apply_pending >/dev/null 2>&1
+expect "apply_pending leaves the remount to setup_registries' lock" ! grep -qx "restart $M" "$SC_LOG"
+expect "...keeps it pending" grep -qx "restart $M" "$PENDING_FILE"
+expect "...and does the rest" grep -qx 'restart containerd-flintlock' "$SC_LOG"
+unset -f mountpoint; rm -f "$PENDING_FILE"
 
 # The forwarder stays while a mirror's restart (through it) is pending.
 printf 'restart firerunner-registry@ghcr.io\n' > "$PENDING_FILE"; : > "$SC_LOG"; PENDING=""
@@ -427,10 +475,11 @@ expect "drained: an upgraded gitlab-runner is installed, not started" upgrade_ke
 # ---- registry upkeep: eviction and garbage collection (firerunner-registry-maint)
 registry_maint_script > "$WORK/registry-maint.sh"
 S=$WORK/store
-# blob STORE DIGEST ATIME: a 64 KiB blob last read at ATIME.
+LOCK=$WORK/maint.lock; : > "$LOCK"   # what the installer makes in REGISTRY_STATE_DIR
+# blob STORE DIGEST ATIME [N]: an N x 64 KiB blob (default 1) last read at ATIME.
 blob() {
     local d=$S/$1/docker/registry/v2/blobs/sha256/${2:0:2}/$2
-    mkdir -p "$d"; head -c 65536 /dev/zero > "$d/data"; touch -a -d "@$3" "$d/data"
+    mkdir -p "$d"; head -c $((65536 * ${4:-1})) /dev/zero > "$d/data"; touch -a -d "@$3" "$d/data"
 }
 # The manifest aa01 is read longest ago; then the layers bb02, cc03 (ghcr.io), dd04.
 store_fixture() {
@@ -450,7 +499,8 @@ maint() {
         mountpoint() { return 0; }
         rm() { if [[ -n ${RM_FAILS:-} && $* == *"$RM_FAILS"* ]]; then return 1; fi; command rm "$@"; }
         export -f df mountpoint rm
-        MSIZE=$MSIZE MUSED=$MUSED RM_FAILS=${RM_FAILS:-} FR_REGISTRY_DIR=$S bash "$WORK/registry-maint.sh" "$@"
+        MSIZE=$MSIZE MUSED=$MUSED RM_FAILS=${RM_FAILS:-} FR_REGISTRY_DIR=$S FR_REGISTRY_LOCK=${MLOCK:-$LOCK} \
+            bash "$WORK/registry-maint.sh" "$@"
     )
 }
 MSIZE=$((10 * K)) MUSED=$((8 * K))
@@ -472,6 +522,24 @@ expect "evict: a layer it cannot delete fails the run" ! maint evict 10 0 20 0
 RM_FAILS=""
 expect "...after deleting the next ones in its place" bash -c "test -f '$S/docker.io/docker/registry/v2/blobs/sha256/bb/bb02/data' && ! test -e '$S/ghcr.io/docker/registry/v2/blobs/sha256/cc/cc03' && ! test -e '$S/docker.io/docker/registry/v2/blobs/sha256/dd/dd04'"
 expect "evict: not mounted, nothing done" bash -c "store=\$(mktemp -d); mountpoint() { return 1; }; export -f mountpoint; FR_REGISTRY_DIR=\$store bash '$WORK/registry-maint.sh' evict 10 1536 20 3072 | grep -q 'not mounted'"
+# Never more than half the file system: one 256 KiB layer would want 512 KiB
+# (2 x largest) of a 640 KiB file system, which would empty it.
+store_fixture; blob docker.io ee05 2500 4; MSIZE=$((10 * K)) MUSED=$((10 * K))
+out=$(maint evict 10 0 20 0 2>&1); rc=$?
+expect "evict: wanting more than half the file system frees half" test "$rc" = 0
+expect "...stopping there: the newest layer kept" has_blob docker.io dd04
+expect "...the older ones deleted, the big one too" bash -c "! test -e '$S/docker.io/docker/registry/v2/blobs/sha256/ee/ee05' && ! test -e '$S/ghcr.io/docker/registry/v2/blobs/sha256/cc/cc03'"
+expect "...and says FR_REGISTRY_GB is small for these layers" grep -q 'half the file system.*FR_REGISTRY_GB is small' <<<"$out"
+# The lock: without it nothing runs; held (by the installer, or gc), evict waits.
+out=$(MLOCK=$WORK/no-lock maint evict 10 0 20 0 2>&1); rc=$?
+expect "evict: no lock file, no run" test "$rc" = 1
+expect "...and says why" grep -q 'cannot open the lock' <<<"$out"
+store_fixture; MSIZE=$((10 * K)) MUSED=$((8 * K))
+flock "$LOCK" sleep 3 &
+held=$!; sleep 0.5; t0=$SECONDS
+maint evict 10 0 20 0 >/dev/null 2>&1
+waited=$((SECONDS - t0)); wait "$held"
+expect "evict: waits while the lock is held (${waited} s)" test "$waited" -ge 2
 
 # The gc step: systemctl, setpriv logged to $GC/log. systemctl is-active says
 # what $GC/state-of-unit holds (else inactive); setpriv fails with "boom" while
@@ -490,6 +558,8 @@ gc_run() {
         }
         setpriv() {
             echo "setpriv $*" >> "$GC/log"
+            # A stop of the service (TimeoutStopSec, systemctl stop) mid-run.
+            if [[ -f $GC/term ]]; then kill -TERM $$; return 0; fi
             if [[ -f $GC/fail ]]; then echo boom; return 1; fi
             if [[ -f $GC/notfound ]]; then echo 'Path not found: /docker/registry/v2/repositories/x/_layers'; return 1; fi
         }
@@ -497,11 +567,11 @@ gc_run() {
         export -f systemctl setpriv mountpoint
         export GC
         FR_REGISTRY_DIR=$S FR_REGISTRY_CONF_DIR=$GC/conf FR_REGISTRY_STATE_DIR=$GC/state FR_JOBS_DIR=$GC/jobs \
-            bash "$WORK/registry-maint.sh" gc
+            FR_REGISTRY_LOCK=$LOCK bash "$WORK/registry-maint.sh" gc
     ) >/dev/null 2>&1
 }
 gc_line() { grep -n -m1 -- "$1" "$GC/log" | cut -d: -f1; }
-gc_fresh() { rm -rf "$GC/state" "$GC/fail" "$GC/notfound"; : > "$GC/log"; }
+gc_fresh() { rm -rf "$GC/state" "$GC/fail" "$GC/notfound" "$GC/term"; : > "$GC/log"; }
 gc_fresh; echo active > "$GC/state-of-unit"; touch "$GC/jobs/job-1.json"
 gc_run
 expect "gc: nothing while a job runs" ! grep -q 'mask\|stop\|setpriv' "$GC/log"
@@ -517,6 +587,13 @@ expect "...a mirror that never stored an image is left alone (garbage-collect fa
 expect "gc: not again the same day" ! grep -q 'setpriv' "$GC/log"
 gc_fresh; touch "$GC/fail"
 expect "gc: a failed garbage-collect fails the run" ! gc_run
+expect "...and the mirror is unmasked and started again all the same" bash -c "grep -q 'systemctl unmask --runtime -q firerunner-registry@docker.io' '$GC/log' && grep -q 'systemctl start firerunner-registry@docker.io' '$GC/log'"
+gc_fresh; touch "$GC/term"
+expect "gc: stopped (SIGTERM) while garbage-collect runs, it ends" ! gc_run
+expect "...through the trap: the mirror unmasked" test "$(gc_line 'garbage-collect')" -lt "$(gc_line 'systemctl unmask --runtime -q firerunner-registry@docker.io')"
+expect "...and started again" grep -q 'systemctl start firerunner-registry@docker.io' "$GC/log"
+gc_fresh; touch "$GC/fail"
+gc_run
 expect "...and the mirror is unmasked and started again all the same" bash -c "grep -q 'systemctl unmask --runtime -q firerunner-registry@docker.io' '$GC/log' && grep -q 'systemctl start firerunner-registry@docker.io' '$GC/log'"
 gc_fresh; touch "$GC/notfound"
 expect "gc: distribution's 'Path not found' (manifests without layers) is no failure" gc_run
