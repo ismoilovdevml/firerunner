@@ -102,9 +102,13 @@ func ReadRunnerState(ctx context.Context) (RunnerState, error) {
 
 // StopRunnerGracefully asks gitlab-runner to stop taking jobs and to exit
 // once its running jobs finished; it does not wait for that. It reports
-// whether it asked: false when gitlab-runner was not running, or already
-// stopping gracefully. It never stops gitlab-runner when systemd would not
-// stop it gracefully.
+// whether it asked: false when gitlab-runner was not running. It never
+// stops gitlab-runner when systemd would not stop it gracefully.
+//
+// A gitlab-runner already stopping gracefully is asked again: an undrain
+// meanwhile may have queued a start behind that stop, which would start it
+// on a drained host once its jobs finished. A stop job replaces a start job
+// that waits, and for a unit already stopping it changes nothing else.
 func StopRunnerGracefully(ctx context.Context) (bool, error) {
 	st, err := ReadRunnerState(ctx)
 	if err != nil {
@@ -112,13 +116,13 @@ func StopRunnerGracefully(ctx context.Context) (bool, error) {
 	}
 	switch {
 	case st.Stopping() && st.Graceful:
-		return false, nil
+		return true, systemctl(ctx, "stop", "--no-block", RunnerUnit)
 	case st.Stopping():
 		return false, ErrRunnerStopping
 	case !st.Running():
 		return false, nil
 	}
-	path := filepath.Join(runnerDropInDir, runnerDropInName)
+	path := DrainDropIn()
 	if cur, err := os.ReadFile(path); err != nil || string(cur) != runnerDropIn {
 		if err := os.MkdirAll(runnerDropInDir, 0o755); err != nil {
 			return false, err
@@ -154,34 +158,64 @@ const (
 	ResumeStarted
 	// ResumeAfterStop: gitlab-runner still finishes the jobs it ran when
 	// drained (a stopping gitlab-runner cannot take jobs again); it starts
-	// once it has exited.
+	// once it has exited. The drain drop-in is still there: DropDrainDropIn
+	// removes it once gitlab-runner no longer stops.
 	ResumeAfterStop
 )
 
+// DrainDropIn is the drop-in drain adds to gitlab-runner's unit.
+func DrainDropIn() string { return filepath.Join(runnerDropInDir, runnerDropInName) }
+
+// HasDrainDropIn reports whether the drain drop-in is in place: every stop
+// of gitlab-runner then waits for its jobs, up to daemon.job_max_age.
+func HasDrainDropIn() bool {
+	_, err := os.Stat(DrainDropIn())
+	return err == nil
+}
+
 // ResumeRunner starts gitlab-runner again if drain stopped it (the drain
 // drop-in is there), then removes the drop-in. While gitlab-runner still
-// stops, the drop-in stays: a reload without it would end that stop by
-// killing the jobs. A start that fails keeps it too, so undrain can be run
-// again. The Resume tells what was done, also with an error.
+// stops, the start waits behind that stop and the drop-in stays
+// (ResumeAfterStop): a reload without it would end that stop by killing the
+// jobs; DropDrainDropIn removes it later. A start that fails keeps it too,
+// so undrain can be run again. The Resume tells what was done, also with an
+// error.
 func ResumeRunner(ctx context.Context) (Resume, error) {
-	path := filepath.Join(runnerDropInDir, runnerDropInName)
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+	if !HasDrainDropIn() {
 		return ResumeNothing, nil
-	}
-	st, err := ReadRunnerState(ctx)
-	if err != nil {
-		return ResumeNothing, err
 	}
 	if err := systemctl(ctx, "start", "--no-block", RunnerUnit); err != nil {
 		return ResumeNothing, err
 	}
-	if st.Stopping() {
+	dropped, err := DropDrainDropIn(ctx)
+	switch {
+	case err != nil:
+		return ResumeStarted, err
+	case !dropped:
 		return ResumeAfterStop, nil
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return ResumeStarted, err
+	return ResumeStarted, nil
+}
+
+// DropDrainDropIn removes the drain drop-in once gitlab-runner no longer
+// stops, and reports whether it is gone. While gitlab-runner stops it stays:
+// a reload without it would set the stop timeout back to 90 s and kill the
+// jobs at its end.
+func DropDrainDropIn(ctx context.Context) (bool, error) {
+	if !HasDrainDropIn() {
+		return true, nil
 	}
-	return ResumeStarted, systemctl(ctx, "daemon-reload")
+	st, err := ReadRunnerState(ctx)
+	if err != nil {
+		return false, err
+	}
+	if st.Stopping() {
+		return false, nil
+	}
+	if err := os.Remove(DrainDropIn()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	return true, systemctl(ctx, "daemon-reload")
 }
 
 // systemctl runs systemctl with commandTimeout; the error carries its output.

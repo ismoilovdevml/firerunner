@@ -34,6 +34,10 @@ type drainRunner interface {
 	Stop(ctx context.Context) (bool, error)
 	Resume(ctx context.Context) (host.Resume, error)
 	State(ctx context.Context) (host.RunnerState, error)
+	// DropDropIn removes the drain drop-in once gitlab-runner no longer
+	// stops; false while it does.
+	DropDropIn(ctx context.Context) (bool, error)
+	HasDropIn() bool
 }
 
 // hostRunner is gitlab-runner's systemd unit on this host.
@@ -46,6 +50,8 @@ func (hostRunner) Resume(ctx context.Context) (host.Resume, error) {
 func (hostRunner) State(ctx context.Context) (host.RunnerState, error) {
 	return host.ReadRunnerState(ctx)
 }
+func (hostRunner) DropDropIn(ctx context.Context) (bool, error) { return host.DropDrainDropIn(ctx) }
+func (hostRunner) HasDropIn() bool                              { return host.HasDrainDropIn() }
 
 // drainer runs drain and undrain against a daemon and a gitlab-runner.
 type drainer struct {
@@ -94,18 +100,27 @@ func cmdDrain(cfg config.Config, args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if *cancel {
-		return newDrainer(cfg).undrain(ctx)
+		return newDrainer(cfg).undrain(ctx, *timeout)
 	}
 	return newDrainer(cfg).drain(ctx, *timeout)
 }
 
 func cmdUndrain(cfg config.Config, args []string) error {
-	if len(args) > 0 {
-		return fmt.Errorf("usage: firerunner undrain")
+	fs := flag.NewFlagSet("undrain", flag.ContinueOnError)
+	timeout := fs.Duration("timeout", defaultDrainTimeout(cfg),
+		"how long to wait for a gitlab-runner that still finishes the jobs it ran when drained (default: daemon.job_max_age + daemon.reconcile_interval)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("usage: firerunner undrain [--timeout D]")
+	}
+	if *timeout <= 0 {
+		return fmt.Errorf("--timeout must be positive")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return newDrainer(cfg).undrain(ctx)
+	return newDrainer(cfg).undrain(ctx, *timeout)
 }
 
 // drain drains the daemon, then gitlab-runner, then waits until nothing
@@ -138,10 +153,22 @@ func (dr drainer) wait(ctx context.Context, timeout time.Duration) error {
 	defer cancel()
 	tick := time.NewTicker(dr.poll)
 	defer tick.Stop()
-	var last, line string
+	var last, line, lastStopErr string
 	var lastAt time.Time
 	for {
 		st, rs, err := dr.look(ctx)
+		if err == nil && st.Drained && rs.Running() {
+			// Started meanwhile (by hand, or a start an undrain queued
+			// behind the stop): stop it again.
+			if asked, serr := dr.runner.Stop(ctx); serr != nil {
+				if serr.Error() != lastStopErr {
+					fmt.Fprintln(dr.out, "warning: gitlab-runner was started during the drain and could not be stopped:", serr)
+					lastStopErr = serr.Error()
+				}
+			} else if asked {
+				fmt.Fprintln(dr.out, "drain: gitlab-runner was started during the drain; stopping it again")
+			}
+		}
 		if ctx.Err() == nil {
 			var done bool
 			line, done, err = drainProgress(st, rs, err)
@@ -228,8 +255,12 @@ func plural(n int, what string) string {
 }
 
 // undrain starts gitlab-runner again if drain stopped it, and lets the
-// daemon boot again. Both are tried; it fails if either does.
-func (dr drainer) undrain(ctx context.Context) error {
+// daemon boot again. Both are tried; it fails if either does. When
+// gitlab-runner still finishes the jobs it ran when drained, it starts once
+// they are done; undrain then waits for that, at most timeout, to remove
+// the drain's drop-in, which would make every later stop of gitlab-runner
+// wait for its jobs.
+func (dr drainer) undrain(ctx context.Context, timeout time.Duration) error {
 	res, rerr := dr.runner.Resume(ctx)
 	switch {
 	case rerr != nil:
@@ -248,7 +279,51 @@ func (dr drainer) undrain(ctx context.Context) error {
 		return errors.Join(rerr, fmt.Errorf("the daemon is still drained (systemctl status firerunner): %w", err))
 	}
 	fmt.Fprintln(dr.out, "undrain: the daemon boots pool VMs and builders again")
+	if rerr == nil && res == host.ResumeAfterStop {
+		return dr.waitDropIn(ctx, timeout)
+	}
 	return rerr
+}
+
+// waitDropIn waits until gitlab-runner no longer stops and then removes
+// the drain drop-in. Until then its stop settings stay: removing them
+// earlier would end the stop by killing the jobs.
+func (dr drainer) waitDropIn(ctx context.Context, timeout time.Duration) error {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	tick := time.NewTicker(dr.poll)
+	defer tick.Stop()
+	var last string
+	var lastAt time.Time
+	for {
+		gone, err := dr.runner.DropDropIn(ctx)
+		if ctx.Err() == nil {
+			if gone && err == nil {
+				fmt.Fprintln(dr.out, "undrain: gitlab-runner finished those jobs and starts again; the drain's stop settings are removed")
+				return nil
+			}
+			line := "gitlab-runner finishing the jobs it ran when drained"
+			if err != nil {
+				line = err.Error() + "; retrying"
+			}
+			if line != last || time.Since(lastAt) >= dr.progressEvery {
+				fmt.Fprintf(dr.out, "waiting %s: %s\n", time.Since(start).Round(time.Second), line)
+				last, lastAt = line, time.Now()
+			}
+		}
+		select {
+		case <-ctx.Done():
+			why := "stopped waiting"
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				why = "still after " + timeout.String()
+			}
+			return fmt.Errorf("gitlab-runner still finishes the jobs it ran when drained (%s). It starts once they are done, "+
+				"but keeps the drain's stop settings (%s), so every stop of it waits for its jobs. "+
+				"Once 'systemctl is-active gitlab-runner' no longer prints deactivating, run: sudo firerunner undrain", why, host.DrainDropIn())
+		case <-tick.C:
+		}
+	}
 }
 
 // drainLine is the Drain line of firerunner status.
@@ -258,6 +333,10 @@ func drainLine(ctx context.Context, d drainDaemon, r drainRunner) string {
 		return "unknown: daemon not reachable"
 	}
 	if !st.Drained {
+		if r.HasDropIn() {
+			return "no, but gitlab-runner keeps the drain's stop settings (" + host.DrainDropIn() +
+				"): every stop of it waits for its jobs; firerunner undrain removes them once it no longer stops"
+		}
 		return "no"
 	}
 	since := "since " + st.Since.Local().Format("2006-01-02 15:04")
