@@ -1411,8 +1411,8 @@ var (
 
 // registryConfDir is where install.sh writes the registry mirrors' configs;
 // registriesDir is where it mounts their file system, of its own (an image
-// or a disk in /etc/fstab) and kept under 90 % by an eviction. Variables
-// for tests.
+// or a disk in /etc/fstab), whose eviction starts below 10 % or 1.5 GiB free
+// and stops at 20 % and 3 GiB free. Variables for tests.
 var (
 	registryConfDir   = host.RegistryConfDir
 	registriesDir     = "/var/lib/firerunner/registries"
