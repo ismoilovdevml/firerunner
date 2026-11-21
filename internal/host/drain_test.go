@@ -16,7 +16,8 @@ import (
 // fakeSystemd plays systemd for gitlab-runner's unit, with the job rules a
 // drain relies on. They are modelled from systemd's behaviour, not run: the
 // test hosts allow no unit changes.
-//   - A drop-in counts once a daemon-reload has read it.
+//   - A drop-in counts once a daemon-reload has read it (DropInPaths),
+//     and a removed one until a daemon-reload went through.
 //   - stop on a running unit leaves it stopping (deactivating) while its
 //     jobs still run; a stop that is not graceful kills them (jobsKilled).
 //   - start on a stopping unit does not start it: the start job waits
@@ -29,7 +30,8 @@ type fakeSystemd struct {
 	mu         sync.Mutex
 	active     string
 	queued     bool            // a start job waits behind the stop
-	loaded     bool            // the drain drop-in was in place at the last daemon-reload
+	loaded     bool            // the drain drop-in is loaded and in effect (graceful)
+	inPaths    bool            // the drain drop-in is loaded (DropInPaths), maybe overridden
 	override   bool            // another drop-in overrides it: never graceful
 	jobsKilled bool            // a stop or reload would have killed the running jobs
 	fail       map[string]bool // systemctl verbs that fail
@@ -51,7 +53,8 @@ func (f *fakeSystemd) command(ctx context.Context, name string, args ...string) 
 	switch verb {
 	case "daemon-reload":
 		_, err := os.Stat(filepath.Join(runnerDropInDir, runnerDropInName))
-		f.loaded = err == nil && !f.override
+		f.inPaths = err == nil
+		f.loaded = f.inPaths && !f.override
 		if f.active == "deactivating" && !f.loaded {
 			f.jobsKilled = true
 		}
@@ -77,7 +80,12 @@ func (f *fakeSystemd) command(ctx context.Context, name string, args ...string) 
 		if f.loaded {
 			killMode, signal, timeout = "mixed", "3", "infinity"
 		}
-		out = fmt.Sprintf("ActiveState=%s\nKillMode=%s\nKillSignal=%s\nTimeoutStopUSec=%s\n", f.active, killMode, signal, timeout)
+		paths := "/etc/systemd/system/gitlab-runner.service.d/firerunner-proxy.conf"
+		if f.loaded || f.inPaths {
+			paths += " " + filepath.Join(runnerDropInDir, runnerDropInName)
+		}
+		out = fmt.Sprintf("ActiveState=%s\nKillMode=%s\nKillSignal=%s\nTimeoutStopUSec=%s\nDropInPaths=%s\n",
+			f.active, killMode, signal, timeout, paths)
 	}
 	cmd := exec.CommandContext(ctx, "sh", "-c", `printf '%s' "$OUT"`)
 	cmd.Env = append(os.Environ(), "OUT="+out)
@@ -233,7 +241,7 @@ func TestResumeRunner(t *testing.T) {
 		{name: "drain did not stop it", sd: &fakeSystemd{active: "inactive"},
 			want: ResumeNothing, active: "inactive"},
 		{name: "stopped by drain", sd: &fakeSystemd{active: "inactive", loaded: true}, dropIn: true,
-			want: ResumeStarted, verbs: []string{"start", "show", "daemon-reload"}, active: "active"},
+			want: ResumeStarted, verbs: []string{"start", "show", "daemon-reload", "show"}, active: "active"},
 		// The start waits behind the stop; a reload without the drop-in
 		// would end the stop by killing the jobs, so it stays.
 		{name: "still finishing its jobs", sd: &fakeSystemd{active: "deactivating", loaded: true}, dropIn: true,
@@ -275,16 +283,23 @@ func TestDropDrainDropIn(t *testing.T) {
 		wantErr    bool
 		verbs      []string
 		wantDropIn bool
+		loaded     bool // afterwards: systemd still has it loaded
 	}{
-		{name: "none there", sd: &fakeSystemd{active: "active"}, gone: true},
+		{name: "none there", sd: &fakeSystemd{active: "active"}, gone: true, verbs: []string{"show"}},
 		{name: "still stopping: kept", sd: &fakeSystemd{active: "deactivating", loaded: true}, dropIn: true,
-			verbs: []string{"show"}, wantDropIn: true},
+			verbs: []string{"show"}, wantDropIn: true, loaded: true},
 		{name: "started again: removed", sd: &fakeSystemd{active: "active", loaded: true}, dropIn: true,
-			gone: true, verbs: []string{"show", "daemon-reload"}},
+			gone: true, verbs: []string{"show", "daemon-reload", "show"}},
 		{name: "stopped: removed", sd: &fakeSystemd{active: "inactive", loaded: true}, dropIn: true,
-			gone: true, verbs: []string{"show", "daemon-reload"}},
+			gone: true, verbs: []string{"show", "daemon-reload", "show"}},
+		// Removed but still loaded: the stop settings still apply, so it is
+		// not gone; a later call reloads again.
+		{name: "daemon-reload fails: not gone", sd: &fakeSystemd{active: "active", loaded: true, fail: map[string]bool{"daemon-reload": true}}, dropIn: true,
+			wantErr: true, verbs: []string{"show", "daemon-reload"}, loaded: true},
+		{name: "file gone but still loaded: reloaded", sd: &fakeSystemd{active: "active", loaded: true},
+			gone: true, verbs: []string{"show", "daemon-reload", "show"}},
 		{name: "systemctl show fails: kept", sd: &fakeSystemd{active: "active", loaded: true, fail: map[string]bool{"show": true}}, dropIn: true,
-			wantErr: true, verbs: []string{"show"}, wantDropIn: true},
+			wantErr: true, verbs: []string{"show"}, wantDropIn: true, loaded: true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -302,6 +317,9 @@ func TestDropDrainDropIn(t *testing.T) {
 			}
 			if HasDrainDropIn() != c.wantDropIn {
 				t.Errorf("drop-in there: %v, want %v", HasDrainDropIn(), c.wantDropIn)
+			}
+			if sd.loaded != c.loaded {
+				t.Errorf("drop-in loaded: %v, want %v", sd.loaded, c.loaded)
 			}
 		})
 	}
@@ -380,5 +398,47 @@ func checkErr(t *testing.T, err, want error) {
 		t.Fatalf("unexpected error: %v", err)
 	case want == errAny && err == nil, want != nil && want != errAny && !errors.Is(err, want):
 		t.Fatalf("error %v, want %v", err, want)
+	}
+}
+
+// A daemon-reload that fails after the file went leaves the stop settings
+// loaded: undrain must not report them gone, and the next try reloads.
+func TestDropDrainDropInRetriesAFailedReload(t *testing.T) {
+	sd := &fakeSystemd{active: "active", loaded: true, fail: map[string]bool{"daemon-reload": true}}
+	putDropIn(t, fakeRunner(t, sd))
+	ctx := context.Background()
+	if gone, err := DropDrainDropIn(ctx); gone || err == nil {
+		t.Fatalf("first try with a failing reload = %v, %v", gone, err)
+	}
+	if left, err := DrainSettingsLeft(ctx); !left || err != nil {
+		t.Fatalf("DrainSettingsLeft after a failed reload = %v, %v; want left", left, err)
+	}
+	sd.mu.Lock()
+	sd.fail = nil
+	sd.mu.Unlock()
+	if gone, err := DropDrainDropIn(ctx); !gone || err != nil || sd.loaded {
+		t.Fatalf("second try = %v, %v; loaded %v", gone, err, sd.loaded)
+	}
+	if left, err := DrainSettingsLeft(ctx); left || err != nil {
+		t.Fatalf("DrainSettingsLeft after the reload = %v, %v", left, err)
+	}
+}
+
+// DropInPaths tells whether systemd has the drain drop-in loaded.
+func TestReadRunnerStateDrainLoaded(t *testing.T) {
+	for _, c := range []struct {
+		paths string
+		want  bool
+	}{
+		{"/etc/systemd/system/gitlab-runner.service.d/kill.conf " + DrainDropIn(), true},
+		{"/etc/systemd/system/gitlab-runner.service.d/kill.conf", false},
+		{"", false},
+		{DrainDropIn() + ".bak", false},
+	} {
+		stubCommands(t, "printf 'ActiveState=active\\nDropInPaths="+c.paths+"\\n'")
+		st, err := ReadRunnerState(context.Background())
+		if err != nil || st.DrainLoaded != c.want {
+			t.Errorf("DropInPaths=%q: %+v, %v; want loaded %v", c.paths, st, err, c.want)
+		}
 	}
 }
