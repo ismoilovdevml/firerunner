@@ -27,6 +27,7 @@ expect() {
 # shellcheck disable=SC1091
 source "$WORK/install-lib.sh"
 set +e; trap - ERR EXIT INT HUP TERM
+CHANGED_FILE=$WORK/changed-files
 CONF_DIR=$WORK/conf FLINTLOCK_TLS_DIR=$WORK/conf/flintlock-tls BIN_DIR=$WORK/bin
 PENDING_FILE=$WORK/pending-restarts TMP_DIR=$WORK/tmp FLINTLOCK_TLS_WAIT=4
 FLINTLOCK_TLS_MARKER=$WORK/flintlock-tls-switching

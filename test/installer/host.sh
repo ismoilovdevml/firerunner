@@ -30,6 +30,7 @@ expect() {
 # shellcheck disable=SC1091
 source "$WORK/install-lib.sh"
 set +e; trap - ERR INT HUP TERM; trap 'rm -rf "$WORK"' EXIT
+CHANGED_FILE=$WORK/changed-files
 
 # ---- cache: the oldest archives go above the size cap
 cache_clean_script > "$WORK/cache-clean.sh"
@@ -737,6 +738,24 @@ expect "system user comment: a ':' never reaches useradd" gecos_ok fr-test "Fire
 for u in "$REGISTRY_USER" "$CACHE_USER"; do
     expect "the installer's own user comments for $u have no ':'" bash -c "! grep -E 'system_user \"\\\$(REGISTRY|CACHE)_USER\" \"[^\"]*:' '$WORK/install-lib.sh'"
 done
+
+# ---- dnsmasq: SELinux lets it into dnsmasq_t only without NoNewPrivileges
+dnsmasq_unit() { sed -n '/^    put \/etc\/systemd\/system\/firerunner-dnsmasq.service/,/^EOF$/p' "$WORK/install-lib.sh"; }
+expect "dnsmasq unit found in the installer" bash -c "$(declare -f dnsmasq_unit); WORK='$WORK'; dnsmasq_unit | grep -q '^ExecStart='"
+expect "dnsmasq unit sets no NoNewPrivileges (SELinux nnp_transition)" bash -c "$(declare -f dnsmasq_unit); WORK='$WORK'; ! dnsmasq_unit | grep -q '^NoNewPrivileges='"
+
+# ---- a run that stops half way: the next run acts on what it changed
+U=$WORK/changed/fr-test.service
+rm -f "$CHANGED_FILE"
+( CHANGED=" "; echo one | put "$U"; exit 1 )
+expect "a run that died after writing a unit left it in CHANGED_FILE" grep -qxF "$U" "$CHANGED_FILE"
+expect "...a plain re-run finds the unit unchanged" bash -c "[[ \$(echo one | md5sum) == \$(md5sum <'$U') ]]"
+half_way() ( CHANGED=" "; load_changed >/dev/null 2>&1; echo one | put "$U"; changed "$U" )
+expect "...the next run still restarts its service" half_way
+expect "...the installer reads them back before it writes any file" bash -c "sed -n '/^main() {/,/^}/p' '$WORK/install-lib.sh' | grep -A1 '^    preflight$' | grep -qx '    load_changed'"
+expect "...and forgets them only at the end of a run that went through" bash -c "sed -n '/^main() {/,/^}/p' '$WORK/install-lib.sh' | grep -B1 '^}' | grep -qx '    rm -f \"\$CHANGED_FILE\"'"
+rm -f "$CHANGED_FILE"
+expect "an unchanged unit after a run that went through: no restart" ! half_way
 
 echo "RESULT pass=$pass fail=$fail"
 [[ $fail -eq 0 ]]

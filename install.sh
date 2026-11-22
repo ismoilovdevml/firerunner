@@ -395,7 +395,7 @@ setup_proxy() {
 proxy_dropin() {
     local d="/etc/systemd/system/$1.service.d/firerunner-proxy.conf"
     if ! proxy_on; then
-        [[ -f $d ]] && { rm -f "$d"; CHANGED+="$d "; }
+        [[ -f $d ]] && { rm -f "$d"; record_changed "$d"; }
         return 0
     fi
     local p="http://127.0.0.1:${PROXY_PORT}" no
@@ -732,6 +732,27 @@ install_binary() {
 # Files that changed in this run; a service restarts only if one of its
 # files changed, so re-running the installer does not kill running jobs.
 CHANGED=" "
+# CHANGED_FILE keeps them until a run ends well. A run that stops half way (an
+# error, ^C) has written files whose services it never restarted, and the next
+# run finds those files unchanged: it reads them back (load_changed).
+CHANGED_FILE=/var/lib/firerunner/changed-files
+
+# record_changed FILE: FILE changed (written, installed or removed).
+record_changed() {
+    CHANGED+="$1 "
+    mkdir -p "$(dirname "$CHANGED_FILE")"
+    echo "$1" >>"$CHANGED_FILE"
+}
+
+# load_changed: what an earlier run changed and did not get to act on.
+load_changed() {
+    [[ -s $CHANGED_FILE ]] || return 0
+    local f
+    while IFS= read -r f; do
+        [[ -n $f && $CHANGED != *" $f "* ]] && CHANGED+="$f "
+    done <"$CHANGED_FILE"
+    log "an earlier run stopped half way: its changes apply in this run"
+}
 
 # put FILE [MODE]: write stdin to FILE only when the content differs.
 put() {
@@ -746,11 +767,11 @@ put() {
     mkdir -p "$(dirname "$f")"
     install -m "$mode" "$tmp" "$f"
     rm -f "$tmp"
-    CHANGED+="$f "
+    record_changed "$f"
 }
 
 # installed FILE: record that a binary was (re)installed.
-installed() { CHANGED+="$1 "; }
+installed() { record_changed "$1"; }
 
 changed() {
     local f
@@ -1265,7 +1286,10 @@ RestartSec=5
 # Serves untrusted microVMs. It binds 53 and 67 on the bridge as root, then
 # runs as nobody and keeps NET_ADMIN for DHCP (and NET_RAW, SO_BINDTODEVICE on
 # older kernels); SETUID and SETGID drop root. Only the lease file is written.
-NoNewPrivileges=yes
+# No NoNewPrivileges: under SELinux it blocks the move into dnsmasq_t (the
+# policy has no nnp_transition for it), dnsmasq stays init_t and may not open
+# its lease file (dnsmasq_lease_t), so it does not start and no microVM gets
+# an address.
 ProtectSystem=strict
 ReadWritePaths=/var/lib/misc
 ProtectHome=yes
@@ -3167,7 +3191,7 @@ uninstall() {
     rm -f /etc/sysctl.d/90-firerunner.conf "$BIN_DIR/flintlockd" "$BIN_DIR/firerunner" "$BIN_DIR/registry" \
         "$BIN_DIR/versitygw" "$BIN_DIR/firecracker" "$BIN_DIR/jailer" "$REGISTRY_MAINT"
     rm -rf "$LIB_DIR" /etc/opt/flintlockd   # flintlockd's config holds the API token
-    rm -f "$FLINTLOCK_TLS_MARKER"
+    rm -f "$FLINTLOCK_TLS_MARKER" "$CHANGED_FILE"
     log "done. containerd binaries in $BIN_DIR are kept (another containerd may use them)."
     log "The users $REGISTRY_USER and $CACHE_USER stay (userdel removes them); the registry mirrors' data is in $REGISTRY_IMG."
     log "To also drop data: vgremove $VG && rm -rf $CONTAINERD_ROOT /var/lib/flintlock /var/lib/firerunner $CONF_DIR /etc/lvm/profile/${THINPOOL}.profile"
@@ -3180,6 +3204,7 @@ main() {
         *) die "usage: install.sh [install|uninstall]" ;;
     esac
     preflight
+    load_changed
     TMP_DIR=$(mktemp -d)
     setup_proxy
     install_packages
@@ -3222,6 +3247,8 @@ main() {
     if [[ -n $FLINTLOCK_TLS_LATER ]]; then
         warn "flintlockd's API stays without TLS for now (${FLINTLOCK_TLS_LATER}); re-run the installer when the runner is idle"
     fi
+    # Every change was acted on, or waits in PENDING_FILE.
+    rm -f "$CHANGED_FILE"
 }
 
 main "$@"

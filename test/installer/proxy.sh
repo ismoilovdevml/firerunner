@@ -23,6 +23,7 @@ expect() {
 # shellcheck disable=SC1090,SC1091
 source $WORK/install-lib.sh
 set +e; trap - ERR
+CHANGED_FILE=$WORK/changed-files
 CONF_DIR=$WORK/conf PROXY_FILE=$WORK/conf/proxy-upstream CA_FILE=$WORK/conf/ca.pem EGRESS_FILE=$WORK/conf/egress-deny
 PENDING_FILE=$WORK/pending-restarts LIB_DIR=$WORK/lib
 FR_SUBNET=10.200.0 BIN_DIR=$WORK/bin
